@@ -23,18 +23,17 @@ jobs:
   # Ядро + тесты + приложение под Linux x64, синтетическое видео для проверки
   linux:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       # установка пакетов иногда зависает на зеркалах — ограничиваем время и повторяем
       - name: Пакеты
-        timeout-minutes: 10
+        timeout-minutes: 35
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
-            cmake ninja-build pkg-config ffmpeg libsdl2-dev libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
+          .github/scripts/apt.sh cmake ninja-build pkg-config ffmpeg libsdl2-dev libavformat-dev libavcodec-dev \
+            libswscale-dev libavutil-dev
       - name: Python-пакеты
         timeout-minutes: 10
         run: pip install --quiet --timeout 60 --retries 3 numpy opencv-python-headless
@@ -72,10 +71,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Пакеты
-        timeout-minutes: 10
-        run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends cmake ninja-build pkg-config nasm mingw-w64
+        timeout-minutes: 35
+        run: .github/scripts/apt.sh cmake ninja-build pkg-config nasm mingw-w64
       - name: Кэш FFmpeg
         id: ffcache
         uses: actions/cache@v4
@@ -159,10 +156,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Пакеты
-        timeout-minutes: 10
-        run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends cmake ninja-build qemu-user-static g++-${{ matrix.triple }}
+        timeout-minutes: 35
+        run: .github/scripts/apt.sh cmake ninja-build qemu-user-static g++-${{ matrix.triple }}
       - name: Сборка и тесты NEON
         run: |
           cmake -S native -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/native/cmake/${{ matrix.triple }}.cmake
