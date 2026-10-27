@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "dronolok/detector.hpp"
@@ -421,6 +422,60 @@ static void test_governor() {
     std::printf("governor, profiles, calibrate (%.2f ms/MP): ok\n", ms);
 }
 
+// Неподвижная камера: маска неба в файл и обратно, проверка на старте, второй кандидат в
+// тайле, пересчёт трекера под частоту кадров
+static std::vector<uint8_t> ground_frame(int w, int h, float horizon, unsigned seed) {
+    std::mt19937 g(seed);
+    std::vector<uint8_t> f((size_t)w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            f[(size_t)y * w + x] = (uint8_t)(y < horizon * h ? 170 + (int)(g() % 3) : 40 + (int)(g() % 120));
+    return f;
+}
+
+static void test_stationary() {
+    const int w = 640, h = 480;
+    const std::string path = "test_mask.bin";
+    DetectorConfig cfg;
+    cfg.threads = 1;
+    std::vector<Candidate> c;
+    Detector a(cfg);
+    a.beginMaskLearning();
+    for (int i = 0; i < 25; ++i) a.detect(ground_frame(w, h, 0.6f, i).data(), w, h, w, c);
+    a.endMaskLearning();
+    CHECK(a.saveMask(path), "saveMask");
+    Detector b(cfg);
+    CHECK(b.loadMask(path, 10) && b.tileMask() == a.tileMask(), "loadMask");
+    for (int i = 0; i < 10; ++i) b.detect(ground_frame(w, h, 0.6f, 100 + i).data(), w, h, w, c);
+    CHECK(!b.verifyingMask() && !b.maskReplaced() && b.tileMask() == a.tileMask(), "mask verify, same scene");
+    Detector m(cfg);   // камеру повернули: земли стало больше — маска учится заново
+    m.loadMask(path, 10);
+    for (int i = 0; i < 10; ++i) m.detect(ground_frame(w, h, 0.3f, 200 + i).data(), w, h, w, c);
+    CHECK(m.maskReplaced() && m.tileMask() != a.tileMask(), "mask verify, moved camera");
+    std::remove(path.c_str());
+
+    // две тёмные точки в одном тайле 64x64: при per_tile 2 обе
+    std::vector<uint8_t> f((size_t)w * h, 170);
+    for (int d = 0; d < 2; ++d)
+        for (int y = 0; y < 3; ++y)
+            for (int x = 0; x < 3; ++x) f[(size_t)(70 + y + d * 6) * w + 70 + x + d * 20] = 120;
+    for (int pt : {1, 2}) {
+        DetectorConfig k;
+        k.threads = 1;
+        k.per_tile = pt;
+        k.bright = false;
+        Detector d(k);
+        d.detect(f.data(), w, h, w, c);
+        CHECK((int)c.size() == pt, "per_tile %d: %zu candidates", pt, c.size());
+    }
+
+    TrackerConfig t;
+    const TrackerConfig t25 = tracker_for_fps(t, 25.f), t10 = tracker_for_fps(t, 10.f);
+    CHECK(t25.gate == t.gate && t25.max_miss == t.max_miss, "tracker_for_fps 25");
+    CHECK(t10.gate > t.gate && t10.max_miss < t.max_miss && t10.confirm == t.confirm, "tracker_for_fps 10");
+    std::printf("stationary camera (mask file, per_tile, fps): ok\n");
+}
+
 int main() {
     const Kernels* ref = kernels_scalar();
     for (Isa isa : available_isas()) {
@@ -437,6 +492,7 @@ int main() {
     test_size_expect();
     test_follow();
     test_governor();
+    test_stationary();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

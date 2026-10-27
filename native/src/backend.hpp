@@ -24,7 +24,14 @@ struct ResponseParams {
     uint8_t hot_thr;          // пиксель "горячий", если отклик > hot_thr
     bool dark, bright;
     int job_rows, job_cols;   // размер задания, тайлы
+    // Ячейки CELL x CELL пикс. (после пулинга) внутри тайлов: максимум отклика каждой и,
+    // если он выше cell_thr, его место. Нужны для фона по ячейкам, накопления по кадрам и
+    // второго кандидата в тайле. tile должен делиться на CELL.
+    bool cells = false;
+    uint8_t cell_thr = 255;
 };
+
+constexpr int CELL = 8;
 
 // Статистика одной полярности по сетке тайлов tilesY x tilesX
 struct TileStats {
@@ -32,7 +39,11 @@ struct TileStats {
     std::vector<uint8_t> maxv;     // максимум отклика
     std::vector<uint16_t> hot;     // число пикселей > hot_thr
     std::vector<uint16_t> argmax;  // первый максимум: y * tile + x
+    // ячейки (ResponseParams::cells): сетка (tilesY*tile/CELL) x (tilesX*tile/CELL)
+    std::vector<uint8_t> cmax;     // максимум отклика ячейки (0 — не считалась)
+    std::vector<uint8_t> carg;     // его место y * CELL + x; 255 — не искали (максимум <= cell_thr)
     void resize(size_t n) { sum.assign(n, 0); maxv.assign(n, 0); hot.assign(n, 0); argmax.assign(n, 0); }
+    void resizeCells(size_t n) { cmax.assign(n, 0); carg.assign(n, 255); }
 };
 
 class Backend {

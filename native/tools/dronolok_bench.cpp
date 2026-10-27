@@ -43,18 +43,27 @@ static void usage() {
         "  --auto-thr [--noise-k 4.5 --thr-min 5]   порог по оценке шума (CFAR)\n"
         "  --ev 3 [--ev-hit 0.3]   подтверждение трека по накопленной уверенности\n"
         "  --confirm 3 --window 5  подтверждение трека: попаданий из окна кадров\n"
-        "  --learn-mask N          авто-маска неба по первым N кадрам\n"
+        "  --learn-mask N          авто-маска неба по первым N кадрам (до замера)\n"
+        "  --learn-live N          учить маску на первых N кадрах замера, как приложение при открытии\n"
+        "  --mask-file f           маска неба из файла (есть — загрузить и сверить, нет — выучить и сохранить)\n"
+        "  --eval-all              оценивать и первый проход (обычно — со второго)\n"
         "  --scales 1..4           доп. масштабы для крупных целей\n"
         "  --focus                 пониженный порог возле прогноза треков\n"
         "  --motion                компенсация движения камеры\n"
         "  --zones                 зоны кадра: небо / смешанные / земля\n"
         "  --full-every N          весь кадр раз в N кадров, между ними — только вокруг треков\n"
         "  --coarse-every N        грубые масштабы целиком раз в N кадров\n"
+        "  --per-tile N            до стольких кандидатов в тайле (2; второй — из ячеек 16x16)\n"
+        "  --no-bg-map             без фона по ячейкам у кромки леса (маска неба с тайлом запаса, как раньше)\n"
+        "  --bg-map [--bg-k 3 --bg-frames 250]  фон по ячейкам у кромки: порог ячейки = медиана + K*СКО\n"
+        "  --tbd [--tbd-thr 7 --tbd-z0 1.5 --tbd-decay 0.7 --tbd-min 0.5]   накопление по кадрам (включает --bg-map)\n"
+        "  --band PX [--band-k 1 --upper-every N]   полоса у горизонта каждый кадр, небо выше — раз в N\n"
         "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
         "  --flap-window 48 --flap-r2 0.45 --flap-depth 0.3 --flap-hold 50   взмахи (окно 0 — выкл.)\n"
         "  --hover 0.3 --flock 150     зависание = дрон, стая с машущей = птицы (0 — выкл.)\n"
+        "  --fps-scale             параметры трекера в секундах: пересчитать под частоту кадров ролика\n"
         "  --stream                не загружать заранее (замер вместе с чтением)\n"
         "  --sweep                 таблица скоростей: наборы инструкций x потоки\n"
         "  --json out.jsonl        дописать итог строкой JSON\n"
@@ -92,9 +101,10 @@ int main(int argc, char** argv) {
                     "введите это число в приложении: Ресурсы > Устройство > мс/Мп на устройстве\n", v);
         return 0;
     }
-    std::string input, gtPath, jsonPath, dumpPath;
-    int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0;
-    bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false;
+    std::string input, gtPath, jsonPath, dumpPath, maskPath;
+    int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0, learnLive = 0;
+    bool evalAll = false;
+    bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false, fpsScale = false;
     GlobalMotion gm;
     std::vector<FocusArea> focusAreas, roiAreas;
     DetectorConfig cfg;
@@ -140,6 +150,9 @@ int main(int argc, char** argv) {
         else if (a == "--hover") tcfg.hover_speed = (float)std::atof(val().c_str());
         else if (a == "--flock") tcfg.flock_px = (float)std::atof(val().c_str());
         else if (a == "--learn-mask") learn = std::atoi(val().c_str());
+        else if (a == "--learn-live") learnLive = std::atoi(val().c_str());
+        else if (a == "--mask-file") maskPath = val();
+        else if (a == "--eval-all") evalAll = true;
         else if (a == "--scales") cfg.scales = std::atoi(val().c_str());
         else if (a == "--focus") focus = true;
         else if (a == "--q") tcfg.q_accel = (float)std::atof(val().c_str());
@@ -149,10 +162,24 @@ int main(int argc, char** argv) {
         else if (a == "--mixed-k") cfg.mixed_k = (float)std::atof(val().c_str());
         else if (a == "--full-every") cfg.full_every = std::atoi(val().c_str());
         else if (a == "--coarse-every") cfg.coarse_every = std::atoi(val().c_str());
+        else if (a == "--per-tile") cfg.per_tile = std::atoi(val().c_str());
+        else if (a == "--bg-map") cfg.bg_map = true;
+        else if (a == "--no-bg-map") cfg.bg_map = false;
+        else if (a == "--bg-k") cfg.bg_k = (float)std::atof(val().c_str());
+        else if (a == "--bg-frames") cfg.bg_frames = std::atoi(val().c_str());
+        else if (a == "--tbd") cfg.tbd = cfg.bg_map = true;
+        else if (a == "--tbd-thr") cfg.tbd_thr = (float)std::atof(val().c_str());
+        else if (a == "--tbd-z0") cfg.tbd_z0 = (float)std::atof(val().c_str());
+        else if (a == "--tbd-decay") cfg.tbd_decay = (float)std::atof(val().c_str());
+        else if (a == "--tbd-min") cfg.tbd_min = (float)std::atof(val().c_str());
+        else if (a == "--band") cfg.band_px = std::atoi(val().c_str());
+        else if (a == "--band-k") cfg.band_k = (float)std::atof(val().c_str());
+        else if (a == "--upper-every") cfg.upper_every = std::atoi(val().c_str());
         else if (a == "--static") tcfg.static_frames = std::atoi(val().c_str());
         else if (a == "--static-hits") tcfg.static_hits = (float)std::atof(val().c_str());
         else if (a == "--gt") gtPath = val();
         else if (a == "--stream") stream = true;
+        else if (a == "--fps-scale") fpsScale = true;
         else if (a == "--sweep") sweep = true;
         else if (a == "--json") jsonPath = val();
         else if (a == "--dump-tracks") dumpPath = val();
@@ -167,6 +194,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     const int W = rd.width(), H = rd.height();
+    if (fpsScale) {   // параметры трекера — в секундах, под частоту кадров ролика
+        tcfg = tracker_for_fps(tcfg, (float)rd.fps());
+        std::printf("трекер под %.1f к/с\n", rd.fps());
+    }
     GroundTruth gt;
     const bool haveGt = !gtPath.empty() && gt.load(gtPath);
     if (!gtPath.empty() && !haveGt) std::printf("разметка %s не прочитана\n", gtPath.c_str());
@@ -211,6 +242,12 @@ int main(int argc, char** argv) {
     Tracker trk(W, H, tcfg);
     std::FILE* dump = dumpPath.empty() ? nullptr : std::fopen(dumpPath.c_str(), "w");
     if (dump) std::fprintf(dump, "loop,frame,id,x,y,hits,speed,resid,contrast,contrast_cv,flap_r2,flap_period,flap_depth,hover,flock,energy,level,cls,gt\n");
+    bool maskLoaded = false;
+    if (!maskPath.empty() && det.loadMask(maskPath)) {
+        maskLoaded = true;
+        learn = learnLive = 0;
+        std::printf("маска неба загружена из %s, сверка 25 кадров\n", maskPath.c_str());
+    }
     if (learn > 0 && !stream) {
         det.beginMaskLearning();
         std::vector<Candidate> c;
@@ -225,7 +262,7 @@ int main(int argc, char** argv) {
 
     std::vector<double> total, resp, sel, trackMs, readMs;
     std::vector<Candidate> cands;
-    EvalStats ev;
+    EvalStats ev, ev3;   // ev3 — первые 3 с первого прохода (с --eval-all)
     const int n = stream ? 0 : (int)frames.size();
     const long nIter = stream ? (long)maxFrames * 1000000 : (long)n * loops;
     for (long i = 0; i < nIter; ++i) {
@@ -242,6 +279,11 @@ int main(int argc, char** argv) {
             g = frames[fi].data();
             if (fi == 0) trk.resetTracks();   // видео зациклено — трек не должен "прыгать" через склейку
         }
+        if (i == 0 && learnLive > 0) det.beginMaskLearning();
+        if (learnLive > 0 && i == learnLive) {
+            det.endMaskLearning();
+            trk.resetTracks();
+        }
         const double t0 = now_ms();
         MotionEstimate me;
         if (motion) me = gm.estimate(g, W, H, W);
@@ -249,7 +291,7 @@ int main(int argc, char** argv) {
             trk.focus(me.dx, me.dy, focusAreas);
             det.setFocus(focusAreas);
         }
-        if (cfg.full_every > 1 || cfg.coarse_every > 1) {
+        if (cfg.full_every > 1 || cfg.coarse_every > 1 || cfg.upper_every > 1 || cfg.bg_map) {
             trk.roi(me.dx, me.dy, roiAreas);
             det.setRoi(roiAreas);
         }
@@ -264,8 +306,11 @@ int main(int argc, char** argv) {
             sel.push_back(det.timing().select_ms);
             trackMs.push_back(t2 - t1);
         }
-        const bool evalFrame = haveGt && fi < (int)gt.frames.size() && (stream || i >= n);
-        if (evalFrame) ev.add(gt.frames[fi], tracks, gsx, gsy);
+        const bool evalFrame = haveGt && fi < (int)gt.frames.size() && (stream || evalAll || i >= n);
+        if (evalFrame) {
+            ev.add(gt.frames[fi], tracks, gsx, gsy);
+            if (i < (long)std::lround(3 * rd.fps())) ev3.add(gt.frames[fi], tracks, gsx, gsy);
+        }
         if (dump && haveGt && fi < (int)gt.frames.size()) {
             for (const auto& t : tracks) {
                 const char* kind = "none";
@@ -279,6 +324,12 @@ int main(int argc, char** argv) {
         }
     }
     if (dump) std::fclose(dump);
+    if (!maskPath.empty()) {
+        if (maskLoaded && det.maskReplaced()) std::printf("маска из файла не совпала с кадром — выучена заново\n");
+        if (!maskLoaded || det.maskReplaced()) {
+            if (det.saveMask(maskPath)) std::printf("маска неба сохранена в %s\n", maskPath.c_str());
+        }
+    }
     const Pct pt = pct(total), pr = pct(resp), ps = pct(sel), pk = pct(trackMs);
     std::printf("кадров %zu: detect+track %.2f мс (p50 %.2f, p95 %.2f, max %.2f) = %.1f FPS\n", total.size(), pt.mean,
                 pt.p50, pt.p95, pt.max, pt.mean > 0 ? 1000 / pt.mean : 0);
@@ -295,6 +346,19 @@ int main(int argc, char** argv) {
     if (haveGt) {
         std::printf("  полнота: дроны %.1f%%, птицы %.1f%%; ложных треков на кадр %.2f\n", 100 * ev.recall(0),
                     100 * ev.recall(1), ev.falsePerFrame());
+        const double gfps = gt.fps > 0 ? gt.fps : rd.fps();
+        for (const auto& g : ev.groups) {
+            int fnd = 0, miss = 0;
+            const double d = ev.meanDelay(g.first, fnd, miss);
+            std::printf("  группа %-5s: полнота %5.1f%%, обнаружение через %.2f с (найдено %d, ни разу %d)\n", g.first.c_str(),
+                        100.0 * g.second.first / std::max(1L, g.second.second), d / gfps, fnd, miss);
+        }
+        if (evalAll)
+            std::printf("  первые 3 с: полнота дронов %.1f%%, ложных треков на кадр %.2f\n", 100 * ev3.recall(0),
+                        ev3.falsePerFrame());
+        std::printf("  ложные тревоги (треки, ни разу не бывшие на цели): %ld за %.0f с = %.1f в минуту, висят %.3f на кадр\n",
+                    ev.falseAlarms(), ev.frames / gfps, ev.falseAlarms() * 60.0 * gfps / std::max(1L, ev.frames),
+                    ev.falseAlarmPerFrame());
         std::printf("  классы найденных дронов: дрон %ld, птица %ld, неясно %ld; птиц: птица %ld, дрон %ld, неясно %ld\n",
                     ev.conf[0][1], ev.conf[0][2], ev.conf[0][0], ev.conf[1][2], ev.conf[1][1], ev.conf[1][0]);
         len += std::snprintf(json + len, sizeof(json) - len,

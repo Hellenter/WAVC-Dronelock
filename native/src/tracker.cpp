@@ -37,6 +37,33 @@ const char* class_name(TargetClass c) {
     return "?";
 }
 
+TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref) {
+    TrackerConfig c = c0;
+    if (!(fps > 0) || !(ref > 0) || std::fabs(fps - ref) < 0.01f * ref) return c;
+    const float t = fps / ref, v = ref / fps;   // t — кадров в той же секунде, v — пикс. за кадр
+    auto frames = [&](int n, int lo) { return n > 0 ? std::max(lo, (int)std::lround(n * t)) : n; };
+    // по физике ворота растут как v, а СКО ускорения в пикс./кадр^2 как v^2. Замер на 10 к/с
+    // (30 с синтетики): так птиц находится больше всех (88%), но 12% попаданий по дронам
+    // уходят в "птицу" — трек слишком вольно гнётся. С v^0.5 и v^1.5 птиц 77% (без пересчёта
+    // 51%), дронов-"птиц" 0, ложных тревог столько же
+    c.gate *= std::sqrt(v);
+    c.q_accel *= v * std::sqrt(v);
+    c.bird_speed *= v;
+    c.hover_speed *= v;
+    c.size_rate_max = std::min(0.5f, c.size_rate_max * v);
+    c.clutter_decay = std::pow(c.clutter_decay, v);
+    c.max_miss = frames(c.max_miss, 3);
+    c.static_frames = frames(c.static_frames, 100);
+    c.flap_hold = frames(c.flap_hold, 5);
+    // окно взмахов: не короче 32 кадров — на 10 к/с частые взмахи приходят сложенными в
+    // низкие частоты, на их период нужно несколько секунд
+    c.flap_window = c.flap_window > 0 ? std::min(64, std::max(32, (int)std::lround(c.flap_window * t))) : 0;
+    c.verify_frames = frames(c.verify_frames, 8);
+    c.hard_miss = frames(c.hard_miss, 6);
+    c.hard_full_every = frames(c.hard_full_every, 1);
+    return c;
+}
+
 Tracker::Tracker(int w, int h, const TrackerConfig& cfg) : cfg_(cfg) {
     gw_ = w / cfg_.clutter_cell + 1;
     gh_ = h / cfg_.clutter_cell + 1;
