@@ -1,0 +1,129 @@
+"""Генератор синтетического 16 Мп видео неба с удалёнными дронами.
+
+Сцена: градиент неба, движущиеся облака, качающаяся кромка леса с просветами,
+провода, 4 дрона (1.5-4 px, один подсвечен лазером = яркий), 3 ласточки.
+Пишет gray-видео (h264, почти без потерь) и ground truth в JSON.
+
+    python synth_sky.py --out sky16mp.mp4 --frames 100
+"""
+import argparse, json, subprocess
+import numpy as np, cv2
+
+
+def fractal_noise(h, w, rng, octaves=6, base=8, persistence=0.55):
+    out = np.zeros((h, w), np.float32)
+    amp, total = 1.0, 0.0
+    for o in range(octaves):
+        cells = base * 2 ** o
+        sh, sw = max(2, h * cells // w), cells
+        n = rng.standard_normal((sh + 1, sw + 1)).astype(np.float32)
+        out += amp * cv2.resize(n, (w, h), interpolation=cv2.INTER_CUBIC)
+        total += amp
+        amp *= persistence
+    return out / total
+
+
+def blob(size, rng):
+    """Маленький силуэт дрона/птицы (субпиксельный, с размытием оптики)."""
+    s = 9
+    k = np.zeros((s * 8, s * 8), np.float32)
+    c = s * 4
+    r = size * 4 / 2
+    cv2.ellipse(k, (c, c), (int(r), int(r * 0.6)), rng.uniform(0, 180), 0, 360, 1.0, -1)
+    k = cv2.resize(k, (s, s), interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(k, (0, 0), 0.6)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="sky16mp.mp4")
+    ap.add_argument("--frames", type=int, default=100)
+    ap.add_argument("--w", type=int, default=4608)
+    ap.add_argument("--h", type=int, default=3456)
+    ap.add_argument("--fps", type=int, default=25)
+    ap.add_argument("--seed", type=int, default=1)
+    a = ap.parse_args()
+    W, H, N = a.w, a.h, a.frames
+    rng = np.random.default_rng(a.seed)
+
+    # --- статичные слои ---
+    yy = np.linspace(0, 1, H, dtype=np.float32)[:, None]
+    sky = (205 - 45 * yy) * np.ones((1, W), np.float32)            # градиент неба
+    pad = 400
+    cl = fractal_noise(H + pad, W + pad, rng, octaves=7, base=6)
+    cl = np.clip((cl - 0.05) * 3.0, 0, 1)                           # облачность
+    shade = fractal_noise(H + pad, W + pad, rng, octaves=6, base=12)
+    clouds = cl * (35 + 25 * shade)                                  # светлые облака с тенями
+    clouds -= np.clip(cl - 0.6, 0, 1) * 60                           # тёмные "днища"
+
+    tree_top = (H * 0.86 + H * 0.05 * fractal_noise(1, W, rng, octaves=7, base=10)[0]).astype(np.float32)
+    leaves = fractal_noise(H, W, rng, octaves=3, base=400)          # мелкая листва
+    wires = []
+    for y0, sag in [(0.70, 0.04), (0.74, 0.05)]:
+        xs = np.arange(W)
+        wires.append(H * y0 + H * sag * ((xs / W - 0.5) * 2) ** 2)
+
+    # --- цели ---
+    objs = []
+    for i in range(4):   # дроны: плавное движение
+        objs.append(dict(kind="drone", bright=(i == 3), size=rng.uniform(1.5, 4.0),
+                         p=np.array([rng.uniform(.15, .85) * W, rng.uniform(.1, .65) * H]),
+                         v=rng.normal(0, 3, 2), contrast=rng.uniform(25, 50)))
+    for i in range(3):   # ласточки: быстрые, рваные
+        objs.append(dict(kind="bird", bright=False, size=rng.uniform(2.0, 4.5),
+                         p=np.array([rng.uniform(.1, .9) * W, rng.uniform(.1, .6) * H]),
+                         v=rng.normal(0, 12, 2), contrast=rng.uniform(40, 70)))
+    for o in objs:
+        o["k"] = blob(o["size"], rng)
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "gray",
+         "-s", f"{W}x{H}", "-r", str(a.fps), "-i", "-", "-c:v", "libx264", "-preset", "fast",
+         "-crf", "12", "-pix_fmt", "yuv420p", a.out], stdin=subprocess.PIPE)
+    gt = []
+    X = np.arange(W, dtype=np.float32)[None, :]
+    Y = np.arange(H, dtype=np.float32)[:, None]
+    for f in range(N):
+        dx, dy = 0.6 * f, 0.15 * f                                   # дрейф облаков
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        img = sky + cv2.warpAffine(clouds, M, (W, H), flags=cv2.INTER_LINEAR)
+        # провода
+        for wy in wires:
+            m = np.abs(Y - wy[None, :]) < 0.7
+            img[m] -= 45
+        # лес: качание по столбцам, просветы неба между листьями
+        sway = 3 * np.sin(f * 0.25 + X[0] * 0.004)
+        top = tree_top + sway
+        tree = (Y > top[None, :]).astype(np.float32)
+        gaps = (leaves > 0.9).astype(np.float32) * (Y > top[None, :] + 15)
+        img = img * (1 - tree) + tree * (55 + 20 * leaves)
+        img = img * (1 - gaps) + gaps * 170
+        rec = []
+        for o in objs:
+            if o["kind"] == "bird":
+                o["v"] = o["v"] * 0.9 + rng.normal(0, 4, 2)
+            else:
+                o["v"] = o["v"] * 0.98 + rng.normal(0, 0.3, 2)
+            o["p"] = o["p"] + o["v"]
+            o["p"][0] %= W
+            o["p"][1] = np.clip(o["p"][1], 50, 0.8 * H)
+            k = o["k"]
+            if o["kind"] == "bird":                                   # взмахи крыльев
+                k = k * (0.6 + 0.4 * abs(np.sin(f * 1.3)))
+            x, y = int(o["p"][0]), int(o["p"][1])
+            s = k.shape[0] // 2
+            if s <= x < W - s - 1:
+                sl = img[y - s:y + s + 1, x - s:x + s + 1]
+                sl += (o["contrast"] if o["bright"] else -o["contrast"]) * k / k.max()
+                rec.append(dict(kind=o["kind"], bright=o["bright"], x=x, y=y))
+        gt.append(rec)
+        img += rng.normal(0, 2.0, img.shape).astype(np.float32)     # шум сенсора
+        proc.stdin.write(np.clip(img, 0, 255).astype(np.uint8).tobytes())
+        if f % 10 == 0:
+            print("frame", f, flush=True)
+    proc.stdin.close(); proc.wait()
+    json.dump(dict(w=W, h=H, fps=a.fps, frames=gt), open(a.out + ".gt.json", "w"))
+
+
+if __name__ == "__main__":
+    main()
