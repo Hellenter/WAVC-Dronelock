@@ -72,7 +72,7 @@ int dl_detect(dl_detector* d, const uint8_t* gray, int w, int h, int stride, dl_
     const int n = (int)d->cands.size();
     for (int i = 0; i < std::min(n, cap); ++i) {
         const Candidate& c = d->cands[i];
-        out[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level};
+        out[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level, c.energy};
     }
     return n;
 }
@@ -110,15 +110,18 @@ void dl_tracker_reset(dl_tracker* t) { t->trk.resetTracks(); }
 
 int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* out, int cap) {
     t->dets.resize(n);
-    for (int i = 0; i < n; ++i)
-        t->dets[i] = {dets[i].x, dets[i].y, dets[i].contrast, dets[i].snr, dets[i].polarity, dets[i].level};
+    for (int i = 0; i < n; ++i) {
+        const dl_candidate& c = dets[i];
+        t->dets[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level};
+        t->dets[i].energy = c.energy;
+    }
     const auto& tr = t->trk.update(t->dets, t->dx, t->dy);
     t->dx = t->dy = 0;
     for (int i = 0; i < std::min((int)tr.size(), cap); ++i) {
         const Track& s = tr[i];
         out[i] = {s.id, s.x, s.y, s.vx, s.vy, s.polarity, s.contrast, s.clutter ? 1 : 0, (int)s.cls,
                   s.birdScore, s.speed, s.resid, s.contrastCv, s.hits, s.age, s.miss, s.sigma, s.score,
-                  s.id == t->trk.lockedId() ? 1 : 0};
+                  s.id == t->trk.lockedId() ? 1 : 0, s.flapR2, s.flapPeriod};
     }
     return (int)tr.size();
 }
@@ -126,7 +129,7 @@ int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* 
 int dl_tracker_clutter(dl_tracker* t, dl_candidate* out, int cap) {
     const auto& c = t->trk.clutterDets();
     for (int i = 0; i < std::min((int)c.size(), cap); ++i)
-        out[i] = {c[i].x, c[i].y, c[i].contrast, c[i].snr, c[i].polarity, c[i].level};
+        out[i] = {c[i].x, c[i].y, c[i].contrast, c[i].snr, c[i].polarity, c[i].level, c[i].energy};
     return (int)c.size();
 }
 

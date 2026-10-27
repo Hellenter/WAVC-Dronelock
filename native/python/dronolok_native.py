@@ -25,7 +25,7 @@ class _Config(C.Structure):
 
 class _Cand(C.Structure):
     _fields_ = [("x", C.c_float), ("y", C.c_float), ("contrast", C.c_float), ("snr", C.c_float),
-                ("polarity", C.c_int), ("level", C.c_int)]
+                ("polarity", C.c_int), ("level", C.c_int), ("energy", C.c_float)]
 
 
 class _Track(C.Structure):
@@ -33,7 +33,8 @@ class _Track(C.Structure):
                 ("polarity", C.c_int), ("contrast", C.c_float), ("clutter", C.c_int), ("cls", C.c_int),
                 ("bird_score", C.c_float), ("speed", C.c_float), ("resid", C.c_float),
                 ("contrast_cv", C.c_float), ("hits", C.c_int), ("age", C.c_int), ("miss", C.c_int),
-                ("sigma", C.c_float), ("score", C.c_float), ("locked", C.c_int)]
+                ("sigma", C.c_float), ("score", C.c_float), ("locked", C.c_int),
+                ("flap_r2", C.c_float), ("flap_period", C.c_float)]
 
 
 class _Timing(C.Structure):
@@ -139,6 +140,8 @@ class NativePointDetector:
         lib().dl_detector_timing(self._h, C.byref(t))
         self.timing = dict(detect_ms=t.total_ms, response_ms=t.response_ms, select_ms=t.select_ms)
         b = self._buf
+        # суммарный контраст кандидатов, в том же порядке: передать в NativeTracker.update(energy=...)
+        self.energy = [b[i].energy for i in range(min(n, len(b)))]
         return [(b[i].x, b[i].y, b[i].contrast, b[i].snr, b[i].polarity, b[i].level)[:6 if self.scales > 1 else 5]
                 for i in range(min(n, len(b)))]
 
@@ -200,12 +203,13 @@ class NativeTracker:
         n = lib().dl_tracker_focus(self._h, buf, 256)
         return [(buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]) for i in range(min(n, 256))]
 
-    def update(self, dets):
+    def update(self, dets, energy=None):
+        """dets — кандидаты NativePointDetector.detect; energy — его .energy (взмахи крыльев)"""
         n = min(len(dets), len(self._dets))
         for i in range(n):
             x, y, c, snr, p = dets[i][:5]
             lvl = dets[i][5] if len(dets[i]) > 5 else 0
-            self._dets[i] = _Cand(x, y, c, snr, p, lvl)
+            self._dets[i] = _Cand(x, y, c, snr, p, lvl, energy[i] if energy else 0.0)
         k = lib().dl_tracker_update(self._h, self._dets, n, self._out, len(self._out))
         m = lib().dl_tracker_clutter(self._h, self._cl, len(self._cl))
         self.clutter_dets = [(self._cl[i].x, self._cl[i].y, self._cl[i].contrast, self._cl[i].snr,
@@ -215,7 +219,8 @@ class NativeTracker:
             t = self._out[i]
             out.append(dict(id=t.id, x=t.x, y=t.y, vx=t.vx, vy=t.vy, pol=t.polarity, c=t.contrast,
                             clutter=bool(t.clutter), cls=CLASSES[t.cls], bird_score=t.bird_score,
-                            speed=t.speed, resid=t.resid, contrast_cv=t.contrast_cv, hits=t.hits,
+                            speed=t.speed, resid=t.resid, contrast_cv=t.contrast_cv, flap_r2=t.flap_r2,
+                            flap_period=t.flap_period, hits=t.hits,
                             miss=t.miss, sigma=t.sigma, score=t.score, locked=bool(t.locked), path=[(t.x, t.y)]))
         return out
 
