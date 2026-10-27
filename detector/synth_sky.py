@@ -133,8 +133,12 @@ def main():
                     help="статичные ложные цели на проводах (катушки ЛЭП), мерцают")
     ap.add_argument("--cls", action="store_true",
                     help="добавить сцену для классификатора: машущие и парящие птицы, стая, зависающие дроны")
+    ap.add_argument("--drone-contrast", default="25,50",
+                    help="контраст дронов, мин,макс (тусклые дальние цели: 6,14)")
+    ap.add_argument("--noise", type=float, default=2.0, help="СКО шума сенсора, уровни яркости")
     a = ap.parse_args()
     W, H, N = a.w, a.h, a.frames
+    c_lo, c_hi = (float(v) for v in a.drone_contrast.split(","))
     rng = np.random.default_rng(a.seed)
 
     # --- статичные слои ---
@@ -168,7 +172,7 @@ def main():
     for i in range(4):   # дроны: плавное движение
         objs.append(dict(kind="drone", bright=(i == 3), size=rng.uniform(1.5, 4.0),
                          p=np.array([rng.uniform(.15, .85) * W, rng.uniform(.1, .65) * H]),
-                         v=rng.normal(0, 3, 2), contrast=rng.uniform(25, 50)))
+                         v=rng.normal(0, 3, 2), contrast=rng.uniform(c_lo, c_hi)))
     for i in range(3):   # ласточки: быстрые, рваные
         objs.append(dict(kind="bird", bright=False, size=rng.uniform(2.0, 4.5),
                          p=np.array([rng.uniform(.1, .9) * W, rng.uniform(.1, .6) * H]),
@@ -235,7 +239,7 @@ def main():
                                 obj=cobjs.index(o), freq=round(float(o.get("freq", 0)), 1),
                                 bursts=bool(o.get("bursts", False))))
         gt.append(rec)
-        img += rng.normal(0, 2.0, img.shape).astype(np.float32)     # шум сенсора
+        img += rng.normal(0, a.noise, img.shape).astype(np.float32)     # шум сенсора
         proc.stdin.write(np.clip(img, 0, 255).astype(np.uint8).tobytes())
         if f % 10 == 0:
             print("frame", f, flush=True)

@@ -25,7 +25,8 @@ class _Config(C.Structure):
 
 class _Cand(C.Structure):
     _fields_ = [("x", C.c_float), ("y", C.c_float), ("contrast", C.c_float), ("snr", C.c_float),
-                ("polarity", C.c_int), ("level", C.c_int), ("energy", C.c_float)]
+                ("polarity", C.c_int), ("level", C.c_int), ("energy", C.c_float),
+                ("margin", C.c_float)]
 
 
 class _Track(C.Structure):
