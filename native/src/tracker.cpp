@@ -421,6 +421,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         t.hist.push_back(true);
         t.path.push_back({t.x, t.y});
         t.obs.push_back({frame_, t.bx, t.by, t.contrast, d.level});
+        t.edgeBorn = d.edge;
         if (learn) t.pend.push_back((uint32_t)cellOf(d));
         tracks_.push_back(std::move(t));
     }
@@ -445,7 +446,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         tr.score = tr.cls == TargetClass::Clutter ? 0.f
                                                   : (float)(mc * std::min(1.0, tr.hits / 10.0) /
                                                             (1.0 + 0.25 * tr.miss));
-        if (!tr.solid || tr.miss > coastLimit(tr)) continue;
+        // родился у кромки неба (кроны, крыши): цель, только если полетела
+        if (!tr.solid || tr.miss > coastLimit(tr) || (tr.edgeBorn && !tr.everMover)) continue;
         out_.push_back(tr);
         if (tr.det >= 0) inTrack[tr.det] = 1;
     }

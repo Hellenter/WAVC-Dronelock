@@ -25,6 +25,8 @@ Effective effective(const Settings& s, int w, int h) {
     Effective e;
     e.scales = s.scales > 0 ? std::min(4, s.scales) : small ? 3 : 1;
     e.motion = s.motion >= 0 ? s.motion > 0 : small;
+    // при неподвижной камере землю убирает маска неба, зоны нужны при съёмке с рук
+    e.zones = s.zones >= 0 ? s.zones > 0 : e.motion;
     return e;
 }
 
@@ -339,9 +341,10 @@ void Pipeline::processLoop() {
         }
         const Frame& f = *p.frame;
         const Effective ef = effective(s, f.w, f.h);
-        if (dirty || ef.scales != dc.scales) {
+        if (dirty || ef.scales != dc.scales || ef.zones != dc.zones) {
             dc = s.det;
             dc.scales = ef.scales;
+            dc.zones = ef.zones;
             det.reconfigure(dc);
             dirty = false;
             std::lock_guard<std::mutex> lr(rm_);
@@ -440,6 +443,7 @@ void Pipeline::processLoop() {
         r->tilesX = det.tilesX();
         r->tilesY = det.tilesY();
         r->tilePx = det.tileSizePx();
+        r->zones = det.zones();
         r->learning = learning;
         r->seq = ++seq;
         r->lockId = trk->lockedId();

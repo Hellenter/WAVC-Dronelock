@@ -42,6 +42,7 @@ static void usage() {
         "  --scales 1..4           доп. масштабы для крупных целей\n"
         "  --focus                 пониженный порог возле прогноза треков\n"
         "  --motion                компенсация движения камеры\n"
+        "  --zones                 зоны кадра: небо / смешанные / земля\n"
         "  --full-every N          весь кадр раз в N кадров, между ними — только вокруг треков\n"
         "  --coarse-every N        грубые масштабы целиком раз в N кадров\n"
         "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
@@ -118,6 +119,8 @@ int main(int argc, char** argv) {
         else if (a == "--q") tcfg.q_accel = (float)std::atof(val().c_str());
         else if (a == "--gate-sigma") tcfg.gate_sigma = (float)std::atof(val().c_str());
         else if (a == "--motion") motion = true;
+        else if (a == "--zones") cfg.zones = true;
+        else if (a == "--mixed-k") cfg.mixed_k = (float)std::atof(val().c_str());
         else if (a == "--full-every") cfg.full_every = std::atoi(val().c_str());
         else if (a == "--coarse-every") cfg.coarse_every = std::atoi(val().c_str());
         else if (a == "--static") tcfg.static_frames = std::atoi(val().c_str());

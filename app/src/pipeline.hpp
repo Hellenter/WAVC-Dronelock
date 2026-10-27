@@ -57,6 +57,7 @@ struct Settings {
     int scales = 0;            // 0 = авто, иначе 1..4 (DetectorConfig::scales)
     int motion = -1;           // компенсация движения камеры: -1 авто, 0 выкл., 1 вкл.
     bool focus = false;        // пониженный порог возле прогноза треков (эксперимент)
+    int zones = -1;            // зоны кадра небо/смешанные/земля: -1 авто, 0 выкл., 1 вкл.
 };
 
 // Что реально включено для кадра w x h. Авто: кадр до ~2 Мп (Full HD и меньше) —
@@ -65,6 +66,7 @@ struct Settings {
 struct Effective {
     int scales;
     bool motion;
+    bool zones;
 };
 Effective effective(const Settings& s, int w, int h);
 
@@ -92,6 +94,7 @@ struct Result {
     bool staticOn = false;
     std::vector<dronolok::TrackPoint> staticCells;
     int staticCellPx = 8;
+    std::vector<uint8_t> zones;   // по тайлам (tilesX x tilesY): 0 земля, 1 смешанная, 2 небо
 };
 
 // Одна строка журнала метрик (на каждый обработанный кадр)

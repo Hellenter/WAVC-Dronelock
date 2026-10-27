@@ -610,9 +610,20 @@ void panel_controls(App& a) {
         help_marker("Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается "
                     "(~1-2 мс) и прогноз целей переносится вместе с ним, иначе захват срывается при каждом "
                     "движении камеры. Авто: до 2 Мп — учитывать.");
+        int zo = a.s.zones + 1;
+        ImGui::SetNextItemWidth(w);
+        if (ImGui::Combo("зоны кадра", &zo, mos, 3)) {
+            a.s.zones = zo - 1;
+            changed = true;
+        }
+        help_marker("Кадр делится на небо, землю (крупные области текстуры: кроны, дома, земля) и смешанные тайлы "
+                    "неба рядом с землёй. В смешанных цель выдаётся, только когда полетела, — так пропадают ложные "
+                    "цели на кромках крон, крыш и столбов. Авто: вместе с учётом движения камеры (при неподвижной "
+                    "землю и так убирает маска неба).");
         if (a.pipe.isOpen()) {
             const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
-            ImGui::TextDisabled("сейчас: масштабов %d, движение камеры %s", ef.scales, ef.motion ? "учитывается" : "нет");
+            ImGui::TextDisabled("сейчас: масштабов %d, движение камеры %s, зоны %s", ef.scales,
+                                ef.motion ? "учитывается" : "нет", ef.zones ? "да" : "нет");
         }
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderFloat("порог крупных, раз", &d.coarse_thr_k, 1, 6, "%.1f");
@@ -702,7 +713,7 @@ void panel_controls(App& a) {
         ImGui::SameLine();
         ImGui::Checkbox("помехи", &a.showClutter);
         ImGui::SameLine();
-        ImGui::Checkbox("маска неба", &a.showMask);
+        ImGui::Checkbox("маска неба и зоны", &a.showMask);
         ImGui::Checkbox("разметка (.gt.json)", &a.showGt);
         ImGui::SameLine();
         ImGui::Checkbox("вырезки целей", &a.showCrops);
@@ -909,6 +920,15 @@ void draw_view(App& a, const Result* r) {
     dl->PushClipRect(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), true);
     // текстура может быть уменьшена (texDs): берём её целиком
     dl->AddImage((ImTextureID)(intptr_t)a.tex, P(0, 0), P((float)a.texW * a.texDs, (float)a.texH * a.texDs));
+    if (a.showMask && r->zones.size() == (size_t)r->tilesX * r->tilesY)   // земля темнее, смешанные — жёлтым
+        for (int ty = 0; ty < r->tilesY; ++ty)
+            for (int tx = 0; tx < r->tilesX; ++tx) {
+                const uint8_t z = r->zones[(size_t)ty * r->tilesX + tx];
+                if (z == 2) continue;
+                dl->AddRectFilled(P((float)tx * r->tilePx, (float)ty * r->tilePx),
+                                  P((float)(tx + 1) * r->tilePx, (float)(ty + 1) * r->tilePx),
+                                  z == 0 ? IM_COL32(60, 30, 0, 110) : IM_COL32(255, 210, 0, 45));
+            }
     if (a.showMask && !r->mask.empty()) {
         for (int ty = 0; ty < r->tilesY; ++ty)
             for (int tx = 0; tx < r->tilesX; ++tx)
@@ -1059,6 +1079,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--full-every") s.det.full_every = atoi(val().c_str());
+        else if (a == "--zones") s.zones = atoi(val().c_str());
         else if (a == "--coarse-every") s.det.coarse_every = atoi(val().c_str());
         else if (a == "--json") json = val();
         else if (a == "--csv") csv = val();

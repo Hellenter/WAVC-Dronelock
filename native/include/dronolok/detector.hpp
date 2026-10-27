@@ -40,6 +40,14 @@ struct DetectorConfig {
     // треков (setRoi). Цель, которую уже ведём, не теряется, новая находится с
     // задержкой до N-1 кадров. 1 — каждый кадр целиком.
     int full_every = 1;
+    // Зоны кадра по тайлам основного масштаба: небо — гладкие тайлы, связанные с верхним
+    // краем кадра через гладкие; земля — текстура и всё, что ею отрезано от неба (снег,
+    // стены, асфальт под линией деревьев); смешанные — небо рядом с землёй (кроны, крыши,
+    // горизонт). На земле не ищем, на смешанных порог можно поднять (mixed_k), а цель там
+    // подтверждается, только когда сдвинулась (Tracker). Считается каждый кадр, поэтому
+    // годится и для съёмки с рук; для неподвижной камеры землю и так убирает маска неба.
+    bool zones = false;
+    float mixed_k = 1.f;        // на ваших роликах главное — правило "подтверждать, когда полетела", порог можно не поднимать
     int coarse_every = 2;       // крупная цель за кадр смещается мало, а грубые масштабы недёшевы
     // ресурсы
     int threads = 0;            // 0 = все аппаратные потоки
@@ -56,6 +64,7 @@ struct Candidate {
     int polarity;      // -1 тёмная цель, +1 яркая
     int level = 0;     // масштаб, на котором найдена: размер цели до k*pool*2^level пикс.
     bool weak = false; // прошла только по пониженному порогу возле прогноза трека
+    bool edge = false; // найдена в смешанной зоне (DetectorConfig::zones)
 };
 
 // Область, где ждём цель (прогноз трека): там порог ниже, см. DetectorConfig::focus_k
@@ -98,6 +107,8 @@ public:
     // Где искать в кадры между полными просмотрами (Tracker::roi)
     void setRoi(const std::vector<FocusArea>& areas) { roi_ = areas; }
     const std::vector<uint8_t>& tileMask() const { return mask_; }   // tilesY x tilesX, 1 = искать
+    // зоны последнего кадра (tilesY x tilesX): 0 земля, 1 смешанная, 2 небо; пусто, если выключены
+    const std::vector<uint8_t>& zones() const { return zones_; }
     int tilesX() const { return tw_; }
     int tilesY() const { return th_; }
     int tileSizePx() const { return cfg_.tile * cfg_.pool; }        // тайл в пикселях кадра
@@ -124,7 +135,9 @@ private:
     std::vector<float> texSum_;
     int texN_ = 0;
     std::vector<FocusArea> focus_, roi_;
-    std::vector<uint8_t> focusTiles_, roiMask_;
+    std::vector<uint8_t> focusTiles_, roiMask_, zones_;
+    std::vector<int> fill_;
+    void computeZones();
     long frameNo_ = 0;
     void roiMask(int tw, int th, int tilePx, const uint8_t* base);
     struct Stats;
@@ -205,6 +218,7 @@ struct Track {
     float bx = 0, by = 0;    // точка рождения в координатах сцены
     int level = 0;
     bool everMover = false;
+    bool edgeBorn = false;   // родился в смешанной зоне: выдаётся, только когда полетит
     std::vector<uint32_t> pend;   // ячейки, где был, пока не полетел: в память, если так и не полетит
 };
 

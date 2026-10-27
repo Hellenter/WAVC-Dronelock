@@ -44,6 +44,7 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.focus_k = std::max(0.2f, std::min(1.f, c.focus_k));
     c.full_every = std::max(1, std::min(16, c.full_every));
     c.coarse_every = std::max(1, std::min(16, c.coarse_every));
+    c.mixed_k = std::max(1.f, std::min(5.f, c.mixed_k));
     return c;
 }
 
@@ -186,6 +187,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         timing_.jobs_skipped += skipped;
     }
     const double t1 = now_ms();
+    if (cfg_.zones) computeZones();
+    else zones_.clear();
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
@@ -206,12 +209,15 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
                 bool dup = false;
                 for (size_t j = 0; j < first && !dup; ++j)
                     dup = out[j].polarity == c.polarity && std::fabs(out[j].x - c.x) < R && std::fabs(out[j].y - c.y) < R;
-                // и не ищем там, где маска неба запрещает поиск
-                if (!dup && !mask_.empty() && !learning_) {
-                    const int mx = (int)c.x / (T * s), my = (int)c.y / (T * s);
-                    dup = mx >= tw_ || my >= th_ || !mask_[(size_t)my * tw_ + mx];
+                // и не ищем там, где маска неба запрещает поиск, и на земле
+                const int mx = (int)c.x / (T * s), my = (int)c.y / (T * s);
+                const size_t mi = (size_t)my * tw_ + mx;
+                if (!dup && !mask_.empty() && !learning_) dup = mx >= tw_ || my >= th_ || !mask_[mi];
+                if (!dup && !zones_.empty()) dup = mx >= tw_ || my >= th_ || zones_[mi] == 0;
+                if (!dup) {
+                    out[keep] = c;
+                    out[keep++].edge = !zones_.empty() && zones_[mi] == 1;
                 }
-                if (!dup) out[keep++] = c;
             }
             out.resize(keep);
         }
@@ -221,6 +227,58 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     timing_.response_ms = t1 - t0;
     timing_.select_ms = t2 - t1;
     timing_.total_ms = t2 - t0;
+}
+
+// Зоны по тайлам основного масштаба (см. DetectorConfig::zones)
+void Detector::computeZones() {
+    const size_t n = (size_t)tw_ * th_;
+    zones_.assign(n, 0);
+    if (!n) return;
+    const uint32_t area = (uint32_t)(cfg_.tile * cfg_.tile);
+    auto textured = [&](const TileStats& ts, size_t i) {
+        return ts.hot.size() == n && (float)div_round_even(ts.hot[i] * 255u, area) / 255.f > cfg_.max_density;
+    };
+    const bool useMask = !learning_ && !mask_.empty();
+    std::vector<uint8_t>& smooth = roiMask_;   // временный буфер
+    smooth.assign(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        smooth[i] = !(useMask && !mask_[i]) && !(cfg_.dark && textured(stats_->dark, i)) &&
+                    !(cfg_.bright && textured(stats_->bright, i));
+    // земля: крупные связные области текстуры (кроны, дома, земля, край виньетки);
+    // мелкие (сама цель, птица, фонарь) — не земля. Остальное — небо.
+    const int minGround = std::max(4, (int)(n / 40));
+    std::fill(zones_.begin(), zones_.end(), 2);
+    std::vector<uint8_t>& seen = focusTiles_;   // тоже временный буфер, markFocus перезапишет
+    seen.assign(n, 0);
+    for (size_t s0 = 0; s0 < n; ++s0) {
+        if (smooth[s0] || seen[s0]) continue;
+        fill_.clear();
+        fill_.push_back((int)s0);
+        seen[s0] = 1;
+        for (size_t k = 0; k < fill_.size(); ++k) {
+            const int i = fill_[k], x = i % tw_, y = i / tw_;
+            for (int yy = std::max(0, y - 1); yy <= std::min(th_ - 1, y + 1); ++yy)
+                for (int xx = std::max(0, x - 1); xx <= std::min(tw_ - 1, x + 1); ++xx) {
+                    const int j = yy * tw_ + xx;
+                    if (!smooth[j] && !seen[j]) { seen[j] = 1; fill_.push_back(j); }
+                }
+        }
+        if ((int)fill_.size() >= minGround)
+            for (int i : fill_) zones_[i] = 0;
+    }
+    // смешанные: небо, у которого в 8-окрестности есть земля
+    for (int y = 0; y < th_; ++y)
+        for (int x = 0; x < tw_; ++x) {
+            const size_t i = (size_t)y * tw_ + x;
+            if (zones_[i] != 2) continue;
+            bool g = false;
+            for (int yy = std::max(0, y - 1); yy <= std::min(th_ - 1, y + 1) && !g; ++yy)
+                for (int xx = std::max(0, x - 1); xx <= std::min(tw_ - 1, x + 1) && !g; ++xx)
+                    g = zones_[(size_t)yy * tw_ + xx] == 0;
+            if (g) zones_[i] = 3;   // пометка, чтобы не размножать смешанные внутри прохода
+        }
+    for (auto& z : zones_)
+        if (z == 3) z = 1;
 }
 
 // маска тайлов вокруг треков (и внутри маски неба base, если она есть)
@@ -271,8 +329,11 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const bool textured = dens > maxDens;
             if (fineGrid && learning_) texSum_[i] += textured;
             if (useMask && !mask_[i]) continue;
+            const uint8_t zone = fineGrid && !zones_.empty() ? zones_[i] : 2;
+            if (zone == 0) continue;
+            const float zk = zone == 1 ? cfg_.mixed_k : 1.f;
             const float mx = ts.maxv[i];
-            const float thr = focusTiles_[i] ? thrF : thr0;
+            const float thr = (focusTiles_[i] ? thrF : thr0) * zk;
             if (textured || !(mx >= thr) || !(mx >= cfg_.clutter_k * level + thr * 0.5f)) continue;
             const int bx = ts.argmax[i] % T, by = ts.argmax[i] / T;
             Candidate c;
@@ -282,7 +343,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             c.snr = mx / (level + 1.f);
             c.polarity = pol ? 1 : -1;
             c.level = lvl;
-            c.weak = focusTiles_[i] && !(mx >= thr0 && mx >= cfg_.clutter_k * level + thr0 * 0.5f);
+            c.weak = focusTiles_[i] && !(mx >= thr0 * zk && mx >= cfg_.clutter_k * level + thr0 * zk * 0.5f);
+            c.edge = zone == 1;
             out.push_back(c);
         }
     if (out.size() - first > (size_t)cfg_.max_cands) {   // слишком много — самые контрастные
