@@ -1,8 +1,10 @@
 #include "platform.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <thread>
 
 #if defined(_WIN32)
@@ -11,6 +13,7 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <objbase.h>
 #include <psapi.h>
 #else
 #include <dirent.h>
@@ -96,18 +99,38 @@ void set_process_priority(int level) {
     SetPriorityClass(GetCurrentProcess(), cls[level < -2 ? 0 : level > 2 ? 4 : level + 2]);
 }
 
-std::string open_video_dialog() {
+static std::atomic<DWORD> g_dlgThread{0};
+
+static std::string dialog_blocking(void* owner) {
+    g_dlgThread = GetCurrentThreadId();
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     wchar_t file[MAX_PATH * 4] = L"";
     OPENFILENAMEW ofn;
     memset(&ofn, 0, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
+    // с владельцем диалог модальный для окна приложения: всегда поверх него, сворачивается вместе
+    // с ним, а щелчки по окну приложения не копятся, пока диалог открыт
+    ofn.hwndOwner = (HWND)owner;
     ofn.lpstrFilter = L"Видео (*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm)\0*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm\0"
                       L"Все файлы (*.*)\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH * 4;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetOpenFileNameW(&ofn)) return "";
-    return to_utf8(file);
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    const bool ok = GetOpenFileNameW(&ofn) != 0;
+    if (SUCCEEDED(co)) CoUninitialize();
+    g_dlgThread = 0;
+    return ok ? to_utf8(file) : "";
+}
+
+static BOOL CALLBACK raise_window(HWND w, LPARAM) {
+    if (!IsWindowVisible(w)) return TRUE;
+    if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+    SetForegroundWindow(w);
+    return FALSE;
+}
+
+static void dialog_to_front() {
+    if (const DWORD t = g_dlgThread) EnumThreadWindows(t, raise_window, 0);
 }
 
 std::vector<std::string> ui_fonts() {
@@ -199,7 +222,7 @@ bool set_cpu_cap(int percent) { return percent >= 100; }
 
 void set_process_priority(int level) { setpriority(PRIO_PROCESS, 0, -level * 5); }
 
-std::string open_video_dialog() {
+static std::string dialog_blocking(void*) {
     FILE* p = popen("zenity --file-selection --title='Видео' 2>/dev/null || kdialog --getopenfilename . 2>/dev/null", "r");
     if (!p) return "";
     char buf[4096] = {0};
@@ -208,6 +231,8 @@ std::string open_video_dialog() {
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
     return s;
 }
+
+static void dialog_to_front() {}
 
 std::vector<std::string> ui_fonts() {
     return {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -218,5 +243,43 @@ std::vector<std::string> ui_fonts() {
 void attach_console() {}
 
 #endif
+
+// ------------------------------------------------------------ диалог выбора видео в своём потоке
+// Раньше диалог открывался прямо в кадре интерфейса: пока он был открыт, окно приложения не
+// перерисовывалось, а щелчки по нему копились и после закрытия открывали диалог снова и снова.
+
+static std::mutex g_dlgMu;
+static std::atomic<int> g_dlgState{0};   // 0 — нет диалога, 1 — открыт, 2 — закрыт, результат не забран
+static std::string g_dlgResult;
+
+bool open_video_dialog(void* owner) {
+    int expected = 0;
+    if (!g_dlgState.compare_exchange_strong(expected, 1)) {
+        if (expected == 1) dialog_to_front();
+        return false;
+    }
+    std::thread([owner] {
+        std::string p = dialog_blocking(owner);
+        {
+            std::lock_guard<std::mutex> lk(g_dlgMu);
+            g_dlgResult = std::move(p);
+        }
+        g_dlgState = 2;
+    }).detach();
+    return true;
+}
+
+bool video_dialog_open() { return g_dlgState == 1; }
+
+bool video_dialog_result(std::string& path) {
+    if (g_dlgState != 2) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_dlgMu);
+        path = std::move(g_dlgResult);
+        g_dlgResult.clear();
+    }
+    g_dlgState = 0;
+    return true;
+}
 
 }  // namespace plat
