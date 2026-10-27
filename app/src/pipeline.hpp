@@ -69,6 +69,10 @@ struct Settings {
     double slowdown = 1.0;
     // авто-упрощение: держать обработку в темпе камеры (dronolok::LoadGovernor)
     bool governor = false;
+    // повторы кадра (запись экрана 60 к/с с ролика 25-30 к/с) не обрабатывать заново
+    bool skipDuplicates = true;
+    // журнал треков (замеры): по строке на подтверждённый трек каждого кадра, CSV
+    std::string trackLog;
 };
 
 // Что реально включено для кадра w x h. Авто: кадр до ~2 Мп (Full HD и меньше) —
@@ -107,6 +111,9 @@ struct Result {
     int staticCellPx = 8;
     std::vector<uint8_t> zones;   // по тайлам (tilesX x tilesY): 0 земля, 1 смешанная, 2 небо
     int govLevel = -1;            // ступень авто-упрощения, -1 — выключено
+    bool dup = false;             // повтор прошлого кадра: результат взят от него
+    dronolok::LockState lockState = dronolok::LockState::None;
+    int verify = 0, verifyNeed = 0;   // кадров подряд цель — дрон, сколько нужно для жёсткого захвата
     bool autoThr = false;         // порог по шуму
     float noiseLvl = 0, thr = 0;  // шум отклика неба и порог, с которым искали на этом кадре
     int fullEvery = 1, coarseEvery = 1;   // что сейчас стоит в детекторе (с учётом упрощения)

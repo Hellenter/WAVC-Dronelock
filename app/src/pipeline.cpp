@@ -34,6 +34,61 @@ Effective effective(const Settings& s, int w, int h) {
     return e;
 }
 
+// Повтор кадра (запись экрана с ролика меньшей частоты): средние по блокам 8x8 почти не
+// изменились, и изменение кадра много меньше обычного для этого ролика. У живой камеры
+// шум матрицы меняет кадр одинаково от кадра к кадру — повторов не найдётся.
+class DupCheck {
+public:
+    bool duplicate(const uint8_t* px, int w, int h, int stride) {
+        const int bw = w / 8, bh = h / 8;
+        if (bw < 4 || bh < 4) return false;
+        cur_.resize((size_t)bw * bh);
+        for (int by = 0; by < bh; ++by) {
+            const uint8_t* r1 = px + (size_t)(by * 8 + 2) * stride;
+            const uint8_t* r2 = px + (size_t)(by * 8 + 5) * stride;
+            for (int bx = 0; bx < bw; ++bx) {
+                const int x = bx * 8;
+                cur_[(size_t)by * bw + bx] =
+                    (r1[x + 1] + r1[x + 3] + r1[x + 5] + r1[x + 7] + r2[x] + r2[x + 2] + r2[x + 4] + r2[x + 6]) * 0.125f;
+            }
+        }
+        bool dup = false;
+        if (prev_.size() == cur_.size() && bw == w_) {
+            double m = 0;
+            size_t big = 0;
+            for (size_t i = 0; i < cur_.size(); ++i) {
+                const float d = std::fabs(cur_[i] - prev_[i]);
+                m += d;
+                big += d > 6.f;
+            }
+            m /= (double)cur_.size();
+            double med = 0;
+            if (!hist_.empty()) {
+                std::vector<double> v(hist_.begin(), hist_.end());
+                std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                med = v[v.size() / 2];
+            }
+            dup = big <= std::max<size_t>(2, cur_.size() / 2000) && (hist_.empty() ? m < 0.05 : m < 0.3 * med);
+            if (!dup) {
+                hist_.push_back(m);
+                while (hist_.size() > 15) hist_.pop_front();
+            }
+        }
+        prev_.swap(cur_);
+        w_ = bw;
+        return dup;
+    }
+    void reset() {
+        prev_.clear();
+        hist_.clear();
+    }
+
+private:
+    std::vector<float> prev_, cur_;
+    int w_ = 0;
+    std::deque<double> hist_;
+};
+
 // история для покадрового просмотра назад
 static const size_t HIST_MAX = 600;
 static const size_t HIST_BYTES = sizeof(void*) > 4 ? (size_t)1 << 30 : (size_t)256 << 20;
@@ -393,6 +448,15 @@ void Pipeline::processLoop() {
     }
     std::vector<Candidate> cands;
     std::vector<TrackPoint> statCells;
+    // "авто" при крупном кадре: движение камеры оценивается всегда (~2 мс на 4 Мп), и если
+    // камера ведёт съёмку с рук или панораму — учёт движения включается
+    std::deque<float> camHist;
+    DupCheck dupCheck;
+    int dupRun = 0;
+    std::shared_ptr<Result> lastR;
+    // память помех на момент открытия: при повторе ролика и перемотке возвращаемся к ней,
+    // чтобы второй просмотр шёл как первый (иначе память выучивает пути целей этого ролика)
+    std::vector<float> statSnap;
     // при закрытии и пересоздании трекера память помех сохраняется рядом с видео
     auto saveStatic = [&] {
         if (!trk || trk->config().static_frames <= 0 || !s.staticFile) return;
@@ -400,6 +464,8 @@ void Pipeline::processLoop() {
         if (!statCells.empty()) trk->saveStatic(staticPath());
     };
     int seq = 0;
+    struct FileCloser { void operator()(FILE* f) const { fclose(f); } };
+    std::unique_ptr<FILE, FileCloser> tlog;
     while (!stop_) {
         Packet p;
         {
@@ -429,6 +495,8 @@ void Pipeline::processLoop() {
         want.zones = ef.zones;
         if (s.governor) LoadGovernor::apply(gov.level(), want);
         else gov.reset();
+        // жёсткий захват: весь кадр — реже, между ними детектор смотрит только вокруг цели
+        if (trk) want.full_every = std::max(want.full_every, trk->hardFullEvery());
         if (dirty || want.scales != dc.scales || want.zones != dc.zones || want.full_every != dc.full_every ||
             want.coarse_every != dc.coarse_every) {
             dc = want;
@@ -449,15 +517,18 @@ void Pipeline::processLoop() {
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = "память помех загружена: " + std::to_string(statCells.size()) + " ячеек";
             }
+            trk->getStatic(statSnap);
         }
-        // память помех — в координатах кадра, при движущейся камере не ведётся
-        trk->config().static_frames = ef.motion ? 0 : s.trk.static_frames;
+        // память помех — в координатах кадра: при движущейся камере учит только наложения
+        // на кадр (надписи, логотипы), см. TrackerConfig::overlay_hits
+        trk->config().static_frames = s.trk.static_frames;
         if (const int cmd = staticCmd_.exchange(0)) {
             if (cmd == 2) {
                 trk->clearStatic();
                 remove_file(staticPath());
             }
             trk->staticCells(statCells);
+            trk->getStatic(statSnap);
             const bool ok = cmd == 2 || trk->saveStatic(staticPath());
             std::lock_guard<std::mutex> lr(rm_);
             staticMsg_ = cmd == 2 ? "память помех очищена"
@@ -466,7 +537,9 @@ void Pipeline::processLoop() {
         }
         if (p.loopStart || p.seekStart) {   // склейка зацикленного видео или перемотка — треки не должны "прыгать"
             trk->resetTracks();
+            trk->setStatic(statSnap);
             gm.reset();
+            camHist.clear();
         }
         // Маска неба привязана к кадру и годится только для неподвижной камеры: при съёмке с рук
         // земля через секунду окажется там, где было небо, и наоборот (дрон пропадёт в "маске").
@@ -492,70 +565,126 @@ void Pipeline::processLoop() {
                 maskOn = false;
             }
         }
-        const double t0 = now_ms();
-        // сдвиг картинки от прошлого кадра: прогноз треков переносится вместе с камерой
-        MotionEstimate me;
-        if (ef.motion) me = gm.estimate(f.px.data(), f.w, f.h, f.w);
-        else gm.reset();
-        const double tm = now_ms();
-        focus.clear();
-        if (s.focus) trk->focus(me.dx, me.dy, focus);
-        det.setFocus(focus);
-        // экономия: между полными просмотрами кадра детектор смотрит только вокруг треков
-        roi.clear();
-        if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) trk->roi(me.dx, me.dy, roi);
-        det.setRoi(roi);
-        det.detect(f.px.data(), f.w, f.h, f.w, cands);
-        trk->setPartial(det.timing().partial);
-        const double t1 = now_ms();
-        const auto& tracks = trk->update(cands, me.dx, me.dy);
-        const double t2 = now_ms();
-        const bool learning = det.learningMask();
-        if (learnLeft > 0 && --learnLeft == 0) det.endMaskLearning();
-        // эмуляция устройства: ядро медленнее в slowdown раз, плюс нижняя граница времени кадра
-        if (s.slowdown > 1) wait_until(t0 + (t2 - t0) * std::min(100.0, s.slowdown), stop_);
-        if (s.emulateMs > 0) wait_until(t0 + s.emulateMs, stop_);
-        const double t3 = now_ms();
-        // авто-упрощение по времени кадра против периода камеры (без замедления просмотра)
-        if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, s.targetFps > 0 ? s.targetFps : info_.fps));
+        // Повтор кадра: запись экрана 60 к/с с ролика 25-30 к/с даёт тот же кадр 2-3 раза.
+        // Нового в нём нет, а трекер видел бы цель то стоящей, то прыгнувшей вдвое — берём
+        // результат прошлого кадра
+        const bool dup = s.skipDuplicates && lastR && !p.loopStart && !p.seekStart && dupRun < 2 &&
+                         dupCheck.duplicate(f.px.data(), f.w, f.h, f.w);
+        if (!s.skipDuplicates || p.loopStart || p.seekStart) dupCheck.reset();
+        dupRun = dup ? dupRun + 1 : 0;
+        std::shared_ptr<Result> r;
+        double t0 = now_ms(), t3 = t0;
+        if (dup) {
+            r = std::make_shared<Result>(*lastR);
+            r->frame = p.frame;
+            r->loop = p.loop;
+            r->seq = ++seq;
+            r->dup = true;
+            r->procMs = r->trackMs = 0;
+            r->dt = DetectTiming();
+            r->gt.clear();
+            t3 = now_ms();
+            r->latencyMs = t3 - p.readyAt;
+        } else {
+            t0 = now_ms();
+            // сдвиг картинки от прошлого кадра: прогноз треков переносится вместе с камерой
+            MotionEstimate me;
+            const bool autoMotion = s.motion < 0;
+            if (ef.motion || autoMotion) me = gm.estimate(f.px.data(), f.w, f.h, f.w);
+            else gm.reset();
+            if (autoMotion) {
+                // крупный кадр: сдвиг трекеру не передаём (оценка по облакам и веткам на
+                // ветру неточна, а камера, ведущая цель, держит её почти на месте кадра),
+                // но, пока камера поворачивается, память помех не учится — иначе она
+                // запомнила бы ведомую камерой цель как неподвижную
+                camHist.push_back(me.valid ? std::fabs(me.dx) + std::fabs(me.dy) : 0.f);
+                while (camHist.size() > 60) camHist.pop_front();
+                float recent = 0;
+                for (float d : camHist) recent += d;
+                trk->setMovingCamera(ef.motion || recent > 4.f);
+            } else {
+                trk->setMovingCamera(ef.motion);
+            }
+            if (!ef.motion) me.dx = me.dy = 0;   // камера стоит: трекеру сдвиг не нужен
+            const double tm = now_ms();
+            focus.clear();
+            if (s.focus) trk->focus(me.dx, me.dy, focus);
+            det.setFocus(focus);
+            // экономия: между полными просмотрами кадра детектор смотрит только вокруг треков
+            roi.clear();
+            if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) trk->roi(me.dx, me.dy, roi);
+            det.setRoi(roi);
+            det.detect(f.px.data(), f.w, f.h, f.w, cands);
+            trk->setPartial(det.timing().partial);
+            // силуэт захваченной цели: прицел в центре крупного БПЛА, а не на крыле или хвосте
+            {
+                float lx, ly, lr;
+                int lp;
+                if (trk->lockSearch(me.dx, me.dy, lx, ly, lr, lp))
+                    trk->setLockSilhouette(measure_silhouette(f.px.data(), f.w, f.h, f.w, lx, ly, lr, lp,
+                                                              std::max(6.f, 0.8f * det.threshold()), trk->config().silh_max));
+            }
+            const double t1 = now_ms();
+            const auto& tracks = trk->update(cands, me.dx, me.dy);
+            const double t2 = now_ms();
+            const bool learning = det.learningMask();
+            if (learnLeft > 0 && --learnLeft == 0) {
+                det.endMaskLearning();
+                // треки, начатые до маски, могли родиться на том, что маска теперь закрыла
+                // (надписи поверх записи экрана, кромка крыш): начинаем заново
+                if (trk->lockState() != dronolok::LockState::Hard) trk->resetTracks();
+            }
+            // эмуляция устройства: ядро медленнее в slowdown раз, плюс нижняя граница времени кадра
+            if (s.slowdown > 1) wait_until(t0 + (t2 - t0) * std::min(100.0, s.slowdown), stop_);
+            if (s.emulateMs > 0) wait_until(t0 + s.emulateMs, stop_);
+            t3 = now_ms();
+            // авто-упрощение по времени кадра против периода камеры (без замедления просмотра)
+            if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, s.targetFps > 0 ? s.targetFps : info_.fps));
 
-        auto r = std::make_shared<Result>();
-        r->frame = p.frame;
-        r->loop = p.loop;
-        r->cands = cands;
-        r->clutter = trk->clutterDets();
-        r->noise = trk->noiseDets();
-        r->tracks = tracks;
-        r->dt = det.timing();
-        r->trackMs = t2 - t1;
-        r->procMs = t3 - t0;
-        r->latencyMs = t3 - p.readyAt;
-        r->mask = det.tileMask();
-        r->tilesX = det.tilesX();
-        r->tilesY = det.tilesY();
-        r->tilePx = det.tileSizePx();
-        r->zones = det.zones();
-        r->learning = learning;
-        r->seq = ++seq;
-        r->lockId = trk->lockedId();
-        r->camDx = me.dx;
-        r->camDy = me.dy;
-        r->camQ = me.quality;
-        r->camValid = me.valid;
-        r->motionOn = ef.motion;
-        r->motionMs = ef.motion ? tm - t0 : 0;
-        r->scales = dc.scales;
-        r->govLevel = s.governor ? gov.level() : -1;
-        r->autoThr = dc.auto_thr;
-        r->noiseLvl = det.noiseLevel();
-        r->thr = det.threshold();
-        r->fullEvery = dc.full_every;
-        r->coarseEvery = dc.scales > 1 ? dc.coarse_every : 0;
-        r->focus = focus;
-        r->staticOn = trk->config().static_frames > 0;
-        if (r->staticOn && seq % 15 == 0) trk->staticCells(statCells);
-        if (r->staticOn) r->staticCells = statCells;
-        r->staticCellPx = trk->staticCellPx();
+            r = std::make_shared<Result>();
+            r->frame = p.frame;
+            r->loop = p.loop;
+            r->cands = cands;
+            r->clutter = trk->clutterDets();
+            r->noise = trk->noiseDets();
+            r->tracks = tracks;
+            r->dt = det.timing();
+            r->trackMs = t2 - t1;
+            r->procMs = t3 - t0;
+            r->latencyMs = t3 - p.readyAt;
+            r->mask = det.tileMask();
+            r->tilesX = det.tilesX();
+            r->tilesY = det.tilesY();
+            r->tilePx = det.tileSizePx();
+            r->zones = det.zones();
+            r->learning = learning;
+            r->seq = ++seq;
+            r->lockId = trk->lockedId();
+            r->camDx = me.dx;
+            r->camDy = me.dy;
+            r->camQ = me.quality;
+            r->camValid = me.valid;
+            r->motionOn = ef.motion;
+            r->motionMs = ef.motion ? tm - t0 : 0;
+            r->scales = dc.scales;
+            r->govLevel = s.governor ? gov.level() : -1;
+            r->lockState = trk->lockState();
+            r->verify = trk->verifyFrames();
+            r->verifyNeed = trk->config().verify_frames;
+            r->autoThr = dc.auto_thr;
+            r->noiseLvl = det.noiseLevel();
+            r->thr = det.threshold();
+            r->fullEvery = dc.full_every;
+            r->coarseEvery = dc.scales > 1 ? dc.coarse_every : 0;
+            r->focus = focus;
+            r->staticOn = trk->config().static_frames > 0;
+            if (r->staticOn && seq % 15 == 0) trk->staticCells(statCells);
+            if (r->staticOn) r->staticCells = statCells;
+            r->staticCellPx = trk->staticCellPx();
+        }
+        lastR = r;
+        const auto& tracks = r->tracks;
+        const auto& cands = r->cands;
         std::shared_ptr<const GroundTruth> gt;
         {
             std::lock_guard<std::mutex> lk(rm_);
@@ -616,6 +745,21 @@ void Pipeline::processLoop() {
         // при съёмке с рук маска неба не учится — качество считаем сразу (своя разметка роликов)
         const bool evalOn = ef.motion || (s.loop ? p.loop >= 1 : f.index >= s.learnMaskFrames);
         if (gtFrame && evalOn) eval_.add(r->gt, tracks, r->gsx, r->gsy);
+        if (!s.trackLog.empty()) {
+            if (!tlog) {
+                tlog.reset(open_file(s.trackLog, "w"));
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells\n");
+            }
+            if (tlog) {
+                if (tracks.empty())
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu\n", p.loop, (long long)f.index, r->lockId, (int)r->lockState,
+                            statCells.size());
+                for (const auto& t : tracks)
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu\n", p.loop, (long long)f.index,
+                            r->lockId, (int)r->lockState, t.id, t.x, t.y, t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits,
+                            t.travel, t.score, statCells.size());
+            }
+        }
         latest_ = r;
         hist_.push_back(r);
         histBytes_ += f.px.size();

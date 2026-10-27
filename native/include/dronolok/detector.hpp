@@ -5,6 +5,7 @@
 // стадии слиты в один потоковый проход по блокам кадра, которые лежат в кэше,
 // и посчитаны SIMD-ядрами (AVX2/SSE2 на x86, NEON на ARM).
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -237,9 +238,53 @@ struct TrackerConfig {
     // помечается. 0 — выключено.
     float flock_px = 150.f;
     float flock_dv = 0.35f;
+    // Захват крупной цели целиком: вокруг захваченной цели на каждом кадре ищется её силуэт
+    // (measure_silhouette по кадру делает вызывающий код, см. lockSearch). Прицел — в центре
+    // силуэта, а не на кончике крыла или хвосте; отклики внутри силуэта (крыло, хвост,
+    // подвес) — части той же цели: другие треки на них не рождаются и захват не уводят.
+    // Силуэт ведёт цель и там, где детектор её не видит (крупнее его масштабов).
+    bool silhouette = true;
+    float silh_max = 400.f;     // предел полуразмера окна поиска силуэта, пикс.
+    // Жёсткий захват: захваченная цель verify_frames кадров подряд классифицирована как дрон —
+    // захват больше не переходит на другие цели, цель держится на прогнозе и силуэте до
+    // hard_miss кадров, а детектор смотрит в основном вокруг неё (весь кадр — раз в
+    // hard_full_every кадров, см. hardFullEvery). Снимается, если цель пропала дольше
+    // hard_miss кадров или оказалась птицей. false — захват как обычно.
+    bool hard_lock = true;
+    int verify_frames = 25;
+    int hard_miss = 60;
+    int hard_full_every = 6;
+    // Наложения на кадр (надписи, логотипы, OSD, грязь на объективе): отклик стоит в одной
+    // точке кадра (СКО меньше overlay_px) overlay_hits попаданий подряд, пока камера ушла на
+    // overlay_cam пикс. — это не цель, а наложение: в долгую память (она в координатах кадра
+    // и для наложений учится и при движущейся камере). overlay_hits = 0 — выключено.
+    int overlay_hits = 16;
+    float overlay_px = 1.f;
+    float overlay_cam = 24.f;
 };
 
 struct TrackPoint { float x, y; };
+
+// Силуэт цели вокруг точки (measure_silhouette): связная область темнее/светлее фона
+struct Silhouette {
+    bool valid = false;
+    float x = 0, y = 0;    // центр, взвешенный по контрасту, пикс. кадра
+    float w = 0, h = 0;    // габарит, пикс.
+    float contrast = 0;    // средний контраст силуэта
+    int area = 0;          // площадь, пикс.
+};
+// Силуэт объекта, который ждём в точке (x, y) кадра gray: r — ожидаемый радиус (0 —
+// неизвестен), polarity -1 тёмный / +1 светлый. Окно растёт, пока силуэт упирается в его
+// край, до полуразмера maxR; крупнее — не цель (земля, крона, облако), valid = false.
+Silhouette measure_silhouette(const uint8_t* gray, int w, int h, int stride, float x, float y, float r, int polarity,
+                              float minContrast = 8.f, float maxR = 400.f);
+
+// Состояние захвата
+enum class LockState : uint8_t {
+    None = 0,      // захвата нет
+    Tracking = 1,  // цель захвачена, проверяем, дрон ли это
+    Hard = 2,      // жёсткий захват: подтверждено, что дрон (TrackerConfig::hard_lock)
+};
 
 struct Track {
     int id = 0;
@@ -266,11 +311,14 @@ struct Track {
     float flapDepth = 0;     // размах пульсации к среднему
     bool hovering = false;   // летал, а теперь висит на месте
     bool flock = false;      // летит в стае с машущей птицей
+    bool overlay = false;    // наложение на кадр: стоит в кадре, пока камера движется
+    bool everLocked = false; // был захвачен: в долгую память помех не попадает
+    float bw = 0, bh = 0;    // габарит силуэта (захваченная цель), 0 — не измерен
     std::deque<TrackPoint> path;      // последние 30 позиций на кадре
     // служебное
     int det = -1;            // индекс детекции этого кадра или -1
     std::deque<bool> hist;
-    struct Obs { int t; float x, y, c; int level; float e; };
+    struct Obs { int t; float x, y, c; int level; float e; float fx, fy; };   // fx, fy — в координатах кадра
     std::deque<Obs> obs;     // попадания в координатах сцены
     float vsx = 0, vsy = 0;  // скорость относительно сцены
     float p00 = 0, p01 = 0, p11 = 0;   // ковариация Калмана (одинакова для x и y)
@@ -300,6 +348,18 @@ public:
     // Захваченная цель: самая весомая из подтверждённых, держится, пока трек жив и его
     // не превзошёл другой в lock_switch раз. 0 — захвата нет.
     int lockedId() const { return lockId_; }
+    LockState lockState() const { return !lockId_ ? LockState::None : hard_ ? LockState::Hard : LockState::Tracking; }
+    // сколько кадров подряд захваченная цель — дрон (до verify_frames — проверка)
+    int verifyFrames() const { return verify_; }
+    // Жёсткий захват: детектору смотреть весь кадр раз в столько кадров (иначе 1)
+    int hardFullEvery() const { return hard_ ? std::max(1, cfg_.hard_full_every) : 1; }
+    // Где искать силуэт захваченной цели на следующем кадре (до update): точка, ожидаемый
+    // радиус, полярность. false — захвата нет или силуэт выключен
+    bool lockSearch(float camDx, float camDy, float& x, float& y, float& r, int& polarity) const;
+    // Силуэт захваченной цели на этом кадре — учитывается в следующем update()
+    void setLockSilhouette(const Silhouette& s) { lockSilh_ = s; }
+    // При движущейся камере долгая память учится только наложениям на кадр (см. overlay_hits)
+    void setMovingCamera(bool m) { movingCam_ = m; }
     const std::vector<Candidate>& clutterDets() const { return clutterDets_; }
     // кандидаты, не попавшие ни в клаттер, ни в подтверждённый трек
     const std::vector<Candidate>& noiseDets() const { return noiseDets_; }
@@ -309,6 +369,9 @@ public:
     bool saveStatic(const std::string& path) const;
     bool loadStatic(const std::string& path);
     void clearStatic();
+    // снимок памяти помех и возврат к нему (повторный просмотр ролика — как первый)
+    void getStatic(std::vector<float>& out) const;
+    void setStatic(const std::vector<float>& v);
     void staticCells(std::vector<TrackPoint>& out) const;
     int staticCellPx() const { return cfg_.clutter_cell; }
     TrackerConfig& config() { return cfg_; }
@@ -319,6 +382,7 @@ private:
     float staticAt(size_t i) const;
     void staticAdd(size_t i);
     bool staticHot(float x, float y) const;
+    bool silhouetteFor(const Track& t) const;
     void classify(Track& t) const;
     void shiftHeat(float dx, float dy);
     float measVar(int level) const;
@@ -337,6 +401,10 @@ private:
     int nextId_ = 1;
     int frame_ = 0;
     int lockId_ = 0, lostFor_ = 0;
+    int verify_ = 0;
+    bool hard_ = false;
+    Silhouette lockSilh_;
+    bool movingCam_ = false;
     bool partial_ = false;
     float lastX_ = 0, lastY_ = 0, lastVx_ = 0, lastVy_ = 0;
 };

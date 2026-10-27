@@ -33,6 +33,7 @@ set(DL_SOURCES
   src/motion.cpp
   src/thread_pool.cpp
   src/tracker.cpp
+  src/silhouette.cpp
   src/tuning.cpp)
 
 add_library(dronolok_obj OBJECT ${DL_SOURCES})

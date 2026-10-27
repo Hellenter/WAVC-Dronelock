@@ -1473,6 +1473,8 @@ int run_bench(int argc, char** argv) {
         else if (a == "--coarse-every") s.det.coarse_every = atoi(val().c_str());
         else if (a == "--json") json = val();
         else if (a == "--csv") csv = val();
+        else if (a == "--tracks") s.trackLog = val();
+        else if (a == "--no-dedup") s.skipDuplicates = false;
         else video = a;
     }
     if (preload > 0) {
