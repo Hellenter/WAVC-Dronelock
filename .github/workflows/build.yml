@@ -23,16 +23,21 @@ jobs:
   # Ядро + тесты + приложение под Linux x64, синтетическое видео для проверки
   linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
+      # установка пакетов иногда зависает на зеркалах — ограничиваем время и повторяем
       - name: Пакеты
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config ffmpeg \
-            libsdl2-dev libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
-          pip install --quiet numpy opencv-python-headless
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
+            cmake ninja-build pkg-config ffmpeg libsdl2-dev libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
+      - name: Python-пакеты
+        timeout-minutes: 10
+        run: pip install --quiet --timeout 60 --retries 3 numpy opencv-python-headless
       - name: Ядро и тесты
         run: |
           cmake -S native -B build-native -G Ninja
