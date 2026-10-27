@@ -546,6 +546,9 @@ void Pipeline::processLoop() {
         r->motionMs = ef.motion ? tm - t0 : 0;
         r->scales = dc.scales;
         r->govLevel = s.governor ? gov.level() : -1;
+        r->autoThr = dc.auto_thr;
+        r->noiseLvl = det.noiseLevel();
+        r->thr = det.threshold();
         r->fullEvery = dc.full_every;
         r->coarseEvery = dc.scales > 1 ? dc.coarse_every : 0;
         r->focus = focus;

@@ -831,6 +831,16 @@ void panel_controls(App& a) {
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderFloat("порог контраста", &d.thr, 3, 40, "%.0f");
         help_marker("Минимальная разница яркости цели и фона, уровни 0..255.");
+        changed |= ImGui::Checkbox("порог по шуму", &d.auto_thr);
+        help_marker("Порог считается на каждом кадре от шума неба (как в радарах): чистое небо — порог ниже и "
+                    "видны тусклые цели, шумная матрица вечером — выше и меньше ложных. Порог контраста выше "
+                    "тогда не используется.");
+        if (d.auto_thr) {
+            ImGui::SetNextItemWidth(w);
+            changed |= ImGui::SliderFloat("во сколько раз выше шума", &d.noise_k, 4, 30, "%.1f");
+            ImGui::SetNextItemWidth(w);
+            changed |= ImGui::DragFloatRange2("пределы порога", &d.thr_min, &d.thr_max, 0.5f, 2, 80, "%.0f", "%.0f");
+        }
         int kk = d.k;
         ImGui::SetNextItemWidth(w);
         if (ImGui::SliderInt("макс. размер цели k", &kk, 3, 15)) {
@@ -1018,6 +1028,8 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
         } else {
             ImGui::TextDisabled("движение камеры не учитывается");
         }
+        if (r->autoThr) ImGui::Text("шум неба %.2f, порог %.1f", r->noiseLvl, r->thr);
+        else ImGui::TextDisabled("порог %.0f (постоянный)", r->thr);
         ImGui::TextDisabled("масштабов %d, весь кадр раз в %d%s", r->scales, r->fullEvery,
                             r->coarseEvery > 1 ? (", крупные раз в " + std::to_string(r->coarseEvery)).c_str() : "");
         if (r->govLevel >= 0)
@@ -1601,7 +1613,14 @@ int run_stress(int argc, char** argv) {
                 s.det.bright = R(4) != 0;
                 break;
             case 22: s.det.clutter_k = F(1, 8); s.det.max_density = F(0.002f, 0.05f); break;
-            case 23: s.det.coarse_thr_k = F(1, 6); s.det.focus_k = F(0.2f, 1); break;
+            case 23:
+                s.det.coarse_thr_k = F(1, 6);
+                s.det.focus_k = F(0.2f, 1);
+                s.det.auto_thr = R(2);
+                s.det.noise_k = F(4, 30);
+                s.det.thr_min = F(2, 20);
+                s.det.thr_max = s.det.thr_min + F(0, 60);
+                break;
             case 24:
                 s.trk.gate = F(5, 150);
                 s.trk.q_accel = F(0.25f, 20);

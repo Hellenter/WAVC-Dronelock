@@ -107,6 +107,8 @@ struct Result {
     int staticCellPx = 8;
     std::vector<uint8_t> zones;   // по тайлам (tilesX x tilesY): 0 земля, 1 смешанная, 2 небо
     int govLevel = -1;            // ступень авто-упрощения, -1 — выключено
+    bool autoThr = false;         // порог по шуму
+    float noiseLvl = 0, thr = 0;  // шум отклика неба и порог, с которым искали на этом кадре
     int fullEvery = 1, coarseEvery = 1;   // что сейчас стоит в детекторе (с учётом упрощения)
 };
 
