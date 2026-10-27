@@ -40,7 +40,7 @@ void apply_blocks(const AlgoBlocks& b, DetectorConfig& d, TrackerConfig& t);
 // Упрощает, когда среднее время кадра выше 90% бюджета; возвращает, когда ниже 50%.
 class LoadGovernor {
 public:
-    static const int MAX_LEVEL = 5;
+    static constexpr int MAX_LEVEL = 5;
     // ms — время обработки кадра (всего: движение камеры, детектор, трекер), budgetMs — период кадров.
     // true — ступень поменялась, настройку надо применить заново (apply)
     bool update(double ms, double budgetMs);

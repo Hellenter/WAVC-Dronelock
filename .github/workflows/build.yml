@@ -201,7 +201,8 @@ jobs:
   # Последняя сборка по постоянной ссылке .../releases/tag/latest-build: обновляется после
   # каждого изменения в main и в открытом PR из этого репозитория
   latest:
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    # только PR в основную ветку: PR в ветку другого PR (доработки соседних задач) сюда не пишут
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == github.event.repository.default_branch)
     needs: [windows, windows-smoke, pi]
     runs-on: ubuntu-24.04
     permissions:

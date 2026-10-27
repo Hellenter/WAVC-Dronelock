@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 
+#include "dronolok/fileutil.hpp"
 #include "dronolok/tuning.hpp"
 #include "platform.hpp"
 
@@ -75,7 +77,12 @@ bool Pipeline::open(const std::string& path, std::string& err) {
     info_ = probe.info();
     probe.close();
     path_ = path;
-    haveGt_ = gt_.load(path + ".gt.json");
+    {
+        auto g = std::make_shared<GroundTruth>();
+        std::lock_guard<std::mutex> lk(rm_);
+        haveGt_ = g->load(gtPath());
+        gt_ = haveGt_ ? g : nullptr;
+    }
     open_ = true;
     relearn_ = true;
     resetStats();
@@ -153,6 +160,15 @@ void Pipeline::step() {
 }
 
 void Pipeline::relearnMask() { relearn_ = true; }
+
+void Pipeline::setGroundTruth(const GroundTruth& g) {
+    auto p = std::make_shared<GroundTruth>(g);
+    std::lock_guard<std::mutex> lk(rm_);
+    haveGt_ = !g.frames.empty();
+    gt_ = haveGt_ ? p : nullptr;
+    eval_ = EvalStats();   // качество считается заново по новой разметке
+    for (auto& m : marks_) m &= (uint8_t)~(MARK_GT | MARK_MISS);
+}
 
 void Pipeline::seek(int64_t frame) {
     seekReq_ = std::max<int64_t>(0, frame);
@@ -439,7 +455,7 @@ void Pipeline::processLoop() {
         if (const int cmd = staticCmd_.exchange(0)) {
             if (cmd == 2) {
                 trk->clearStatic();
-                std::remove(staticPath().c_str());
+                remove_file(staticPath());
             }
             trk->staticCells(statCells);
             const bool ok = cmd == 2 || trk->saveStatic(staticPath());
@@ -537,11 +553,16 @@ void Pipeline::processLoop() {
         if (r->staticOn && seq % 15 == 0) trk->staticCells(statCells);
         if (r->staticOn) r->staticCells = statCells;
         r->staticCellPx = trk->staticCellPx();
-        const bool gtFrame = haveGt_ && f.index < (int64_t)gt_.frames.size();
+        std::shared_ptr<const GroundTruth> gt;
+        {
+            std::lock_guard<std::mutex> lk(rm_);
+            gt = gt_;
+        }
+        const bool gtFrame = gt && f.index < (int64_t)gt->frames.size();
         if (gtFrame) {
-            r->gt = gt_.frames[f.index];
-            r->gsx = gt_.w ? (float)f.w / gt_.w : 1.f;
-            r->gsy = gt_.h ? (float)f.h / gt_.h : 1.f;
+            r->gt = gt->frames[f.index];
+            r->gsx = gt->w ? (float)f.w / gt->w : 1.f;
+            r->gsy = gt->h ? (float)f.h / gt->h : 1.f;
         }
         FrameRec rec;
         rec.decodeMs = (float)f.decodeMs;
@@ -589,7 +610,8 @@ void Pipeline::processLoop() {
         rec.t = t3 - t0_;
         if (log_.size() < 500000) log_.push_back(rec);
         // качество считаем после первого прохода (как run_demo.py) или после обучения маски
-        const bool evalOn = s.loop ? p.loop >= 1 : f.index >= s.learnMaskFrames;
+        // при съёмке с рук маска неба не учится — качество считаем сразу (своя разметка роликов)
+        const bool evalOn = ef.motion || (s.loop ? p.loop >= 1 : f.index >= s.learnMaskFrames);
         if (gtFrame && evalOn) eval_.add(r->gt, tracks, r->gsx, r->gsy);
         latest_ = r;
         hist_.push_back(r);
@@ -699,7 +721,7 @@ Metrics Pipeline::metrics(int histLen) const {
 }
 
 bool Pipeline::exportCsv(const std::string& path) const {
-    FILE* f = fopen(path.c_str(), "w");
+    FILE* f = open_file(path, "w");
     if (!f) return false;
     fprintf(f, "t_ms,frame,decode_ms,motion_ms,detect_ms,response_ms,select_ms,track_ms,proc_ms,latency_ms,"
                "candidates,drones,birds,unknown,clutter,noise,lock_id,cam_dx,cam_dy,gov_level\n");
@@ -711,6 +733,87 @@ bool Pipeline::exportCsv(const std::string& path) const {
                 r.govLevel);
     fclose(f);
     return true;
+}
+
+// 8-битный BMP с серой палитрой: открывается любым просмотрщиком, кодировщик не нужен
+static bool write_bmp(const std::string& path, const uint8_t* px, int w, int h) {
+    FILE* f = open_file(path, "wb");
+    if (!f) return false;
+    const int stride = (w + 3) & ~3;
+    const uint32_t off = 14 + 40 + 1024, size = off + (uint32_t)stride * h;
+    uint8_t hdr[54] = {'B', 'M'};
+    auto put32 = [&](int at, uint32_t v) { for (int i = 0; i < 4; ++i) hdr[at + i] = (uint8_t)(v >> (8 * i)); };
+    put32(2, size);
+    put32(10, off);
+    put32(14, 40);
+    put32(18, (uint32_t)w);
+    put32(22, (uint32_t)h);
+    hdr[26] = 1;
+    hdr[28] = 8;
+    put32(34, (uint32_t)stride * h);
+    put32(46, 256);
+    fwrite(hdr, 1, 54, f);
+    for (int i = 0; i < 256; ++i) {
+        const uint8_t c[4] = {(uint8_t)i, (uint8_t)i, (uint8_t)i, 0};
+        fwrite(c, 1, 4, f);
+    }
+    std::vector<uint8_t> row(stride, 0);
+    for (int y = h - 1; y >= 0; --y) {   // BMP хранит строки снизу вверх
+        std::copy(px + (size_t)y * w, px + (size_t)y * w + w, row.begin());
+        fwrite(row.data(), 1, stride, f);
+    }
+    return fclose(f) == 0;
+}
+
+int Pipeline::exportCrops(const std::string& dir, std::string& msg) const {
+    std::vector<std::shared_ptr<const Result>> hist;
+    {
+        std::lock_guard<std::mutex> lk(rm_);
+        hist.assign(hist_.begin(), hist_.end());
+    }
+    if (hist.empty()) {
+        msg = "история пуста: сначала прогоните видео";
+        return 0;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::u8path(dir), ec);
+    FILE* idx = open_file(dir + "/crops.csv", "w");
+    if (!idx) {
+        msg = "не удалось создать " + dir;
+        return 0;
+    }
+    // признаки трека — те же, что видит классификатор; truth — по разметке (если есть)
+    fprintf(idx, "file,frame,track,x,y,class,truth,contrast,speed,resid,contrast_cv,hits,miss,locked\n");
+    const int S = 48;
+    std::vector<uint8_t> crop((size_t)S * S);
+    int n = 0;
+    for (const auto& r : hist) {
+        const Frame& f = *r->frame;
+        if (f.w < S || f.h < S) continue;
+        for (const auto& t : r->tracks) {
+            if (t.clutter || t.miss > 0 || !t.confirmed) continue;
+            const char* truth = "";
+            if (!r->gt.empty()) {
+                truth = "ложная";
+                for (const auto& g : r->gt)
+                    if (std::fabs(t.x - g.x * r->gsx) < 10 && std::fabs(t.y - g.y * r->gsy) < 10) truth = g.bird ? "птица" : "дрон";
+            }
+            const char* cls = t.cls == TargetClass::Drone ? "дрон" : t.cls == TargetClass::Bird ? "птица" : "неясно";
+            const int x0 = std::min(std::max(0, (int)t.x - S / 2), f.w - S), y0 = std::min(std::max(0, (int)t.y - S / 2), f.h - S);
+            for (int y = 0; y < S; ++y)
+                std::copy(f.px.data() + (size_t)(y0 + y) * f.w + x0, f.px.data() + (size_t)(y0 + y) * f.w + x0 + S,
+                          crop.begin() + (size_t)y * S);
+            char name[96];
+            snprintf(name, sizeof(name), "f%06lld_t%d_%s.bmp", (long long)f.index, t.id, *truth ? truth : cls);
+            if (!write_bmp(dir + "/" + name, crop.data(), S, S)) continue;
+            fprintf(idx, "%s,%lld,%d,%.1f,%.1f,%s,%s,%.1f,%.2f,%.2f,%.3f,%d,%d,%d\n", name, (long long)f.index, t.id,
+                    t.x, t.y, cls, truth, t.contrast, t.speed, t.resid, t.contrastCv, t.hits, t.miss, t.id == r->lockId);
+            ++n;
+        }
+    }
+    fclose(idx);
+    msg = "вырезок " + std::to_string(n) + " из " + std::to_string(hist.size()) + " кадров: " + dir;
+    return n;
 }
 
 std::string Pipeline::reportJson() const {

@@ -4,12 +4,12 @@
 // Дополнительно — матрица "что на самом деле" x "каким классом назвал трекер".
 #pragma once
 #include <cmath>
-#include <fstream>
-#include <sstream>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/fileutil.hpp"
 #include "mini_json.hpp"
 
 namespace dronolok {
@@ -25,12 +25,14 @@ struct GroundTruth {
     std::vector<std::vector<GtObj>> frames;
 
     bool load(const std::string& path) {
-        std::ifstream f(path, std::ios::binary);
+        FILE* f = open_file(path, "rb");
         if (!f) return false;
-        std::stringstream ss;
-        ss << f.rdbuf();
+        std::string text;
+        char buf[65536];
+        for (size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;) text.append(buf, n);
+        std::fclose(f);
         minijson::Value v;
-        if (!minijson::parse(ss.str(), v)) return false;
+        if (!minijson::parse(text, v)) return false;
         w = (int)v["w"].num();
         h = (int)v["h"].num();
         frames.clear();

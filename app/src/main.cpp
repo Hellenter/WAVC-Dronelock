@@ -16,9 +16,11 @@
 #include <string>
 #include <vector>
 
+#include "annotate.hpp"
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
+#include "dronolok/fileutil.hpp"
 #include "dronolok/tuning.hpp"
 #include "pipeline.hpp"
 #include "platform.hpp"
@@ -119,6 +121,11 @@ struct App {
     bool showNoise = true, showClutter = true, showTracks = true, showPaths = true, showIds = true;
     bool showMask = false, showGt = true, showCrops = true, showPred = true, showFocus = false;
     int viewSeq = -1;      // кадр из истории на паузе (Result::seq), -1 — последний обработанный
+    // разметка целей
+    bool annotate = false;
+    Annotation ann;
+    int annCur = 0;        // выбранный объект (AnnObject::id)
+    std::string annMsg;
     // шкала видео
     std::vector<uint8_t> marks;
     int64_t scrub = -1;    // куда тянут ползунок шкалы
@@ -219,6 +226,23 @@ void open_video(App& a, const std::string& path) {
     a.zoom = 1.f;
     a.panX = a.panY = 0;
     a.viewSeq = -1;
+    const VideoInfo vi = a.pipe.info();
+    a.ann.load(a.pipe.gtPath(), vi.w, vi.h, vi.fps);
+    a.annCur = a.ann.objs.empty() ? 0 : a.ann.objs[0].id;
+    a.annMsg.clear();
+}
+
+// разметку поменяли: сохранить в <видео>.gt.json и сразу считать по ней качество
+void ann_changed(App& a) {
+    const int64_t n = a.pipe.length();
+    if (!a.ann.save(a.pipe.gtPath(), n)) {
+        a.annMsg = "не удалось сохранить " + a.pipe.gtPath();
+        return;
+    }
+    a.pipe.setGroundTruth(a.ann.toGroundTruth(n));
+    int keys = 0;
+    for (const auto& o : a.ann.objs) keys += (int)o.keys.size();
+    a.annMsg = "сохранено: объектов " + std::to_string(a.ann.objs.size()) + ", точек " + std::to_string(keys);
 }
 
 // ------------------------------------------------------------ плеер: пауза, покадрово, скорость
@@ -442,6 +466,48 @@ void help_marker(const char* t) {
     }
 }
 
+void panel_annotate(App& a) {
+    ImGui::SeparatorText("Разметка целей");
+    if (!a.ann.editable) {
+        ImGui::TextDisabled("разметка из synth_sky.py: только просмотр");
+        return;
+    }
+    ImGui::Checkbox("размечать на видео", &a.annotate);
+    help_marker("Своя разметка, чтобы приложение считало полноту и ложные цели на ваших роликах, а шкала "
+                "показывала, где дрон пропущен. Поставьте паузу и щёлкните по дрону: на этом кадре появится "
+                "опорная точка (рядом с целью алгоритма она прилипает к ней). Между точками положение считается "
+                "по прямой, поэтому точку достаточно ставить раз в 10-30 кадров и на поворотах; объект есть "
+                "от первой до последней точки. Правый щелчок — убрать точку на этом кадре. Сохраняется сразу "
+                "в <видео>.gt.json, рядом с видео.");
+    if (!a.annotate) {
+        if (!a.ann.objs.empty()) ImGui::TextDisabled("размечено объектов: %d", (int)a.ann.objs.size());
+        return;
+    }
+    if (ImGui::SmallButton("+ дрон")) a.annCur = a.ann.add(false);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ птица")) a.annCur = a.ann.add(true);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!a.ann.find(a.annCur));
+    if (ImGui::SmallButton("удалить объект")) {
+        a.ann.objs.erase(std::remove_if(a.ann.objs.begin(), a.ann.objs.end(),
+                                        [&](const AnnObject& o) { return o.id == a.annCur; }),
+                         a.ann.objs.end());
+        a.annCur = a.ann.objs.empty() ? 0 : a.ann.objs.back().id;
+        ann_changed(a);
+    }
+    ImGui::EndDisabled();
+    for (const auto& o : a.ann.objs) {
+        char b[128];
+        if (o.keys.empty()) snprintf(b, sizeof(b), "#%d %s: точек нет##o%d", o.id, o.bird ? "птица" : "дрон", o.id);
+        else
+            snprintf(b, sizeof(b), "#%d %s: точек %d, кадры %lld-%lld##o%d", o.id, o.bird ? "птица" : "дрон",
+                     (int)o.keys.size(), (long long)o.keys.begin()->first, (long long)o.keys.rbegin()->first, o.id);
+        if (ImGui::Selectable(b, a.annCur == o.id)) a.annCur = o.id;
+    }
+    if (a.ann.objs.empty()) ImGui::TextDisabled("щёлкните по дрону на кадре — появится объект #1");
+    if (!a.annMsg.empty()) ImGui::TextDisabled("%s", a.annMsg.c_str());
+}
+
 void panel_controls(App& a) {
     bool changed = false;
     const VideoInfo vi = a.pipe.info();
@@ -497,6 +563,7 @@ void panel_controls(App& a) {
                             "этом не откатывается: вперёд с последнего кадра идёт обработка следующего.");
             }
             changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
+            panel_annotate(a);
         }
     }
     if (ImGui::CollapsingHeader("Подача кадров", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -969,7 +1036,8 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
     if (m.haveGt) {
         ImGui::SeparatorText("Качество по разметке");
         if (m.eval.frames == 0) {
-            ImGui::TextDisabled("считается после первого прохода видео");
+            ImGui::TextDisabled(m.eval.frames == 0 && a.pipe.paused() ? "считается по обработанным кадрам с разметкой"
+                                                                        : "считается после первого прохода видео");
         } else {
             ImGui::Text("найдено дронов %.1f%%, птиц %.1f%%", 100 * m.eval.recall(0), 100 * m.eval.recall(1));
             ImGui::Text("ложных треков на кадр: %.2f", m.eval.falsePerFrame());
@@ -986,13 +1054,23 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
     ImGui::SameLine();
     if (ImGui::Button("Отчёт JSON")) {
         std::string p = a.pipe.path() + ".report.json";
-        FILE* f = fopen(p.c_str(), "w");
+        FILE* f = open_file(p, "w");
         if (f) {
             fprintf(f, "%s\n", a.pipe.reportJson().c_str());
             fclose(f);
         }
         a.note = f ? "сохранено: " + p : "не удалось сохранить " + p;
     }
+    if (ImGui::Button("Вырезки целей")) {
+        std::string dir = a.pipe.path();
+        const size_t dot = dir.find_last_of('.'), sl = dir.find_last_of("/\\");
+        if (dot != std::string::npos && (sl == std::string::npos || dot > sl)) dir.resize(dot);
+        a.pipe.exportCrops(dir + "_вырезки", a.note);
+    }
+    help_marker("Цели из последних обработанных кадров (история, до 600 кадров) — картинки 48x48 и таблица "
+                "crops.csv с признаками трека (скорость, отклонение от траектории, мигание контраста), классом, "
+                "который дал алгоритм, и правдой по разметке. Набор для настройки классификатора дрон/птица "
+                "и для обучения нейросети. Папка <видео>_вырезки рядом с видео.");
     if (!a.note.empty()) ImGui::TextWrapped("%s", a.note.c_str());
 
     if (a.showCrops && r && a.cropTex) {
@@ -1088,7 +1166,7 @@ void draw_view(App& a, const Result* r) {
             dl->AddLine(ImVec2(q.x - h, q.y - h), ImVec2(q.x + h, q.y + h), COL_STATIC, 1.f);
             dl->AddLine(ImVec2(q.x - h, q.y + h), ImVec2(q.x + h, q.y - h), COL_STATIC, 1.f);
         }
-    if (a.showGt)
+    if (a.showGt && !a.annotate)
         for (const auto& g : r->gt) {
             const ImVec2 q = P(g.x * r->gsx, g.y * r->gsy);
             if (g.bird) dl->AddNgon(q, 18, COL_GT, 4, 1.5f);
@@ -1148,6 +1226,48 @@ void draw_view(App& a, const Result* r) {
             }
             if (hovered && std::fabs(io.MousePos.x - q.x) < h + 2 && std::fabs(io.MousePos.y - q.y) < h + 2) hover = &t;
         }
+    if (a.annotate && a.ann.editable) {
+        // разметка: опорные точки и положение объектов на этом кадре (в пикселях видео)
+        const VideoInfo vi = a.pipe.info();
+        const float kx = vi.w > 0 ? (float)f.w / vi.w : 1.f, ky = vi.h > 0 ? (float)f.h / vi.h : 1.f;
+        for (const auto& o : a.ann.objs) {
+            const bool cur = o.id == a.annCur;
+            const ImU32 c = cur ? IM_COL32(0, 255, 120, 255) : IM_COL32(0, 200, 100, 170);
+            if (cur && o.keys.size() > 1) {
+                std::vector<ImVec2> pts;
+                for (const auto& k : o.keys) pts.push_back(P(k.second.first * kx, k.second.second * ky));
+                dl->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(0, 255, 120, 90), 0, 1.f);
+            }
+            float x, y;
+            if (!Annotation::pos(o, f.index, x, y)) continue;
+            const ImVec2 q = P(x * kx, y * ky);
+            const bool key = o.keys.count(f.index) > 0;
+            dl->AddCircle(q, 16, c, 0, cur ? 2.5f : 1.5f);
+            if (key) dl->AddCircleFilled(q, 4, c);
+            char b[32];
+            snprintf(b, sizeof(b), "#%d %s%s", o.id, o.bird ? "птица" : "дрон", key ? "" : " (по прямой)");
+            dl->AddText(ImVec2(q.x + 18, q.y + 4), c, b);
+        }
+        // щелчок без перетаскивания — опорная точка выбранного объекта (прилипает к ближайшей цели)
+        if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16) {
+            float fx = (io.MousePos.x - o.x) / sc, fy = (io.MousePos.y - o.y) / sc;
+            float best = 14.f / sc;
+            for (const auto& t : r->tracks)
+                if (!t.clutter && std::hypot(t.x - fx, t.y - fy) < best) {
+                    best = std::hypot(t.x - fx, t.y - fy);
+                    fx = t.x;
+                    fy = t.y;
+                }
+            if (fx >= 0 && fy >= 0 && fx < f.w && fy < f.h) {
+                if (!a.ann.find(a.annCur)) a.annCur = a.ann.add(false);
+                a.ann.find(a.annCur)->keys[f.index] = {fx / kx, fy / ky};
+                ann_changed(a);
+            }
+        }
+        if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+            if (AnnObject* ob = a.ann.find(a.annCur))
+                if (ob->keys.erase(f.index)) ann_changed(a);
+    }
     dl->PopClipRect();
     // строка состояния и легенда поверх видео
     char st[320];
@@ -1262,6 +1382,13 @@ void draw_timeline(App& a, const Result* r, const Metrics& m) {
             dl->AddRectFilled(ImVec2(fx, p0.y + hTop + 2), ImVec2(fx + 1, p1.y - 2),
                               acc & MARK_MISS ? IM_COL32(255, 60, 60, 255) : COL_GT);
     }
+    // опорные точки выбранного объекта разметки
+    if (a.annotate)
+        if (const AnnObject* ob = a.ann.find(a.annCur))
+            for (const auto& k : ob->keys) {
+                const float kx = p0.x + (float)((k.first + 0.5) / n * w);
+                dl->AddTriangleFilled(ImVec2(kx - 4, p0.y), ImVec2(kx + 4, p0.y), ImVec2(kx, p0.y + 6), COL_GT);
+            }
     // текущий кадр
     const float cx = p0.x + (float)((cur + 0.5) / n * w);
     dl->AddLine(ImVec2(cx, p0.y - 2), ImVec2(cx, p1.y + 2), IM_COL32(255, 255, 255, 255), 2);
@@ -1367,7 +1494,7 @@ int run_bench(int argc, char** argv) {
     const std::string rep = p.reportJson();
     printf("%s\n", rep.c_str());
     if (!json.empty())
-        if (FILE* f = fopen(json.c_str(), "w")) {
+        if (FILE* f = open_file(json, "w")) {
             fprintf(f, "%s\n", rep.c_str());
             fclose(f);
         }
@@ -1512,8 +1639,8 @@ int run_stress(int argc, char** argv) {
     }
     const Metrics m = p.metrics(0);
     p.close();
-    std::remove(tmp.c_str());
-    std::remove(p.staticPath().c_str());   // "сохранить память" пишет файл и без staticFile
+    remove_file(tmp);
+    remove_file(p.staticPath());   // "сохранить память" пишет файл и без staticFile
     printf("стресс: %.0f с, действий %ld, кадров обработано %ld, просмотрено %ld (%u) — без падений\n", seconds,
            actions, m.processed, seen, sum & 1);
     return 0;

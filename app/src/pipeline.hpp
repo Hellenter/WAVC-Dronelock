@@ -180,6 +180,12 @@ public:
     void staticSave() { staticCmd_ = 1; }
     void staticClear() { staticCmd_ = 2; }
     void resetStats();
+    // Разметка <видео>.gt.json: заменить на ходу (после правки в приложении); пустая — убрать
+    std::string gtPath() const { return path_ + ".gt.json"; }
+    void setGroundTruth(const dronolok::GroundTruth& g);
+    // Вырезки целей из истории кадров с подписью по разметке — набор для настройки классификатора.
+    // Возвращает число вырезок, msg — что и куда сохранено
+    int exportCrops(const std::string& dir, std::string& msg) const;
 
     std::shared_ptr<const Result> latest() const;
     // Последние обработанные кадры для просмотра назад на паузе (номера seq подряд).
@@ -201,7 +207,7 @@ private:
     std::string path_;
     bool open_ = false;
     VideoInfo info_;
-    dronolok::GroundTruth gt_;
+    std::shared_ptr<const dronolok::GroundTruth> gt_;   // под rm_: разметку можно заменить на ходу
     bool haveGt_ = false;
 
     mutable std::mutex sm_;

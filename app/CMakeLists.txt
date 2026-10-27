@@ -56,6 +56,7 @@ endif()
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libswscale libavutil)
 
 add_executable(dronolok_app
+  src/annotate.cpp
   src/main.cpp
   src/pipeline.cpp
   src/platform.cpp
