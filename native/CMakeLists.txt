@@ -30,6 +30,7 @@ set(DL_SOURCES
   src/kernels_sse2.cpp
   src/kernels_avx2.cpp
   src/kernels_neon.cpp
+  src/motion.cpp
   src/thread_pool.cpp
   src/tracker.cpp)
 

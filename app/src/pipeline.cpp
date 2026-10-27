@@ -20,6 +20,18 @@ static void wait_until(double t, const std::atomic<bool>& stop) {
     while (!stop && now_ms() < t) std::this_thread::yield();
 }
 
+Effective effective(const Settings& s, int w, int h) {
+    const bool small = (double)w * h <= 2.2e6;
+    Effective e;
+    e.scales = s.scales > 0 ? std::min(4, s.scales) : small ? 3 : 1;
+    e.motion = s.motion >= 0 ? s.motion > 0 : small;
+    return e;
+}
+
+// история для покадрового просмотра назад
+static const size_t HIST_MAX = 600;
+static const size_t HIST_BYTES = sizeof(void*) > 4 ? (size_t)1 << 30 : (size_t)256 << 20;
+
 struct BufPool {
     std::mutex m;
     std::vector<std::vector<uint8_t>> free;
@@ -72,6 +84,8 @@ void Pipeline::close() {
     open_ = false;
     std::lock_guard<std::mutex> lk(rm_);
     latest_.reset();
+    hist_.clear();
+    histBytes_ = 0;
 }
 
 VideoInfo Pipeline::info() const { return info_; }
@@ -81,6 +95,11 @@ void Pipeline::startThreads() {
     {
         std::lock_guard<std::mutex> lk(qm_);
         q_.clear();
+    }
+    {   // номера кадров seq начнутся заново
+        std::lock_guard<std::mutex> lk(rm_);
+        hist_.clear();
+        histBytes_ = 0;
     }
     dec_ = std::thread([this] { decodeLoop(); });
     proc_ = std::thread([this] { processLoop(); });
@@ -250,7 +269,8 @@ void Pipeline::decodeLoop() {
         const bool realtime = cur.pace == Pace::Realtime && !paused_;
         if (realtime) {
             const double fps = cur.targetFps > 0 ? cur.targetFps : info_.fps;
-            const double period = 1000.0 / std::max(0.1, fps);
+            // замедление: кадры "приходят с камеры" реже, обработка та же
+            const double period = 1000.0 / std::max(0.1, fps) / std::min(4.0, std::max(0.01, cur.speed));
             wait_until(next, stop_);
             next += period;
             if (now_ms() - next > period) next = now_ms();   // декодер не успевает — без рывков вдогонку
@@ -273,9 +293,14 @@ void Pipeline::processLoop() {
         ver = settingsVer_;
     }
     Detector det(s.det);
+    DetectorConfig dc = s.det;   // то, что сейчас стоит в детекторе (с учётом "авто")
+    bool dirty = true;
+    GlobalMotion gm;
+    std::vector<FocusArea> focus;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
+    bool maskOn = false, motionWas = false;
     {
         std::lock_guard<std::mutex> lk(rm_);
         backend_ = det.backendName();
@@ -301,34 +326,67 @@ void Pipeline::processLoop() {
             if (settingsVer_ != ver) {
                 s = settings_;
                 ver = settingsVer_;
-                det.reconfigure(s.det);
+                dirty = true;
                 if (trk) trk->config() = s.trk;
-                std::lock_guard<std::mutex> lr(rm_);
-                backend_ = det.backendName();
-                threads_ = det.threads();
             }
         }
         const Frame& f = *p.frame;
+        const Effective ef = effective(s, f.w, f.h);
+        if (dirty || ef.scales != dc.scales) {
+            dc = s.det;
+            dc.scales = ef.scales;
+            det.reconfigure(dc);
+            dirty = false;
+            std::lock_guard<std::mutex> lr(rm_);
+            backend_ = det.backendName();
+            threads_ = det.threads();
+        }
         if (!trk || trkW != f.w || trkH != f.h || trkCell != s.trk.clutter_cell) {
             trk.reset(new Tracker(f.w, f.h, s.trk));
             trkW = f.w;
             trkH = f.h;
             trkCell = s.trk.clutter_cell;
         }
-        if (p.loopStart) trk->resetTracks();   // склейка зацикленного видео — треки не должны "прыгать"
-        if (relearn_.exchange(false)) {
+        if (p.loopStart) {   // склейка зацикленного видео — треки не должны "прыгать"
+            trk->resetTracks();
+            gm.reset();
+        }
+        // Маска неба привязана к кадру и годится только для неподвижной камеры: при съёмке с рук
+        // земля через секунду окажется там, где было небо, и наоборот (дрон пропадёт в "маске").
+        if (ef.motion != motionWas) {
+            if (!ef.motion) relearn_ = true;
+            motionWas = ef.motion;
+        }
+        if (ef.motion) {
+            if (maskOn) {
+                det.clearMask();
+                maskOn = false;
+                learnLeft = 0;
+            }
+            relearn_ = false;
+        } else if (relearn_.exchange(false)) {
             if (s.learnMaskFrames > 0) {
                 det.beginMaskLearning();
                 learnLeft = s.learnMaskFrames;
+                maskOn = true;
             } else {
                 det.clearMask();
                 learnLeft = 0;
+                maskOn = false;
             }
         }
         const double t0 = now_ms();
+        // сдвиг картинки от прошлого кадра: прогноз треков переносится вместе с камерой
+        MotionEstimate me;
+        if (ef.motion) me = gm.estimate(f.px.data(), f.w, f.h, f.w);
+        else gm.reset();
+        const double tm = now_ms();
+        focus.clear();
+        if (s.focus) trk->focus(me.dx, me.dy, focus);
+        det.setFocus(focus);
         det.detect(f.px.data(), f.w, f.h, f.w, cands);
         const double t1 = now_ms();
-        const auto& tracks = trk->update(cands);
+        const auto& tracks = trk->update(cands, me.dx, me.dy);
         const double t2 = now_ms();
         const bool learning = det.learningMask();
         if (learnLeft > 0 && --learnLeft == 0) det.endMaskLearning();
@@ -352,6 +410,15 @@ void Pipeline::processLoop() {
         r->tilePx = det.tileSizePx();
         r->learning = learning;
         r->seq = ++seq;
+        r->lockId = trk->lockedId();
+        r->camDx = me.dx;
+        r->camDy = me.dy;
+        r->camQ = me.quality;
+        r->camValid = me.valid;
+        r->motionOn = ef.motion;
+        r->motionMs = ef.motion ? tm - t0 : 0;
+        r->scales = ef.scales;
+        r->focus = focus;
         const bool gtFrame = haveGt_ && f.index < (int64_t)gt_.frames.size();
         if (gtFrame) {
             r->gt = gt_.frames[f.index];
@@ -377,6 +444,10 @@ void Pipeline::processLoop() {
         }
         rec.clutter = (int)r->clutter.size();
         rec.noise = (int)r->noise.size();
+        rec.motionMs = (float)r->motionMs;
+        rec.lockId = r->lockId;
+        rec.camDx = r->camDx;
+        rec.camDy = r->camDy;
         std::lock_guard<std::mutex> lk(rm_);
         rec.t = t3 - t0_;
         if (log_.size() < 500000) log_.push_back(rec);
@@ -384,12 +455,33 @@ void Pipeline::processLoop() {
         const bool evalOn = s.loop ? p.loop >= 1 : f.index >= s.learnMaskFrames;
         if (gtFrame && evalOn) eval_.add(r->gt, tracks, r->gsx, r->gsy);
         latest_ = r;
+        hist_.push_back(r);
+        histBytes_ += f.px.size();
+        while (hist_.size() > 1 && (hist_.size() > HIST_MAX || histBytes_ > HIST_BYTES)) {
+            histBytes_ -= hist_.front()->frame->px.size();
+            hist_.pop_front();
+        }
     }
 }
 
 std::shared_ptr<const Result> Pipeline::latest() const {
     std::lock_guard<std::mutex> lk(rm_);
     return latest_;
+}
+
+std::shared_ptr<const Result> Pipeline::at(int seq) const {
+    std::lock_guard<std::mutex> lk(rm_);
+    if (hist_.empty()) return nullptr;
+    const long i = (long)seq - hist_.front()->seq;
+    return i >= 0 && i < (long)hist_.size() ? hist_[(size_t)i] : nullptr;
+}
+
+bool Pipeline::historyRange(int& first, int& last) const {
+    std::lock_guard<std::mutex> lk(rm_);
+    if (hist_.empty()) return false;
+    first = hist_.front()->seq;
+    last = hist_.back()->seq;
+    return true;
 }
 
 static Stat stat_of(std::vector<float> v) {
@@ -426,7 +518,8 @@ Metrics Pipeline::metrics(int histLen) const {
     m.elapsedS = (now - t0_) / 1000.0;
     // статистика по последним 300 кадрам
     const size_t n = log_.size(), from = n > 300 ? n - 300 : 0;
-    std::vector<float> dec, det, resp, sel, trk, proc, lat;
+    std::vector<float> dec, det, resp, sel, trk, proc, lat, mot;
+    int locked = 0;
     for (size_t i = from; i < n; ++i) {
         const FrameRec& r = log_[i];
         dec.push_back(r.decodeMs);
@@ -436,7 +529,11 @@ Metrics Pipeline::metrics(int histLen) const {
         trk.push_back(r.trackMs);
         proc.push_back(r.procMs);
         lat.push_back(r.latencyMs);
+        mot.push_back(r.motionMs);
+        locked += r.lockId != 0;
     }
+    m.lockPct = n > from ? 100.0 * locked / (n - from) : 0;
+    m.motion = stat_of(mot);
     m.decode = stat_of(dec);
     m.detect = stat_of(det);
     m.response = stat_of(resp);
@@ -465,13 +562,13 @@ Metrics Pipeline::metrics(int histLen) const {
 bool Pipeline::exportCsv(const std::string& path) const {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) return false;
-    fprintf(f, "t_ms,frame,decode_ms,detect_ms,response_ms,select_ms,track_ms,proc_ms,latency_ms,"
-               "candidates,drones,birds,unknown,clutter,noise\n");
+    fprintf(f, "t_ms,frame,decode_ms,motion_ms,detect_ms,response_ms,select_ms,track_ms,proc_ms,latency_ms,"
+               "candidates,drones,birds,unknown,clutter,noise,lock_id,cam_dx,cam_dy\n");
     std::lock_guard<std::mutex> lk(rm_);
     for (const auto& r : log_)
-        fprintf(f, "%.2f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d\n", r.t, (long long)r.index,
-                r.decodeMs, r.detectMs, r.responseMs, r.selectMs, r.trackMs, r.procMs, r.latencyMs, r.cands, r.drones,
-                r.birds, r.unknown, r.clutter, r.noise);
+        fprintf(f, "%.2f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f\n", r.t,
+                (long long)r.index, r.decodeMs, r.motionMs, r.detectMs, r.responseMs, r.selectMs, r.trackMs, r.procMs,
+                r.latencyMs, r.cands, r.drones, r.birds, r.unknown, r.clutter, r.noise, r.lockId, r.camDx, r.camDy);
     fclose(f);
     return true;
 }
@@ -486,11 +583,12 @@ std::string Pipeline::reportJson() const {
         "{\"video\": \"%dx%d\", \"processing\": \"%dx%d\", \"cpu\": \"%s\", \"backend\": \"%s\", \"threads\": %d, "
         "\"frames\": %ld, \"dropped\": %ld, \"fps\": %.1f, \"decode_ms\": %.2f, \"detect_ms\": %.2f, "
         "\"detect_p95_ms\": %.2f, \"response_ms\": %.2f, \"track_ms\": %.3f, \"proc_ms\": %.2f, "
-        "\"detect_fps_potential\": %.1f, \"latency_ms\": %.1f, \"emulate_ms\": %.1f",
+        "\"detect_fps_potential\": %.1f, \"latency_ms\": %.1f, \"emulate_ms\": %.1f, \"scales\": %d, "
+        "\"motion\": %s, \"motion_ms\": %.2f, \"lock_pct\": %.1f",
         info_.w, info_.h, r ? r->frame->w : 0, r ? r->frame->h : 0, plat::cpu_model().c_str(), m.backend.c_str(),
         m.threads, m.processed, m.dropped, m.processed / std::max(1e-3, m.elapsedS), m.decode.mean, m.detect.mean,
         m.detect.p95, m.response.mean, m.track.mean, m.proc.mean, m.detect.mean > 0 ? 1000 / m.detect.mean : 0,
-        m.latency.mean, s.emulateMs);
+        m.latency.mean, s.emulateMs, r ? r->scales : 0, r && r->motionOn ? "true" : "false", m.motion.mean, m.lockPct);
     if (m.haveGt)
         len += snprintf(buf + len, sizeof(buf) - len,
                         ", \"recall_drone\": %.3f, \"recall_bird\": %.3f, \"false_tracks_per_frame\": %.2f, "

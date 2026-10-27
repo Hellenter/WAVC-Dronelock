@@ -51,7 +51,22 @@ struct Settings {
     // имитация слабого железа: обработка кадра занимает не меньше emulateMs
     double emulateMs = 0;
     int learnMaskFrames = 25;  // авто-маска неба по первым кадрам (0 = выкл.)
+    // просмотр
+    double speed = 1.0;        // скорость воспроизведения в режиме "как камера": 0.25 = в 4 раза медленнее
+    // алгоритм поверх det/trk; "авто" решается по размеру кадра (см. effective())
+    int scales = 0;            // 0 = авто, иначе 1..4 (DetectorConfig::scales)
+    int motion = -1;           // компенсация движения камеры: -1 авто, 0 выкл., 1 вкл.
+    bool focus = false;        // пониженный порог возле прогноза треков (эксперимент)
 };
+
+// Что реально включено для кадра w x h. Авто: кадр до ~2 Мп (Full HD и меньше) —
+// обычно съёмка с рук и близкий крупный дрон: 3 масштаба и учёт движения камеры.
+// 8-16 Мп — неподвижная камера и дальние точки: 1 масштаб, без оценки движения.
+struct Effective {
+    int scales;
+    bool motion;
+};
+Effective effective(const Settings& s, int w, int h);
 
 struct Result {
     FramePtr frame;
@@ -66,14 +81,23 @@ struct Result {
     std::vector<dronolok::GtObj> gt;
     float gsx = 1, gsy = 1;
     int seq = 0;
+    // захват и прогноз
+    int lockId = 0;                              // захваченная цель (Track::id), 0 — нет
+    float camDx = 0, camDy = 0, camQ = 0;        // сдвиг картинки за кадр и уверенность оценки
+    bool camValid = false, motionOn = false;
+    double motionMs = 0;
+    int scales = 1;
+    std::vector<dronolok::FocusArea> focus;      // где детектор искал с пониженным порогом
 };
 
 // Одна строка журнала метрик (на каждый обработанный кадр)
 struct FrameRec {
     double t;          // момент окончания обработки, мс от начала замера
-    float decodeMs, detectMs, responseMs, selectMs, trackMs, procMs, latencyMs;
+    float decodeMs, detectMs, responseMs, selectMs, trackMs, procMs, latencyMs, motionMs;
     int64_t index;
     int cands, drones, birds, unknown, clutter, noise;
+    int lockId;
+    float camDx, camDy;
 };
 
 struct Stat {
@@ -83,7 +107,7 @@ struct Stat {
 struct Metrics {
     long processed = 0, dropped = 0, decoded = 0;
     double procFps = 0, decodeFps = 0, sourceFps = 0;
-    Stat decode, detect, response, select, track, proc, latency;
+    Stat decode, detect, response, select, track, proc, latency, motion;
     std::vector<float> histDecode, histDetect, histTrack, histProc;   // последние кадры, для графика
     int queue = 0, queueCap = 0;
     std::string backend, status;
@@ -91,6 +115,7 @@ struct Metrics {
     dronolok::EvalStats eval;
     bool haveGt = false;
     double elapsedS = 0;
+    double lockPct = 0;   // доля кадров (из последних 300) с захватом
 };
 
 class Pipeline {
@@ -113,6 +138,10 @@ public:
     void resetStats();
 
     std::shared_ptr<const Result> latest() const;
+    // Последние обработанные кадры для просмотра назад на паузе (номера seq подряд).
+    // Держим не больше HIST_MAX кадров и HIST_BYTES памяти.
+    std::shared_ptr<const Result> at(int seq) const;   // nullptr, если кадр уже вытеснен
+    bool historyRange(int& first, int& last) const;
     Metrics metrics(int histLen = 300) const;
     bool exportCsv(const std::string& path) const;
     std::string reportJson() const;
@@ -152,6 +181,8 @@ private:
 
     mutable std::mutex rm_;
     std::shared_ptr<const Result> latest_;
+    std::deque<std::shared_ptr<const Result>> hist_;
+    size_t histBytes_ = 0;
     std::vector<FrameRec> log_;
     long dropped_ = 0, decoded_ = 0;
     std::deque<double> decodeTimes_;   // моменты выдачи кадров декодером

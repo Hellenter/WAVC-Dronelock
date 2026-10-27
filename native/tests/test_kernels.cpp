@@ -105,17 +105,20 @@ static std::vector<uint8_t> synth_frame(int w, int h, unsigned seed) {
 static bool same(const std::vector<Candidate>& a, const std::vector<Candidate>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i)
-        if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].contrast != b[i].contrast || a[i].polarity != b[i].polarity)
+        if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].contrast != b[i].contrast || a[i].polarity != b[i].polarity ||
+            a[i].level != b[i].level)
             return false;
     return true;
 }
 
 static void test_detector() {
+    for (int scales : {1, 3})
     for (int pool : {1, 2})
         for (auto wh : {std::pair<int, int>{1001, 777}, std::pair<int, int>{640, 480}}) {
             const int w = wh.first, h = wh.second;
             auto f = synth_frame(w, h, 7 + pool);
             DetectorConfig base;
+            base.scales = scales;
             base.pool = pool;
             base.threads = 1;
             base.isa = Isa::Scalar;
@@ -138,8 +141,38 @@ static void test_detector() {
                         CHECK(same(r, c), "detector %s threads=%d job=%dx%d pool=%d %dx%d: %zu vs %zu",
                               isa_name(isa), th, j.first, j.second, pool, w, h, r.size(), c.size());
                     }
-            std::printf("detector pool=%d %dx%d: %zu кандидатов, все варианты совпали\n", pool, w, h, r.size());
+            std::printf("detector scales=%d pool=%d %dx%d: %zu кандидатов, все варианты совпали\n", scales, pool, w,
+                        h, r.size());
         }
+}
+
+// Крупная цель 12x12 на ровном фоне: на одном масштабе её нет (тайл выглядит текстурой), со вторым — есть,
+// и прогноз трека (setFocus) снижает порог только возле себя.
+static void test_scales_focus() {
+    const int w = 640, h = 480;
+    std::vector<uint8_t> f((size_t)w * h, 160);
+    for (int y = 200; y < 212; ++y)
+        for (int x = 300; x < 312; ++x) f[(size_t)y * w + x] = 100;
+    for (int y = 100; y < 103; ++y)   // слабая точечная цель: контраст 8 < thr 10
+        for (int x = 100; x < 103; ++x) f[(size_t)y * w + x] = 152;
+    DetectorConfig c;
+    c.threads = 1;
+    std::vector<Candidate> out;
+    Detector d1(c);
+    d1.detect(f.data(), w, h, w, out);
+    CHECK(out.empty(), "scales=1: %zu кандидатов, ждали 0", out.size());
+    c.scales = 2;
+    Detector d2(c);
+    d2.detect(f.data(), w, h, w, out);
+    CHECK(out.size() == 1 && out[0].level == 1 && std::fabs(out[0].x - 306) < 6 && std::fabs(out[0].y - 206) < 6,
+          "scales=2: %zu кандидатов", out.size());
+    d2.setFocus({{101, 101, 10}});
+    d2.detect(f.data(), w, h, w, out);
+    CHECK(out.size() == 2, "focus: %zu кандидатов, ждали 2", out.size());
+    d2.setFocus({{400, 400, 10}});
+    d2.detect(f.data(), w, h, w, out);
+    CHECK(out.size() == 1, "focus мимо: %zu кандидатов, ждали 1", out.size());
+    std::printf("scales + focus: ok\n");
 }
 
 int main() {
@@ -151,6 +184,7 @@ int main() {
         std::printf("kernels %s: ok\n", K->name);
     }
     test_detector();
+    test_scales_focus();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

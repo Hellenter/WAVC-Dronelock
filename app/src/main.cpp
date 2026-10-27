@@ -4,7 +4,8 @@
 // разрешение, искусственное замедление), чтобы примерить алгоритм к слабому железу.
 //
 //   dronolok_app [видео]
-//   dronolok_app --bench видео [--frames N] [--threads N] [--isa avx2] [--json out.json]
+//   dronolok_app --bench видео [--frames N] [--threads N] [--isa avx2] [--scales 0..4] [--motion 0|1]
+//                [--focus] [--json out.json]
 #include <SDL.h>
 
 #include <algorithm>
@@ -30,6 +31,8 @@ const ImU32 COL_UNKNOWN = IM_COL32(255, 210, 0, 255);
 const ImU32 COL_CLUTTER = IM_COL32(170, 170, 170, 220);
 const ImU32 COL_NOISE = IM_COL32(210, 210, 210, 150);
 const ImU32 COL_GT = IM_COL32(0, 255, 120, 220);
+const ImU32 COL_LOCK = IM_COL32(255, 60, 230, 255);
+const ImU32 COL_FOCUS = IM_COL32(90, 170, 255, 110);
 
 ImU32 class_color(const Track& t) {
     if (t.clutter) return COL_CLUTTER;
@@ -88,7 +91,8 @@ struct App {
     int cpuCap = 100, priority = 0, resIdx = 0;
     // отображение
     bool showNoise = true, showClutter = true, showTracks = true, showPaths = true, showIds = true;
-    bool showMask = false, showGt = true, showCrops = true;
+    bool showMask = false, showGt = true, showCrops = true, showPred = true, showFocus = false;
+    int viewSeq = -1;      // кадр из истории на паузе (Result::seq), -1 — последний обработанный
     int displayMode = 1;   // 0 каждый кадр, 1 до 30 FPS, 2 до 10 FPS, 3 не показывать
     float zoom = 1.f, panX = 0, panY = 0;
     // текстуры
@@ -143,6 +147,41 @@ void open_video(App& a, const std::string& path) {
     a.pipe.setSettings(a.s);
     a.zoom = 1.f;
     a.panX = a.panY = 0;
+    a.viewSeq = -1;
+}
+
+// ------------------------------------------------------------ плеер: пауза, покадрово, скорость
+
+void toggle_pause(App& a) {
+    const bool p = !a.pipe.paused();
+    a.pipe.setPaused(p);
+    if (!p) a.viewSeq = -1;
+}
+
+// назад — по уже обработанным кадрам (история), трекер не откатывается
+void step_back(App& a) {
+    a.pipe.setPaused(true);
+    int first, last;
+    if (!a.pipe.historyRange(first, last)) return;
+    a.viewSeq = std::max(first, (a.viewSeq >= 0 ? a.viewSeq : last) - 1);
+}
+
+// вперёд — по истории, а с последнего кадра — обработать следующий
+void step_forward(App& a) {
+    int first, last;
+    if (a.pipe.paused() && a.viewSeq >= 0 && a.pipe.historyRange(first, last) && a.viewSeq < last) {
+        a.viewSeq = a.viewSeq + 1 >= last ? -1 : a.viewSeq + 1;
+        return;
+    }
+    a.pipe.setPaused(true);
+    a.viewSeq = -1;
+    a.pipe.step();
+}
+
+void set_speed(App& a, double sp) {
+    a.s.speed = std::min(2.0, std::max(0.05, sp));
+    a.s.pace = Pace::Realtime;   // замедление имеет смысл только в темпе камеры
+    a.pipe.setSettings(a.s);
 }
 
 // ------------------------------------------------------------ текстура кадра
@@ -205,7 +244,9 @@ std::vector<const Track*> top_targets(const Result& r) {
     std::vector<const Track*> v;
     for (const auto& t : r.tracks)
         if (!t.clutter) v.push_back(&t);
-    auto rank = [](const Track* t) { return t->cls == TargetClass::Drone ? 0 : t->cls == TargetClass::Unknown ? 1 : 2; };
+    auto rank = [&](const Track* t) {
+        return t->id == r.lockId ? -1 : t->cls == TargetClass::Drone ? 0 : t->cls == TargetClass::Unknown ? 1 : 2;
+    };
     std::sort(v.begin(), v.end(), [&](const Track* a, const Track* b) {
         return rank(a) != rank(b) ? rank(a) < rank(b) : a->contrast > b->contrast;
     });
@@ -326,13 +367,41 @@ void panel_controls(App& a) {
             ImGui::TextDisabled("%dx%d, %.2f к/с, %s (%s)%s", vi.w, vi.h, vi.fps, vi.codec.c_str(), vi.pixfmt.c_str(),
                                 vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "");
             const bool paused = a.pipe.paused();
-            if (ImGui::Button(paused ? "Продолжить" : "Пауза")) a.pipe.setPaused(!paused);
+            if (ImGui::Button(paused ? "Продолжить" : "Пауза")) toggle_pause(a);
             ImGui::SameLine();
-            ImGui::BeginDisabled(!paused);
-            if (ImGui::Button("Кадр >")) a.pipe.step();
-            ImGui::EndDisabled();
+            if (ImGui::Button("< кадр")) step_back(a);
+            ImGui::SameLine();
+            if (ImGui::Button("кадр >")) step_forward(a);
             ImGui::SameLine();
             if (ImGui::Button("С начала")) open_video(a, a.pipe.path());
+            // скорость
+            static const double speeds[] = {0.1, 0.25, 0.5, 1.0};
+            static const char* speedNames[] = {"x0.1", "x0.25", "x0.5", "x1"};
+            for (int i = 0; i < 4; ++i) {
+                if (i) ImGui::SameLine();
+                const bool on = a.s.pace == Pace::Realtime && std::fabs(a.s.speed - speeds[i]) < 1e-3;
+                if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::Button(speedNames[i])) set_speed(a, speeds[i]);
+                if (on) ImGui::PopStyleColor();
+            }
+            ImGui::SameLine();
+            float sp = (float)a.s.speed;
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+            if (ImGui::SliderFloat("скорость", &sp, 0.05f, 2.f, "x%.2f", ImGuiSliderFlags_Logarithmic)) set_speed(a, sp);
+            help_marker("Замедление видео: кадры подаются реже, каждый обрабатывается. Работает в режиме подачи "
+                        "\"как камера\". Клавиши: пробел — пауза, стрелки влево/вправо — кадр назад/вперёд, "
+                        "+/- — быстрее/медленнее.");
+            // история обработанных кадров (назад на паузе)
+            int first, last;
+            if (paused && a.pipe.historyRange(first, last) && last > first) {
+                int cur = a.viewSeq >= 0 ? a.viewSeq : last;
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+                char fmt[64];
+                snprintf(fmt, sizeof(fmt), cur == last ? "последний" : "%d кадров назад", last - cur);
+                if (ImGui::SliderInt("история", &cur, first, last, fmt)) a.viewSeq = cur >= last ? -1 : cur;
+                help_marker("Последние обработанные кадры с разметкой (до 600 кадров и 1 ГБ памяти). Трекер при "
+                            "этом не откатывается: вперёд с последнего кадра идёт обработка следующего.");
+            }
             changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
         }
     }
@@ -521,10 +590,58 @@ void panel_controls(App& a) {
         changed |= ImGui::SliderInt("кадров на маску неба", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
         ImGui::SameLine();
         if (ImGui::SmallButton("заново")) a.pipe.relearnMask();
-        ImGui::SeparatorText("Трекер и классы");
+        help_marker("Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не просматриваются. Только для "
+                    "неподвижной камеры: при учёте движения камеры маска не строится.");
+        ImGui::SeparatorText("Крупные цели и движение камеры");
+        static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
+        ImGui::SetNextItemWidth(w);
+        changed |= ImGui::Combo("размер цели", &a.s.scales, scl, 5);
+        help_marker("Сколько масштабов просматривать. 1 — только точки (дальний дрон), каждый следующий — кадр, "
+                    "уменьшенный ещё в 2 раза, для близкой крупной цели. Каждый добавляет ~20-35% времени. "
+                    "Авто: до 2 Мп — 3, больше — 1.");
+        int mo = a.s.motion + 1;
+        static const char* mos[] = {"авто", "не учитывать", "учитывать"};
+        ImGui::SetNextItemWidth(w);
+        if (ImGui::Combo("движение камеры", &mo, mos, 3)) {
+            a.s.motion = mo - 1;
+            changed = true;
+        }
+        help_marker("Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается "
+                    "(~1-2 мс) и прогноз целей переносится вместе с ним, иначе захват срывается при каждом "
+                    "движении камеры. Авто: до 2 Мп — учитывать.");
+        if (a.pipe.isOpen()) {
+            const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
+            ImGui::TextDisabled("сейчас: масштабов %d, движение камеры %s", ef.scales, ef.motion ? "учитывается" : "нет");
+        }
+        ImGui::SetNextItemWidth(w);
+        changed |= ImGui::SliderFloat("порог крупных, раз", &d.coarse_thr_k, 1, 6, "%.1f");
+        help_marker("Во сколько раз порог контраста выше на уменьшенных масштабах: крупная близкая цель "
+                    "контрастна, а пятна облаков на них дают ложные цели.");
+        changed |= ImGui::Checkbox("искать возле прогноза", &a.s.focus);
+        help_marker("Эксперимент: там, где трек ожидается на следующем кадре, порог ниже, чтобы не терять "
+                    "бледнеющую цель. На ваших роликах пока чуть хуже, поэтому выключено.");
+        if (a.s.focus) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(w * 0.6f);
+            changed |= ImGui::SliderFloat("порог там", &d.focus_k, 0.2f, 1, "x%.2f");
+        }
+        ImGui::SeparatorText("Трекер, захват и классы");
         TrackerConfig& t = a.s.trk;
         ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("радиус связи, пикс.", &t.gate, 5, 150, "%.0f");
+        changed |= ImGui::SliderFloat("макс. радиус поиска, пикс.", &t.gate, 5, 150, "%.0f");
+        help_marker("Где искать цель на следующем кадре: вокруг прогноза по её скорости. Окно растёт с "
+                    "неуверенностью прогноза (пропуски, манёвры), но не больше этого.");
+        ImGui::SetNextItemWidth(w);
+        changed |= ImGui::SliderFloat("манёвренность цели", &t.q_accel, 0.25f, 20, "%.2f", ImGuiSliderFlags_Logarithmic);
+        help_marker("Ускорение в фильтре Калмана, пикс./кадр². Меньше — прогноз жёстче, захват плавно летящего дрона "
+                    "устойчивее; больше — окно шире, не теряет резкие манёвры (птицы).");
+        ImGui::SetNextItemWidth(w);
+        changed |= ImGui::SliderInt("держать на прогнозе, кадров", &t.max_miss, 1, 60);
+        help_marker("Сколько кадров подряд цель может не находиться (ушла за провод, слилась с фоном), а трек и "
+                    "захват идут по прогнозу. Новые и стоящие на месте треки держатся только 1 кадр.");
+        ImGui::SetNextItemWidth(w);
+        changed |= ImGui::SliderFloat("смена захвата, раз", &t.lock_switch, 1, 5, "%.1f");
+        help_marker("Захват переходит на другую цель, только если она весомее текущей во столько раз.");
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderInt("подтверждение, кадров", &t.confirm, 1, t.window);
         ImGui::SetNextItemWidth(w);
@@ -556,6 +673,11 @@ void panel_controls(App& a) {
         ImGui::Checkbox("разметка (.gt.json)", &a.showGt);
         ImGui::SameLine();
         ImGui::Checkbox("вырезки целей", &a.showCrops);
+        ImGui::Checkbox("прогноз движения", &a.showPred);
+        help_marker("Линия — куда цель придёт за 10 кадров при нынешней скорости (у захвата и устоявшихся треков). "
+                    "Пунктирная рамка — трек идёт по прогнозу; у захвата круг — где цель может быть (3 сигмы).");
+        ImGui::SameLine();
+        ImGui::Checkbox("зоны пониженного порога", &a.showFocus);
     }
     if (changed) a.pipe.setSettings(a.s);
 }
@@ -592,6 +714,7 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
         ImGui::TableSetupColumn("макс");
         ImGui::TableHeadersRow();
         row_stat("декодирование", m.decode);
+        row_stat("движение камеры", m.motion);
         row_stat("детекция", m.detect);
         row_stat("  морфология", m.response);
         row_stat("  выбор пиков", m.select);
@@ -637,6 +760,26 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
         ImGui::SameLine();
         ImGui::TextDisabled("кандидатов %d", (int)r->cands.size());
         if (r->learning) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "учится маска неба...");
+        const Track* lk = nullptr;
+        for (const auto& t : r->tracks)
+            if (t.id == r->lockId) lk = &t;
+        if (lk) {
+            ImGui::TextColored(ImColor(COL_LOCK).Value, "захват: #%d %s", lk->id, class_ru(*lk));
+            ImGui::SameLine();
+            if (lk->miss) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "на прогнозе %d кадр.", lk->miss);
+            else ImGui::TextDisabled("ведётся");
+        } else {
+            ImGui::TextDisabled("захвата нет");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%.0f%% кадров с захватом)", m.lockPct);
+        if (r->motionOn) {
+            if (r->camValid) ImGui::Text("камера: сдвиг %+.1f, %+.1f пикс./кадр", r->camDx, r->camDy);
+            else ImGui::TextDisabled("камера: сдвиг не определён (нет текстуры)");
+        } else {
+            ImGui::TextDisabled("движение камеры не учитывается");
+        }
+        ImGui::TextDisabled("масштабов %d", r->scales);
     }
     if (m.haveGt) {
         ImGui::SeparatorText("Качество по разметке");
@@ -742,6 +885,8 @@ void draw_view(App& a, const Result* r) {
             const ImVec2 q = P(c.x, c.y);
             dl->AddRect(ImVec2(q.x - 6, q.y - 6), ImVec2(q.x + 6, q.y + 6), COL_CLUTTER);
         }
+    if (a.showFocus)
+        for (const auto& fa : r->focus) dl->AddCircle(P(fa.x, fa.y), fa.r * sc, COL_FOCUS, 0, 1.f);
     if (a.showGt)
         for (const auto& g : r->gt) {
             const ImVec2 q = P(g.x * r->gsx, g.y * r->gsy);
@@ -755,7 +900,41 @@ void draw_view(App& a, const Result* r) {
             const ImU32 col = class_color(t);
             const ImVec2 q = P(t.x, t.y);
             const float h = t.clutter ? 8.f : 12.f;
-            dl->AddRect(ImVec2(q.x - h, q.y - h), ImVec2(q.x + h, q.y + h), col, 0, 0, t.clutter ? 1.f : 2.f);
+            if (t.miss > 0) {   // цель не найдена, трек идёт по прогнозу — пунктир
+                const ImVec2 c[4] = {ImVec2(q.x - h, q.y - h), ImVec2(q.x + h, q.y - h), ImVec2(q.x + h, q.y + h),
+                                     ImVec2(q.x - h, q.y + h)};
+                for (int k = 0; k < 4; ++k) {
+                    const ImVec2 a0 = c[k], a1 = c[(k + 1) % 4];
+                    for (int j = 0; j < 4; j += 2)
+                        dl->AddLine(ImVec2(a0.x + (a1.x - a0.x) * j / 4, a0.y + (a1.y - a0.y) * j / 4),
+                                    ImVec2(a0.x + (a1.x - a0.x) * (j + 1) / 4, a0.y + (a1.y - a0.y) * (j + 1) / 4), col, 2.f);
+                }
+                if (a.showPred && t.id == r->lockId) dl->AddCircle(q, std::max(h, std::min(3 * t.sigma * sc, 200.f)), COL_LOCK, 0, 1.f);
+            } else {
+                dl->AddRect(ImVec2(q.x - h, q.y - h), ImVec2(q.x + h, q.y + h), col, 0, 0, t.clutter ? 1.f : 2.f);
+            }
+            // прогноз — у захваченной цели и у устоявшихся треков, иначе на кадре рябит от линий
+            if (!t.clutter && a.showPred && (t.id == r->lockId || t.hits >= 8) && t.vx * t.vx + t.vy * t.vy > 0.01f) {
+                const ImVec2 e = P(t.x + 10 * t.vx, t.y + 10 * t.vy);
+                dl->AddLine(q, e, col, 1.5f);
+                dl->AddCircleFilled(e, 3.f, col);
+            }
+            if (t.id == r->lockId) {   // прицел захвата: уголки и перекрестие
+                const float g = h + 9, l = 8;
+                for (int sx = -1; sx <= 1; sx += 2)
+                    for (int sy = -1; sy <= 1; sy += 2) {
+                        const ImVec2 c(q.x + sx * g, q.y + sy * g);
+                        dl->AddLine(c, ImVec2(c.x - sx * l, c.y), COL_LOCK, 2.5f);
+                        dl->AddLine(c, ImVec2(c.x, c.y - sy * l), COL_LOCK, 2.5f);
+                    }
+                dl->AddLine(ImVec2(q.x - g - 10, q.y), ImVec2(q.x - h - 3, q.y), COL_LOCK, 1.5f);
+                dl->AddLine(ImVec2(q.x + h + 3, q.y), ImVec2(q.x + g + 10, q.y), COL_LOCK, 1.5f);
+                dl->AddLine(ImVec2(q.x, q.y - g - 10), ImVec2(q.x, q.y - h - 3), COL_LOCK, 1.5f);
+                dl->AddLine(ImVec2(q.x, q.y + h + 3), ImVec2(q.x, q.y + g + 10), COL_LOCK, 1.5f);
+                char b[48];
+                snprintf(b, sizeof(b), t.miss ? "ЗАХВАТ (прогноз %d)" : "ЗАХВАТ", t.miss);
+                dl->AddText(ImVec2(q.x - g, q.y + g + 2), COL_LOCK, b);
+            }
             if (!t.clutter && a.showPaths && t.path.size() > 1) {
                 std::vector<ImVec2> pts;
                 for (const auto& pp : t.path) pts.push_back(P(pp.x, pp.y));
@@ -770,18 +949,28 @@ void draw_view(App& a, const Result* r) {
         }
     dl->PopClipRect();
     // строка состояния и легенда поверх видео
-    char st[192];
-    snprintf(st, sizeof(st), "%dx%d  кадр %lld  проход %d  детекция %.2f мс  обработка %.2f мс%s", f.w, f.h,
-             (long long)f.index, r->loop + 1, r->dt.total_ms, r->procMs, a.pipe.paused() ? "  [пауза]" : "");
+    char st[320];
+    int len = snprintf(st, sizeof(st), "%dx%d  кадр %lld  проход %d  детекция %.2f мс  обработка %.2f мс", f.w, f.h,
+                       (long long)f.index, r->loop + 1, r->dt.total_ms, r->procMs);
+    if (r->motionOn && r->camValid)
+        len += snprintf(st + len, sizeof(st) - len, "  камера %+.1f %+.1f", r->camDx, r->camDy);
+    if (a.s.pace == Pace::Realtime && std::fabs(a.s.speed - 1) > 1e-3)
+        len += snprintf(st + len, sizeof(st) - len, "  x%.2f", a.s.speed);
+    int hf, hl;
+    if (a.viewSeq >= 0 && a.pipe.historyRange(hf, hl))
+        len += snprintf(st + len, sizeof(st) - len, "  [история: %d кадр. назад]", hl - a.viewSeq);
+    else if (a.pipe.paused())
+        len += snprintf(st + len, sizeof(st) - len, "  [пауза]");
     dl->AddRectFilled(ImVec2(p0.x + 6, p0.y + 6), ImVec2(p0.x + 12 + ImGui::CalcTextSize(st).x, p0.y + 10 + ImGui::GetFontSize()),
                       IM_COL32(0, 0, 0, 160), 3);
     dl->AddText(ImVec2(p0.x + 9, p0.y + 8), IM_COL32(120, 255, 140, 255), st);
-    struct L { ImU32 c; const char* t; } legend[] = {{COL_DRONE, "дрон"}, {COL_BIRD, "птица"}, {COL_UNKNOWN, "цель, класс неясен"},
+    struct L { ImU32 c; const char* t; } legend[] = {{COL_LOCK, "захват (пунктир — по прогнозу)"}, {COL_DRONE, "дрон"},
+                                                     {COL_BIRD, "птица"}, {COL_UNKNOWN, "цель, класс неясен"},
                                                      {COL_CLUTTER, "статичная помеха"}, {COL_NOISE, "шум (одиночные отклики)"},
                                                      {COL_GT, "разметка: круг дрон, ромб птица"}};
     float ly = p0.y + avail.y - 8;
-    for (int i = 5; i >= 0; --i) {
-        if (i == 5 && r->gt.empty()) continue;
+    for (int i = 6; i >= 0; --i) {
+        if (i == 6 && r->gt.empty()) continue;
         ly -= ImGui::GetFontSize() + 4;
         dl->AddRectFilled(ImVec2(p0.x + 8, ly + 3), ImVec2(p0.x + 20, ly + 15), legend[i].c);
         dl->AddText(ImVec2(p0.x + 26, ly), IM_COL32(230, 230, 230, 255), legend[i].t);
@@ -793,6 +982,9 @@ void draw_view(App& a, const Result* r) {
         ImGui::Text("контраст %.0f, скорость %.1f пикс./кадр", hover->contrast, hover->speed);
         ImGui::Text("отклонение от плавной траектории %.2f пикс.", hover->resid);
         ImGui::Text("мигание контраста %.2f, попаданий %d", hover->contrastCv, hover->hits);
+        ImGui::Text("скорость по сцене %.1f, %.1f; прошёл %.0f пикс.", hover->vsx, hover->vsy, hover->travel);
+        ImGui::Text("ошибка прогноза %.1f пикс., вес для захвата %.1f", hover->sigma, hover->score);
+        if (hover->miss) ImGui::Text("на прогнозе %d кадр.", hover->miss);
         ImGui::EndTooltip();
     }
 }
@@ -817,6 +1009,9 @@ int run_bench(int argc, char** argv) {
         } else if (a == "--size") sscanf(val().c_str(), "%dx%d", &s.procW, &s.procH);
         else if (a == "--preload") { preload = atoi(val().c_str()); }
         else if (a == "--learn-mask") s.learnMaskFrames = atoi(val().c_str());
+        else if (a == "--scales") s.scales = atoi(val().c_str());
+        else if (a == "--motion") s.motion = atoi(val().c_str());
+        else if (a == "--focus") s.focus = true;
         else if (a == "--json") json = val();
         else if (a == "--csv") csv = val();
         else video = a;
@@ -944,9 +1139,12 @@ int main(int argc, char** argv) {
             a.cpuWall = nw;
         }
         // новый кадр на текстуру — не чаще, чем разрешено настройкой отображения
-        auto r = a.pipe.latest();
+        std::shared_ptr<const Result> r;
+        if (a.viewSeq >= 0 && !(r = a.pipe.at(a.viewSeq))) a.viewSeq = -1;   // кадр вытеснен из истории
+        const bool still = r || a.pipe.paused();   // на паузе кадр показываем сразу
+        if (!r) r = a.pipe.latest();
         static const double minGap[] = {0, 1000.0 / 30, 1000.0 / 10, 1e18};
-        if (r && r->seq != a.texSeq && a.displayMode != 3 && nw - a.texAt >= minGap[a.displayMode]) {
+        if (r && r->seq != a.texSeq && a.displayMode != 3 && (still || nw - a.texAt >= minGap[a.displayMode])) {
             upload_frame(a, *r->frame);
             if (a.showCrops) upload_crops(a, *r, top_targets(*r));
             a.texSeq = r->seq;
@@ -959,6 +1157,15 @@ int main(int argc, char** argv) {
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
+        if (!io.WantTextInput && a.pipe.isOpen()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) toggle_pause(a);
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) step_back(a);
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step_forward(a);
+            if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
+                set_speed(a, a.s.speed * 2);
+            if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
+                set_speed(a, a.s.speed / 2);
+        }
         const ImVec2 ds = io.DisplaySize;
         const float lw = 420 * scale, rw = 400 * scale;
         const ImGuiWindowFlags fixed = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |

@@ -10,8 +10,16 @@
 
 namespace dronolok {
 
+// Уровень грубого масштаба: кадр, уменьшенный в 2^l раз (min и 255-max), и его статистика
+struct Level {
+    std::vector<uint8_t> d, b, junk;
+    int w = 0, h = 0, tw = 0, th = 0, tile = 0;
+    TileStats sd, sb;
+};
+
 struct Detector::Stats {
-    TileStats dark, bright;
+    TileStats dark, bright, unused;
+    std::vector<Level> lv;   // lv[0] — уровень 1 (x2), lv[1] — уровень 2 (x4)
 };
 
 static double now_ms() {
@@ -32,6 +40,8 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.pool = c.pool == 1 ? 1 : 2;
     c.tile = std::max(8, std::min(128, c.tile));
     c.max_cands = std::max(1, c.max_cands);
+    c.scales = std::max(1, std::min(4, c.scales));
+    c.focus_k = std::max(0.2f, std::min(1.f, c.focus_k));
     return c;
 }
 
@@ -115,9 +125,73 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     const uint8_t* m = (!learning_ && !mask_.empty()) ? mask_.data() : nullptr;
     backend_->compute(FrameView{gray, w, h, stride}, p, m, stats_->dark, stats_->bright,
                       timing_.jobs, timing_.jobs_skipped);
+
+    // грубые масштабы: кадр уменьшается min/max-пулингом, обе полярности считаются
+    // как "тёмные" (яркая — на инвертированном 255-max кадре)
+    auto& lv = stats_->lv;
+    lv.resize(cfg_.scales - 1);
+    for (size_t l = 0; l < lv.size(); ++l) {
+        Level& L = lv[l];
+        const int sw = l ? lv[l - 1].w : w, sh = l ? lv[l - 1].h : h;
+        L.w = sw / 2;
+        L.h = sh / 2;
+        // на мелком кадре тайл уменьшается, чтобы по каждой оси было хотя бы 2 тайла
+        L.tile = T;
+        while (L.tile > 8 && (std::min(L.w, L.h) / s) / L.tile < 2) L.tile /= 2;
+        L.tw = (L.w / s) / L.tile;
+        L.th = (L.h / s) / L.tile;
+        const size_t n = (size_t)L.w * L.h;
+        L.d.resize(n);
+        L.b.resize(n);
+        L.junk.resize(n);
+        if (L.tw == 0 || L.th == 0) { L.sd.resize(0); L.sb.resize(0); continue; }
+        if (l == 0) {
+            backend_->pool2(FrameView{gray, w, h, stride}, L.d.data(), L.b.data(), L.w);
+        } else {
+            const Level& P = lv[l - 1];
+            if (cfg_.dark) backend_->pool2(FrameView{P.d.data(), P.w, P.h, P.w}, L.d.data(), L.junk.data(), L.w);
+            if (cfg_.bright) backend_->pool2(FrameView{P.b.data(), P.w, P.h, P.w}, L.b.data(), L.junk.data(), L.w);
+        }
+        ResponseParams q = p;
+        q.tile = L.tile;
+        q.dark = true;
+        q.bright = false;
+        int jobs = 0, skipped = 0;
+        if (cfg_.dark) backend_->compute(FrameView{L.d.data(), L.w, L.h, L.w}, q, nullptr, L.sd, stats_->unused, jobs, skipped);
+        if (cfg_.bright) backend_->compute(FrameView{L.b.data(), L.w, L.h, L.w}, q, nullptr, L.sb, stats_->unused, jobs, skipped);
+        timing_.jobs += jobs;
+    }
     const double t1 = now_ms();
-    if (cfg_.dark) selectPolarity(0, out);
-    if (cfg_.bright) selectPolarity(1, out);
+    markFocus(tw_, th_, T * s);
+    if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
+    if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
+    if (!lv.empty()) {
+        for (size_t l = 0; l < lv.size(); ++l) {
+            const Level& L = lv[l];
+            if (L.tw == 0 || L.th == 0) continue;
+            const int f = s << (l + 1);
+            markFocus(L.tw, L.th, L.tile * f);
+            const size_t first = out.size();
+            if (cfg_.dark) selectTiles(L.sd, L.tw, L.th, L.tile, f, 0, (int)l + 1, false, out);
+            if (cfg_.bright) selectTiles(L.sb, L.tw, L.th, L.tile, f, 1, (int)l + 1, false, out);
+            // цель, которую уже нашёл более мелкий масштаб, второй раз не отдаём
+            const float R = 0.5f * cfg_.k * f;
+            size_t keep = first;
+            for (size_t i = first; i < out.size(); ++i) {
+                const Candidate& c = out[i];
+                bool dup = false;
+                for (size_t j = 0; j < first && !dup; ++j)
+                    dup = out[j].polarity == c.polarity && std::fabs(out[j].x - c.x) < R && std::fabs(out[j].y - c.y) < R;
+                // и не ищем там, где маска неба запрещает поиск
+                if (!dup && !mask_.empty() && !learning_) {
+                    const int mx = (int)c.x / (T * s), my = (int)c.y / (T * s);
+                    dup = mx >= tw_ || my >= th_ || !mask_[(size_t)my * tw_ + mx];
+                }
+                if (!dup) out[keep++] = c;
+            }
+            out.resize(keep);
+        }
+    }
     if (learning_) ++texN_;
     const double t2 = now_ms();
     timing_.response_ms = t1 - t0;
@@ -125,31 +199,50 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     timing_.total_ms = t2 - t0;
 }
 
-void Detector::selectPolarity(int pol, std::vector<Candidate>& out) {
-    const TileStats& ts = pol ? stats_->bright : stats_->dark;
-    if (ts.sum.size() != (size_t)tw_ * th_) return;
-    const int T = cfg_.tile, s = cfg_.pool;
+// тайлы, задетые областями прогноза треков
+void Detector::markFocus(int tw, int th, int tilePx) {
+    focusTiles_.assign((size_t)tw * th, 0);
+    for (const FocusArea& a : focus_) {
+        const int x0 = std::max(0, (int)std::floor((a.x - a.r) / tilePx));
+        const int x1 = std::min(tw - 1, (int)std::floor((a.x + a.r) / tilePx));
+        const int y0 = std::max(0, (int)std::floor((a.y - a.r) / tilePx));
+        const int y1 = std::min(th - 1, (int)std::floor((a.y + a.r) / tilePx));
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x) focusTiles_[(size_t)y * tw + x] = 1;
+    }
+}
+
+void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, int pol, int lvl, bool fineGrid,
+                           std::vector<Candidate>& out) {
+    if (ts.sum.size() != (size_t)tw * th) return;
     const uint32_t area = (uint32_t)(T * T);
-    const float thr = cfg_.thr;
+    // на грубых масштабах крупная цель сама занимает заметную долю тайла: ей прощаем
+    // до k*k/2 "горячих" пикселей. Основной масштаб — строго как в detector.py.
+    const float maxDens = fineGrid ? cfg_.max_density : cfg_.max_density + 0.5f * cfg_.k * cfg_.k / (float)area;
+    const float ck = fineGrid ? 1.f : cfg_.coarse_thr_k;
+    const float thr0 = cfg_.thr * ck, thrF = cfg_.thr * ck * cfg_.focus_k;
     const size_t first = out.size();
-    const bool useMask = !learning_ && !mask_.empty();
-    for (int ty = 0; ty < th_; ++ty)
-        for (int tx = 0; tx < tw_; ++tx) {
-            const size_t i = (size_t)ty * tw_ + tx;
+    const bool useMask = fineGrid && !learning_ && !mask_.empty();
+    for (int ty = 0; ty < th; ++ty)
+        for (int tx = 0; tx < tw; ++tx) {
+            const size_t i = (size_t)ty * tw + tx;
             const float level = (float)std::min<uint32_t>(255, div_round_even(ts.sum[i], area));
             const float dens = (float)div_round_even(ts.hot[i] * 255u, area) / 255.f;
-            const bool textured = dens > cfg_.max_density;
-            if (learning_) texSum_[i] += textured;
+            const bool textured = dens > maxDens;
+            if (fineGrid && learning_) texSum_[i] += textured;
             if (useMask && !mask_[i]) continue;
             const float mx = ts.maxv[i];
+            const float thr = focusTiles_[i] ? thrF : thr0;
             if (textured || !(mx >= thr) || !(mx >= cfg_.clutter_k * level + thr * 0.5f)) continue;
             const int bx = ts.argmax[i] % T, by = ts.argmax[i] / T;
             Candidate c;
-            c.x = (float)((tx * T + bx) * s) + (s - 1) * 0.5f;
-            c.y = (float)((ty * T + by) * s) + (s - 1) * 0.5f;
+            c.x = (float)((tx * T + bx) * f) + (f - 1) * 0.5f;
+            c.y = (float)((ty * T + by) * f) + (f - 1) * 0.5f;
             c.contrast = mx;
             c.snr = mx / (level + 1.f);
             c.polarity = pol ? 1 : -1;
+            c.level = lvl;
+            c.weak = focusTiles_[i] && !(mx >= thr0 && mx >= cfg_.clutter_k * level + thr0 * 0.5f);
             out.push_back(c);
         }
     if (out.size() - first > (size_t)cfg_.max_cands) {   // слишком много — самые контрастные

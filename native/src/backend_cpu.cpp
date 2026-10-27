@@ -181,6 +181,19 @@ private:
         }
     }
 
+    void pool2(const FrameView& f, uint8_t* dk, uint8_t* br, int ds) override {
+        const int w2 = f.w / 2, h2 = f.h / 2;
+        if (w2 <= 0 || h2 <= 0) return;
+        const int rowsPerJob = 32, njobs = (h2 + rowsPerJob - 1) / rowsPerJob;
+        pool_.run(njobs, [&](int job, int) {
+            const int y1 = std::min(h2, (job + 1) * rowsPerJob);
+            for (int y = job * rowsPerJob; y < y1; ++y) {
+                const uint8_t* r0 = f.data + (size_t)(2 * y) * f.stride;
+                K_->pool2(r0, r0 + f.stride, dk + (size_t)y * ds, br + (size_t)y * ds, w2);
+            }
+        });
+    }
+
     const Kernels* K_;
     ThreadPool pool_;
     std::vector<Scratch> scratch_;

@@ -28,6 +28,13 @@ struct DetectorConfig {
     float max_density = 0.012f; // доля "горячих" пикселей в тайле, выше — текстура
     bool dark = true, bright = true;
     int max_cands = 300;        // на полярность
+    // Масштабы. 1: цели примерно до 7 пикс. (при pool 2; крупнее тайл похож на текстуру
+    // и отбрасывается). 2, 3, 4 добавляют проходы по кадру, уменьшенному в 2, 4, 8 раз
+    // (min/max-пулинг): цели до ~28, ~56, ~112 пикс. — близкий дрон, ролик низкого
+    // разрешения. Все вместе стоят примерно +35% времени.
+    int scales = 1;
+    float coarse_thr_k = 3.f;   // на грубых масштабах порог выше: крупная близкая цель контрастна
+    float focus_k = 0.6f;       // возле прогноза трека (setFocus) порог = thr * focus_k
     // ресурсы
     int threads = 0;            // 0 = все аппаратные потоки
     std::vector<int> cpus;      // привязка рабочих потоков к ядрам (пусто = как решит ОС)
@@ -41,6 +48,13 @@ struct Candidate {
     float contrast;    // отклик, уровни яркости
     float snr;         // отклик / (средний отклик в тайле + 1)
     int polarity;      // -1 тёмная цель, +1 яркая
+    int level = 0;     // масштаб, на котором найдена: размер цели до k*pool*2^level пикс.
+    bool weak = false; // прошла только по пониженному порогу возле прогноза трека
+};
+
+// Область, где ждём цель (прогноз трека): там порог ниже, см. DetectorConfig::focus_k
+struct FocusArea {
+    float x, y, r;     // пиксели кадра
 };
 
 struct DetectTiming {
@@ -51,6 +65,7 @@ struct DetectTiming {
 };
 
 class Backend;
+struct TileStats;
 
 class Detector {
 public:
@@ -68,6 +83,9 @@ public:
     void endMaskLearning(float frac = 0.3f);
     bool learningMask() const { return learning_; }
     void clearMask();
+
+    // Прогнозы треков на этот кадр. Действует до следующего вызова.
+    void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
     const std::vector<uint8_t>& tileMask() const { return mask_; }   // tilesY x tilesX, 1 = искать
     int tilesX() const { return tw_; }
     int tilesY() const { return th_; }
@@ -82,7 +100,9 @@ public:
     int threads() const;
 
 private:
-    void selectPolarity(int pol, std::vector<Candidate>& out);
+    void selectTiles(const TileStats& ts, int tw, int th, int tile, int factor, int pol, int lvl,
+                     bool fineGrid, std::vector<Candidate>& out);
+    void markFocus(int tw, int th, int tilePx);
 
     DetectorConfig cfg_;
     std::unique_ptr<Backend> backend_;
@@ -92,6 +112,8 @@ private:
     bool learning_ = false;
     std::vector<float> texSum_;
     int texN_ = 0;
+    std::vector<FocusArea> focus_;
+    std::vector<uint8_t> focusTiles_;
     struct Stats;
     std::unique_ptr<Stats> stats_;
 };
@@ -107,10 +129,19 @@ enum class TargetClass : uint8_t {
 const char* class_name(TargetClass c);
 
 struct TrackerConfig {
-    float gate = 40.f;          // радиус ассоциации, пиксели кадра
+    // ассоциация: прогноз фильтра Калмана (постоянная скорость) и ворота по его ошибке
+    float gate = 40.f;          // макс. радиус ассоциации, пиксели кадра
+    float gate_sigma = 4.f;     // ворота = столько СКО ошибки прогноза...
+    float gate_min = 4.f;       // ...но не меньше, пикс.
+    float q_accel = 4.f;        // манёвренность цели: СКО ускорения, пикс./кадр^2 (птицы рвут до 4)
+    float r_meas = 1.5f;        // ошибка измерения позиции, пикс. (на грубых масштабах больше)
     int confirm = 3;            // подтверждение: confirm попаданий из window кадров
     int window = 5;
-    int max_miss = 5;
+    int max_miss = 12;          // подтверждённый трек держится на прогнозе до стольких кадров (не дольше, чем было попаданий)
+    int tentative_miss = 2;     // неподтверждённый — столько
+    float mover_px = 16.f;      // трек, ушедший по сцене дальше, — движущаяся цель, а не помеха
+    float dup_px = 8.f;         // ближе к существующему треку новый трек не рождается
+    float lock_switch = 1.5f;   // захват переходит на другую цель, если она весомее во столько раз
     int clutter_cell = 8;       // ячейка карты статичного клаттера
     float clutter_decay = 0.97f;
     float clutter_level = 0.35f;
@@ -126,31 +157,47 @@ struct TrackPoint { float x, y; };
 
 struct Track {
     int id = 0;
-    float x = 0, y = 0, vx = 0, vy = 0;
+    float x = 0, y = 0;      // позиция на кадре; при пропуске — прогноз
+    float vx = 0, vy = 0;    // скорость на кадре, пикс./кадр (с учётом движения камеры)
     int polarity = -1;
     float contrast = 0;
-    int miss = 0;
+    int miss = 0;            // кадров подряд без попадания (> 0 — трек держится на прогнозе)
     int hits = 0;            // всего попаданий
     int age = 0;             // кадров с рождения
-    bool clutter = false;    // стоит в "горячей" ячейке карты клаттера
+    bool confirmed = false;  // хоть раз был подтверждён
+    bool solid = false;      // подтверждён сейчас (на пропусках держится прежнее значение)
+    bool clutter = false;    // стоит в "горячей" ячейке карты клаттера и никуда не летал
+    float sigma = 0;         // СКО ошибки прогноза позиции, пикс.
+    float score = 0;         // "весомость" цели для захвата: контраст, стаж, не помеха
+    float travel = 0;        // как далеко ушёл по сцене от точки рождения, пикс.
     TargetClass cls = TargetClass::Unknown;
     float birdScore = 0;     // сглаженная "птичность", 0..1
     // признаки классификатора
     float speed = 0, resid = 0, contrastCv = 0;
-    std::deque<TrackPoint> path;      // последние 30 позиций
+    std::deque<TrackPoint> path;      // последние 30 позиций на кадре
     // служебное
-    int det = -1;            // индекс детекции этого кадра (среди не-клаттерных)
+    int det = -1;            // индекс детекции этого кадра или -1
     std::deque<bool> hist;
-    struct Obs { int t; float x, y, c; };
-    std::deque<Obs> obs;
+    struct Obs { int t; float x, y, c; int level; };
+    std::deque<Obs> obs;     // попадания в координатах сцены
+    float vsx = 0, vsy = 0;  // скорость относительно сцены
+    float p00 = 0, p01 = 0, p11 = 0;   // ковариация Калмана (одинакова для x и y)
+    float bx = 0, by = 0;    // точка рождения в координатах сцены
+    int level = 0;
 };
 
 class Tracker {
 public:
     Tracker(int w, int h, const TrackerConfig& cfg = TrackerConfig());
-    // Возвращает подтверждённые треки (как Tracker.update в Python)
-    const std::vector<Track>& update(const std::vector<Candidate>& dets);
+    // Кадр: детекции и сдвиг картинки относительно прошлого кадра (GlobalMotion, 0 для
+    // неподвижной камеры). Возвращает подтверждённые треки, в том числе идущие на прогнозе.
+    const std::vector<Track>& update(const std::vector<Candidate>& dets, float camDx = 0, float camDy = 0);
+    // Где ждать подтверждённые цели на следующем кадре (до update): для Detector::setFocus
+    void focus(float camDx, float camDy, std::vector<FocusArea>& out) const;
     const std::vector<Track>& confirmed() const { return out_; }
+    // Захваченная цель: самая весомая из подтверждённых, держится, пока трек жив и его
+    // не превзошёл другой в lock_switch раз. 0 — захвата нет.
+    int lockedId() const { return lockId_; }
     const std::vector<Candidate>& clutterDets() const { return clutterDets_; }
     // кандидаты, не попавшие ни в клаттер, ни в подтверждённый трек
     const std::vector<Candidate>& noiseDets() const { return noiseDets_; }
@@ -161,14 +208,42 @@ public:
 private:
     bool hot(float x, float y) const;
     void classify(Track& t) const;
+    void shiftHeat(float dx, float dy);
+    float measVar(int level) const;
+    int coastLimit(const Track& t) const;
 
     TrackerConfig cfg_;
     int gw_, gh_;
-    std::vector<float> heat_;
+    std::vector<float> heat_, heatTmp_;
+    float heatAccX_ = 0, heatAccY_ = 0;
+    float gx_ = 0, gy_ = 0;   // накопленный сдвиг камеры
     std::vector<Track> tracks_, out_;
     std::vector<Candidate> clutterDets_, noiseDets_;
     int nextId_ = 1;
     int frame_ = 0;
+    int lockId_ = 0, lostFor_ = 0;
+    float lastX_ = 0, lastY_ = 0, lastVx_ = 0, lastVy_ = 0;
+};
+
+// Сдвиг картинки между соседними кадрами (камера в руке или на поворотном устройстве).
+// Сопоставление градиентов на уменьшенной копии кадра, от грубого уровня к точному.
+struct MotionEstimate {
+    float dx = 0, dy = 0;     // куда сдвинулась картинка, пикс. кадра
+    float quality = 0;        // 0..1: насколько уверенно (на ровном небе — низко)
+    bool valid = false;
+};
+
+class GlobalMotion {
+public:
+    MotionEstimate estimate(const uint8_t* gray, int w, int h, int stride);
+    void reset() { prev_.clear(); }
+    double lastMs() const { return ms_; }
+
+private:
+    struct Img { std::vector<uint8_t> px; int w = 0, h = 0; };
+    std::vector<Img> prev_, cur_;
+    int f_ = 1, w_ = 0, h_ = 0;
+    double ms_ = 0;
 };
 
 }  // namespace dronolok

@@ -25,11 +25,14 @@ typedef struct {
     int threads, isa, job_rows, job_cols;
     int ncpus;
     const int* cpus; /* привязка потоков к ядрам, ncpus штук */
+    int scales;      /* 1..3: доп. масштабы x2, x4 для крупных целей */
+    float focus_k;   /* порог возле прогноза трека = thr * focus_k */
 } dl_config;
 
 typedef struct {
     float x, y, contrast, snr;
     int polarity; /* -1 тёмная, +1 яркая */
+    int level;    /* масштаб, на котором найдена */
 } dl_candidate;
 
 /* cls: 0 unknown, 1 drone, 2 bird, 3 clutter */
@@ -41,6 +44,10 @@ typedef struct {
     int clutter, cls;
     float bird_score, speed, resid, contrast_cv;
     int hits, age;
+    int miss;     /* > 0: трек держится на прогнозе столько кадров */
+    float sigma;  /* СКО ошибки прогноза позиции, пикс. */
+    float score;  /* весомость цели */
+    int locked;   /* 1 — захваченная цель */
 } dl_track;
 
 typedef struct {
@@ -71,6 +78,17 @@ DL_API dl_tracker* dl_tracker_create(int w, int h);
 DL_API void dl_tracker_destroy(dl_tracker* t);
 /* Возвращает число подтверждённых треков. */
 DL_API int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* out, int cap);
+/* Сдвиг картинки к этому кадру (камера движется): применить в следующем update. */
+/* Сдвиг картинки относительно прошлого кадра. Возвращает 1, если оценка надёжна. */
+typedef struct dl_motion dl_motion;
+DL_API dl_motion* dl_motion_create(void);
+DL_API void dl_motion_destroy(dl_motion* m);
+DL_API int dl_motion_estimate(dl_motion* m, const uint8_t* gray, int w, int h, int stride, float* dx, float* dy,
+                              float* quality);
+DL_API void dl_tracker_set_motion(dl_tracker* t, float dx, float dy);
+/* Области прогноза подтверждённых треков (x, y, r тройками) для dl_detector_set_focus. */
+DL_API int dl_tracker_focus(dl_tracker* t, float* xyr, int cap);
+DL_API void dl_detector_set_focus(dl_detector* d, const float* xyr, int n);
 DL_API int dl_tracker_clutter(dl_tracker* t, dl_candidate* out, int cap);
 DL_API void dl_tracker_reset(dl_tracker* t);
 

@@ -19,19 +19,21 @@ class _Config(C.Structure):
     _fields_ = [("k", C.c_int), ("pool", C.c_int), ("thr", C.c_float), ("clutter_k", C.c_float),
                 ("tile", C.c_int), ("max_density", C.c_float), ("dark", C.c_int), ("bright", C.c_int),
                 ("max_cands", C.c_int), ("threads", C.c_int), ("isa", C.c_int), ("job_rows", C.c_int),
-                ("job_cols", C.c_int), ("ncpus", C.c_int), ("cpus", C.POINTER(C.c_int))]
+                ("job_cols", C.c_int), ("ncpus", C.c_int), ("cpus", C.POINTER(C.c_int)),
+                ("scales", C.c_int), ("focus_k", C.c_float)]
 
 
 class _Cand(C.Structure):
     _fields_ = [("x", C.c_float), ("y", C.c_float), ("contrast", C.c_float), ("snr", C.c_float),
-                ("polarity", C.c_int)]
+                ("polarity", C.c_int), ("level", C.c_int)]
 
 
 class _Track(C.Structure):
     _fields_ = [("id", C.c_int), ("x", C.c_float), ("y", C.c_float), ("vx", C.c_float), ("vy", C.c_float),
                 ("polarity", C.c_int), ("contrast", C.c_float), ("clutter", C.c_int), ("cls", C.c_int),
                 ("bird_score", C.c_float), ("speed", C.c_float), ("resid", C.c_float),
-                ("contrast_cv", C.c_float), ("hits", C.c_int), ("age", C.c_int)]
+                ("contrast_cv", C.c_float), ("hits", C.c_int), ("age", C.c_int), ("miss", C.c_int),
+                ("sigma", C.c_float), ("score", C.c_float), ("locked", C.c_int)]
 
 
 class _Timing(C.Structure):
@@ -73,6 +75,13 @@ def _load():
     lib.dl_tracker_clutter.argtypes = [C.c_void_p, C.POINTER(_Cand), C.c_int]
     lib.dl_tracker_reset.argtypes = [C.c_void_p]
     lib.dl_config_default.argtypes = [C.POINTER(_Config)]
+    lib.dl_motion_create.restype = C.c_void_p
+    lib.dl_motion_destroy.argtypes = [C.c_void_p]
+    lib.dl_motion_estimate.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_float),
+                                       C.POINTER(C.c_float), C.POINTER(C.c_float)]
+    lib.dl_tracker_set_motion.argtypes = [C.c_void_p, C.c_float, C.c_float]
+    lib.dl_tracker_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
+    lib.dl_detector_set_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
     return lib
 
 
@@ -88,19 +97,20 @@ def lib():
 
 class NativePointDetector:
     def __init__(self, k=7, pool=2, thr=10, clutter_k=3.0, tile=32, max_density=0.012, dark=True, bright=True,
-                 max_cands=300, threads=0, isa="auto", cpus=None, job=(4, 0), **_ignored):
+                 max_cands=300, threads=0, isa="auto", cpus=None, job=(4, 0), scales=1, focus_k=0.6, **_ignored):
         L = lib()
         c = _Config()
         L.dl_config_default(C.byref(c))
         c.k, c.pool, c.thr, c.clutter_k, c.tile = k, pool, thr, clutter_k, tile
         c.max_density, c.dark, c.bright, c.max_cands = max_density, int(dark), int(bright), max_cands
         c.threads, c.isa, c.job_rows, c.job_cols = threads, ISA[isa], job[0], job[1]
+        c.scales, c.focus_k = scales, focus_k
         self._cpus = (C.c_int * len(cpus))(*cpus) if cpus else None
         if cpus:
             c.ncpus, c.cpus = len(cpus), self._cpus
         self._h = L.dl_detector_create(C.byref(c))
         self._buf = (_Cand * 4096)()
-        self.tile, self.pool = tile, pool
+        self.tile, self.pool, self.scales = tile, pool, scales
         self.timing = {}
         self.tile_mask = None
 
@@ -125,7 +135,13 @@ class NativePointDetector:
         lib().dl_detector_timing(self._h, C.byref(t))
         self.timing = dict(detect_ms=t.total_ms, response_ms=t.response_ms, select_ms=t.select_ms)
         b = self._buf
-        return [(b[i].x, b[i].y, b[i].contrast, b[i].snr, b[i].polarity) for i in range(min(n, len(b)))]
+        return [(b[i].x, b[i].y, b[i].contrast, b[i].snr, b[i].polarity, b[i].level)[:6 if self.scales > 1 else 5]
+                for i in range(min(n, len(b)))]
+
+    def set_focus(self, areas):
+        """areas: [(x, y, r)] — где ждём цели (NativeTracker.focus()), там порог ниже"""
+        a = (C.c_float * (3 * max(1, len(areas))))(*[v for xyr in areas for v in xyr])
+        lib().dl_detector_set_focus(self._h, a, len(areas))
 
     def learn_mask(self, frames, frac=0.3):
         L = lib()
@@ -158,11 +174,21 @@ class NativeTracker:
     def reset_tracks(self):
         lib().dl_tracker_reset(self._h)
 
+    def set_motion(self, dx, dy):
+        """сдвиг картинки к следующему кадру (камера движется)"""
+        lib().dl_tracker_set_motion(self._h, dx, dy)
+
+    def focus(self):
+        buf = (C.c_float * (3 * 256))()
+        n = lib().dl_tracker_focus(self._h, buf, 256)
+        return [(buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]) for i in range(min(n, 256))]
+
     def update(self, dets):
         n = min(len(dets), len(self._dets))
         for i in range(n):
-            x, y, c, snr, p = dets[i]
-            self._dets[i] = _Cand(x, y, c, snr, p)
+            x, y, c, snr, p = dets[i][:5]
+            lvl = dets[i][5] if len(dets[i]) > 5 else 0
+            self._dets[i] = _Cand(x, y, c, snr, p, lvl)
         k = lib().dl_tracker_update(self._h, self._dets, n, self._out, len(self._out))
         m = lib().dl_tracker_clutter(self._h, self._cl, len(self._cl))
         self.clutter_dets = [(self._cl[i].x, self._cl[i].y, self._cl[i].contrast, self._cl[i].snr,
@@ -173,5 +199,24 @@ class NativeTracker:
             out.append(dict(id=t.id, x=t.x, y=t.y, vx=t.vx, vy=t.vy, pol=t.polarity, c=t.contrast,
                             clutter=bool(t.clutter), cls=CLASSES[t.cls], bird_score=t.bird_score,
                             speed=t.speed, resid=t.resid, contrast_cv=t.contrast_cv, hits=t.hits,
-                            path=[(t.x, t.y)]))
+                            miss=t.miss, sigma=t.sigma, score=t.score, locked=bool(t.locked), path=[(t.x, t.y)]))
         return out
+
+
+class NativeMotion:
+    """Сдвиг картинки между кадрами (камера движется): estimate(gray) -> (dx, dy, quality, valid)"""
+
+    def __init__(self):
+        self._h = lib().dl_motion_create()
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib().dl_motion_destroy(self._h)
+            self._h = None
+
+    def estimate(self, gray):
+        g = np.ascontiguousarray(gray, dtype=np.uint8)
+        dx, dy, q = C.c_float(), C.c_float(), C.c_float()
+        ok = lib().dl_motion_estimate(self._h, g.ctypes.data, g.shape[1], g.shape[0], g.strides[0],
+                                      C.byref(dx), C.byref(dy), C.byref(q))
+        return dx.value, dy.value, q.value, bool(ok)

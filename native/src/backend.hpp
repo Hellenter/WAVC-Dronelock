@@ -44,6 +44,9 @@ public:
     // их статистика тогда нулевая. jobs/skipped — для метрик.
     virtual void compute(const FrameView& f, const ResponseParams& p, const uint8_t* mask,
                          TileStats& dark, TileStats& bright, int& jobs, int& skipped) = 0;
+    // Уменьшение кадра в 2 раза для следующего масштаба: dark = min 2x2, bright = 255 - max 2x2.
+    // Выход (w/2) x (h/2), шаг строки dstStride.
+    virtual void pool2(const FrameView& f, uint8_t* dark, uint8_t* bright, int dstStride) = 0;
 };
 
 std::unique_ptr<Backend> make_cpu_backend(Isa isa, int threads, const std::vector<int>& cpus);

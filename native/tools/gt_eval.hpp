@@ -53,7 +53,7 @@ struct EvalStats {
     void add(const std::vector<GtObj>& gt, const std::vector<Track>& tracks, float sx = 1, float sy = 1) {
         std::vector<const Track*> live;
         for (const auto& t : tracks)
-            if (!t.clutter) live.push_back(&t);
+            if (!t.clutter && t.cls != TargetClass::Clutter) live.push_back(&t);
         std::vector<char> matched(live.size(), 0);
         for (const auto& o : gt) {
             const int k = o.bird ? 1 : 0;

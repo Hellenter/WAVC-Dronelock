@@ -39,6 +39,9 @@ static void usage() {
         "  --pool 1|2 --k 7 --thr 10 --tile 32 --job RxC\n"
         "  --polarity dark|bright|both\n"
         "  --learn-mask N          авто-маска неба по первым N кадрам\n"
+        "  --scales 1..4           доп. масштабы для крупных целей\n"
+        "  --focus                 пониженный порог возле прогноза треков\n"
+        "  --motion                компенсация движения камеры\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
         "  --stream                не загружать заранее (замер вместе с чтением)\n"
@@ -74,7 +77,9 @@ int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
     std::string input, gtPath, jsonPath, dumpPath;
     int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0;
-    bool yuv420 = false, stream = false, sweep = false;
+    bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false;
+    GlobalMotion gm;
+    std::vector<FocusArea> focusAreas;
     DetectorConfig cfg;
     TrackerConfig tcfg;
     for (int i = 1; i < argc; ++i) {
@@ -105,6 +110,11 @@ int main(int argc, char** argv) {
         else if (a == "--bird-cv") tcfg.bird_contrast_cv = (float)std::atof(val().c_str());
         else if (a == "--bird-speed") tcfg.bird_speed = (float)std::atof(val().c_str());
         else if (a == "--learn-mask") learn = std::atoi(val().c_str());
+        else if (a == "--scales") cfg.scales = std::atoi(val().c_str());
+        else if (a == "--focus") focus = true;
+        else if (a == "--q") tcfg.q_accel = (float)std::atof(val().c_str());
+        else if (a == "--gate-sigma") tcfg.gate_sigma = (float)std::atof(val().c_str());
+        else if (a == "--motion") motion = true;
         else if (a == "--gt") gtPath = val();
         else if (a == "--stream") stream = true;
         else if (a == "--sweep") sweep = true;
@@ -196,9 +206,15 @@ int main(int argc, char** argv) {
             if (fi == 0) trk.resetTracks();   // видео зациклено — трек не должен "прыгать" через склейку
         }
         const double t0 = now_ms();
+        MotionEstimate me;
+        if (motion) me = gm.estimate(g, W, H, W);
+        if (focus) {
+            trk.focus(me.dx, me.dy, focusAreas);
+            det.setFocus(focusAreas);
+        }
         det.detect(g, W, H, W, cands);
         const double t1 = now_ms();
-        const auto& tracks = trk.update(cands);
+        const auto& tracks = trk.update(cands, me.dx, me.dy);
         const double t2 = now_ms();
         if (i >= 3) {
             total.push_back(t2 - t0);
