@@ -453,7 +453,27 @@ void draw_chart(const Metrics& m, float budgetMs, ImVec2 size) {
     }
 }
 
-// ------------------------------------------------------------ панели
+// ------------------------------------------------------------ оформление
+
+const float FONT_BASE = 16.f;   // размер шрифта интерфейса до масштаба экрана
+const ImVec4 TXT_OK(0.40f, 0.90f, 0.50f, 1), TXT_WARN(1, 0.80f, 0.30f, 1), TXT_BAD(1, 0.42f, 0.42f, 1);
+const ImVec4 TXT_DIM(0.60f, 0.60f, 0.63f, 1), TXT_HEAD(0.62f, 0.76f, 1, 1);
+const ImVec4 ACC(0.20f, 0.45f, 0.85f, 1), ACC_HOV(0.27f, 0.53f, 0.93f, 1), ACC_ACT(0.16f, 0.38f, 0.75f, 1);
+
+// крупнее или мельче обычного шрифта на время блока
+struct FontSize {
+    explicit FontSize(float k) { ImGui::PushFont(nullptr, FONT_BASE * k); }
+    ~FontSize() { ImGui::PopFont(); }
+    FontSize(const FontSize&) = delete;
+    FontSize& operator=(const FontSize&) = delete;
+};
+
+void push_accent() {
+    ImGui::PushStyleColor(ImGuiCol_Button, ACC);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ACC_HOV);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ACC_ACT);
+}
+void pop_accent() { ImGui::PopStyleColor(3); }
 
 void help_marker(const char* t) {
     ImGui::SameLine();
@@ -466,29 +486,90 @@ void help_marker(const char* t) {
     }
 }
 
+// заголовок группы настроек
+void heading(const char* t) {
+    ImGui::Spacing();
+    FontSize f(1.1f);
+    ImGui::PushStyleColor(ImGuiCol_Text, TXT_HEAD);
+    ImGui::SeparatorText(t);
+    ImGui::PopStyleColor();
+}
+
+// подпись над полем, само поле — на всю ширину следующей строкой
+void label(const char* t, const char* help = nullptr) {
+    ImGui::TextUnformatted(t);
+    if (help) help_marker(help);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+}
+
+// ряд кнопок-переключателей на всю ширину; выбранная подсвечена. true — выбрали другую
+bool segmented(const char* id, const char* const* labels, int n, int& cur, float h = 0,
+               const char* const* tips = nullptr) {
+    ImGui::PushID(id);
+    const float sp = ImGui::GetStyle().ItemSpacing.x * 0.5f;
+    const float w = (ImGui::GetContentRegionAvail().x - sp * (n - 1)) / n;
+    bool ch = false;
+    for (int i = 0; i < n; ++i) {
+        if (i) ImGui::SameLine(0, sp);
+        const bool on = cur == i;
+        if (on) push_accent();
+        if (ImGui::Button(labels[i], ImVec2(w, h)) && !on) {
+            cur = i;
+            ch = true;
+        }
+        if (on) pop_accent();
+        if (tips && tips[i]) ImGui::SetItemTooltip("%s", tips[i]);
+    }
+    ImGui::PopID();
+    return ch;
+}
+
+// вкладка, у которой содержимое прокручивается отдельно от того, что над ней
+template <class F>
+void tab(const char* name, F&& body) {
+    if (!ImGui::BeginTabItem(name)) return;
+    ImGui::PushID(name);
+    ImGui::BeginChild("body", ImVec2(0, 0));
+    body();
+    ImGui::EndChild();
+    ImGui::PopID();
+    ImGui::EndTabItem();
+}
+
+// ------------------------------------------------------------ панель управления
+
 void panel_annotate(App& a) {
-    ImGui::SeparatorText("Разметка целей");
+    if (!a.pipe.isOpen()) {
+        ImGui::TextDisabled("сначала откройте видео");
+        return;
+    }
     if (!a.ann.editable) {
         ImGui::TextDisabled("разметка из synth_sky.py: только просмотр");
         return;
     }
-    ImGui::Checkbox("размечать на видео", &a.annotate);
+    {
+        FontSize f(1.1f);
+        ImGui::Checkbox("Размечать на видео", &a.annotate);
+    }
     help_marker("Своя разметка, чтобы приложение считало полноту и ложные цели на ваших роликах, а шкала "
                 "показывала, где дрон пропущен. Поставьте паузу и щёлкните по дрону: на этом кадре появится "
                 "опорная точка (рядом с целью алгоритма она прилипает к ней). Между точками положение считается "
                 "по прямой, поэтому точку достаточно ставить раз в 10-30 кадров и на поворотах; объект есть "
                 "от первой до последней точки. Правый щелчок — убрать точку на этом кадре. Сохраняется сразу "
                 "в <видео>.gt.json, рядом с видео.");
+    ImGui::TextWrapped("Пауза, щелчок по дрону — опорная точка, правый щелчок — убрать. Точку достаточно ставить "
+                       "раз в 10-30 кадров.");
     if (!a.annotate) {
         if (!a.ann.objs.empty()) ImGui::TextDisabled("размечено объектов: %d", (int)a.ann.objs.size());
         return;
     }
-    if (ImGui::SmallButton("+ дрон")) a.annCur = a.ann.add(false);
+    const float bw = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3;
+    if (ImGui::Button("+ дрон", ImVec2(bw, 0))) a.annCur = a.ann.add(false);
     ImGui::SameLine();
-    if (ImGui::SmallButton("+ птица")) a.annCur = a.ann.add(true);
+    if (ImGui::Button("+ птица", ImVec2(bw, 0))) a.annCur = a.ann.add(true);
     ImGui::SameLine();
     ImGui::BeginDisabled(!a.ann.find(a.annCur));
-    if (ImGui::SmallButton("удалить объект")) {
+    if (ImGui::Button("удалить", ImVec2(bw, 0))) {
         a.ann.objs.erase(std::remove_if(a.ann.objs.begin(), a.ann.objs.end(),
                                         [&](const AnnObject& o) { return o.id == a.annCur; }),
                          a.ann.objs.end());
@@ -496,6 +577,7 @@ void panel_annotate(App& a) {
         ann_changed(a);
     }
     ImGui::EndDisabled();
+    heading("Объекты");
     for (const auto& o : a.ann.objs) {
         char b[128];
         if (o.keys.empty()) snprintf(b, sizeof(b), "#%d %s: точек нет##o%d", o.id, o.bird ? "птица" : "дрон", o.id);
@@ -508,102 +590,46 @@ void panel_annotate(App& a) {
     if (!a.annMsg.empty()) ImGui::TextDisabled("%s", a.annMsg.c_str());
 }
 
-void panel_controls(App& a) {
-    bool changed = false;
+// главное, всегда на виду: видео, устройство, профиль, темп камеры
+void panel_main(App& a, bool& changed) {
     const VideoInfo vi = a.pipe.info();
-    if (ImGui::CollapsingHeader("Видео", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::Button("Открыть видео...")) {
+    const float bigH = ImGui::GetFrameHeight() * 1.9f;
+    {
+        FontSize f(1.25f);
+        push_accent();
+        if (ImGui::Button(a.pipe.isOpen() ? "Открыть другое видео..." : "Открыть видео...", ImVec2(-FLT_MIN, bigH))) {
             std::string p = plat::open_video_dialog();
             if (!p.empty()) open_video(a, p);
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("или перетащите файл в окно");
-        if (!a.err.empty()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", a.err.c_str());
-        if (a.pipe.isOpen()) {
-            std::string name = a.pipe.path();
-            size_t sl = name.find_last_of("/\\");
-            if (sl != std::string::npos) name = name.substr(sl + 1);
+        pop_accent();
+    }
+    ImGui::SetItemTooltip("Или перетащите файл в окно");
+    if (!a.err.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, TXT_BAD);
+        ImGui::TextWrapped("%s", a.err.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (a.pipe.isOpen()) {
+        std::string name = a.pipe.path();
+        size_t sl = name.find_last_of("/\\");
+        if (sl != std::string::npos) name = name.substr(sl + 1);
+        {
+            FontSize f(1.1f);
             ImGui::TextWrapped("%s", name.c_str());
-            ImGui::TextDisabled("%dx%d, %.2f к/с, %s (%s)%s", vi.w, vi.h, vi.fps, vi.codec.c_str(), vi.pixfmt.c_str(),
-                                vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "");
-            const bool paused = a.pipe.paused();
-            if (ImGui::Button(paused ? "Продолжить" : "Пауза")) toggle_pause(a);
-            ImGui::SameLine();
-            if (ImGui::Button("< кадр")) step_back(a);
-            ImGui::SameLine();
-            if (ImGui::Button("кадр >")) step_forward(a);
-            ImGui::SameLine();
-            if (ImGui::Button("С начала")) seek_to(a, 0, false);
-            // скорость
-            static const double speeds[] = {0.1, 0.25, 0.5, 1.0};
-            static const char* speedNames[] = {"x0.1", "x0.25", "x0.5", "x1"};
-            for (int i = 0; i < 4; ++i) {
-                if (i) ImGui::SameLine();
-                const bool on = a.s.pace == Pace::Realtime && std::fabs(a.s.speed - speeds[i]) < 1e-3;
-                if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-                if (ImGui::Button(speedNames[i])) set_speed(a, speeds[i]);
-                if (on) ImGui::PopStyleColor();
-            }
-            ImGui::SameLine();
-            float sp = (float)a.s.speed;
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
-            if (ImGui::SliderFloat("скорость", &sp, 0.05f, 2.f, "x%.2f", ImGuiSliderFlags_Logarithmic)) set_speed(a, sp);
-            help_marker("Замедление видео: кадры подаются реже, каждый обрабатывается. Работает в режиме подачи "
-                        "\"как камера\". Клавиши: пробел — пауза, стрелки влево/вправо — кадр назад/вперёд, "
-                        "+/- — быстрее/медленнее.");
-            // история обработанных кадров (назад на паузе)
-            int first, last;
-            if (paused && a.pipe.historyRange(first, last) && last > first) {
-                int cur = a.viewSeq >= 0 ? a.viewSeq : last;
-                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
-                char fmt[64];
-                snprintf(fmt, sizeof(fmt), cur == last ? "последний" : "%d кадров назад", last - cur);
-                if (ImGui::SliderInt("история", &cur, first, last, fmt)) a.viewSeq = cur >= last ? -1 : cur;
-                help_marker("Последние обработанные кадры с разметкой (до 600 кадров и 1 ГБ памяти). Трекер при "
-                            "этом не откатывается: вперёд с последнего кадра идёт обработка следующего.");
-            }
-            changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
-            panel_annotate(a);
         }
+        ImGui::TextDisabled("%dx%d, %.2f к/с, %s%s", vi.w, vi.h, vi.fps, vi.codec.c_str(),
+                            vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "");
+    } else {
+        ImGui::TextDisabled("или перетащите файл в окно");
     }
-    if (ImGui::CollapsingHeader("Подача кадров", ImGuiTreeNodeFlags_DefaultOpen)) {
-        int pace = a.s.pace == Pace::Realtime ? 0 : 1;
-        changed |= ImGui::RadioButton("Как камера", &pace, 0);
-        help_marker("Кадры приходят с частотой видео (или заданной). Если обработка не успевает, лишние кадры "
-                    "выбрасываются, как у настоящей камеры. Счётчик пропусков — в метриках.");
-        ImGui::SameLine();
-        changed |= ImGui::RadioButton("Максимально быстро", &pace, 1);
-        help_marker("Без пропусков и пауз: замер предельной скорости всего конвейера.");
-        a.s.pace = pace == 0 ? Pace::Realtime : Pace::MaxSpeed;
-        if (a.s.pace == Pace::Realtime) {
-            float fps = (float)a.s.targetFps;
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-            if (ImGui::SliderFloat("к/с камеры", &fps, 0, 120, fps <= 0 ? "как в видео" : "%.0f")) {
-                a.s.targetFps = fps;
-                changed = true;
-            }
-        }
-        int src = a.s.source == Source::Stream ? 0 : 1;
-        bool srcCh = ImGui::RadioButton("Читать файл", &src, 0);
-        ImGui::SameLine();
-        srcCh |= ImGui::RadioButton("Предзагрузка в память", &src, 1);
-        help_marker("Кадры заранее декодируются в память и подаются по кругу без копирования, как сырые буферы "
-                    "камеры. Тогда декодирование видео не мешает замеру.");
-        if (src == 1) {
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-            srcCh |= ImGui::SliderInt("кадров", &a.s.preloadFrames, 10, 1000);
-            const int w = a.s.procW ? a.s.procW : vi.w, h = a.s.procH ? a.s.procH : vi.h;
-            ImGui::TextDisabled("памяти: ~%.0f МБ", (double)w * h * a.s.preloadFrames / (1024.0 * 1024.0));
-        }
-        if (srcCh) {
-            a.s.source = src == 0 ? Source::Stream : Source::Preload;
-            changed = true;
-        }
-    }
-    if (ImGui::CollapsingHeader("Ресурсы (имитация железа)", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // устройство: ядра, ширина векторов и скорость ядра (по калибровке)
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
-        if (ImGui::BeginCombo("устройство", DEVICES[a.devIdx].name)) {
+
+    heading("Устройство");
+    {
+        FontSize f(1.15f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x * 1.5f,
+                                                               ImGui::GetStyle().FramePadding.y * 1.6f));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##device", DEVICES[a.devIdx].name)) {
             for (int i = 0; i < N_DEVICES; ++i)
                 if (ImGui::Selectable(DEVICES[i].name, a.devIdx == i)) {
                     apply_device(a, i);
@@ -611,322 +637,447 @@ void panel_controls(App& a) {
                 }
             ImGui::EndCombo();
         }
-        help_marker("Имитация устройства на этом ПК: столько же ядер, векторы 128 бит (как NEON), а обработка "
-                    "каждого кадра растягивается во столько раз, во сколько ядро устройства медленнее ядра ПК. "
-                    "Скорость ПК меряется при запуске приложения. Скорость устройства — оценка; точнее: "
-                    "запустите на нём dronolok_bench --calibrate и введите число в поле ниже. Вместе с "
-                    "устройством ставится подходящий профиль алгоритма (его можно поменять).");
-        if (a.devIdx > 0) {
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.3f);
-            if (ImGui::InputFloat("мс/Мп на устройстве", &a.devMs[a.devIdx], 0, 0, "%.2f")) {
-                a.devMs[a.devIdx] = std::max(0.01f, a.devMs[a.devIdx]);
-                a.s.slowdown = std::max(1.0, a.devMs[a.devIdx] / std::max(1e-3, a.pcMs));
-                changed = true;
-            }
-            ImGui::TextDisabled("этот ПК: %.2f мс/Мп, устройство медленнее в %.1f раза", a.pcMs, a.s.slowdown);
-            if (a.devMs[a.devIdx] < a.pcMs)
-                ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "ядро ПК медленнее устройства: точная имитация невозможна");
-        } else {
-            ImGui::TextDisabled("этот ПК: %.2f мс/Мп (1 поток, 128 бит)", a.pcMs);
-        }
-        const int hw = plat::logical_cpus();
-        int th = a.s.det.threads > 0 ? a.s.det.threads : hw;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        if (ImGui::SliderInt("потоков детектора", &th, 1, std::max(hw, 16))) {
-            a.s.det.threads = th;
-            changed = true;
-        }
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        if (ImGui::BeginCombo("SIMD", isa_ru(a.s.det.isa))) {
-            std::vector<Isa> isas = available_isas();
-            isas.insert(isas.begin(), Isa::Auto);
-            for (Isa i : isas)
-                if (ImGui::Selectable(isa_ru(i), a.s.det.isa == i)) {
-                    a.s.det.isa = i;
-                    changed = true;
-                }
-            ImGui::EndCombo();
-        }
-        help_marker("Набор векторных инструкций. На Raspberry Pi 3/5 есть только NEON (128 бит), по ширине это "
-                    "как SSE2. AVX2 — 256 бит, есть на большинстве ПК.");
-        ImGui::TextUnformatted("Ядра процесса:");
-        help_marker("Процесс (детектор, декодер, интерфейс) работает только на отмеченных логических ядрах. "
-                    "Например, 4 ядра — как у Raspberry Pi.");
-        bool cpuCh = false;
-        for (int i = 0; i < (int)a.cpuOn.size() && i < 64; ++i) {
-            if (i % 8) ImGui::SameLine();
-            char lbl[8];
-            snprintf(lbl, sizeof(lbl), "%d##c", i);
-            bool on = a.cpuOn[i] != 0;
-            ImGui::PushID(i);
-            if (ImGui::Checkbox(lbl, &on)) {
-                a.cpuOn[i] = on;
-                cpuCh = true;
-            }
-            ImGui::PopID();
-        }
-        if (ImGui::SmallButton("все")) { std::fill(a.cpuOn.begin(), a.cpuOn.end(), 1); cpuCh = true; }
-        for (int n : {1, 2, 4}) {
-            if (n >= (int)a.cpuOn.size()) continue;
-            ImGui::SameLine();
-            char lbl[32];
-            snprintf(lbl, sizeof(lbl), "первые %d", n);
-            if (ImGui::SmallButton(lbl)) {
-                for (size_t i = 0; i < a.cpuOn.size(); ++i) a.cpuOn[i] = (int)i < n;
-                cpuCh = true;
-            }
-        }
-        cpuCh |= ImGui::Checkbox("Закрепить потоки детектора за ядрами", &a.pinWorkers);
-        if (cpuCh) {
-            apply_resources(a);
-            changed = true;
-        }
-        int dth = a.s.decoderThreads;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        if (ImGui::SliderInt("потоков декодера", &dth, 0, hw, dth == 0 ? "авто" : "%d")) {
-            a.s.decoderThreads = dth;
-            changed = true;
-        }
-        ImGui::BeginDisabled(!plat::cpu_cap_supported());
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        if (ImGui::SliderInt("потолок CPU, %", &a.cpuCap, 5, 100, a.cpuCap >= 100 ? "нет" : "%d%%"))
-            plat::set_cpu_cap(a.cpuCap);
-        ImGui::EndDisabled();
-        help_marker("Жёсткое ограничение загрузки всем процессом, в процентах от всех ядер ПК (Windows Job Object). "
-                    "Имитирует более медленный процессор.");
-        static const char* prios[] = {"низкий", "ниже среднего", "обычный", "выше среднего", "высокий"};
-        int pr = a.priority + 2;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        if (ImGui::Combo("приоритет", &pr, prios, 5)) {
-            a.priority = pr - 2;
-            plat::set_process_priority(a.priority);
-        }
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        if (ImGui::BeginCombo("разрешение", RES_OPTS[a.resIdx].label)) {
-            for (int i = 0; i < (int)(sizeof(RES_OPTS) / sizeof(RES_OPTS[0])); ++i)
-                if (ImGui::Selectable(RES_OPTS[i].label, a.resIdx == i)) {
-                    a.resIdx = i;
-                    set_resolution(a);
-                    changed = true;
-                }
-            ImGui::EndCombo();
-        }
-        help_marker("Кадр масштабируется перед детектором. 16 Мп — растянуть ролик до размера кадра "
-                    "широкоугольной камеры (как --upscale в run_demo.py).");
-        float emu = (float)a.s.emulateMs;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        if (ImGui::SliderFloat("мин. мс на кадр", &emu, 0, 200, emu <= 0 ? "выкл." : "%.0f мс")) {
-            a.s.emulateMs = emu;
-            changed = true;
-        }
-        help_marker("Имитация медленного устройства: обработка кадра занимает не меньше заданного времени. "
-                    "Подставьте время, которое dronolok_bench показал на Raspberry Pi, и посмотрите, сколько "
-                    "кадров будет теряться в режиме \"как камера\".");
+        ImGui::PopStyleVar();
     }
-    if (ImGui::CollapsingHeader("Блоки алгоритма (под железо)", ImGuiTreeNodeFlags_DefaultOpen)) {
-        DetectorConfig& d = a.s.det;
-        TrackerConfig& t = a.s.trk;
-        const float w = ImGui::GetContentRegionAvail().x * 0.4f;
-        bool blk = false;   // блок поменяли вручную — профиль "свой"
-        static const char* profs[] = {"Полный", "Сбалансированный", "Экономный", "Минимальный", "Свой"};
-        int pi = a.profIdx >= 0 ? a.profIdx : 4;
-        ImGui::SetNextItemWidth(w);
-        if (ImGui::Combo("профиль", &pi, profs, 5) && pi < 4) {
+    ImGui::SetItemTooltip("Имитация устройства на этом ПК: столько же ядер, векторы 128 бит (как NEON), а обработка "
+                          "каждого кадра растягивается во столько раз, во сколько ядро устройства медленнее ядра ПК. "
+                          "Вместе с устройством ставится подходящий профиль алгоритма. Тонкая настройка — на "
+                          "вкладке «Железо».");
+    if (a.devIdx > 0) {
+        ImGui::TextDisabled("%d ядра, 128 бит, обработка медленнее этого ПК в %.1f раза", DEVICES[a.devIdx].cores,
+                            a.s.slowdown);
+        if (a.devMs[a.devIdx] < a.pcMs)
+            ImGui::TextColored(TXT_WARN, "ядро ПК медленнее устройства: точная имитация невозможна");
+    } else {
+        ImGui::TextDisabled("все ядра и SIMD этого ПК");
+    }
+
+    heading("Профиль алгоритма");
+    static const char* profs[] = {"Полный", "Баланс", "Эконом", "Минимум"};
+    static const char* tips[] = {
+        "Всё включено: каждый кадр целиком, 3 масштаба. Для мощного ПК.",
+        "Как по умолчанию: хороший компромисс скорости и полноты.",
+        "Для Raspberry Pi 4-5: весь кадр через кадр, 2 масштаба.",
+        "Для Raspberry Pi 3: только точки и тёмные цели, кадр вдвое меньше, весь кадр раз в 3.",
+    };
+    int pi = a.profIdx;
+    {
+        FontSize f(1.1f);
+        if (segmented("profile", profs, 4, pi, bigH * 0.75f, tips)) {
             apply_profile(a, pi);
             changed = true;
         }
-        help_marker("Готовые наборы блоков от \"всё включено\" до минимума для слабого устройства. Полный — каждый "
-                    "кадр целиком, 3 масштаба. Сбалансированный — как по умолчанию. Экономный (Pi 4-5) — весь кадр "
-                    "через кадр, 2 масштаба. Минимальный (Pi 3) — только точки, только тёмные цели, кадр вдвое "
-                    "меньше, весь кадр раз в 3. Любой блок ниже можно переключить вручную.");
-        changed |= ImGui::Checkbox("держать темп камеры (авто-упрощение)", &a.s.governor);
-        help_marker("Если кадр обрабатывается дольше, чем приходит следующий с камеры, алгоритм упрощается "
-                    "ступенями: реже крупные масштабы, реже весь кадр, меньше масштабов. Когда запас появляется, "
-                    "возвращается обратно. Ступень видна справа в метриках и в CSV. Это же есть в ядре для "
-                    "устройства (dronolok::LoadGovernor).");
-        ImGui::SeparatorText("Крупные цели и движение камеры");
-        static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
-        ImGui::SetNextItemWidth(w);
-        blk |= ImGui::Combo("размер цели", &a.s.scales, scl, 5);
-        help_marker("Сколько масштабов просматривать. 1 — только точки (дальний дрон), каждый следующий — кадр, "
-                    "уменьшенный ещё в 2 раза, для близкой крупной цели. Каждый добавляет ~20-35% времени. "
-                    "Авто: до 2 Мп — 3, больше — 1.");
-        int mo = a.s.motion + 1;
-        static const char* mos[] = {"авто", "не учитывать", "учитывать"};
-        ImGui::SetNextItemWidth(w);
-        if (ImGui::Combo("движение камеры", &mo, mos, 3)) {
-            a.s.motion = mo - 1;
-            blk = true;
-        }
-        help_marker("Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается "
-                    "(~1-2 мс) и прогноз целей переносится вместе с ним, иначе захват срывается при каждом "
-                    "движении камеры. Авто: до 2 Мп — учитывать.");
-        int zo = a.s.zones + 1;
-        ImGui::SetNextItemWidth(w);
-        if (ImGui::Combo("зоны кадра", &zo, mos, 3)) {
-            a.s.zones = zo - 1;
-            blk = true;
-        }
-        help_marker("Кадр делится на небо, землю (крупные области текстуры: кроны, дома, земля) и смешанные тайлы "
-                    "неба рядом с землёй. В смешанных цель выдаётся, только когда полетела, — так пропадают ложные "
-                    "цели на кромках крон, крыш и столбов. Авто: вместе с учётом движения камеры (при неподвижной "
-                    "землю и так убирает маска неба).");
-        if (a.pipe.isOpen()) {
-            const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
-            ImGui::TextDisabled("сейчас: масштабов %d, движение камеры %s, зоны %s", ef.scales,
-                                ef.motion ? "учитывается" : "нет", ef.zones ? "да" : "нет");
-        }
-        blk |= ImGui::Checkbox("тёмные цели", &d.dark);
-        ImGui::SameLine();
-        blk |= ImGui::Checkbox("яркие цели", &d.bright);
-        help_marker("Каждая полярность — отдельный проход морфологии. Дрон на фоне неба почти всегда темнее неба, "
-                    "поэтому на слабом железе можно оставить только тёмные: вдвое быстрее.");
-        ImGui::SeparatorText("Неподвижная камера");
-        ImGui::SetNextItemWidth(w);
-        blk |= ImGui::SliderInt("кадров на маску неба", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("заново")) a.pipe.relearnMask();
-        help_marker("Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не просматриваются. Только для "
-                    "неподвижной камеры: при учёте движения камеры маска не строится.");
-        bool stOn = t.static_frames > 0;
-        if (ImGui::Checkbox("память статичных помех", &stOn)) {
-            t.static_frames = stOn ? 3000 : 0;
-            blk = true;
-        }
-        help_marker("Для неподвижной камеры. Места, где цели раз за разом появляются и никуда не летят (катушки и "
-                    "изоляторы ЛЭП, фонари, антенны), запоминаются, и там больше не рождаются цели. Дрон, пролетающий "
-                    "мимо такого места, не теряется. Память лежит рядом с видео (.static.bin): загружается при "
-                    "открытии, сохраняется при закрытии. При учёте движения камеры не ведётся.");
-        if (stOn) {
-            ImGui::SetNextItemWidth(w);
-            changed |= ImGui::SliderFloat("запомнить после, откликов", &t.static_hits, 3, 40, "%.0f");
-            help_marker("Сколько неподвижных откликов в одном месте делают его помехой. Меньше — быстрее учится, "
-                        "но зависший на одном месте дрон тоже может стать \"помехой\" (если его трек много раз "
-                        "терялся, а дрон так и не сдвинулся).");
-            ImGui::SetNextItemWidth(w);
-            changed |= ImGui::SliderInt("забывать за, кадров", &t.static_frames, 300, 30000, "%d",
-                                        ImGuiSliderFlags_Logarithmic);
-            if (ImGui::SmallButton("сохранить память")) a.pipe.staticSave();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("забыть всё")) a.pipe.staticClear();
-        }
-        ImGui::SeparatorText("Экономия");
-        ImGui::SetNextItemWidth(w);
-        blk |= ImGui::SliderInt("весь кадр раз в, кадров", &d.full_every, 1, 4, d.full_every > 1 ? "%d" : "каждый");
-        help_marker("В остальные кадры детектор смотрит только вокруг уже найденных целей. Ведомая цель не "
-                    "теряется, новая находится с задержкой до N-1 кадров. На 16 Мп раз в 2 кадра — минус ~35% "
-                    "времени; на синтетике полнота 96.7% -> 95%. Для Raspberry Pi.");
-        ImGui::SetNextItemWidth(w);
-        blk |= ImGui::SliderInt("крупные масштабы раз в, кадров", &d.coarse_every, 1, 4, d.coarse_every > 1 ? "%d" : "каждый");
-        help_marker("Уменьшенные копии кадра (поиск крупной цели) целиком — раз в N кадров, а между ними только "
-                    "если крупная цель уже ведётся. 16 Мп, 3 масштаба: 7.4 мс -> 5.7 (раз в 2) -> 4.8 (раз в 4).");
-        if (blk) {
-            a.profIdx = -1;
+    }
+    if (a.profIdx < 0) ImGui::TextColored(TXT_WARN, "свой набор: блоки изменены на вкладке «Алгоритм»");
+    {
+        FontSize f(1.1f);
+        changed |= ImGui::Checkbox("Держать темп камеры", &a.s.governor);
+    }
+    help_marker("Авто-упрощение. Если кадр обрабатывается дольше, чем приходит следующий с камеры, алгоритм "
+                "упрощается ступенями: реже крупные масштабы, реже весь кадр, меньше масштабов. Когда запас "
+                "появляется, возвращается обратно. Ступень видна справа на вкладке «Цели» и в CSV. Это же есть в "
+                "ядре для устройства (dronolok::LoadGovernor).");
+}
+
+void tab_video(App& a, bool& changed) {
+    const VideoInfo vi = a.pipe.info();
+    heading("Подача кадров");
+    static const char* paces[] = {"Как камера", "Максимально быстро"};
+    static const char* paceTips[] = {
+        "Кадры приходят с частотой видео (или заданной). Если обработка не успевает, лишние кадры "
+        "выбрасываются, как у настоящей камеры. Счётчик пропусков — справа.",
+        "Без пропусков и пауз: замер предельной скорости всего конвейера.",
+    };
+    int pace = a.s.pace == Pace::Realtime ? 0 : 1;
+    if (segmented("pace", paces, 2, pace, 0, paceTips)) {
+        a.s.pace = pace == 0 ? Pace::Realtime : Pace::MaxSpeed;
+        changed = true;
+    }
+    if (a.s.pace == Pace::Realtime) {
+        float fps = (float)a.s.targetFps;
+        label("частота камеры, к/с");
+        if (ImGui::SliderFloat("##fps", &fps, 0, 120, fps <= 0 ? "как в видео" : "%.0f")) {
+            a.s.targetFps = fps;
             changed = true;
+        }
+        float sp = (float)a.s.speed;
+        label("скорость видео", "Замедление: кадры подаются реже, каждый обрабатывается. Кнопки x0.1-x1 есть и "
+                                "под видео. Клавиши + и -.");
+        if (ImGui::SliderFloat("##speed", &sp, 0.05f, 2.f, "x%.2f", ImGuiSliderFlags_Logarithmic)) set_speed(a, sp);
+    }
+    heading("Источник кадров");
+    static const char* srcs[] = {"Читать файл", "Предзагрузка"};
+    static const char* srcTips[] = {
+        "Кадры декодируются по ходу проигрывания.",
+        "Кадры заранее декодируются в память и подаются по кругу без копирования, как сырые буферы камеры. "
+        "Тогда декодирование видео не мешает замеру.",
+    };
+    int src = a.s.source == Source::Stream ? 0 : 1;
+    bool srcCh = segmented("src", srcs, 2, src, 0, srcTips);
+    if (src == 1) {
+        label("кадров в памяти");
+        srcCh |= ImGui::SliderInt("##preload", &a.s.preloadFrames, 10, 1000);
+        const int w = a.s.procW ? a.s.procW : vi.w, h = a.s.procH ? a.s.procH : vi.h;
+        ImGui::TextDisabled("памяти: ~%.0f МБ", (double)w * h * a.s.preloadFrames / (1024.0 * 1024.0));
+    }
+    if (srcCh) {
+        a.s.source = src == 0 ? Source::Stream : Source::Preload;
+        changed = true;
+    }
+    heading("Проигрывание");
+    changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
+    int first, last;
+    if (a.pipe.paused() && a.pipe.historyRange(first, last) && last > first) {
+        int cur = a.viewSeq >= 0 ? a.viewSeq : last;
+        char fmt[64];
+        snprintf(fmt, sizeof(fmt), cur == last ? "последний" : "%d кадров назад", last - cur);
+        label("история обработанных кадров",
+              "Последние обработанные кадры с разметкой (до 600 кадров и 1 ГБ памяти). Трекер при этом не "
+              "откатывается: вперёд с последнего кадра идёт обработка следующего.");
+        if (ImGui::SliderInt("##history", &cur, first, last, fmt)) a.viewSeq = cur >= last ? -1 : cur;
+    }
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
+    ImGui::TextWrapped("Клавиши: пробел — пауза, стрелки — кадр назад/вперёд, Shift+стрелки — на секунду, "
+                       "Home — в начало, +/- — скорость.");
+    ImGui::PopStyleColor();
+}
+
+void tab_hardware(App& a, bool& changed) {
+    heading("Скорость устройства");
+    if (a.devIdx > 0) {
+        label("мс на 1 Мп на устройстве",
+              "Сколько ядро устройства тратит на 1 Мп (1 поток, 128 бит). Сейчас — оценка; точное число даёт "
+              "dronolok_bench --calibrate, запущенный на самом устройстве.");
+        if (ImGui::InputFloat("##devms", &a.devMs[a.devIdx], 0, 0, "%.2f")) {
+            a.devMs[a.devIdx] = std::max(0.01f, a.devMs[a.devIdx]);
+            a.s.slowdown = std::max(1.0, a.devMs[a.devIdx] / std::max(1e-3, a.pcMs));
+            changed = true;
+        }
+        ImGui::TextDisabled("этот ПК: %.2f мс/Мп, устройство медленнее в %.1f раза", a.pcMs, a.s.slowdown);
+    } else {
+        ImGui::TextDisabled("этот ПК: %.2f мс/Мп (1 поток, 128 бит)", a.pcMs);
+        ImGui::TextDisabled("выберите устройство сверху, чтобы имитировать Pi");
+    }
+
+    heading("Процессор");
+    const int hw = plat::logical_cpus();
+    int th = a.s.det.threads > 0 ? a.s.det.threads : hw;
+    label("потоков детектора");
+    if (ImGui::SliderInt("##threads", &th, 1, std::max(hw, 16))) {
+        a.s.det.threads = th;
+        changed = true;
+    }
+    label("набор инструкций (SIMD)", "На Raspberry Pi 3/5 есть только NEON (128 бит), по ширине это как SSE2. "
+                                     "AVX2 — 256 бит, есть на большинстве ПК.");
+    if (ImGui::BeginCombo("##simd", isa_ru(a.s.det.isa))) {
+        std::vector<Isa> isas = available_isas();
+        isas.insert(isas.begin(), Isa::Auto);
+        for (Isa i : isas)
+            if (ImGui::Selectable(isa_ru(i), a.s.det.isa == i)) {
+                a.s.det.isa = i;
+                changed = true;
+            }
+        ImGui::EndCombo();
+    }
+    ImGui::TextUnformatted("ядра процесса");
+    help_marker("Процесс (детектор, декодер, интерфейс) работает только на отмеченных логических ядрах. "
+                "Например, 4 ядра — как у Raspberry Pi.");
+    bool cpuCh = false;
+    for (int i = 0; i < (int)a.cpuOn.size() && i < 64; ++i) {
+        if (i % 8) ImGui::SameLine();
+        char lbl[8];
+        snprintf(lbl, sizeof(lbl), "%d##c", i);
+        bool on = a.cpuOn[i] != 0;
+        ImGui::PushID(i);
+        if (ImGui::Checkbox(lbl, &on)) {
+            a.cpuOn[i] = on;
+            cpuCh = true;
+        }
+        ImGui::PopID();
+    }
+    if (ImGui::SmallButton("все")) {
+        std::fill(a.cpuOn.begin(), a.cpuOn.end(), 1);
+        cpuCh = true;
+    }
+    for (int n : {1, 2, 4}) {
+        if (n >= (int)a.cpuOn.size()) continue;
+        ImGui::SameLine();
+        char lbl[32];
+        snprintf(lbl, sizeof(lbl), "первые %d", n);
+        if (ImGui::SmallButton(lbl)) {
+            for (size_t i = 0; i < a.cpuOn.size(); ++i) a.cpuOn[i] = (int)i < n;
+            cpuCh = true;
         }
     }
-    if (ImGui::CollapsingHeader("Алгоритм: пороги, трекер, классы")) {
-        DetectorConfig& d = a.s.det;
-        const float w = ImGui::GetContentRegionAvail().x * 0.4f;
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("порог контраста", &d.thr, 3, 40, "%.0f");
-        help_marker("Минимальная разница яркости цели и фона, уровни 0..255.");
-        changed |= ImGui::Checkbox("порог по шуму", &d.auto_thr);
-        help_marker("Порог считается на каждом кадре от шума неба (как в радарах): чистое небо — порог ниже и "
-                    "видны тусклые цели, шумная матрица вечером — выше и меньше ложных. Порог контраста выше "
-                    "тогда не используется.");
-        if (d.auto_thr) {
-            ImGui::SetNextItemWidth(w);
-            changed |= ImGui::SliderFloat("во сколько раз выше шума", &d.noise_k, 4, 30, "%.1f");
-            ImGui::SetNextItemWidth(w);
-            changed |= ImGui::DragFloatRange2("пределы порога", &d.thr_min, &d.thr_max, 0.5f, 2, 80, "%.0f", "%.0f");
-        }
-        int kk = d.k;
-        ImGui::SetNextItemWidth(w);
-        if (ImGui::SliderInt("макс. размер цели k", &kk, 3, 15)) {
-            d.k = kk | 1;
-            changed = true;
-        }
-        help_marker("В пикселях после пулинга (нечётное). При пулинге 2x2 цель до ~2k пикселей кадра.");
-        bool pool2 = d.pool == 2;
-        if (ImGui::Checkbox("пулинг 2x2", &pool2)) {
-            d.pool = pool2 ? 2 : 1;
-            changed = true;
-        }
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("выше клаттера, раз", &d.clutter_k, 1, 8, "%.1f");
-        ImGui::SetNextItemWidth(w);
-        float dens = d.max_density * 100;
-        if (ImGui::SliderFloat("текстура тайла, %", &dens, 0.2f, 5, "%.1f")) {
-            d.max_density = dens / 100;
-            changed = true;
-        }
-        help_marker("Тайл, где откликов больше этой доли, считается текстурой (листва, рябь облаков) и пропускается.");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("порог крупных, раз", &d.coarse_thr_k, 1, 6, "%.1f");
-        help_marker("Во сколько раз порог контраста выше на уменьшенных масштабах: крупная близкая цель "
-                    "контрастна, а пятна облаков на них дают ложные цели.");
-        changed |= ImGui::Checkbox("искать возле прогноза", &a.s.focus);
-        help_marker("Эксперимент: там, где трек ожидается на следующем кадре, порог ниже, чтобы не терять "
-                    "бледнеющую цель. На ваших роликах пока чуть хуже, поэтому выключено.");
-        if (a.s.focus) {
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(w * 0.6f);
-            changed |= ImGui::SliderFloat("порог там", &d.focus_k, 0.2f, 1, "x%.2f");
-        }
-        ImGui::SeparatorText("Трекер, захват и классы");
-        TrackerConfig& t = a.s.trk;
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("макс. радиус поиска, пикс.", &t.gate, 5, 150, "%.0f");
-        help_marker("Где искать цель на следующем кадре: вокруг прогноза по её скорости. Окно растёт с "
-                    "неуверенностью прогноза (пропуски, манёвры), но не больше этого.");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("манёвренность цели", &t.q_accel, 0.25f, 20, "%.2f", ImGuiSliderFlags_Logarithmic);
-        help_marker("Ускорение в фильтре Калмана, пикс./кадр². Меньше — прогноз жёстче, захват плавно летящего дрона "
-                    "устойчивее; больше — окно шире, не теряет резкие манёвры (птицы).");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderInt("держать на прогнозе, кадров", &t.max_miss, 1, 60);
-        help_marker("Сколько кадров подряд цель может не находиться (ушла за провод, слилась с фоном), а трек и "
-                    "захват идут по прогнозу. Новые и стоящие на месте треки держатся только 1 кадр.");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("смена захвата, раз", &t.lock_switch, 1, 5, "%.1f");
-        help_marker("Захват переходит на другую цель, только если она весомее текущей во столько раз.");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderInt("подтверждение, кадров", &t.confirm, 1, t.window);
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("птица: отклонение, пикс.", &t.bird_resid, 0.5f, 10, "%.1f");
-        help_marker("Средний разброс точек трека вокруг плавной траектории за последние 16 попаданий. "
-                    "Дрон летит плавно (~1 пикс.), ласточка дёргается (3-10 пикс.).");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("птица: мигание контраста", &t.bird_contrast_cv, 0.05f, 1, "%.2f");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderFloat("птица: скорость, пикс./кадр", &t.bird_speed, 0, 40, t.bird_speed > 0 ? "%.0f" : "не учитывать");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderInt("попаданий до решения", &t.cls_min_hits, 3, t.cls_window);
+    cpuCh |= ImGui::Checkbox("Закрепить потоки детектора за ядрами", &a.pinWorkers);
+    if (cpuCh) {
+        apply_resources(a);
+        changed = true;
     }
-    if (ImGui::CollapsingHeader("Отображение")) {
-        static const char* modes[] = {"каждый кадр", "до 30 к/с", "до 10 к/с", "не показывать видео"};
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-        ImGui::Combo("обновление", &a.displayMode, modes, 4);
-        help_marker("Отрисовка 16 Мп кадра тоже тратит CPU. Для чистого замера скорости выберите \"не показывать\".");
-        ImGui::Checkbox("цели и классы", &a.showTracks);
+    int dth = a.s.decoderThreads;
+    label("потоков декодера");
+    if (ImGui::SliderInt("##decth", &dth, 0, hw, dth == 0 ? "авто" : "%d")) {
+        a.s.decoderThreads = dth;
+        changed = true;
+    }
+    ImGui::BeginDisabled(!plat::cpu_cap_supported());
+    label("потолок загрузки CPU",
+          "Жёсткое ограничение загрузки всем процессом, в процентах от всех ядер ПК (Windows Job Object). "
+          "Имитирует более медленный процессор.");
+    if (ImGui::SliderInt("##cpucap", &a.cpuCap, 5, 100, a.cpuCap >= 100 ? "нет" : "%d%%")) plat::set_cpu_cap(a.cpuCap);
+    ImGui::EndDisabled();
+    static const char* prios[] = {"низкий", "ниже среднего", "обычный", "выше среднего", "высокий"};
+    int pr = a.priority + 2;
+    label("приоритет процесса");
+    if (ImGui::Combo("##prio", &pr, prios, 5)) {
+        a.priority = pr - 2;
+        plat::set_process_priority(a.priority);
+    }
+
+    heading("Кадр");
+    label("разрешение обработки", "Кадр масштабируется перед детектором. 16 Мп — растянуть ролик до размера "
+                                  "кадра широкоугольной камеры (как --upscale в run_demo.py).");
+    if (ImGui::BeginCombo("##res", RES_OPTS[a.resIdx].label)) {
+        for (int i = 0; i < (int)(sizeof(RES_OPTS) / sizeof(RES_OPTS[0])); ++i)
+            if (ImGui::Selectable(RES_OPTS[i].label, a.resIdx == i)) {
+                a.resIdx = i;
+                set_resolution(a);
+                changed = true;
+            }
+        ImGui::EndCombo();
+    }
+    float emu = (float)a.s.emulateMs;
+    label("не быстрее, мс на кадр",
+          "Обработка кадра занимает не меньше заданного времени. Подставьте время, которое dronolok_bench "
+          "показал на Raspberry Pi, и посмотрите, сколько кадров будет теряться в режиме «как камера».");
+    if (ImGui::SliderFloat("##emu", &emu, 0, 200, emu <= 0 ? "выкл." : "%.0f мс")) {
+        a.s.emulateMs = emu;
+        changed = true;
+    }
+}
+
+void tab_algorithm(App& a, bool& changed) {
+    const VideoInfo vi = a.pipe.info();
+    DetectorConfig& d = a.s.det;
+    TrackerConfig& t = a.s.trk;
+    bool blk = false;   // блок поменяли вручную — профиль "свой"
+    ImGui::TextWrapped("Блоки, из которых собран профиль. Любой можно переключить — профиль станет «свой».");
+    heading("Крупные цели и движение камеры");
+    static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
+    label("размер цели (масштабов)",
+          "Сколько масштабов просматривать. 1 — только точки (дальний дрон), каждый следующий — кадр, уменьшенный "
+          "ещё в 2 раза, для близкой крупной цели. Каждый добавляет ~20-35% времени. Авто: до 2 Мп — 3, больше — 1.");
+    blk |= ImGui::Combo("##scales", &a.s.scales, scl, 5);
+    static const char* mos[] = {"авто", "нет", "да"};
+    int mo = a.s.motion + 1;
+    label("учитывать движение камеры",
+          "Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается (~1-2 мс) и "
+          "прогноз целей переносится вместе с ним, иначе захват срывается при каждом движении камеры. Авто: до "
+          "2 Мп — учитывать.");
+    if (segmented("motion", mos, 3, mo)) {
+        a.s.motion = mo - 1;
+        blk = true;
+    }
+    int zo = a.s.zones + 1;
+    label("зоны кадра (небо, земля, кромки)",
+          "Кадр делится на небо, землю (кроны, дома, земля) и смешанные тайлы неба рядом с землёй. В смешанных "
+          "цель выдаётся, только когда полетела, — так пропадают ложные цели на кромках крон, крыш и столбов. "
+          "Авто: вместе с учётом движения камеры.");
+    if (segmented("zones", mos, 3, zo)) {
+        a.s.zones = zo - 1;
+        blk = true;
+    }
+    if (a.pipe.isOpen()) {
+        const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
+        ImGui::TextDisabled("сейчас: масштабов %d, камера %s, зоны %s", ef.scales, ef.motion ? "учитывается" : "нет",
+                            ef.zones ? "да" : "нет");
+    }
+    blk |= ImGui::Checkbox("тёмные цели", &d.dark);
+    ImGui::SameLine();
+    blk |= ImGui::Checkbox("яркие цели", &d.bright);
+    help_marker("Каждая полярность — отдельный проход морфологии. Дрон на фоне неба почти всегда темнее неба, "
+                "поэтому на слабом железе можно оставить только тёмные: вдвое быстрее.");
+
+    heading("Неподвижная камера");
+    label("кадров на маску неба", "Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не "
+                                  "просматриваются. При учёте движения камеры маска не строится.");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.7f);
+    blk |= ImGui::SliderInt("##mask", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
+    ImGui::SameLine();
+    if (ImGui::Button("заново", ImVec2(-FLT_MIN, 0))) a.pipe.relearnMask();
+    bool stOn = t.static_frames > 0;
+    if (ImGui::Checkbox("Память статичных помех", &stOn)) {
+        t.static_frames = stOn ? 3000 : 0;
+        blk = true;
+    }
+    help_marker("Места, где цели раз за разом появляются и никуда не летят (катушки и изоляторы ЛЭП, фонари, "
+                "антенны), запоминаются, и там больше не рождаются цели. Дрон, пролетающий мимо такого места, не "
+                "теряется. Память лежит рядом с видео (.static.bin). При учёте движения камеры не ведётся.");
+    if (stOn) {
+        ImGui::Indent();
+        label("запомнить после, откликов", "Меньше — быстрее учится, но зависший на одном месте дрон тоже может "
+                                           "стать «помехой».");
+        changed |= ImGui::SliderFloat("##sthits", &t.static_hits, 3, 40, "%.0f");
+        label("забывать за, кадров");
+        changed |= ImGui::SliderInt("##stframes", &t.static_frames, 300, 30000, "%d", ImGuiSliderFlags_Logarithmic);
+        if (ImGui::SmallButton("сохранить память")) a.pipe.staticSave();
         ImGui::SameLine();
-        ImGui::Checkbox("траектории", &a.showPaths);
-        ImGui::SameLine();
-        ImGui::Checkbox("номера", &a.showIds);
-        ImGui::Checkbox("шум", &a.showNoise);
-        ImGui::SameLine();
-        ImGui::Checkbox("помехи", &a.showClutter);
-        ImGui::SameLine();
-        ImGui::Checkbox("маска неба и зоны", &a.showMask);
-        ImGui::Checkbox("разметка (.gt.json)", &a.showGt);
-        ImGui::SameLine();
-        ImGui::Checkbox("вырезки целей", &a.showCrops);
-        ImGui::Checkbox("прогноз движения", &a.showPred);
-        help_marker("Линия — куда цель придёт за 10 кадров при нынешней скорости (у захвата и устоявшихся треков). "
-                    "Пунктирная рамка — трек идёт по прогнозу; у захвата круг — где цель может быть (3 сигмы).");
-        ImGui::SameLine();
-        ImGui::Checkbox("зоны пониженного порога", &a.showFocus);
+        if (ImGui::SmallButton("забыть всё")) a.pipe.staticClear();
+        ImGui::Unindent();
+    }
+
+    heading("Экономия");
+    label("весь кадр раз в, кадров",
+          "В остальные кадры детектор смотрит только вокруг уже найденных целей. Ведомая цель не теряется, новая "
+          "находится с задержкой до N-1 кадров. На 16 Мп раз в 2 кадра — минус ~35% времени.");
+    blk |= ImGui::SliderInt("##fullev", &d.full_every, 1, 4, d.full_every > 1 ? "%d" : "каждый");
+    label("крупные масштабы раз в, кадров",
+          "Уменьшенные копии кадра (поиск крупной цели) целиком — раз в N кадров, а между ними только если крупная "
+          "цель уже ведётся. 16 Мп, 3 масштаба: 7.4 мс -> 5.7 (раз в 2) -> 4.8 (раз в 4).");
+    blk |= ImGui::SliderInt("##coarseev", &d.coarse_every, 1, 4, d.coarse_every > 1 ? "%d" : "каждый");
+    if (blk) {
+        a.profIdx = -1;
+        changed = true;
+    }
+}
+
+void tab_fine(App& a, bool& changed) {
+    DetectorConfig& d = a.s.det;
+    TrackerConfig& t = a.s.trk;
+    if (ImGui::Button("Вернуть по умолчанию", ImVec2(-FLT_MIN, 0))) {
+        // ресурсы (потоки, SIMD, ядра) не трогаем, блоки — по текущему профилю
+        DetectorConfig nd;
+        nd.threads = d.threads;
+        nd.isa = d.isa;
+        nd.cpus = d.cpus;
+        d = nd;
+        t = TrackerConfig();
+        a.s.focus = false;
+        apply_profile(a, a.profIdx >= 0 ? a.profIdx : (int)Profile::Balanced);
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Пороги, трекер и классификатор — как по умолчанию; блоки — по выбранному профилю.");
+
+    heading("Порог обнаружения");
+    {
+        FontSize f(1.05f);
+        changed |= ImGui::Checkbox("Порог по шуму", &d.auto_thr);
+    }
+    help_marker("Порог считается на каждом кадре от шума неба (как в радарах): чистое небо — порог ниже и видны "
+                "тусклые цели, шумная матрица вечером — выше и меньше ложных. Текущие шум и порог — справа на "
+                "вкладке «Цели».");
+    if (d.auto_thr) {
+        label("во сколько раз выше шума");
+        changed |= ImGui::SliderFloat("##noisek", &d.noise_k, 4, 30, "%.1f");
+        label("пределы порога");
+        changed |= ImGui::DragFloatRange2("##thrrange", &d.thr_min, &d.thr_max, 0.5f, 2, 80, "от %.0f", "до %.0f");
+    } else {
+        label("порог контраста", "Минимальная разница яркости цели и фона, уровни 0..255.");
+        changed |= ImGui::SliderFloat("##thr", &d.thr, 3, 40, "%.0f");
+    }
+    label("выше клаттера, раз");
+    changed |= ImGui::SliderFloat("##clutk", &d.clutter_k, 1, 8, "%.1f");
+    float dens = d.max_density * 100;
+    label("текстура тайла, %", "Тайл, где откликов больше этой доли, считается текстурой (листва, рябь облаков) "
+                               "и пропускается.");
+    if (ImGui::SliderFloat("##dens", &dens, 0.2f, 5, "%.1f")) {
+        d.max_density = dens / 100;
+        changed = true;
+    }
+    label("порог крупных масштабов, раз", "Во сколько раз порог выше на уменьшенных масштабах: крупная близкая "
+                                          "цель контрастна, а пятна облаков на них дают ложные цели.");
+    changed |= ImGui::SliderFloat("##coarsek", &d.coarse_thr_k, 1, 6, "%.1f");
+    int kk = d.k;
+    label("макс. размер цели k, пикс.", "После пулинга (нечётное). При пулинге 2x2 цель до ~2k пикселей кадра.");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    if (ImGui::SliderInt("##k", &kk, 3, 15)) {
+        d.k = kk | 1;
+        changed = true;
+    }
+    ImGui::SameLine();
+    bool pool2 = d.pool == 2;
+    if (ImGui::Checkbox("пулинг 2x2", &pool2)) {
+        d.pool = pool2 ? 2 : 1;
+        changed = true;
+    }
+    changed |= ImGui::Checkbox("Искать возле прогноза", &a.s.focus);
+    help_marker("Эксперимент: там, где трек ожидается на следующем кадре, порог ниже, чтобы не терять бледнеющую "
+                "цель. На ваших роликах пока чуть хуже, поэтому выключено.");
+    if (a.s.focus) {
+        label("порог там");
+        changed |= ImGui::SliderFloat("##focusk", &d.focus_k, 0.2f, 1, "x%.2f");
+    }
+
+    heading("Трекер и захват");
+    label("макс. радиус поиска, пикс.", "Где искать цель на следующем кадре: вокруг прогноза по её скорости. "
+                                        "Окно растёт с неуверенностью прогноза, но не больше этого.");
+    changed |= ImGui::SliderFloat("##gate", &t.gate, 5, 150, "%.0f");
+    label("манёвренность цели", "Ускорение в фильтре Калмана, пикс./кадр². Меньше — прогноз жёстче, захват "
+                                "плавно летящего дрона устойчивее; больше — не теряет резкие манёвры.");
+    changed |= ImGui::SliderFloat("##qacc", &t.q_accel, 0.25f, 20, "%.2f", ImGuiSliderFlags_Logarithmic);
+    label("держать на прогнозе, кадров", "Сколько кадров подряд цель может не находиться (ушла за провод, слилась "
+                                         "с фоном), а трек и захват идут по прогнозу.");
+    changed |= ImGui::SliderInt("##maxmiss", &t.max_miss, 1, 60);
+    label("смена захвата, раз", "Захват переходит на другую цель, только если она весомее текущей во столько раз.");
+    changed |= ImGui::SliderFloat("##lockswitch", &t.lock_switch, 1, 5, "%.1f");
+    label("подтверждение, кадров");
+    changed |= ImGui::SliderInt("##confirm", &t.confirm, 1, t.window);
+
+    heading("Птица или дрон");
+    label("отклонение от траектории, пикс.", "Средний разброс точек трека вокруг плавной траектории за последние "
+                                             "16 попаданий. Дрон летит плавно (~1 пикс.), ласточка дёргается (3-10).");
+    changed |= ImGui::SliderFloat("##birdresid", &t.bird_resid, 0.5f, 10, "%.1f");
+    label("мигание контраста (взмахи)");
+    changed |= ImGui::SliderFloat("##birdcv", &t.bird_contrast_cv, 0.05f, 1, "%.2f");
+    label("скорость птицы, пикс./кадр");
+    changed |= ImGui::SliderFloat("##birdspeed", &t.bird_speed, 0, 40, t.bird_speed > 0 ? "%.0f" : "не учитывать");
+    label("попаданий до решения");
+    changed |= ImGui::SliderInt("##clsmin", &t.cls_min_hits, 3, t.cls_window);
+}
+
+void tab_view(App& a) {
+    heading("Видео на экране");
+    static const char* modes[] = {"каждый кадр", "до 30 к/с", "до 10 к/с", "не показывать видео"};
+    label("обновление картинки", "Отрисовка 16 Мп кадра тоже тратит CPU. Для чистого замера скорости выберите "
+                                 "«не показывать».");
+    ImGui::Combo("##dispmode", &a.displayMode, modes, 4);
+    heading("Что рисовать на кадре");
+    if (ImGui::BeginTable("show", 2, ImGuiTableFlags_SizingStretchSame)) {
+        auto item = [](const char* name, bool* v, const char* help = nullptr) {
+            ImGui::TableNextColumn();
+            ImGui::Checkbox(name, v);
+            if (help) help_marker(help);
+        };
+        item("цели и классы", &a.showTracks);
+        item("траектории", &a.showPaths);
+        item("номера целей", &a.showIds);
+        item("прогноз движения", &a.showPred,
+             "Линия — куда цель придёт за 10 кадров при нынешней скорости (у захвата и устоявшихся треков). "
+             "Пунктирная рамка — трек идёт по прогнозу; у захвата круг — где цель может быть (3 сигмы).");
+        item("шум", &a.showNoise);
+        item("помехи", &a.showClutter);
+        item("маска неба и зоны", &a.showMask);
+        item("пониженный порог", &a.showFocus);
+        item("разметка (.gt.json)", &a.showGt);
+        item("вырезки целей", &a.showCrops);
+        ImGui::EndTable();
+    }
+}
+
+void panel_controls(App& a) {
+    bool changed = false;
+    panel_main(a, changed);
+    ImGui::Spacing();
+    ImGui::Spacing();
+    if (ImGui::BeginTabBar("settings")) {
+        tab("Видео", [&] { tab_video(a, changed); });
+        tab("Железо", [&] { tab_hardware(a, changed); });
+        tab("Алгоритм", [&] { tab_algorithm(a, changed); });
+        tab("Тонко", [&] { tab_fine(a, changed); });
+        tab("Вид", [&] { tab_view(a); });
+        tab("Разметка", [&] { panel_annotate(a); });
+        ImGui::EndTabBar();
     }
     if (changed) a.pipe.setSettings(a.s);
 }
@@ -942,152 +1093,116 @@ void row_stat(const char* name, const Stat& s) {
     }
 }
 
-void panel_metrics(App& a, const Metrics& m, const Result* r) {
-    const float fps = (float)m.procFps;
-    ImGui::Text("Обработано:");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.4f, 1, 0.5f, 1), "%.1f к/с", fps);
-    const double detFps = m.detect.mean > 0 ? 1000.0 / m.detect.mean : 0;
-    ImGui::Text("Детектор: %.2f мс/кадр", m.detect.mean);
-    ImGui::SameLine();
-    ImGui::TextDisabled("(до %.0f к/с)", detFps);
-    if (r) ImGui::TextDisabled("кадр %dx%d (%.1f Мп), %s, потоков %d", r->frame->w, r->frame->h,
-                               r->frame->w * (double)r->frame->h / 1e6, m.backend.c_str(), m.threads);
-    if (!m.status.empty()) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", m.status.c_str());
-
-    if (ImGui::BeginTable("times", 5, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("мс", ImGuiTableColumnFlags_WidthStretch, 2.2f);
-        ImGui::TableSetupColumn("сред.");
-        ImGui::TableSetupColumn("p50");
-        ImGui::TableSetupColumn("p95");
-        ImGui::TableSetupColumn("макс");
-        ImGui::TableHeadersRow();
-        row_stat("декодирование", m.decode);
-        row_stat("движение камеры", m.motion);
-        row_stat("детекция", m.detect);
-        row_stat("  морфология", m.response);
-        row_stat("  выбор пиков", m.select);
-        row_stat("трекинг", m.track);
-        row_stat("кадр целиком", m.proc);
-        row_stat("задержка", m.latency);
-        ImGui::EndTable();
+// плитка ключевой метрики: подпись, крупное значение, пояснение
+void kpi(const char* title, const char* value, ImVec4 col, const char* sub, float w) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float h = ImGui::GetTextLineHeight() * 2 + FONT_BASE * 1.8f * st.FontScaleDpi + st.ItemSpacing.y * 2 +
+                    st.WindowPadding.y * 2;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(32, 35, 42, 255));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 5);
+    ImGui::BeginChild(title, ImVec2(w, h), ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::TextDisabled("%s", title);
+    {
+        FontSize f(1.8f);
+        ImGui::TextColored(col, "%s", value);
     }
-    const Settings s = a.pipe.settings();
-    const double fpsSrc = s.targetFps > 0 ? s.targetFps : m.sourceFps;
-    draw_chart(m, s.pace == Pace::Realtime ? (float)(1000.0 / std::max(0.1, fpsSrc)) : 0.f,
-               ImVec2(ImGui::GetContentRegionAvail().x, 110));
+    ImGui::TextDisabled("%s", sub);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
 
-    ImGui::SeparatorText("Конвейер");
-    const double dropPct = m.processed + m.dropped ? 100.0 * m.dropped / (m.processed + m.dropped) : 0;
-    ImGui::Text("кадров: %ld, пропущено: %ld (%.1f%%)", m.processed, m.dropped, dropPct);
-    ImGui::Text("декодер: %.1f к/с, видео: %.1f к/с", m.decodeFps, m.sourceFps);
-    ImGui::Text("очередь: %d / %d, время замера %.0f с", m.queue, m.queueCap, m.elapsedS);
-
-    ImGui::SeparatorText("Процесс");
-    ImGui::Text("CPU: %.0f%% (≈ %.1f ядра из %d)", a.cpuPct, a.cpuPct / 100.0 * plat::logical_cpus(),
-                plat::logical_cpus());
-    ImGui::Text("память: %.0f МБ", plat::process_memory_mb());
-    ImGui::TextDisabled("%s", plat::cpu_model().c_str());
-
-    if (r) {
-        int dr = 0, bi = 0, un = 0, cl = (int)r->clutter.size();
-        for (const auto& t : r->tracks) {
-            if (t.clutter) { ++cl; continue; }
-            dr += t.cls == TargetClass::Drone;
-            bi += t.cls == TargetClass::Bird;
-            un += t.cls == TargetClass::Unknown;
-        }
-        ImGui::SeparatorText("На кадре");
-        ImGui::TextColored(ImColor(COL_DRONE).Value, "дронов %d", dr);
-        ImGui::SameLine();
-        ImGui::TextColored(ImColor(COL_BIRD).Value, "птиц %d", bi);
-        ImGui::SameLine();
-        ImGui::TextColored(ImColor(COL_UNKNOWN).Value, "неясно %d", un);
-        ImGui::TextColored(ImColor(COL_CLUTTER).Value, "помех %d", cl);
-        ImGui::SameLine();
-        ImGui::TextColored(ImColor(COL_NOISE).Value, "шум %d", (int)r->noise.size());
-        ImGui::SameLine();
-        ImGui::TextDisabled("кандидатов %d", (int)r->cands.size());
-        if (r->learning) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "учится маска неба...");
-        const Track* lk = nullptr;
+// крупный статус захвата: на что сейчас наведена система
+void lock_banner(const Result* r, const Metrics& m) {
+    const Track* lk = nullptr;
+    if (r)
         for (const auto& t : r->tracks)
             if (t.id == r->lockId) lk = &t;
-        if (lk) {
-            ImGui::TextColored(ImColor(COL_LOCK).Value, "захват: #%d %s", lk->id, class_ru(*lk));
-            ImGui::SameLine();
-            if (lk->miss) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "на прогнозе %d кадр.", lk->miss);
-            else ImGui::TextDisabled("ведётся");
-        } else {
-            ImGui::TextDisabled("захвата нет");
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(%.0f%% кадров с захватом)", m.lockPct);
-        if (r->motionOn) {
-            if (r->camValid) ImGui::Text("камера: сдвиг %+.1f, %+.1f пикс./кадр", r->camDx, r->camDy);
-            else ImGui::TextDisabled("камера: сдвиг не определён (нет текстуры)");
-        } else {
-            ImGui::TextDisabled("движение камеры не учитывается");
-        }
-        if (r->autoThr) ImGui::Text("шум неба %.2f, порог %.1f", r->noiseLvl, r->thr);
-        else ImGui::TextDisabled("порог %.0f (постоянный)", r->thr);
-        ImGui::TextDisabled("масштабов %d, весь кадр раз в %d%s", r->scales, r->fullEvery,
-                            r->coarseEvery > 1 ? (", крупные раз в " + std::to_string(r->coarseEvery)).c_str() : "");
-        if (r->govLevel >= 0)
-            ImGui::TextColored(r->govLevel ? ImVec4(1, 0.8f, 0.3f, 1) : ImVec4(0.6f, 0.6f, 0.63f, 1),
-                               "авто-упрощение: ступень %d из %d — %s", r->govLevel, LoadGovernor::MAX_LEVEL,
-                               LoadGovernor::describe(r->govLevel));
-        if (a.s.slowdown > 1)
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "имитация: %s, обработка x%.1f", DEVICES[a.devIdx].name,
-                               a.s.slowdown);
-        if (r->staticOn) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImColor(COL_STATIC).Value, "запомнено помех: %d", (int)r->staticCells.size());
-        }
-        if (!m.staticMsg.empty()) ImGui::TextDisabled("%s", m.staticMsg.c_str());
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float h = FONT_BASE * 1.6f * st.FontScaleDpi + ImGui::GetTextLineHeight() + st.ItemSpacing.y +
+                    st.WindowPadding.y * 2;
+    const ImVec4 bg = lk ? ImVec4(0.45f, 0.10f, 0.40f, 1) : ImVec4(0.13f, 0.14f, 0.17f, 1);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 5);
+    ImGui::BeginChild("lock", ImVec2(-FLT_MIN, h), ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    {
+        FontSize f(1.6f);
+        if (lk) ImGui::TextColored(ImVec4(1, 0.85f, 0.98f, 1), "ЗАХВАТ  #%d %s", lk->id, class_ru(*lk));
+        else ImGui::TextColored(TXT_DIM, "Захвата нет");
     }
-    if (m.haveGt) {
-        ImGui::SeparatorText("Качество по разметке");
-        if (m.eval.frames == 0) {
-            ImGui::TextDisabled(m.eval.frames == 0 && a.pipe.paused() ? "считается по обработанным кадрам с разметкой"
-                                                                        : "считается после первого прохода видео");
-        } else {
-            ImGui::Text("найдено дронов %.1f%%, птиц %.1f%%", 100 * m.eval.recall(0), 100 * m.eval.recall(1));
-            ImGui::Text("ложных треков на кадр: %.2f", m.eval.falsePerFrame());
-            ImGui::Text("класс верный: дроны %.0f%%, птицы %.0f%%", 100 * m.eval.clsAccuracy(0), 100 * m.eval.clsAccuracy(1));
-        }
-    }
-    ImGui::Separator();
-    if (ImGui::Button("Сбросить")) a.pipe.resetStats();
-    ImGui::SameLine();
-    if (ImGui::Button("CSV по кадрам")) {
-        std::string p = a.pipe.path() + ".metrics.csv";
-        a.note = a.pipe.exportCsv(p) ? "сохранено: " + p : "не удалось сохранить " + p;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Отчёт JSON")) {
-        std::string p = a.pipe.path() + ".report.json";
-        FILE* f = open_file(p, "w");
-        if (f) {
-            fprintf(f, "%s\n", a.pipe.reportJson().c_str());
-            fclose(f);
-        }
-        a.note = f ? "сохранено: " + p : "не удалось сохранить " + p;
-    }
-    if (ImGui::Button("Вырезки целей")) {
-        std::string dir = a.pipe.path();
-        const size_t dot = dir.find_last_of('.'), sl = dir.find_last_of("/\\");
-        if (dot != std::string::npos && (sl == std::string::npos || dot > sl)) dir.resize(dot);
-        a.pipe.exportCrops(dir + "_вырезки", a.note);
-    }
-    help_marker("Цели из последних обработанных кадров (история, до 600 кадров) — картинки 48x48 и таблица "
-                "crops.csv с признаками трека (скорость, отклонение от траектории, мигание контраста), классом, "
-                "который дал алгоритм, и правдой по разметке. Набор для настройки классификатора дрон/птица "
-                "и для обучения нейросети. Папка <видео>_вырезки рядом с видео.");
-    if (!a.note.empty()) ImGui::TextWrapped("%s", a.note.c_str());
+    if (lk && lk->miss) ImGui::TextColored(TXT_WARN, "на прогнозе %d кадр.", lk->miss);
+    else if (lk) ImGui::TextUnformatted("цель ведётся");
+    else ImGui::TextDisabled("нет подтверждённой цели");
+    char pct[48];
+    snprintf(pct, sizeof(pct), "захват в %.0f%% кадров", m.lockPct);
+    ImGui::SameLine(std::max(ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + 8, ImGui::GetWindowWidth() - st.WindowPadding.x -
+                                                            ImGui::CalcTextSize(pct).x));
+    ImGui::TextDisabled("%s", pct);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
 
-    if (a.showCrops && r && a.cropTex) {
-        ImGui::SeparatorText("Цели крупно");
+void metrics_targets(App& a, const Metrics& m, const Result* r) {
+    if (!r) {
+        ImGui::TextDisabled("нет обработанного кадра");
+        return;
+    }
+    int dr = 0, bi = 0, un = 0, cl = (int)r->clutter.size();
+    for (const auto& t : r->tracks) {
+        if (t.clutter) {
+            ++cl;
+            continue;
+        }
+        dr += t.cls == TargetClass::Drone;
+        bi += t.cls == TargetClass::Bird;
+        un += t.cls == TargetClass::Unknown;
+    }
+    heading("На кадре");
+    if (ImGui::BeginTable("counts", 3, ImGuiTableFlags_SizingStretchSame)) {
+        auto cell = [](ImU32 c, const char* name, int n) {
+            ImGui::TableNextColumn();
+            {
+                FontSize f(1.4f);
+                ImGui::TextColored(ImColor(c).Value, "%d", n);
+            }
+            ImGui::TextDisabled("%s", name);
+        };
+        cell(COL_DRONE, "дронов", dr);
+        cell(COL_BIRD, "птиц", bi);
+        cell(COL_UNKNOWN, "неясно", un);
+        cell(COL_CLUTTER, "помех", cl);
+        cell(COL_NOISE, "шум", (int)r->noise.size());
+        cell(IM_COL32(150, 150, 160, 255), "кандидатов", (int)r->cands.size());
+        ImGui::EndTable();
+    }
+    if (r->learning) ImGui::TextColored(TXT_WARN, "учится маска неба...");
+
+    heading("Состояние алгоритма");
+    if (r->motionOn) {
+        if (r->camValid) ImGui::Text("камера: сдвиг %+.1f, %+.1f пикс./кадр", r->camDx, r->camDy);
+        else ImGui::TextDisabled("камера: сдвиг не определён (нет текстуры)");
+    } else {
+        ImGui::TextDisabled("движение камеры не учитывается");
+    }
+    if (r->autoThr) ImGui::Text("шум неба %.2f, порог %.1f", r->noiseLvl, r->thr);
+    else ImGui::Text("порог %.0f (постоянный)", r->thr);
+    ImGui::TextDisabled("масштабов %d, весь кадр раз в %d%s", r->scales, r->fullEvery,
+                        r->coarseEvery > 1 ? (", крупные раз в " + std::to_string(r->coarseEvery)).c_str() : "");
+    if (r->govLevel >= 0)
+        ImGui::TextColored(r->govLevel ? TXT_WARN : TXT_DIM, "авто-упрощение: ступень %d из %d — %s", r->govLevel,
+                           LoadGovernor::MAX_LEVEL, LoadGovernor::describe(r->govLevel));
+    if (a.s.slowdown > 1)
+        ImGui::TextColored(TXT_WARN, "имитация: %s, обработка x%.1f", DEVICES[a.devIdx].name, a.s.slowdown);
+    if (r->staticOn) ImGui::TextColored(ImColor(COL_STATIC).Value, "запомнено помех: %d", (int)r->staticCells.size());
+    if (!m.staticMsg.empty()) ImGui::TextDisabled("%s", m.staticMsg.c_str());
+
+    if (a.showCrops && a.cropTex) {
+        heading("Цели крупно");
         const auto targets = top_targets(*r);
+        if (targets.empty()) ImGui::TextDisabled("целей нет");
         const float sz = std::min(ImGui::GetContentRegionAvail().x / 2 - 8, 150.f);
         for (size_t i = 0; i < targets.size(); ++i) {
             const Track& t = *targets[i];
@@ -1101,6 +1216,138 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
             ImGui::EndGroup();
             if (i % 2 == 0) ImGui::SameLine();
         }
+    }
+}
+
+void metrics_quality(App& a, const Metrics& m) {
+    heading("Качество по разметке");
+    if (!m.haveGt) {
+        ImGui::TextWrapped("Разметки нет. Её можно сделать на вкладке «Разметка» слева или положить рядом с видео "
+                           "файл <видео>.gt.json.");
+    } else if (m.eval.frames == 0) {
+        ImGui::TextDisabled(a.pipe.paused() ? "считается по обработанным кадрам с разметкой"
+                                            : "считается после первого прохода видео");
+    } else if (ImGui::BeginTable("quality", 2, ImGuiTableFlags_SizingStretchSame)) {
+        auto cell = [](const char* name, const char* fmt, double v, ImVec4 c) {
+            ImGui::TableNextColumn();
+            {
+                FontSize f(1.4f);
+                ImGui::TextColored(c, fmt, v);
+            }
+            ImGui::TextDisabled("%s", name);
+        };
+        const double rd = 100 * m.eval.recall(0), fp = m.eval.falsePerFrame();
+        cell("найдено дронов", "%.1f%%", rd, rd >= 90 ? TXT_OK : rd >= 70 ? TXT_WARN : TXT_BAD);
+        cell("найдено птиц", "%.1f%%", 100 * m.eval.recall(1), TXT_DIM);
+        cell("ложных треков на кадр", "%.2f", fp, fp <= 0.1 ? TXT_OK : fp <= 0.5 ? TXT_WARN : TXT_BAD);
+        cell("класс дрона верный", "%.0f%%", 100 * m.eval.clsAccuracy(0), TXT_DIM);
+        cell("класс птицы верный", "%.0f%%", 100 * m.eval.clsAccuracy(1), TXT_DIM);
+        ImGui::EndTable();
+    }
+
+    heading("Сохранить");
+    const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+    ImGui::BeginDisabled(!a.pipe.isOpen());
+    if (ImGui::Button("CSV по кадрам", ImVec2(bw, 0))) {
+        std::string p = a.pipe.path() + ".metrics.csv";
+        a.note = a.pipe.exportCsv(p) ? "сохранено: " + p : "не удалось сохранить " + p;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Отчёт JSON", ImVec2(bw, 0))) {
+        std::string p = a.pipe.path() + ".report.json";
+        FILE* f = open_file(p, "w");
+        if (f) {
+            fprintf(f, "%s\n", a.pipe.reportJson().c_str());
+            fclose(f);
+        }
+        a.note = f ? "сохранено: " + p : "не удалось сохранить " + p;
+    }
+    if (ImGui::Button("Вырезки целей", ImVec2(bw, 0))) {
+        std::string dir = a.pipe.path();
+        const size_t dot = dir.find_last_of('.'), sl = dir.find_last_of("/\\");
+        if (dot != std::string::npos && (sl == std::string::npos || dot > sl)) dir.resize(dot);
+        a.pipe.exportCrops(dir + "_вырезки", a.note);
+    }
+    ImGui::EndDisabled();
+    help_marker("Цели из последних обработанных кадров (история, до 600 кадров) — картинки 48x48 и таблица "
+                "crops.csv с признаками трека (скорость, отклонение от траектории, мигание контраста), классом, "
+                "который дал алгоритм, и правдой по разметке. Набор для настройки классификатора дрон/птица "
+                "и для обучения нейросети. Папка <видео>_вырезки рядом с видео.");
+    if (!a.note.empty()) ImGui::TextWrapped("%s", a.note.c_str());
+}
+
+void panel_metrics(App& a, const Metrics& m, const Result* r) {
+    const Settings s = a.pipe.settings();
+    const double fpsSrc = s.targetFps > 0 ? s.targetFps : m.sourceFps;
+    const bool rt = s.pace == Pace::Realtime;
+    const double dropPct = m.processed + m.dropped ? 100.0 * m.dropped / (m.processed + m.dropped) : 0;
+    const double detFps = m.detect.mean > 0 ? 1000.0 / m.detect.mean : 0;
+
+    // ключевые метрики: успевает ли алгоритм за камерой и чего это стоит
+    const float tw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+    char v[32], sub[64];
+    snprintf(v, sizeof(v), "%.1f к/с", m.procFps);
+    if (rt && fpsSrc > 0) snprintf(sub, sizeof(sub), "камера %.0f к/с", fpsSrc);
+    else snprintf(sub, sizeof(sub), "максимально быстро");
+    kpi("Обработка", v, m.processed == 0 ? TXT_DIM : dropPct < 2 ? TXT_OK : TXT_WARN, sub, tw);
+    ImGui::SameLine();
+    snprintf(v, sizeof(v), "%.1f%%", dropPct);
+    snprintf(sub, sizeof(sub), "%ld из %ld кадров", m.dropped, m.processed + m.dropped);
+    kpi("Пропущено", v, m.processed == 0 ? TXT_DIM : dropPct < 2 ? TXT_OK : dropPct < 10 ? TXT_WARN : TXT_BAD, sub, tw);
+    snprintf(v, sizeof(v), "%.1f мс", m.detect.mean);
+    snprintf(sub, sizeof(sub), "до %.0f к/с, потоков %d", detFps, m.threads);
+    kpi("Детектор", v, ImVec4(0.85f, 0.88f, 0.95f, 1), sub, tw);
+    ImGui::SameLine();
+    snprintf(v, sizeof(v), "%.0f%%", a.cpuPct);
+    snprintf(sub, sizeof(sub), "≈%.1f ядра, %.0f МБ", a.cpuPct / 100.0 * plat::logical_cpus(),
+             plat::process_memory_mb());
+    kpi("CPU", v, a.cpuPct > 90 ? TXT_WARN : ImVec4(0.85f, 0.88f, 0.95f, 1), sub, tw);
+    lock_banner(r, m);
+    if (!m.status.empty()) ImGui::TextColored(TXT_WARN, "%s", m.status.c_str());
+    ImGui::Spacing();
+
+    if (ImGui::BeginTabBar("metrics")) {
+        tab("Время", [&] {
+            if (r) ImGui::TextDisabled("кадр %dx%d (%.1f Мп), %s", r->frame->w, r->frame->h,
+                                       r->frame->w * (double)r->frame->h / 1e6, m.backend.c_str());
+            if (ImGui::BeginTable("times", 5, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("мс", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+                ImGui::TableSetupColumn("сред.");
+                ImGui::TableSetupColumn("p50");
+                ImGui::TableSetupColumn("p95");
+                ImGui::TableSetupColumn("макс");
+                ImGui::TableHeadersRow();
+                row_stat("декодирование", m.decode);
+                row_stat("движение камеры", m.motion);
+                row_stat("детекция", m.detect);
+                row_stat("  морфология", m.response);
+                row_stat("  выбор пиков", m.select);
+                row_stat("трекинг", m.track);
+                row_stat("кадр целиком", m.proc);
+                row_stat("задержка", m.latency);
+                ImGui::EndTable();
+            }
+            ImGui::Dummy(ImVec2(0, ImGui::GetFontSize()));
+            draw_chart(m, rt ? (float)(1000.0 / std::max(0.1, fpsSrc)) : 0.f,
+                       ImVec2(ImGui::GetContentRegionAvail().x, 130));
+            ImGui::Spacing();
+            if (ImGui::Button("Сбросить замер", ImVec2(-FLT_MIN, 0))) a.pipe.resetStats();
+        });
+        tab("Цели", [&] { metrics_targets(a, m, r); });
+        tab("Качество", [&] { metrics_quality(a, m); });
+        tab("Система", [&] {
+            heading("Конвейер");
+            ImGui::Text("кадров: %ld, пропущено: %ld (%.1f%%)", m.processed, m.dropped, dropPct);
+            ImGui::Text("декодер: %.1f к/с, видео: %.1f к/с", m.decodeFps, m.sourceFps);
+            ImGui::Text("очередь: %d / %d, время замера %.0f с", m.queue, m.queueCap, m.elapsedS);
+            heading("Процесс");
+            ImGui::Text("CPU: %.0f%% (≈ %.1f ядра из %d)", a.cpuPct, a.cpuPct / 100.0 * plat::logical_cpus(),
+                        plat::logical_cpus());
+            ImGui::Text("память: %.0f МБ", plat::process_memory_mb());
+            ImGui::TextWrapped("%s", plat::cpu_model().c_str());
+            ImGui::TextDisabled("этот ПК: %.2f мс/Мп (1 поток, 128 бит)", a.pcMs);
+        });
+        ImGui::EndTabBar();
     }
 }
 
@@ -1325,6 +1572,12 @@ void draw_view(App& a, const Result* r) {
 // ------------------------------------------------------------ шкала видео
 
 // Шкала под видео: перемотка в любое место файла, отметки целей, захвата и пропусков по разметке
+// высота кнопок плеера и всей нижней панели (кнопки + шкала)
+float timeline_buttons_h() { return ImGui::GetFrameHeight() * 1.6f; }
+float timeline_height() {
+    return 4 + timeline_buttons_h() + ImGui::GetStyle().ItemSpacing.y + ImGui::GetFrameHeight() * 1.3f + 14;
+}
+
 void draw_timeline(App& a, const Result* r, const Metrics& m) {
     ImGuiIO& io = ImGui::GetIO();
     const VideoInfo vi = a.pipe.info();
@@ -1334,39 +1587,78 @@ void draw_timeline(App& a, const Result* r, const Metrics& m) {
     int64_t n = a.pipe.length();
     const bool known = n > 0;
     n = std::max<int64_t>({n, (int64_t)a.marks.size(), cur + 1, 1});
-    const float pad = 8;
+    const float pad = 8, bh = timeline_buttons_h();
     ImGui::SetCursorPos(ImVec2(pad, ImGui::GetCursorPosY() + 4));
-    // кнопки плеера
+    const float rowY = ImGui::GetCursorPosY();
+    // кнопки плеера, крупно
     const bool paused = a.pipe.paused();
-    if (ImGui::Button("|<")) seek_to(a, 0, false);
-    ImGui::SetItemTooltip("В начало (Home)");
-    ImGui::SameLine();
-    if (ImGui::Button("<")) step_back(a);
-    ImGui::SetItemTooltip("Кадр назад (стрелка влево)");
-    ImGui::SameLine();
-    if (ImGui::Button(paused ? "  Пуск  " : " Пауза ")) {
-        if (paused && m.status == "видео закончилось") seek_to(a, 0, false);
-        toggle_pause(a);
-    }
-    ImGui::SetItemTooltip("Пробел");
-    ImGui::SameLine();
-    if (ImGui::Button(">")) step_forward(a);
-    ImGui::SetItemTooltip("Кадр вперёд (стрелка вправо)");
-    ImGui::SameLine();
-    const int64_t shown = a.scrub >= 0 ? a.scrub : cur;
-    ImGui::Text("%s / %s   кадр %lld / %lld%s", fmt_time(shown / fps).c_str(), fmt_time(n / fps).c_str(),
-                (long long)shown, (long long)n, known ? "" : "+");
-    if (a.s.pace == Pace::Realtime && std::fabs(a.s.speed - 1) > 1e-3) {
+    {
+        FontSize f(1.2f);
+        if (ImGui::Button("|<", ImVec2(bh, bh))) seek_to(a, 0, false);
+        ImGui::SetItemTooltip("В начало (Home)");
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "x%.2f", a.s.speed);
+        if (ImGui::Button("<", ImVec2(bh, bh))) step_back(a);
+        ImGui::SetItemTooltip("Кадр назад (стрелка влево)");
+        ImGui::SameLine();
+        push_accent();
+        if (ImGui::Button(paused ? "Пуск" : "Пауза", ImVec2(bh * 2.4f, bh))) {
+            if (paused && m.status == "видео закончилось") seek_to(a, 0, false);
+            toggle_pause(a);
+        }
+        pop_accent();
+        ImGui::SetItemTooltip("Пробел");
+        ImGui::SameLine();
+        if (ImGui::Button(">", ImVec2(bh, bh))) step_forward(a);
+        ImGui::SetItemTooltip("Кадр вперёд (стрелка вправо)");
+    }
+    const int64_t shown = a.scrub >= 0 ? a.scrub : cur;
+    auto centered = [&] {
+        ImGui::SameLine(0, 14);
+        ImGui::SetCursorPosY(rowY + (bh - ImGui::GetTextLineHeight()) / 2);
+    };
+    {
+        FontSize f(1.15f);
+        centered();
+        ImGui::Text("%s / %s", fmt_time(shown / fps).c_str(), fmt_time(n / fps).c_str());
+    }
+    // скорость справа в той же строке; на узком окне номер кадра уступает ей место
+    const float sw = bh * 1.3f, sp = 4, total = 4 * sw + 3 * sp;
+    const float sx = ImGui::GetWindowWidth() - pad - total;
+    char frameTxt[64];
+    snprintf(frameTxt, sizeof(frameTxt), "кадр %lld / %lld%s", (long long)shown, (long long)n, known ? "" : "+");
+    auto room = [&](float need) { return ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + 14 + need + 20 < sx; };
+    if (room(ImGui::CalcTextSize(frameTxt).x)) {
+        centered();
+        ImGui::TextDisabled("%s", frameTxt);
     }
     if (a.viewSeq >= 0) {
         int hf, hl;
-        if (a.pipe.historyRange(hf, hl)) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "история: %d кадр. назад", hl - a.viewSeq);
+        if (a.pipe.historyRange(hf, hl) && room(ImGui::CalcTextSize("история: 000 кадр. назад").x)) {
+            centered();
+            ImGui::TextColored(TXT_WARN, "история: %d кадр. назад", hl - a.viewSeq);
         }
     }
+    static const double speeds[] = {0.1, 0.25, 0.5, 1.0};
+    bool preset = false;
+    for (double v : speeds) preset |= std::fabs(a.s.speed - v) < 1e-3;
+    if (a.s.pace == Pace::Realtime && !preset && room(ImGui::CalcTextSize("x0.00").x)) {
+        centered();
+        ImGui::TextColored(TXT_WARN, "x%.2f", a.s.speed);
+    }
+    static const char* speedNames[] = {"x0.1", "x0.25", "x0.5", "x1"};
+    if (room(0)) {
+        ImGui::SameLine(sx);
+        ImGui::SetCursorPosY(rowY);
+        for (int i = 0; i < 4; ++i) {
+            if (i) ImGui::SameLine(0, sp);
+            const bool on = a.s.pace == Pace::Realtime && std::fabs(a.s.speed - speeds[i]) < 1e-3;
+            if (on) push_accent();
+            if (ImGui::Button(speedNames[i], ImVec2(sw, bh))) set_speed(a, speeds[i]);
+            if (on) pop_accent();
+            ImGui::SetItemTooltip("Скорость видео (клавиши + и -)");
+        }
+    }
+    ImGui::SetCursorPosY(rowY + bh + ImGui::GetStyle().ItemSpacing.y);
     // полоса: сверху — что нашёл алгоритм, снизу — разметка (зелёный найден, красный пропущен)
     ImGui::SetCursorPosX(pad);
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -1704,13 +1996,40 @@ int main(int argc, char** argv) {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 0;
-    style.FrameRounding = 3;
+    style.FrameRounding = 4;
+    style.GrabRounding = 4;
+    style.TabRounding = 4;
+    style.FramePadding = ImVec2(8, 5);
+    style.ItemSpacing = ImVec2(8, 6);
+    style.WindowPadding = ImVec2(12, 10);
+    style.GrabMinSize = 12;
+    style.ScrollbarSize = 14;
+    style.SeparatorTextBorderSize = 1;
+    ImVec4* c = style.Colors;
+    c[ImGuiCol_WindowBg] = ImVec4(0.09f, 0.10f, 0.12f, 1);
+    c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_FrameBg] = ImVec4(0.17f, 0.19f, 0.23f, 1);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.22f, 0.25f, 0.31f, 1);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.25f, 0.30f, 0.38f, 1);
+    c[ImGuiCol_Button] = ImVec4(0.20f, 0.22f, 0.27f, 1);
+    c[ImGuiCol_ButtonHovered] = ImVec4(0.27f, 0.30f, 0.37f, 1);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.32f, 0.36f, 0.45f, 1);
+    c[ImGuiCol_Tab] = ImVec4(0.15f, 0.17f, 0.21f, 1);
+    c[ImGuiCol_TabHovered] = ImVec4(0.27f, 0.53f, 0.93f, 1);
+    c[ImGuiCol_TabSelected] = ImVec4(0.20f, 0.45f, 0.85f, 1);
+    c[ImGuiCol_TabSelectedOverline] = ImVec4(0.20f, 0.45f, 0.85f, 1);
+    c[ImGuiCol_CheckMark] = ImVec4(0.45f, 0.70f, 1, 1);
+    c[ImGuiCol_SliderGrab] = ImVec4(0.30f, 0.55f, 0.95f, 1);
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.45f, 0.70f, 1, 1);
+    c[ImGuiCol_Header] = ImVec4(0.20f, 0.45f, 0.85f, 0.45f);
+    c[ImGuiCol_HeaderHovered] = ImVec4(0.20f, 0.45f, 0.85f, 0.65f);
+    c[ImGuiCol_Separator] = ImVec4(0.25f, 0.28f, 0.34f, 1);
     style.ScaleAllSizes(scale);
     style.FontScaleDpi = scale;
     for (const auto& path : plat::ui_fonts()) {
         if (FILE* f = fopen(path.c_str(), "rb")) {
             fclose(f);
-            if (io.Fonts->AddFontFromFileTTF(path.c_str(), 16.f)) break;
+            if (io.Fonts->AddFontFromFileTTF(path.c_str(), FONT_BASE)) break;
         }
     }
     ImGui_ImplSDL2_InitForSDLRenderer(win, a.ren);
@@ -1789,7 +2108,7 @@ int main(int argc, char** argv) {
                 set_speed(a, a.s.speed / 2);
         }
         const ImVec2 ds = io.DisplaySize;
-        const float lw = 420 * scale, rw = 400 * scale;
+        const float lw = 470 * scale, rw = 430 * scale;
         const ImGuiWindowFlags fixed = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                                        ImGuiWindowFlags_NoSavedSettings;
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -1806,7 +2125,7 @@ int main(int argc, char** argv) {
         ImGui::SetNextWindowSize(ImVec2(std::max(50.f, ds.x - lw - rw), ds.y));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("Видео", nullptr, fixed | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        const float barH = a.pipe.isOpen() ? ImGui::GetFrameHeightWithSpacing() + ImGui::GetFrameHeight() * 1.3f + 16 : 0;
+        const float barH = a.pipe.isOpen() ? timeline_height() : 0;
         ImGui::BeginChild("view", ImVec2(0, -barH), ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         draw_view(a, shown);
