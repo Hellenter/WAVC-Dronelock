@@ -190,3 +190,33 @@ jobs:
           files: |
             dist/Dronolok-win64.zip
             dist/dronolok-*/dronolok-*.tar.gz
+
+  # Последняя сборка по постоянной ссылке .../releases/tag/latest-build: обновляется после
+  # каждого изменения в main и в открытом PR из этого репозитория
+  latest:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [windows, windows-smoke, pi]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Обновить релиз latest-build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SRC: ${{ github.event.pull_request.head.ref || github.ref_name }}
+        run: |
+          cd dist
+          zip -qr Dronolok-win64.zip Dronolok-win64
+          files="Dronolok-win64.zip $(ls dronolok-*/dronolok-*.tar.gz)"
+          notes="Собрано автоматически: ветка $SRC, коммит ${SHA::7}, $(date -u '+%Y-%m-%d %H:%M') UTC.
+          Windows 10/11 x64: Dronolok-win64.zip. Raspberry Pi: dronolok-aarch64-linux-gnu.tar.gz (64-бит ОС), dronolok-arm-linux-gnueabihf.tar.gz (32-бит ОС)."
+          if gh release view latest-build -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload latest-build $files --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit latest-build --notes "$notes" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create latest-build $files --prerelease --target "$SHA" \
+              --title "Дронолок — последняя сборка" --notes "$notes" -R "$GITHUB_REPOSITORY"
+          fi
