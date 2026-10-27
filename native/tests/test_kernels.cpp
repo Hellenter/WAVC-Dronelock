@@ -175,6 +175,60 @@ static void test_scales_focus() {
     std::printf("scales + focus: ok\n");
 }
 
+// Долгая память статичных помех: неподвижная точка выучивается и не даёт трека, летящая
+// цель, проходящая через неё, не теряется, память переживает сохранение в файл
+static void test_static_map() {
+    TrackerConfig tc;
+    tc.static_frames = 100;
+    Tracker t(640, 480, tc);
+    auto cand = [](float x, float y, float c) {
+        Candidate d{};
+        d.x = x; d.y = y; d.contrast = c; d.snr = 5; d.polarity = -1;
+        return d;
+    };
+    for (int i = 0; i < 200; ++i) {   // катушка: отклик в 4 кадрах из 5
+        std::vector<Candidate> v;
+        if (i % 5) v.push_back(cand(200, 200, 30));
+        t.update(v);
+    }
+    std::vector<TrackPoint> cells;
+    t.staticCells(cells);
+    CHECK(!cells.empty() && cells.size() <= 2, "статичная точка: запомнено ячеек %zu", cells.size());
+    // пауза 60 кадров: короткая карта клаттера остыла, долгая память — нет
+    for (int i = 0; i < 60; ++i) t.update({});
+    t.update({cand(200, 200, 30)});
+    CHECK(t.clutterDets().size() == 1, "после паузы статичная точка не помеха");
+    // дрон летит через катушку: трек один и тот же от начала до конца
+    int id = 0;
+    bool kept = true;
+    for (int i = 0; i < 50; ++i) {
+        std::vector<Candidate> v = {cand(100 + 4.f * i, 202, 40)};
+        if (i % 5) v.push_back(cand(200, 200, 30));
+        const auto& out = t.update(v);
+        const Track* tr = nullptr;
+        for (const auto& o : out)
+            if (std::fabs(o.x - (100 + 4.f * i)) < 6) tr = &o;
+        if (i >= 6) {
+            if (!tr) kept = false;
+            else if (!id) id = tr->id;
+            else if (tr->id != id) kept = false;
+        }
+    }
+    CHECK(kept && id, "летящая цель потерялась у статичной помехи");
+    t.staticCells(cells);
+    CHECK(cells.size() <= 3, "след летящей цели попал в память: %zu ячеек", cells.size());
+    const std::string path = "test_static_map.bin";
+    CHECK(t.saveStatic(path), "не сохранилась память");
+    Tracker t2(640, 480, tc);
+    CHECK(t2.loadStatic(path), "не загрузилась память");
+    t2.update({cand(200, 200, 30)});
+    CHECK(t2.clutterDets().size() == 1, "после загрузки статичная точка не помеха");
+    Tracker t3(320, 240, tc);
+    CHECK(!t3.loadStatic(path), "память загрузилась для другого размера кадра");
+    std::remove(path.c_str());
+    std::printf("static map: ok\n");
+}
+
 int main() {
     const Kernels* ref = kernels_scalar();
     for (Isa isa : available_isas()) {
@@ -185,6 +239,7 @@ int main() {
     }
     test_detector();
     test_scales_focus();
+    test_static_map();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

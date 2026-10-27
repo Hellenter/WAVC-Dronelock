@@ -88,6 +88,10 @@ struct Result {
     double motionMs = 0;
     int scales = 1;
     std::vector<dronolok::FocusArea> focus;      // где детектор искал с пониженным порогом
+    // долгая память статичных помех (обновляется раз в 15 кадров)
+    bool staticOn = false;
+    std::vector<dronolok::TrackPoint> staticCells;
+    int staticCellPx = 8;
 };
 
 // Одна строка журнала метрик (на каждый обработанный кадр)
@@ -116,6 +120,7 @@ struct Metrics {
     bool haveGt = false;
     double elapsedS = 0;
     double lockPct = 0;   // доля кадров (из последних 300) с захватом
+    std::string staticMsg;
 };
 
 class Pipeline {
@@ -135,6 +140,11 @@ public:
     bool paused() const { return paused_; }
     void step();                         // один кадр на паузе
     void relearnMask();
+    // Память статичных помех лежит рядом с видео (<видео>.static.bin): загружается при
+    // открытии и сохраняется при закрытии, если включена
+    std::string staticPath() const { return path_ + ".static.bin"; }
+    void staticSave() { staticCmd_ = 1; }
+    void staticClear() { staticCmd_ = 2; }
     void resetStats();
 
     std::shared_ptr<const Result> latest() const;
@@ -169,6 +179,8 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<int> steps_{0};
     std::atomic<bool> relearn_{true};
+    std::atomic<int> staticCmd_{0};
+    std::string staticMsg_;
 
     // очередь кадров
     mutable std::mutex qm_;

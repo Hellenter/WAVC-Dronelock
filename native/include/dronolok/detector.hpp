@@ -145,6 +145,13 @@ struct TrackerConfig {
     int clutter_cell = 8;       // ячейка карты статичного клаттера
     float clutter_decay = 0.97f;
     float clutter_level = 0.35f;
+    // Долгая память статичных помех (катушки и изоляторы ЛЭП, фонари, антенны) для
+    // неподвижной камеры. Ячейка копит отклики, которые так никуда и не полетели: трек,
+    // умерший на месте, или помеха карты клаттера. Набрала static_hits (с забыванием за
+    // ~static_frames кадров) — там больше не рождаются цели. Летящая цель, проходящая
+    // мимо такой точки, не теряется. static_frames = 0 — выключено.
+    int static_frames = 3000;
+    float static_hits = 8.f;
     // классификатор по движению
     int cls_window = 16;        // сколько последних попаданий смотреть
     int cls_min_hits = 8;       // меньше — класс Unknown
@@ -184,6 +191,8 @@ struct Track {
     float p00 = 0, p01 = 0, p11 = 0;   // ковариация Калмана (одинакова для x и y)
     float bx = 0, by = 0;    // точка рождения в координатах сцены
     int level = 0;
+    bool everMover = false;
+    std::vector<uint32_t> pend;   // ячейки, где был, пока не полетел: в память, если так и не полетит
 };
 
 class Tracker {
@@ -202,11 +211,21 @@ public:
     // кандидаты, не попавшие ни в клаттер, ни в подтверждённый трек
     const std::vector<Candidate>& noiseDets() const { return noiseDets_; }
     void resetTracks();
+    // Память статичных помех: сохранить/загрузить (файл привязан к размеру кадра), забыть,
+    // и центры запомненных ячеек — для отображения
+    bool saveStatic(const std::string& path) const;
+    bool loadStatic(const std::string& path);
+    void clearStatic();
+    void staticCells(std::vector<TrackPoint>& out) const;
+    int staticCellPx() const { return cfg_.clutter_cell; }
     TrackerConfig& config() { return cfg_; }
     int frame() const { return frame_; }
 
 private:
     bool hot(float x, float y) const;
+    float staticAt(size_t i) const;
+    void staticAdd(size_t i);
+    bool staticHot(float x, float y) const;
     void classify(Track& t) const;
     void shiftHeat(float dx, float dy);
     float measVar(int level) const;
@@ -216,6 +235,8 @@ private:
     int gw_, gh_;
     std::vector<float> heat_, heatTmp_;
     float heatAccX_ = 0, heatAccY_ = 0;
+    std::vector<float> stat_;   // память статичных помех: значение на кадр statT_
+    std::vector<int> statT_;    // (затухание считается лениво, при обращении)
     float gx_ = 0, gy_ = 0;   // накопленный сдвиг камеры
     std::vector<Track> tracks_, out_;
     std::vector<Candidate> clutterDets_, noiseDets_;

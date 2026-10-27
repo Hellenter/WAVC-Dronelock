@@ -91,6 +91,12 @@ DL_API int dl_tracker_focus(dl_tracker* t, float* xyr, int cap);
 DL_API void dl_detector_set_focus(dl_detector* d, const float* xyr, int n);
 DL_API int dl_tracker_clutter(dl_tracker* t, dl_candidate* out, int cap);
 DL_API void dl_tracker_reset(dl_tracker* t);
+/* Долгая память статичных помех (неподвижная камера): frames = 0 выключает,
+   hits — сколько неподвижных откликов делают место помехой. Файл привязан к размеру кадра. */
+DL_API void dl_tracker_set_static(dl_tracker* t, int frames, float hits);
+DL_API int dl_tracker_static_save(dl_tracker* t, const char* path);
+DL_API int dl_tracker_static_load(dl_tracker* t, const char* path);
+DL_API void dl_tracker_static_clear(dl_tracker* t);
 
 #ifdef __cplusplus
 }

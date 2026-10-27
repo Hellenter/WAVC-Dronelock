@@ -307,6 +307,13 @@ void Pipeline::processLoop() {
         threads_ = det.threads();
     }
     std::vector<Candidate> cands;
+    std::vector<TrackPoint> statCells;
+    // при закрытии и пересоздании трекера память помех сохраняется рядом с видео
+    auto saveStatic = [&] {
+        if (!trk || trk->config().static_frames <= 0) return;
+        trk->staticCells(statCells);
+        if (!statCells.empty()) trk->saveStatic(staticPath());
+    };
     int seq = 0;
     while (!stop_) {
         Packet p;
@@ -342,10 +349,30 @@ void Pipeline::processLoop() {
             threads_ = det.threads();
         }
         if (!trk || trkW != f.w || trkH != f.h || trkCell != s.trk.clutter_cell) {
+            saveStatic();
             trk.reset(new Tracker(f.w, f.h, s.trk));
             trkW = f.w;
             trkH = f.h;
             trkCell = s.trk.clutter_cell;
+            if (trk->loadStatic(staticPath())) {
+                trk->staticCells(statCells);
+                std::lock_guard<std::mutex> lr(rm_);
+                staticMsg_ = "память помех загружена: " + std::to_string(statCells.size()) + " ячеек";
+            }
+        }
+        // память помех — в координатах кадра, при движущейся камере не ведётся
+        trk->config().static_frames = ef.motion ? 0 : s.trk.static_frames;
+        if (const int cmd = staticCmd_.exchange(0)) {
+            if (cmd == 2) {
+                trk->clearStatic();
+                std::remove(staticPath().c_str());
+            }
+            trk->staticCells(statCells);
+            const bool ok = cmd == 2 || trk->saveStatic(staticPath());
+            std::lock_guard<std::mutex> lr(rm_);
+            staticMsg_ = cmd == 2 ? "память помех очищена"
+                         : ok     ? "сохранено " + std::to_string(statCells.size()) + " ячеек: " + staticPath()
+                                  : "не удалось сохранить " + staticPath();
         }
         if (p.loopStart) {   // склейка зацикленного видео — треки не должны "прыгать"
             trk->resetTracks();
@@ -419,6 +446,10 @@ void Pipeline::processLoop() {
         r->motionMs = ef.motion ? tm - t0 : 0;
         r->scales = ef.scales;
         r->focus = focus;
+        r->staticOn = trk->config().static_frames > 0;
+        if (r->staticOn && seq % 15 == 0) trk->staticCells(statCells);
+        if (r->staticOn) r->staticCells = statCells;
+        r->staticCellPx = trk->staticCellPx();
         const bool gtFrame = haveGt_ && f.index < (int64_t)gt_.frames.size();
         if (gtFrame) {
             r->gt = gt_.frames[f.index];
@@ -462,6 +493,7 @@ void Pipeline::processLoop() {
             hist_.pop_front();
         }
     }
+    saveStatic();
 }
 
 std::shared_ptr<const Result> Pipeline::latest() const {
@@ -511,6 +543,7 @@ Metrics Pipeline::metrics(int histLen) const {
     m.backend = backend_;
     m.threads = threads_;
     m.status = status_;
+    m.staticMsg = staticMsg_;
     m.eval = eval_;
     m.haveGt = haveGt_;
     m.sourceFps = info_.fps;

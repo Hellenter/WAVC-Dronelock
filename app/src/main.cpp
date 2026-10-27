@@ -33,6 +33,7 @@ const ImU32 COL_NOISE = IM_COL32(210, 210, 210, 150);
 const ImU32 COL_GT = IM_COL32(0, 255, 120, 220);
 const ImU32 COL_LOCK = IM_COL32(255, 60, 230, 255);
 const ImU32 COL_FOCUS = IM_COL32(90, 170, 255, 110);
+const ImU32 COL_STATIC = IM_COL32(190, 190, 190, 230);   // как помеха, но крестиком
 
 ImU32 class_color(const Track& t) {
     if (t.clutter) return COL_CLUTTER;
@@ -642,6 +643,28 @@ void panel_controls(App& a) {
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderFloat("смена захвата, раз", &t.lock_switch, 1, 5, "%.1f");
         help_marker("Захват переходит на другую цель, только если она весомее текущей во столько раз.");
+        bool stOn = t.static_frames > 0;
+        if (ImGui::Checkbox("память статичных помех", &stOn)) {
+            t.static_frames = stOn ? 3000 : 0;
+            changed = true;
+        }
+        help_marker("Для неподвижной камеры. Места, где цели раз за разом появляются и никуда не летят (катушки и "
+                    "изоляторы ЛЭП, фонари, антенны), запоминаются, и там больше не рождаются цели. Дрон, пролетающий "
+                    "мимо такого места, не теряется. Память лежит рядом с видео (.static.bin): загружается при "
+                    "открытии, сохраняется при закрытии. При учёте движения камеры не ведётся.");
+        if (stOn) {
+            ImGui::SetNextItemWidth(w);
+            changed |= ImGui::SliderFloat("запомнить после, откликов", &t.static_hits, 3, 40, "%.0f");
+            help_marker("Сколько неподвижных откликов в одном месте делают его помехой. Меньше — быстрее учится, "
+                        "но зависший на одном месте дрон тоже может стать \"помехой\" (если его трек много раз "
+                        "терялся, а дрон так и не сдвинулся).");
+            ImGui::SetNextItemWidth(w);
+            changed |= ImGui::SliderInt("забывать за, кадров", &t.static_frames, 300, 30000, "%d",
+                                        ImGuiSliderFlags_Logarithmic);
+            if (ImGui::SmallButton("сохранить память")) a.pipe.staticSave();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("забыть всё")) a.pipe.staticClear();
+        }
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderInt("подтверждение, кадров", &t.confirm, 1, t.window);
         ImGui::SetNextItemWidth(w);
@@ -780,6 +803,11 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
             ImGui::TextDisabled("движение камеры не учитывается");
         }
         ImGui::TextDisabled("масштабов %d", r->scales);
+        if (r->staticOn) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImColor(COL_STATIC).Value, "запомнено помех: %d", (int)r->staticCells.size());
+        }
+        if (!m.staticMsg.empty()) ImGui::TextDisabled("%s", m.staticMsg.c_str());
     }
     if (m.haveGt) {
         ImGui::SeparatorText("Качество по разметке");
@@ -887,6 +915,13 @@ void draw_view(App& a, const Result* r) {
         }
     if (a.showFocus)
         for (const auto& fa : r->focus) dl->AddCircle(P(fa.x, fa.y), fa.r * sc, COL_FOCUS, 0, 1.f);
+    if (a.showClutter && r->staticOn)   // запомненные статичные помехи — косые крестики
+        for (const auto& c : r->staticCells) {
+            const ImVec2 q = P(c.x, c.y);
+            const float h = std::max(3.f, 0.5f * r->staticCellPx * sc);
+            dl->AddLine(ImVec2(q.x - h, q.y - h), ImVec2(q.x + h, q.y + h), COL_STATIC, 1.f);
+            dl->AddLine(ImVec2(q.x - h, q.y + h), ImVec2(q.x + h, q.y - h), COL_STATIC, 1.f);
+        }
     if (a.showGt)
         for (const auto& g : r->gt) {
             const ImVec2 q = P(g.x * r->gsx, g.y * r->gsy);
@@ -966,7 +1001,7 @@ void draw_view(App& a, const Result* r) {
     dl->AddText(ImVec2(p0.x + 9, p0.y + 8), IM_COL32(120, 255, 140, 255), st);
     struct L { ImU32 c; const char* t; } legend[] = {{COL_LOCK, "захват (пунктир — по прогнозу)"}, {COL_DRONE, "дрон"},
                                                      {COL_BIRD, "птица"}, {COL_UNKNOWN, "цель, класс неясен"},
-                                                     {COL_CLUTTER, "статичная помеха"}, {COL_NOISE, "шум (одиночные отклики)"},
+                                                     {COL_CLUTTER, "статичная помеха (крестик — запомнена)"}, {COL_NOISE, "шум (одиночные отклики)"},
                                                      {COL_GT, "разметка: круг дрон, ромб птица"}};
     float ly = p0.y + avail.y - 8;
     for (int i = 6; i >= 0; --i) {
@@ -1012,6 +1047,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--scales") s.scales = atoi(val().c_str());
         else if (a == "--motion") s.motion = atoi(val().c_str());
         else if (a == "--focus") s.focus = true;
+        else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--json") json = val();
         else if (a == "--csv") csv = val();
         else video = a;

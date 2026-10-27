@@ -42,6 +42,7 @@ static void usage() {
         "  --scales 1..4           доп. масштабы для крупных целей\n"
         "  --focus                 пониженный порог возле прогноза треков\n"
         "  --motion                компенсация движения камеры\n"
+        "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
         "  --stream                не загружать заранее (замер вместе с чтением)\n"
@@ -115,6 +116,8 @@ int main(int argc, char** argv) {
         else if (a == "--q") tcfg.q_accel = (float)std::atof(val().c_str());
         else if (a == "--gate-sigma") tcfg.gate_sigma = (float)std::atof(val().c_str());
         else if (a == "--motion") motion = true;
+        else if (a == "--static") tcfg.static_frames = std::atoi(val().c_str());
+        else if (a == "--static-hits") tcfg.static_hits = (float)std::atof(val().c_str());
         else if (a == "--gt") gtPath = val();
         else if (a == "--stream") stream = true;
         else if (a == "--sweep") sweep = true;
@@ -124,6 +127,7 @@ int main(int argc, char** argv) {
         else if (a[0] == '-' && a != "-") { std::printf("неизвестный параметр %s\n", a.c_str()); return 1; }
         else input = a;
     }
+    if (motion) tcfg.static_frames = 0;   // память привязана к кадру неподвижной камеры
     FrameReader rd;
     if (!rd.open(input, rawW, rawH, yuv420)) {
         std::printf("не удалось открыть %s\n", input.c_str());

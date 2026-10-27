@@ -7,12 +7,17 @@
 // при одном-двух пропущенных кадрах; цель, которая уже пролетела по сцене, не
 // записывается в помехи, даже если зависла; карта клаттера едет вместе с камерой.
 //
+// Помехи помнятся двояко: карта клаттера — на секунды (блик, рябь), долгая память
+// статичных помех — на минуты (катушки ЛЭП, фонари) и сохраняется в файл, чтобы
+// неподвижная камера после перезапуска не училась заново.
+//
 // Классификатор: по последним cls_window попаданиям трека строится плавная
 // траектория (квадратичная по времени). Дрон летит плавно и отклоняется от неё
 // на 1-2 пикселя (квантование пулинга), ласточка дёргается и разворачивается,
 // а взмахи крыльев меняют её контраст. Пороги — в TrackerConfig.
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include "dronolok/detector.hpp"
 
@@ -32,6 +37,8 @@ Tracker::Tracker(int w, int h, const TrackerConfig& cfg) : cfg_(cfg) {
     gw_ = w / cfg_.clutter_cell + 1;
     gh_ = h / cfg_.clutter_cell + 1;
     heat_.assign((size_t)gw_ * gh_, 0.f);
+    stat_.assign(heat_.size(), 0.f);
+    statT_.assign(heat_.size(), 0);
 }
 
 void Tracker::resetTracks() {
@@ -44,6 +51,68 @@ bool Tracker::hot(float x, float y) const {
     const int cx = std::min(gw_ - 1, std::max(0, (int)x / cfg_.clutter_cell));
     const int cy = std::min(gh_ - 1, std::max(0, (int)y / cfg_.clutter_cell));
     return heat_[(size_t)cy * gw_ + cx] > cfg_.clutter_level;
+}
+
+// ---------------------------------------------------------------- память статичных помех
+
+// значение — число "неподвижных" откликов в ячейке, затухает с постоянной static_frames
+float Tracker::staticAt(size_t i) const {
+    if (cfg_.static_frames <= 0 || stat_[i] <= 0) return 0.f;
+    return stat_[i] * std::pow(1.f - 1.f / (float)cfg_.static_frames, (float)(frame_ - statT_[i]));
+}
+
+void Tracker::staticAdd(size_t i) {
+    stat_[i] = staticAt(i) + 1.f;
+    statT_[i] = frame_;
+}
+
+// Ячейка и соседи: провод качается на ветру, катушка дрожит в пределах пары пикселей
+bool Tracker::staticHot(float x, float y) const {
+    if (cfg_.static_frames <= 0) return false;
+    const int cx = std::min(gw_ - 1, std::max(0, (int)x / cfg_.clutter_cell));
+    const int cy = std::min(gh_ - 1, std::max(0, (int)y / cfg_.clutter_cell));
+    for (int yy = std::max(0, cy - 1); yy <= std::min(gh_ - 1, cy + 1); ++yy)
+        for (int xx = std::max(0, cx - 1); xx <= std::min(gw_ - 1, cx + 1); ++xx)
+            if (staticAt((size_t)yy * gw_ + xx) > cfg_.static_hits) return true;
+    return false;
+}
+
+void Tracker::clearStatic() {
+    std::fill(stat_.begin(), stat_.end(), 0.f);
+    std::fill(statT_.begin(), statT_.end(), 0);
+}
+
+void Tracker::staticCells(std::vector<TrackPoint>& out) const {
+    out.clear();
+    const float c = (float)cfg_.clutter_cell;
+    for (int y = 0; y < gh_; ++y)
+        for (int x = 0; x < gw_; ++x)
+            if (staticAt((size_t)y * gw_ + x) > cfg_.static_hits) out.push_back({(x + 0.5f) * c, (y + 0.5f) * c});
+}
+
+// Файл: "DLSM", версия, ширина и высота сетки, ячейка, затем значения по ячейкам
+bool Tracker::saveStatic(const std::string& path) const {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const int32_t hdr[5] = {0x4D534C44, 2, gw_, gh_, cfg_.clutter_cell};
+    std::vector<float> v(stat_.size());
+    for (size_t i = 0; i < v.size(); ++i) v[i] = staticAt(i);
+    const bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(v.data(), sizeof(float), v.size(), f) == v.size();
+    return fclose(f) == 0 && ok;
+}
+
+bool Tracker::loadStatic(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    int32_t hdr[5];
+    std::vector<float> v(stat_.size());
+    const bool ok = fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == 0x4D534C44 && hdr[1] == 2 && hdr[2] == gw_ &&
+                    hdr[3] == gh_ && hdr[4] == cfg_.clutter_cell && fread(v.data(), sizeof(float), v.size(), f) == v.size();
+    fclose(f);
+    if (!ok) return false;
+    stat_ = std::move(v);
+    std::fill(statT_.begin(), statT_.end(), frame_);
+    return true;
 }
 
 // МНК-парабола p(t) = a + b t + c t^2; возвращает сумму квадратов остатков, b — скорость в середине окна
@@ -236,12 +305,16 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         isMover[di] = owner[di] >= 0 && mover(tracks_[owner[di]]);
         if (!isMover[di] && !shadow[di] && !dets[di].weak) heat_[cellOf(dets[di])] += 1.f - decay;
     }
+    // долгая память учится только при неподвижной камере: координаты ячеек — кадра
+    const bool learn = cfg_.static_frames > 0 && std::fabs(camDx) < 0.5f && std::fabs(camDy) < 0.5f;
     clutterDets_.clear();
     std::vector<char> clut(dets.size(), 0);
     for (size_t di = 0; di < dets.size(); ++di) {
-        if (isMover[di] || heat_[cellOf(dets[di])] <= cfg_.clutter_level) continue;
+        if (isMover[di] || (heat_[cellOf(dets[di])] <= cfg_.clutter_level && !staticHot(dets[di].x, dets[di].y)))
+            continue;
         clut[di] = 1;
         clutterDets_.push_back(dets[di]);
+        if (learn && !shadow[di] && !dets[di].weak) staticAdd(cellOf(dets[di]));
         if (owner[di] >= 0) {
             match[owner[di]] = -1;
             owner[di] = -1;
@@ -283,7 +356,23 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         tr.travel = std::max(tr.travel, std::hypot(sx - tr.bx, sy - tr.by));
         tr.obs.push_back({frame_, sx, sy, d.contrast, d.level});
         while ((int)tr.obs.size() > cfg_.cls_window) tr.obs.pop_front();
+        // полетел — его отклики не помеха; стоит долго — уже ясно, что помеха
+        if (mover(tr)) {
+            tr.everMover = true;
+            tr.pend.clear();
+        } else if (learn && !tr.everMover) {
+            tr.pend.push_back((uint32_t)cellOf(d));
+            if (tr.pend.size() >= 256 && tr.id != lockId_) {
+                for (uint32_t c : tr.pend) staticAdd(c);
+                tr.pend.clear();
+            }
+        }
     }
+    // трек умер, так и не полетев: его отклики — в долгую память
+    if (cfg_.static_frames > 0)
+        for (const Track& t : tracks_)
+            if (t.miss > (t.confirmed ? coastLimit(t) : cfg_.tentative_miss) && !t.everMover && t.id != lockId_)
+                for (uint32_t c : t.pend) staticAdd(c);
     tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
                                  [&](const Track& t) {
                                      return t.miss > (t.confirmed ? coastLimit(t) : cfg_.tentative_miss);
@@ -316,6 +405,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         t.hist.push_back(true);
         t.path.push_back({t.x, t.y});
         t.obs.push_back({frame_, t.bx, t.by, t.contrast, d.level});
+        if (learn) t.pend.push_back((uint32_t)cellOf(d));
         tracks_.push_back(std::move(t));
     }
     out_.clear();
@@ -327,7 +417,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         // чтобы цель держалась на прогнозе, а не исчезала
         if (tr.miss == 0) tr.solid = nh >= cfg_.confirm;
         if (tr.solid) tr.confirmed = true;
-        tr.clutter = tr.miss == 0 && !mover(tr) && hot(tr.x, tr.y);
+        tr.clutter = tr.miss == 0 && !mover(tr) && (hot(tr.x, tr.y) || staticHot(tr.x, tr.y));
         tr.vx = tr.vsx + camDx;
         tr.vy = tr.vsy + camDy;
         tr.sigma = std::sqrt(std::max(0.f, tr.p00));

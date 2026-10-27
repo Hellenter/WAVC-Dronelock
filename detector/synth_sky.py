@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--h", type=int, default=3456)
     ap.add_argument("--fps", type=int, default=25)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--insulators", type=int, default=0,
+                    help="статичные ложные цели на проводах (катушки ЛЭП), мерцают")
     a = ap.parse_args()
     W, H, N = a.w, a.h, a.frames
     rng = np.random.default_rng(a.seed)
@@ -62,6 +64,15 @@ def main():
     for y0, sag in [(0.70, 0.04), (0.74, 0.05)]:
         xs = np.arange(W)
         wires.append(H * y0 + H * sag * ((xs / W - 0.5) * 2) ** 2)
+
+    # катушки на проводах: свой генератор, чтобы остальное видео не менялось
+    irng = np.random.default_rng(a.seed + 100)
+    insul = []
+    for i in range(a.insulators):
+        x = int(irng.uniform(0.05, 0.95) * W)
+        wy = wires[i % len(wires)]
+        insul.append(dict(x=x, y=int(wy[x]) + 1, k=blob(irng.uniform(2.0, 3.5), irng),
+                          c=irng.uniform(25, 45)))
 
     # --- цели ---
     objs = []
@@ -98,6 +109,11 @@ def main():
         gaps = (leaves > 0.9).astype(np.float32) * (Y > top[None, :] + 15)
         img = img * (1 - tree) + tree * (55 + 20 * leaves)
         img = img * (1 - gaps) + gaps * 170
+        for o in insul:   # отблеск: видна в ~3/4 кадров, контраст гуляет
+            if irng.random() < 0.75:
+                k = o["k"]
+                s = k.shape[0] // 2
+                img[o["y"] - s:o["y"] + s + 1, o["x"] - s:o["x"] + s + 1] -= o["c"] * irng.uniform(0.7, 1.0) * k / k.max()
         rec = []
         for o in objs:
             if o["kind"] == "bird":

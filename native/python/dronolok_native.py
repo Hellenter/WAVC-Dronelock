@@ -74,6 +74,10 @@ def _load():
     lib.dl_tracker_update.argtypes = [C.c_void_p, C.POINTER(_Cand), C.c_int, C.POINTER(_Track), C.c_int]
     lib.dl_tracker_clutter.argtypes = [C.c_void_p, C.POINTER(_Cand), C.c_int]
     lib.dl_tracker_reset.argtypes = [C.c_void_p]
+    lib.dl_tracker_set_static.argtypes = [C.c_void_p, C.c_int, C.c_float]
+    lib.dl_tracker_static_save.argtypes = [C.c_void_p, C.c_char_p]
+    lib.dl_tracker_static_load.argtypes = [C.c_void_p, C.c_char_p]
+    lib.dl_tracker_static_clear.argtypes = [C.c_void_p]
     lib.dl_config_default.argtypes = [C.POINTER(_Config)]
     lib.dl_motion_create.restype = C.c_void_p
     lib.dl_motion_destroy.argtypes = [C.c_void_p]
@@ -173,6 +177,19 @@ class NativeTracker:
 
     def reset_tracks(self):
         lib().dl_tracker_reset(self._h)
+
+    def set_static(self, frames=3000, hits=8.0):
+        """Долгая память статичных помех (неподвижная камера); frames=0 — выключить."""
+        lib().dl_tracker_set_static(self._h, frames, hits)
+
+    def save_static(self, path):
+        return bool(lib().dl_tracker_static_save(self._h, os.fsencode(path)))
+
+    def load_static(self, path):
+        return bool(lib().dl_tracker_static_load(self._h, os.fsencode(path)))
+
+    def clear_static(self):
+        lib().dl_tracker_static_clear(self._h)
 
     def set_motion(self, dx, dy):
         """сдвиг картинки к следующему кадру (камера движется)"""

@@ -130,6 +130,14 @@ int dl_tracker_clutter(dl_tracker* t, dl_candidate* out, int cap) {
     return (int)c.size();
 }
 
+void dl_tracker_set_static(dl_tracker* t, int frames, float hits) {
+    t->trk.config().static_frames = frames;
+    t->trk.config().static_hits = hits;
+}
+int dl_tracker_static_save(dl_tracker* t, const char* path) { return t->trk.saveStatic(path) ? 1 : 0; }
+int dl_tracker_static_load(dl_tracker* t, const char* path) { return t->trk.loadStatic(path) ? 1 : 0; }
+void dl_tracker_static_clear(dl_tracker* t) { t->trk.clearStatic(); }
+
 void dl_tracker_set_motion(dl_tracker* t, float dx, float dy) {
     t->dx = dx;
     t->dy = dy;
