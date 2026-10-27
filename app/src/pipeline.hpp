@@ -64,6 +64,11 @@ struct Settings {
     // В замерах выключено: зацикленный ролик повторяет те же позиции целей, и память,
     // накопленная прошлыми запусками, искажала бы результат
     bool staticFile = true;
+    // эмуляция устройства: обработка кадра растягивается в slowdown раз (ядро устройства
+    // медленнее ядра ПК во столько раз, см. calibrate_ms_per_mp)
+    double slowdown = 1.0;
+    // авто-упрощение: держать обработку в темпе камеры (dronolok::LoadGovernor)
+    bool governor = false;
 };
 
 // Что реально включено для кадра w x h. Авто: кадр до ~2 Мп (Full HD и меньше) —
@@ -101,6 +106,8 @@ struct Result {
     std::vector<dronolok::TrackPoint> staticCells;
     int staticCellPx = 8;
     std::vector<uint8_t> zones;   // по тайлам (tilesX x tilesY): 0 земля, 1 смешанная, 2 небо
+    int govLevel = -1;            // ступень авто-упрощения, -1 — выключено
+    int fullEvery = 1, coarseEvery = 1;   // что сейчас стоит в детекторе (с учётом упрощения)
 };
 
 // Одна строка журнала метрик (на каждый обработанный кадр)
@@ -111,6 +118,7 @@ struct FrameRec {
     int cands, drones, birds, unknown, clutter, noise;
     int lockId;
     float camDx, camDy;
+    int govLevel;
 };
 
 // Отметки на шкале видео, по номеру кадра (биты)

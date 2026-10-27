@@ -5,7 +5,8 @@
 //
 //   dronolok_app [видео]
 //   dronolok_app --bench видео [--frames N] [--threads N] [--isa avx2] [--scales 0..4] [--motion 0|1]
-//                [--focus] [--json out.json]
+//                [--focus] [--camera] [--slowdown K] [--governor] [--profile 0..3] [--json out.json]
+//   dronolok_app --stress видео [--seconds 30] [--seed N]
 #include <SDL.h>
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
+#include "dronolok/tuning.hpp"
 #include "pipeline.hpp"
 #include "platform.hpp"
 
@@ -82,9 +84,32 @@ const ResOpt RES_OPTS[] = {
     {"Full HD (1920x1080)", 0, 1920, 1080},
 };
 
+// Устройства для имитации. мс/Мп — эталонный замер calibrate_ms_per_mp (1 поток, 128 бит).
+// Для Raspberry Pi — оценки по типовой скорости ядер относительно x86 (Xeon 2.8 ГГц даёт ~0.6):
+// A76 2.4 ГГц ~2.5x медленнее, A72 1.8 ГГц ~6x, A53 1.2 ГГц (в порядке очереди, слабая память) ~15x.
+// Точное число даёт dronolok_bench --calibrate на самом устройстве.
+struct DevicePreset {
+    const char* name;
+    float msPerMp;   // 0 — этот ПК без ограничений
+    int cores;
+    int profile;     // рекомендуемый профиль алгоритма (Profile), -1 — не менять
+};
+const DevicePreset DEVICES[] = {
+    {"Этот ПК (без ограничений)", 0, 0, -1},
+    {"Raspberry Pi 5 (4 ядра A76, 2.4 ГГц)", 1.5f, 4, (int)Profile::Balanced},
+    {"Raspberry Pi 4 (4 ядра A72, 1.8 ГГц)", 3.5f, 4, (int)Profile::Economy},
+    {"Raspberry Pi 3 (4 ядра A53, 1.2 ГГц)", 9.f, 4, (int)Profile::Minimal},
+    {"Своё устройство (4 ядра)", 3.f, 4, -1},
+};
+const int N_DEVICES = (int)(sizeof(DEVICES) / sizeof(DEVICES[0]));
+
 struct App {
     Pipeline pipe;
     Settings s;
+    // устройство и профиль
+    int devIdx = 0, profIdx = 1;
+    float devMs[N_DEVICES] = {};
+    double pcMs = 0.6;     // калибровка этого ПК, мс/Мп
     std::string err, note;
     // ресурсы
     std::vector<char> cpuOn;
@@ -129,6 +154,47 @@ void apply_resources(App& a) {
     // маска процесса действует на все уже запущенные потоки; при закреплении за ядрами
     // новый список cpus пересоздаёт пул детектора
     a.s.det.cpus = a.pinWorkers ? cpus : std::vector<int>();
+}
+
+void set_resolution(App& a);
+
+void apply_profile(App& a, int p) {
+    const AlgoBlocks b = profile_blocks((Profile)p);
+    TrackerConfig t = a.s.trk;
+    apply_blocks(b, a.s.det, t);
+    a.s.trk.static_frames = t.static_frames;
+    a.s.scales = b.scales;   // 0 — авто по размеру кадра
+    a.s.motion = b.motion ? -1 : 0;
+    a.s.zones = b.zones ? -1 : 0;
+    a.s.learnMaskFrames = b.skyMask ? 25 : 0;
+    a.resIdx = b.resolution >= 0.99f ? 0 : b.resolution >= 0.74f ? 1 : b.resolution >= 0.49f ? 2 : 3;
+    set_resolution(a);
+    a.profIdx = p;
+}
+
+void apply_device(App& a, int i) {
+    const DevicePreset& d = DEVICES[i];
+    a.devIdx = i;
+    if (d.msPerMp <= 0) {   // весь ПК
+        a.s.det.threads = 0;
+        a.s.det.isa = Isa::Auto;
+        std::fill(a.cpuOn.begin(), a.cpuOn.end(), 1);
+        a.pinWorkers = false;
+        a.s.slowdown = 1;
+    } else {
+        // 128-битные векторы, как NEON у Raspberry Pi
+        a.s.det.isa = Isa::Scalar;
+        for (Isa x : available_isas())
+            if (x == Isa::SSE2 || x == Isa::NEON) a.s.det.isa = x;
+        const int n = std::min<int>(d.cores, (int)a.cpuOn.size());
+        a.s.det.threads = n;
+        for (size_t k = 0; k < a.cpuOn.size(); ++k) a.cpuOn[k] = (int)k < n;
+        a.pinWorkers = true;
+        a.s.slowdown = std::max(1.0, a.devMs[i] / std::max(1e-3, a.pcMs));
+    }
+    a.s.emulateMs = 0;
+    apply_resources(a);
+    if (d.profile >= 0) apply_profile(a, d.profile);
 }
 
 void set_resolution(App& a) {
@@ -468,6 +534,34 @@ void panel_controls(App& a) {
         }
     }
     if (ImGui::CollapsingHeader("Ресурсы (имитация железа)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // устройство: ядра, ширина векторов и скорость ядра (по калибровке)
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.62f);
+        if (ImGui::BeginCombo("устройство", DEVICES[a.devIdx].name)) {
+            for (int i = 0; i < N_DEVICES; ++i)
+                if (ImGui::Selectable(DEVICES[i].name, a.devIdx == i)) {
+                    apply_device(a, i);
+                    changed = true;
+                }
+            ImGui::EndCombo();
+        }
+        help_marker("Имитация устройства на этом ПК: столько же ядер, векторы 128 бит (как NEON), а обработка "
+                    "каждого кадра растягивается во столько раз, во сколько ядро устройства медленнее ядра ПК. "
+                    "Скорость ПК меряется при запуске приложения. Скорость устройства — оценка; точнее: "
+                    "запустите на нём dronolok_bench --calibrate и введите число в поле ниже. Вместе с "
+                    "устройством ставится подходящий профиль алгоритма (его можно поменять).");
+        if (a.devIdx > 0) {
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.3f);
+            if (ImGui::InputFloat("мс/Мп на устройстве", &a.devMs[a.devIdx], 0, 0, "%.2f")) {
+                a.devMs[a.devIdx] = std::max(0.01f, a.devMs[a.devIdx]);
+                a.s.slowdown = std::max(1.0, a.devMs[a.devIdx] / std::max(1e-3, a.pcMs));
+                changed = true;
+            }
+            ImGui::TextDisabled("этот ПК: %.2f мс/Мп, устройство медленнее в %.1f раза", a.pcMs, a.s.slowdown);
+            if (a.devMs[a.devIdx] < a.pcMs)
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "ядро ПК медленнее устройства: точная имитация невозможна");
+        } else {
+            ImGui::TextDisabled("этот ПК: %.2f мс/Мп (1 поток, 128 бит)", a.pcMs);
+        }
         const int hw = plat::logical_cpus();
         int th = a.s.det.threads > 0 ? a.s.det.threads : hw;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
@@ -561,29 +655,110 @@ void panel_controls(App& a) {
         help_marker("Имитация медленного устройства: обработка кадра занимает не меньше заданного времени. "
                     "Подставьте время, которое dronolok_bench показал на Raspberry Pi, и посмотрите, сколько "
                     "кадров будет теряться в режиме \"как камера\".");
-        if (ImGui::SmallButton("Пресет: весь ПК")) {
-            a.s.det.threads = 0;
-            a.s.det.isa = Isa::Auto;
-            std::fill(a.cpuOn.begin(), a.cpuOn.end(), 1);
-            a.s.emulateMs = 0;
-            a.cpuCap = 100;
-            plat::set_cpu_cap(100);
-            apply_resources(a);
-            changed = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Пресет: 4 ядра + 128-бит SIMD")) {
-            a.s.det.threads = 4;
-            a.s.det.isa = Isa::SSE2;
-            for (size_t i = 0; i < a.cpuOn.size(); ++i) a.cpuOn[i] = i < 4;
-            a.pinWorkers = true;
-            apply_resources(a);
-            changed = true;
-        }
-        help_marker("Число ядер и ширина векторов как у Raspberry Pi. Сами ядра ПК быстрее, поэтому для точной "
-                    "имитации добавьте \"мин. мс на кадр\" по замеру на устройстве.");
     }
-    if (ImGui::CollapsingHeader("Алгоритм")) {
+    if (ImGui::CollapsingHeader("Блоки алгоритма (под железо)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        DetectorConfig& d = a.s.det;
+        TrackerConfig& t = a.s.trk;
+        const float w = ImGui::GetContentRegionAvail().x * 0.4f;
+        bool blk = false;   // блок поменяли вручную — профиль "свой"
+        static const char* profs[] = {"Полный", "Сбалансированный", "Экономный", "Минимальный", "Свой"};
+        int pi = a.profIdx >= 0 ? a.profIdx : 4;
+        ImGui::SetNextItemWidth(w);
+        if (ImGui::Combo("профиль", &pi, profs, 5) && pi < 4) {
+            apply_profile(a, pi);
+            changed = true;
+        }
+        help_marker("Готовые наборы блоков от \"всё включено\" до минимума для слабого устройства. Полный — каждый "
+                    "кадр целиком, 3 масштаба. Сбалансированный — как по умолчанию. Экономный (Pi 4-5) — весь кадр "
+                    "через кадр, 2 масштаба. Минимальный (Pi 3) — только точки, только тёмные цели, кадр вдвое "
+                    "меньше, весь кадр раз в 3. Любой блок ниже можно переключить вручную.");
+        changed |= ImGui::Checkbox("держать темп камеры (авто-упрощение)", &a.s.governor);
+        help_marker("Если кадр обрабатывается дольше, чем приходит следующий с камеры, алгоритм упрощается "
+                    "ступенями: реже крупные масштабы, реже весь кадр, меньше масштабов. Когда запас появляется, "
+                    "возвращается обратно. Ступень видна справа в метриках и в CSV. Это же есть в ядре для "
+                    "устройства (dronolok::LoadGovernor).");
+        ImGui::SeparatorText("Крупные цели и движение камеры");
+        static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
+        ImGui::SetNextItemWidth(w);
+        blk |= ImGui::Combo("размер цели", &a.s.scales, scl, 5);
+        help_marker("Сколько масштабов просматривать. 1 — только точки (дальний дрон), каждый следующий — кадр, "
+                    "уменьшенный ещё в 2 раза, для близкой крупной цели. Каждый добавляет ~20-35% времени. "
+                    "Авто: до 2 Мп — 3, больше — 1.");
+        int mo = a.s.motion + 1;
+        static const char* mos[] = {"авто", "не учитывать", "учитывать"};
+        ImGui::SetNextItemWidth(w);
+        if (ImGui::Combo("движение камеры", &mo, mos, 3)) {
+            a.s.motion = mo - 1;
+            blk = true;
+        }
+        help_marker("Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается "
+                    "(~1-2 мс) и прогноз целей переносится вместе с ним, иначе захват срывается при каждом "
+                    "движении камеры. Авто: до 2 Мп — учитывать.");
+        int zo = a.s.zones + 1;
+        ImGui::SetNextItemWidth(w);
+        if (ImGui::Combo("зоны кадра", &zo, mos, 3)) {
+            a.s.zones = zo - 1;
+            blk = true;
+        }
+        help_marker("Кадр делится на небо, землю (крупные области текстуры: кроны, дома, земля) и смешанные тайлы "
+                    "неба рядом с землёй. В смешанных цель выдаётся, только когда полетела, — так пропадают ложные "
+                    "цели на кромках крон, крыш и столбов. Авто: вместе с учётом движения камеры (при неподвижной "
+                    "землю и так убирает маска неба).");
+        if (a.pipe.isOpen()) {
+            const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
+            ImGui::TextDisabled("сейчас: масштабов %d, движение камеры %s, зоны %s", ef.scales,
+                                ef.motion ? "учитывается" : "нет", ef.zones ? "да" : "нет");
+        }
+        blk |= ImGui::Checkbox("тёмные цели", &d.dark);
+        ImGui::SameLine();
+        blk |= ImGui::Checkbox("яркие цели", &d.bright);
+        help_marker("Каждая полярность — отдельный проход морфологии. Дрон на фоне неба почти всегда темнее неба, "
+                    "поэтому на слабом железе можно оставить только тёмные: вдвое быстрее.");
+        ImGui::SeparatorText("Неподвижная камера");
+        ImGui::SetNextItemWidth(w);
+        blk |= ImGui::SliderInt("кадров на маску неба", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("заново")) a.pipe.relearnMask();
+        help_marker("Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не просматриваются. Только для "
+                    "неподвижной камеры: при учёте движения камеры маска не строится.");
+        bool stOn = t.static_frames > 0;
+        if (ImGui::Checkbox("память статичных помех", &stOn)) {
+            t.static_frames = stOn ? 3000 : 0;
+            blk = true;
+        }
+        help_marker("Для неподвижной камеры. Места, где цели раз за разом появляются и никуда не летят (катушки и "
+                    "изоляторы ЛЭП, фонари, антенны), запоминаются, и там больше не рождаются цели. Дрон, пролетающий "
+                    "мимо такого места, не теряется. Память лежит рядом с видео (.static.bin): загружается при "
+                    "открытии, сохраняется при закрытии. При учёте движения камеры не ведётся.");
+        if (stOn) {
+            ImGui::SetNextItemWidth(w);
+            changed |= ImGui::SliderFloat("запомнить после, откликов", &t.static_hits, 3, 40, "%.0f");
+            help_marker("Сколько неподвижных откликов в одном месте делают его помехой. Меньше — быстрее учится, "
+                        "но зависший на одном месте дрон тоже может стать \"помехой\" (если его трек много раз "
+                        "терялся, а дрон так и не сдвинулся).");
+            ImGui::SetNextItemWidth(w);
+            changed |= ImGui::SliderInt("забывать за, кадров", &t.static_frames, 300, 30000, "%d",
+                                        ImGuiSliderFlags_Logarithmic);
+            if (ImGui::SmallButton("сохранить память")) a.pipe.staticSave();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("забыть всё")) a.pipe.staticClear();
+        }
+        ImGui::SeparatorText("Экономия");
+        ImGui::SetNextItemWidth(w);
+        blk |= ImGui::SliderInt("весь кадр раз в, кадров", &d.full_every, 1, 4, d.full_every > 1 ? "%d" : "каждый");
+        help_marker("В остальные кадры детектор смотрит только вокруг уже найденных целей. Ведомая цель не "
+                    "теряется, новая находится с задержкой до N-1 кадров. На 16 Мп раз в 2 кадра — минус ~35% "
+                    "времени; на синтетике полнота 96.7% -> 95%. Для Raspberry Pi.");
+        ImGui::SetNextItemWidth(w);
+        blk |= ImGui::SliderInt("крупные масштабы раз в, кадров", &d.coarse_every, 1, 4, d.coarse_every > 1 ? "%d" : "каждый");
+        help_marker("Уменьшенные копии кадра (поиск крупной цели) целиком — раз в N кадров, а между ними только "
+                    "если крупная цель уже ведётся. 16 Мп, 3 масштаба: 7.4 мс -> 5.7 (раз в 2) -> 4.8 (раз в 4).");
+        if (blk) {
+            a.profIdx = -1;
+            changed = true;
+        }
+    }
+    if (ImGui::CollapsingHeader("Алгоритм: пороги, трекер, классы")) {
         DetectorConfig& d = a.s.det;
         const float w = ImGui::GetContentRegionAvail().x * 0.4f;
         ImGui::SetNextItemWidth(w);
@@ -601,10 +776,6 @@ void panel_controls(App& a) {
             d.pool = pool2 ? 2 : 1;
             changed = true;
         }
-        ImGui::SameLine();
-        changed |= ImGui::Checkbox("тёмные", &d.dark);
-        ImGui::SameLine();
-        changed |= ImGui::Checkbox("яркие", &d.bright);
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderFloat("выше клаттера, раз", &d.clutter_k, 1, 8, "%.1f");
         ImGui::SetNextItemWidth(w);
@@ -615,57 +786,9 @@ void panel_controls(App& a) {
         }
         help_marker("Тайл, где откликов больше этой доли, считается текстурой (листва, рябь облаков) и пропускается.");
         ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderInt("кадров на маску неба", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("заново")) a.pipe.relearnMask();
-        help_marker("Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не просматриваются. Только для "
-                    "неподвижной камеры: при учёте движения камеры маска не строится.");
-        ImGui::SeparatorText("Крупные цели и движение камеры");
-        static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::Combo("размер цели", &a.s.scales, scl, 5);
-        help_marker("Сколько масштабов просматривать. 1 — только точки (дальний дрон), каждый следующий — кадр, "
-                    "уменьшенный ещё в 2 раза, для близкой крупной цели. Каждый добавляет ~20-35% времени. "
-                    "Авто: до 2 Мп — 3, больше — 1.");
-        int mo = a.s.motion + 1;
-        static const char* mos[] = {"авто", "не учитывать", "учитывать"};
-        ImGui::SetNextItemWidth(w);
-        if (ImGui::Combo("движение камеры", &mo, mos, 3)) {
-            a.s.motion = mo - 1;
-            changed = true;
-        }
-        help_marker("Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается "
-                    "(~1-2 мс) и прогноз целей переносится вместе с ним, иначе захват срывается при каждом "
-                    "движении камеры. Авто: до 2 Мп — учитывать.");
-        int zo = a.s.zones + 1;
-        ImGui::SetNextItemWidth(w);
-        if (ImGui::Combo("зоны кадра", &zo, mos, 3)) {
-            a.s.zones = zo - 1;
-            changed = true;
-        }
-        help_marker("Кадр делится на небо, землю (крупные области текстуры: кроны, дома, земля) и смешанные тайлы "
-                    "неба рядом с землёй. В смешанных цель выдаётся, только когда полетела, — так пропадают ложные "
-                    "цели на кромках крон, крыш и столбов. Авто: вместе с учётом движения камеры (при неподвижной "
-                    "землю и так убирает маска неба).");
-        if (a.pipe.isOpen()) {
-            const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
-            ImGui::TextDisabled("сейчас: масштабов %d, движение камеры %s, зоны %s", ef.scales,
-                                ef.motion ? "учитывается" : "нет", ef.zones ? "да" : "нет");
-        }
-        ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderFloat("порог крупных, раз", &d.coarse_thr_k, 1, 6, "%.1f");
         help_marker("Во сколько раз порог контраста выше на уменьшенных масштабах: крупная близкая цель "
                     "контрастна, а пятна облаков на них дают ложные цели.");
-        ImGui::SeparatorText("Экономия");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderInt("весь кадр раз в, кадров", &d.full_every, 1, 4, d.full_every > 1 ? "%d" : "каждый");
-        help_marker("В остальные кадры детектор смотрит только вокруг уже найденных целей. Ведомая цель не "
-                    "теряется, новая находится с задержкой до N-1 кадров. На 16 Мп раз в 2 кадра — минус ~35% "
-                    "времени; на синтетике полнота 96.7% -> 95%. Для Raspberry Pi.");
-        ImGui::SetNextItemWidth(w);
-        changed |= ImGui::SliderInt("крупные масштабы раз в, кадров", &d.coarse_every, 1, 4, d.coarse_every > 1 ? "%d" : "каждый");
-        help_marker("Уменьшенные копии кадра (поиск крупной цели) целиком — раз в N кадров, а между ними только "
-                    "если крупная цель уже ведётся. 16 Мп, 3 масштаба: 7.4 мс -> 5.7 (раз в 2) -> 4.8 (раз в 4).");
         changed |= ImGui::Checkbox("искать возле прогноза", &a.s.focus);
         help_marker("Эксперимент: там, где трек ожидается на следующем кадре, порог ниже, чтобы не терять "
                     "бледнеющую цель. На ваших роликах пока чуть хуже, поэтому выключено.");
@@ -691,28 +814,6 @@ void panel_controls(App& a) {
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderFloat("смена захвата, раз", &t.lock_switch, 1, 5, "%.1f");
         help_marker("Захват переходит на другую цель, только если она весомее текущей во столько раз.");
-        bool stOn = t.static_frames > 0;
-        if (ImGui::Checkbox("память статичных помех", &stOn)) {
-            t.static_frames = stOn ? 3000 : 0;
-            changed = true;
-        }
-        help_marker("Для неподвижной камеры. Места, где цели раз за разом появляются и никуда не летят (катушки и "
-                    "изоляторы ЛЭП, фонари, антенны), запоминаются, и там больше не рождаются цели. Дрон, пролетающий "
-                    "мимо такого места, не теряется. Память лежит рядом с видео (.static.bin): загружается при "
-                    "открытии, сохраняется при закрытии. При учёте движения камеры не ведётся.");
-        if (stOn) {
-            ImGui::SetNextItemWidth(w);
-            changed |= ImGui::SliderFloat("запомнить после, откликов", &t.static_hits, 3, 40, "%.0f");
-            help_marker("Сколько неподвижных откликов в одном месте делают его помехой. Меньше — быстрее учится, "
-                        "но зависший на одном месте дрон тоже может стать \"помехой\" (если его трек много раз "
-                        "терялся, а дрон так и не сдвинулся).");
-            ImGui::SetNextItemWidth(w);
-            changed |= ImGui::SliderInt("забывать за, кадров", &t.static_frames, 300, 30000, "%d",
-                                        ImGuiSliderFlags_Logarithmic);
-            if (ImGui::SmallButton("сохранить память")) a.pipe.staticSave();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("забыть всё")) a.pipe.staticClear();
-        }
         ImGui::SetNextItemWidth(w);
         changed |= ImGui::SliderInt("подтверждение, кадров", &t.confirm, 1, t.window);
         ImGui::SetNextItemWidth(w);
@@ -850,7 +951,15 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
         } else {
             ImGui::TextDisabled("движение камеры не учитывается");
         }
-        ImGui::TextDisabled("масштабов %d", r->scales);
+        ImGui::TextDisabled("масштабов %d, весь кадр раз в %d%s", r->scales, r->fullEvery,
+                            r->coarseEvery > 1 ? (", крупные раз в " + std::to_string(r->coarseEvery)).c_str() : "");
+        if (r->govLevel >= 0)
+            ImGui::TextColored(r->govLevel ? ImVec4(1, 0.8f, 0.3f, 1) : ImVec4(0.6f, 0.6f, 0.63f, 1),
+                               "авто-упрощение: ступень %d из %d — %s", r->govLevel, LoadGovernor::MAX_LEVEL,
+                               LoadGovernor::describe(r->govLevel));
+        if (a.s.slowdown > 1)
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "имитация: %s, обработка x%.1f", DEVICES[a.devIdx].name,
+                               a.s.slowdown);
         if (r->staticOn) {
             ImGui::SameLine();
             ImGui::TextColored(ImColor(COL_STATIC).Value, "запомнено помех: %d", (int)r->staticCells.size());
@@ -1207,6 +1316,19 @@ int run_bench(int argc, char** argv) {
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--static-file") s.staticFile = true;
+        else if (a == "--slowdown") s.slowdown = atof(val().c_str());
+        else if (a == "--governor") s.governor = true;
+        else if (a == "--camera") s.pace = Pace::Realtime;   // кадры в темпе видео, лишние выбрасываются
+        else if (a == "--profile") {
+            const AlgoBlocks b = profile_blocks((Profile)std::min(3, std::max(0, atoi(val().c_str()))));
+            TrackerConfig t = s.trk;
+            apply_blocks(b, s.det, t);
+            s.trk.static_frames = t.static_frames;
+            s.scales = b.scales;
+            s.motion = b.motion ? s.motion : 0;
+            s.zones = b.zones ? s.zones : 0;
+            s.learnMaskFrames = b.skyMask ? s.learnMaskFrames : 0;
+        }
         else if (a == "--full-every") s.det.full_every = atoi(val().c_str());
         else if (a == "--zones") s.zones = atoi(val().c_str());
         else if (a == "--coarse-every") s.det.coarse_every = atoi(val().c_str());
@@ -1338,7 +1460,11 @@ int run_stress(int argc, char** argv) {
             }
             case 14: s.decoderThreads = R(4); break;
             case 15: s.loop = R(4) != 0; break;
-            case 16: s.emulateMs = R(3) ? 0 : F(0, 60); break;
+            case 16:
+                s.emulateMs = R(3) ? 0 : F(0, 60);
+                s.slowdown = R(3) ? 1 : F(1, 20);
+                s.governor = R(2);
+                break;
             case 17: s.learnMaskFrames = R(3) ? 25 : R(100); break;
             case 18: s.det.thr = F(3, 40); break;
             case 19: s.det.k = (3 + R(13)) | 1; break;
@@ -1444,6 +1570,9 @@ int main(int argc, char** argv) {
     ImGui_ImplSDL2_InitForSDLRenderer(win, a.ren);
     ImGui_ImplSDLRenderer2_Init(a.ren);
 
+    // скорость ядра этого ПК для имитации устройств (~0.1 с, пока видео не открыто)
+    a.pcMs = calibrate_ms_per_mp();
+    for (int i = 0; i < N_DEVICES; ++i) a.devMs[i] = DEVICES[i].msPerMp;
     a.cpuOn.assign(std::min(64, plat::logical_cpus()), 1);
     const uint64_t aff = plat::process_affinity();
     for (size_t i = 0; i < a.cpuOn.size(); ++i) a.cpuOn[i] = (aff >> i) & 1;

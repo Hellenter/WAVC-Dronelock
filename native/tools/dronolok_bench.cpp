@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/tuning.hpp"
 #include "gt_eval.hpp"
 #include "y4m_reader.hpp"
 
@@ -30,6 +31,7 @@ static double now_ms() {
 static void usage() {
     std::printf(
         "usage: dronolok_bench <video.y4m | raw | -> [options]\n"
+        "       dronolok_bench --calibrate   эталонный замер ядра CPU для эмуляции устройства в приложении\n"
         "  --size WxH [--yuv420]   сырой поток вместо y4m\n"
         "  --frames N              сколько кадров загрузить (100)\n"
         "  --loops L               проходов по кадрам (3)\n"
@@ -79,6 +81,12 @@ static Pct pct(std::vector<double> v) {
 
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
+    if (std::string(argv[1]) == "--calibrate") {   // число для эмуляции устройства в приложении
+        const double v = calibrate_ms_per_mp();
+        std::printf("калибровка: %.2f мс на 1 Мп (1 поток, 128-бит SIMD)\n"
+                    "введите это число в приложении: Ресурсы > Устройство > мс/Мп на устройстве\n", v);
+        return 0;
+    }
     std::string input, gtPath, jsonPath, dumpPath;
     int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0;
     bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false;

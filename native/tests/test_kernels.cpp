@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/tuning.hpp"
 #include "kernels.hpp"
 
 using namespace dronolok;
@@ -248,6 +249,47 @@ static void test_static_map() {
     std::printf("static map: ok\n");
 }
 
+// Регулятор нагрузки: при перегрузке упрощает до предела, при запасе возвращает; профили
+static void test_governor() {
+    LoadGovernor g;
+    int changes = 0;
+    for (int i = 0; i < 200; ++i) changes += g.update(50, 33.3);   // кадр дольше периода камеры
+    if (g.level() != LoadGovernor::MAX_LEVEL || changes != LoadGovernor::MAX_LEVEL) {
+        std::printf("governor up: level %d, changes %d\n", g.level(), changes);
+        ++failures;
+    }
+    for (int i = 0; i < 2000; ++i) g.update(5, 33.3);   // большой запас
+    if (g.level() != 0) {
+        std::printf("governor down: level %d\n", g.level());
+        ++failures;
+    }
+    for (int i = 0; i < 300; ++i) g.update(25, 33.3);   // 75% бюджета — ступень не меняется
+    if (g.level() != 0) {
+        std::printf("governor steady: level %d\n", g.level());
+        ++failures;
+    }
+    DetectorConfig d;
+    d.scales = 3;
+    LoadGovernor::apply(LoadGovernor::MAX_LEVEL, d);
+    if (d.scales != 1 || d.full_every != 4 || d.coarse_every != 4) {
+        std::printf("governor apply: scales %d full %d coarse %d\n", d.scales, d.full_every, d.coarse_every);
+        ++failures;
+    }
+    TrackerConfig t;
+    d = DetectorConfig();
+    apply_blocks(profile_blocks(Profile::Minimal), d, t);
+    if (d.scales != 1 || d.bright || !d.dark || d.full_every != 3) {
+        std::printf("profile minimal\n");
+        ++failures;
+    }
+    const double ms = calibrate_ms_per_mp(5);
+    if (!(ms > 0 && ms < 1000)) {
+        std::printf("calibrate: %f\n", ms);
+        ++failures;
+    }
+    std::printf("governor, profiles, calibrate (%.2f ms/MP): ok\n", ms);
+}
+
 int main() {
     const Kernels* ref = kernels_scalar();
     for (Isa isa : available_isas()) {
@@ -259,6 +301,7 @@ int main() {
     test_detector();
     test_scales_focus();
     test_static_map();
+    test_governor();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

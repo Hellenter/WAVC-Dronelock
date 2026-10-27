@@ -32,7 +32,8 @@ set(DL_SOURCES
   src/kernels_neon.cpp
   src/motion.cpp
   src/thread_pool.cpp
-  src/tracker.cpp)
+  src/tracker.cpp
+  src/tuning.cpp)
 
 add_library(dronolok_obj OBJECT ${DL_SOURCES})
 target_include_directories(dronolok_obj PUBLIC include PRIVATE src)

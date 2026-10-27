@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "dronolok/tuning.hpp"
 #include "platform.hpp"
 
 using namespace dronolok;
@@ -363,6 +364,7 @@ void Pipeline::processLoop() {
     DetectorConfig dc = s.det;   // то, что сейчас стоит в детекторе (с учётом "авто")
     bool dirty = true;
     GlobalMotion gm;
+    LoadGovernor gov;
     std::vector<FocusArea> focus, roi;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
@@ -406,10 +408,14 @@ void Pipeline::processLoop() {
         }
         const Frame& f = *p.frame;
         const Effective ef = effective(s, f.w, f.h);
-        if (dirty || ef.scales != dc.scales || ef.zones != dc.zones) {
-            dc = s.det;
-            dc.scales = ef.scales;
-            dc.zones = ef.zones;
+        DetectorConfig want = s.det;
+        want.scales = ef.scales;
+        want.zones = ef.zones;
+        if (s.governor) LoadGovernor::apply(gov.level(), want);
+        else gov.reset();
+        if (dirty || want.scales != dc.scales || want.zones != dc.zones || want.full_every != dc.full_every ||
+            want.coarse_every != dc.coarse_every) {
+            dc = want;
             det.reconfigure(dc);
             dirty = false;
             std::lock_guard<std::mutex> lr(rm_);
@@ -490,8 +496,12 @@ void Pipeline::processLoop() {
         const double t2 = now_ms();
         const bool learning = det.learningMask();
         if (learnLeft > 0 && --learnLeft == 0) det.endMaskLearning();
+        // эмуляция устройства: ядро медленнее в slowdown раз, плюс нижняя граница времени кадра
+        if (s.slowdown > 1) wait_until(t0 + (t2 - t0) * std::min(100.0, s.slowdown), stop_);
         if (s.emulateMs > 0) wait_until(t0 + s.emulateMs, stop_);
         const double t3 = now_ms();
+        // авто-упрощение по времени кадра против периода камеры (без замедления просмотра)
+        if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, s.targetFps > 0 ? s.targetFps : info_.fps));
 
         auto r = std::make_shared<Result>();
         r->frame = p.frame;
@@ -518,7 +528,10 @@ void Pipeline::processLoop() {
         r->camValid = me.valid;
         r->motionOn = ef.motion;
         r->motionMs = ef.motion ? tm - t0 : 0;
-        r->scales = ef.scales;
+        r->scales = dc.scales;
+        r->govLevel = s.governor ? gov.level() : -1;
+        r->fullEvery = dc.full_every;
+        r->coarseEvery = dc.scales > 1 ? dc.coarse_every : 0;
         r->focus = focus;
         r->staticOn = trk->config().static_frames > 0;
         if (r->staticOn && seq % 15 == 0) trk->staticCells(statCells);
@@ -553,6 +566,7 @@ void Pipeline::processLoop() {
         rec.lockId = r->lockId;
         rec.camDx = r->camDx;
         rec.camDy = r->camDy;
+        rec.govLevel = r->govLevel;
         uint8_t mk = MARK_DONE;
         if (rec.drones) mk |= MARK_DRONE;
         if (rec.birds) mk |= MARK_BIRD;
@@ -688,12 +702,13 @@ bool Pipeline::exportCsv(const std::string& path) const {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) return false;
     fprintf(f, "t_ms,frame,decode_ms,motion_ms,detect_ms,response_ms,select_ms,track_ms,proc_ms,latency_ms,"
-               "candidates,drones,birds,unknown,clutter,noise,lock_id,cam_dx,cam_dy\n");
+               "candidates,drones,birds,unknown,clutter,noise,lock_id,cam_dx,cam_dy,gov_level\n");
     std::lock_guard<std::mutex> lk(rm_);
     for (const auto& r : log_)
-        fprintf(f, "%.2f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f\n", r.t,
+        fprintf(f, "%.2f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d\n", r.t,
                 (long long)r.index, r.decodeMs, r.motionMs, r.detectMs, r.responseMs, r.selectMs, r.trackMs, r.procMs,
-                r.latencyMs, r.cands, r.drones, r.birds, r.unknown, r.clutter, r.noise, r.lockId, r.camDx, r.camDy);
+                r.latencyMs, r.cands, r.drones, r.birds, r.unknown, r.clutter, r.noise, r.lockId, r.camDx, r.camDy,
+                r.govLevel);
     fclose(f);
     return true;
 }
@@ -709,11 +724,12 @@ std::string Pipeline::reportJson() const {
         "\"frames\": %ld, \"dropped\": %ld, \"fps\": %.1f, \"decode_ms\": %.2f, \"detect_ms\": %.2f, "
         "\"detect_p95_ms\": %.2f, \"response_ms\": %.2f, \"track_ms\": %.3f, \"proc_ms\": %.2f, "
         "\"detect_fps_potential\": %.1f, \"latency_ms\": %.1f, \"emulate_ms\": %.1f, \"scales\": %d, "
-        "\"motion\": %s, \"motion_ms\": %.2f, \"lock_pct\": %.1f",
+        "\"motion\": %s, \"motion_ms\": %.2f, \"lock_pct\": %.1f, \"slowdown\": %.1f, \"gov_level\": %d",
         info_.w, info_.h, r ? r->frame->w : 0, r ? r->frame->h : 0, plat::cpu_model().c_str(), m.backend.c_str(),
         m.threads, m.processed, m.dropped, m.processed / std::max(1e-3, m.elapsedS), m.decode.mean, m.detect.mean,
         m.detect.p95, m.response.mean, m.track.mean, m.proc.mean, m.detect.mean > 0 ? 1000 / m.detect.mean : 0,
-        m.latency.mean, s.emulateMs, r ? r->scales : 0, r && r->motionOn ? "true" : "false", m.motion.mean, m.lockPct);
+        m.latency.mean, s.emulateMs, r ? r->scales : 0, r && r->motionOn ? "true" : "false", m.motion.mean, m.lockPct, s.slowdown,
+        r ? r->govLevel : -1);
     if (m.haveGt)
         len += snprintf(buf + len, sizeof(buf) - len,
                         ", \"recall_drone\": %.3f, \"recall_bird\": %.3f, \"false_tracks_per_frame\": %.2f, "
