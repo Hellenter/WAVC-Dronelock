@@ -312,6 +312,29 @@ static void test_hard_lock() {
     std::printf("hard lock: ok\n");
 }
 
+// Ожидание размера: цель приближается (силуэт растёт на 2% за кадр) — захват ведёт
+// размер и скорость его изменения
+static void test_size_expect() {
+    TrackerConfig tc;
+    Tracker t(1280, 720, tc);
+    float size = 30, x = 200, y = 300, exp = 0, dls = 0;
+    for (int i = 0; i < 90; ++i) {
+        x += 4;
+        size *= 1.02f;
+        Silhouette s;
+        s.valid = true;
+        s.x = x; s.y = y; s.w = size; s.h = 0.4f * size; s.contrast = 30; s.area = (int)(0.2f * size * size);
+        t.setLockSilhouette(s);
+        Candidate d{};
+        d.x = x; d.y = y; d.contrast = 30; d.snr = 5; d.polarity = -1; d.margin = 3;
+        for (const auto& tr : t.update({d}))
+            if (tr.id == t.lockedId()) { exp = tr.expectedSize(); dls = tr.dls; }
+    }
+    CHECK(exp > 0 && std::fabs(exp / (size * 1.02f) - 1) < 0.15f, "ожидание размера: %.0f при %.0f", exp, size * 1.02f);
+    CHECK(dls > 0.01f, "ожидание размера: рост не замечен (%.3f за кадр)", dls);
+    std::printf("size expectation: ok (%.0f / %.0f px)\n", exp, size * 1.02f);
+}
+
 // Регулятор нагрузки: при перегрузке упрощает до предела, при запасе возвращает; профили
 static void test_governor() {
     LoadGovernor g;
@@ -366,6 +389,7 @@ int main() {
     test_static_map();
     test_silhouette();
     test_hard_lock();
+    test_size_expect();
     test_governor();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;

@@ -749,16 +749,17 @@ void Pipeline::processLoop() {
         if (!s.trackLog.empty()) {
             if (!tlog) {
                 tlog.reset(open_file(s.trackLog, "w"));
-                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells\n");
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp\n");
             }
             if (tlog) {
                 if (tracks.empty())
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu\n", p.loop, (long long)f.index, r->lockId, (int)r->lockState,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,\n", p.loop, (long long)f.index, r->lockId, (int)r->lockState,
                             statCells.size());
                 for (const auto& t : tracks)
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu\n", p.loop, (long long)f.index,
-                            r->lockId, (int)r->lockState, t.id, t.x, t.y, t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits,
-                            t.travel, t.score, statCells.size());
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f\n", p.loop,
+                            (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x, t.y,
+                            t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits, t.travel, t.score, statCells.size(), t.bw,
+                            t.bh, t.expectedSize());
             }
         }
         latest_ = r;

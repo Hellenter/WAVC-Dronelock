@@ -1035,6 +1035,11 @@ void tab_fine(App& a, bool& changed) {
         label("силуэт до, пикс.", "Больше этого — уже не цель, а земля, крона или облако.");
         changed |= ImGui::SliderFloat("##silhmax", &t.silh_max, 50, 1000, "%.0f");
     }
+    changed |= ImGui::Checkbox("ожидание размера", &t.size_predict);
+    help_marker("Видимый размер захваченной цели ведётся вместе со скоростью его изменения: дрон приближается — "
+                "растёт, удаляется — уменьшается. По ожидаемому размеру выбирается масштаб детектора вокруг цели, "
+                "а силуэт, внезапно ставший намного больше ожидаемого (слился с облаком или кроной), не "
+                "принимается. Размер и «приближается / удаляется» видны в статусе захвата.");
     changed |= ImGui::Checkbox("на мачте или столбе — не дрон", &t.anchor_check);
     help_marker("Если от захваченной цели вверх или вниз тянется длинная тонкая линия (мачта прожектора, столб, "
                 "ствол), это светильник или что-то на конструкции: захват снимается, цель становится помехой. "
@@ -1168,10 +1173,17 @@ void lock_banner(const Result* r, const Metrics& m) {
         else if (lk) ImGui::TextColored(ImVec4(1, 0.85f, 0.98f, 1), "ЗАХВАТ  #%d %s", lk->id, class_ru(*lk));
         else ImGui::TextColored(TXT_DIM, "Захвата нет");
     }
-    if (lk && lk->miss) ImGui::TextColored(TXT_WARN, "на прогнозе %d кадр.", lk->miss);
-    else if (lk && hard) ImGui::TextUnformatted("проверен, на другие цели не отвлекается");
-    else if (lk && r->verifyNeed > 0) ImGui::Text("проверка, дрон ли это: %d из %d кадров", r->verify, r->verifyNeed);
-    else if (lk) ImGui::TextUnformatted("цель ведётся");
+    // ожидание размера: видимый размер и приближается ли цель
+    char sz[64] = "";
+    if (lk && lk->lsN >= 3) {
+        const float pct = 100.f * (std::exp(lk->dls) - 1.f);
+        snprintf(sz, sizeof(sz), "  ·  %.0f пикс.%s", lk->expectedSize(0),
+                 pct > 0.5f ? ", приближается" : pct < -0.5f ? ", удаляется" : "");
+    }
+    if (lk && lk->miss) ImGui::TextColored(TXT_WARN, "на прогнозе %d кадр.%s", lk->miss, sz);
+    else if (lk && hard) ImGui::Text("проверен, на другие цели не отвлекается%s", sz);
+    else if (lk && r->verifyNeed > 0) ImGui::Text("проверка, дрон ли это: %d из %d кадров%s", r->verify, r->verifyNeed, sz);
+    else if (lk) ImGui::Text("цель ведётся%s", sz);
     else ImGui::TextDisabled("нет подтверждённой цели");
     char pct[48];
     snprintf(pct, sizeof(pct), "захват в %.0f%% кадров", m.lockPct);
@@ -1813,6 +1825,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--tracks") s.trackLog = val();
         else if (a == "--dedup") s.skipDuplicates = true;
         else if (a == "--no-anchor") s.trk.anchor_check = false;
+        else if (a == "--no-size") s.trk.size_predict = false;
         else video = a;
     }
     if (preload > 0) {
@@ -1972,6 +1985,7 @@ int run_stress(int argc, char** argv) {
                 s.trk.hard_full_every = 1 + R(30);
                 s.trk.silhouette = R(3) != 0;
                 s.trk.anchor_check = R(3) != 0;
+                s.trk.size_predict = R(3) != 0;
                 s.trk.silh_max = F(50, 1000);
                 s.skipDuplicates = R(2);
                 break;

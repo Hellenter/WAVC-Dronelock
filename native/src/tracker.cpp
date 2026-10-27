@@ -50,6 +50,7 @@ void Tracker::resetTracks() {
     out_.clear();
     lockId_ = 0;
     lostFor_ = 0;
+    lastLsN_ = 0;
     verify_ = 0;
     hard_ = false;
     lockSilh_ = Silhouette();
@@ -361,11 +362,18 @@ void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
         kf_predict(t, camDx, camDy, q);
         const float S = t.p00 + measVar(t.level);
         const float gmin = cfg_.gate_min * (float)(1 << std::min(4, t.level));
+        // захват с ожиданием размера: смотрим на масштабе, подходящем размеру на этом кадре
+        const float e = cfg_.size_predict && t.id == lockId_ ? t.expectedSize() : 0.f;
+        int lv = t.level;
+        if (e > 0) {
+            lv = 0;
+            while (lv < 4 && e > 14.f * (float)(1 << lv)) ++lv;
+        }
         // запас на размер цели: на грубом масштабе её отклик гуляет по корпусу
         out.push_back({t.x, t.y,
-                       std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << t.level) +
-                           0.5f * std::max(t.bw, t.bh),
-                       t.level});
+                       std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << lv) +
+                           0.5f * std::max(e, std::max(t.bw, t.bh)),
+                       lv});
     }
 }
 
@@ -425,8 +433,14 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     const Silhouette sil = lockSilh_;
     lockSilh_ = Silhouette();
     // силуэт, резко сменивший размер, — захватил соседнее (облако, крону): не верим
-    const bool silOk = sil.valid && (lockIdx < 0 || tracks_[lockIdx].bw <= 0 ||
-                                     std::max(sil.w, sil.h) < 2.5f * std::max(tracks_[lockIdx].bw, tracks_[lockIdx].bh) + 16.f);
+    // (с ожиданием размера — не похожий по размеру на ожидаемый, с учётом приближения)
+    bool silOk = sil.valid && (lockIdx < 0 || tracks_[lockIdx].bw <= 0 ||
+                               std::max(sil.w, sil.h) < 2.5f * std::max(tracks_[lockIdx].bw, tracks_[lockIdx].bh) + 16.f);
+    // С ожиданием размера верхняя граница — от ожидаемого размера (сглаженного, с учётом
+    // приближения), а не от прошлого замера: силуэт тонкого крыла скачет от кадра к кадру.
+    // Меньший силуэт принимается — это часть цели (крыло слилось с небом)
+    if (sil.valid && lockIdx >= 0 && cfg_.size_predict && tracks_[lockIdx].lsN >= 3)
+        silOk = std::max(sil.w, sil.h) < cfg_.size_tol * tracks_[lockIdx].expectedSize() + 16.f;
     // захваченное на мачте или столбе: большинство замеров с линией от силуэта
     if (cfg_.anchor_check && lockIdx >= 0 && sil.valid) {
         Track& L = tracks_[lockIdx];
@@ -470,6 +484,29 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         }
         L.bw = sil.w;
         L.bh = sil.h;
+        if (cfg_.size_predict) {   // ожидание размера: альфа-бета фильтр по логарифму размера
+            const float z = std::log(std::max(4.f, std::max(sil.w, sil.h)));
+            const float rmax = std::log(1.f + cfg_.size_rate_max);
+            if (!L.lsN) {
+                L.ls = z;
+                L.dls = 0;
+                ++L.lsN;
+            } else {
+                const float pred = L.ls + L.dls, res = z - pred;
+                // замер сильно меньше ожидаемого — часть цели, в размер не идёт; несколько
+                // таких подряд (или больше ожидаемого) — ожидание неверно, следуем замерам
+                const bool outlier = std::fabs(res) > std::log(cfg_.size_tol) * 0.8f;
+                if (outlier && ++L.sizeRej < 4) {
+                    L.ls = pred;
+                } else {
+                    const float g = outlier ? 0.7f : 0.3f;
+                    L.ls = pred + g * res;
+                    L.dls = std::max(-rmax, std::min(rmax, L.dls + 0.05f * res));
+                    if (!outlier) L.sizeRej = 0;
+                    if (L.lsN < 255) ++L.lsN;
+                }
+            }
+        }
         // треки на частях той же цели (крыло, хвост) сливаются с захваченным
         if (size > 2.f * cfg_.dup_px) {
             const int keep = L.id;
@@ -482,7 +519,10 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 if (tracks_[i].id == keep) lockIdx = i;
         }
     } else if (lockIdx >= 0) {
-        tracks_[lockIdx].bw = tracks_[lockIdx].bh = 0;
+        Track& L = tracks_[lockIdx];
+        // силуэта нет: ожидание размера остаётся прежним (продолжать его по скорости
+        // изменения без замеров хуже — расходится с целью)
+        L.bw = L.bh = 0;
     }
 
     // "тени": слабый отклик рядом с более сильным (светлый ореол у тёмной цели от резкости
@@ -757,6 +797,23 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         lockId_ = best ? best->id : 0;
         lostFor_ = 0;
         if (best) { lastX_ = best->x; lastY_ = best->y; lastVx_ = best->vsx; lastVy_ = best->vsy; }
+    }
+
+    // ожидание размера переходит к треку, подхватившему ту же цель
+    if (cfg_.size_predict && lockId_) {
+        for (Track& t : tracks_) {
+            if (t.id != lockId_) continue;
+            if (same && !t.lsN && lastLsN_) {
+                t.ls = lastLs_ + (float)std::max(1, lostFor_) * lastDls_;
+                t.dls = lastDls_;
+                t.lsN = lastLsN_;
+            }
+            lastLs_ = t.ls;
+            lastDls_ = t.dls;
+            lastLsN_ = t.lsN;
+        }
+    } else {
+        lastLsN_ = 0;
     }
 
     // проверка захваченной цели: verify_frames кадров подряд дрон — жёсткий захват
