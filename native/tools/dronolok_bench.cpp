@@ -50,6 +50,8 @@ static void usage() {
         "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
+        "  --flap-window 48 --flap-r2 0.45 --flap-depth 0.3 --flap-hold 50   взмахи (окно 0 — выкл.)\n"
+        "  --hover 0.3 --flock 150     зависание = дрон, стая с машущей = птицы (0 — выкл.)\n"
         "  --stream                не загружать заранее (замер вместе с чтением)\n"
         "  --sweep                 таблица скоростей: наборы инструкций x потоки\n"
         "  --json out.jsonl        дописать итог строкой JSON\n"
@@ -121,6 +123,12 @@ int main(int argc, char** argv) {
         else if (a == "--bird-resid") tcfg.bird_resid = (float)std::atof(val().c_str());
         else if (a == "--bird-cv") tcfg.bird_contrast_cv = (float)std::atof(val().c_str());
         else if (a == "--bird-speed") tcfg.bird_speed = (float)std::atof(val().c_str());
+        else if (a == "--flap-window") tcfg.flap_window = std::atoi(val().c_str());
+        else if (a == "--flap-r2") tcfg.flap_r2 = (float)std::atof(val().c_str());
+        else if (a == "--flap-depth") tcfg.flap_depth = (float)std::atof(val().c_str());
+        else if (a == "--flap-hold") tcfg.flap_hold = std::atoi(val().c_str());
+        else if (a == "--hover") tcfg.hover_speed = (float)std::atof(val().c_str());
+        else if (a == "--flock") tcfg.flock_px = (float)std::atof(val().c_str());
         else if (a == "--learn-mask") learn = std::atoi(val().c_str());
         else if (a == "--scales") cfg.scales = std::atoi(val().c_str());
         else if (a == "--focus") focus = true;
@@ -192,7 +200,7 @@ int main(int argc, char** argv) {
     Detector det(cfg);
     Tracker trk(W, H, tcfg);
     std::FILE* dump = dumpPath.empty() ? nullptr : std::fopen(dumpPath.c_str(), "w");
-    if (dump) std::fprintf(dump, "loop,frame,id,x,y,hits,speed,resid,contrast,contrast_cv,cls,gt\n");
+    if (dump) std::fprintf(dump, "loop,frame,id,x,y,hits,speed,resid,contrast,contrast_cv,flap_r2,flap_period,flap_depth,hover,flock,energy,level,cls,gt\n");
     if (learn > 0 && !stream) {
         det.beginMaskLearning();
         std::vector<Candidate> c;
@@ -253,8 +261,10 @@ int main(int argc, char** argv) {
                 const char* kind = "none";
                 for (const auto& o : gt.frames[fi])
                     if (std::fabs(t.x - o.x * gsx) < 10 && std::fabs(t.y - o.y * gsy) < 10) { kind = o.bird ? "bird" : "drone"; break; }
-                std::fprintf(dump, "%ld,%d,%d,%.1f,%.1f,%d,%.2f,%.2f,%.1f,%.3f,%s,%s\n", n ? i / n : 0, fi, t.id, t.x, t.y,
-                             t.hits, t.speed, t.resid, t.contrast, t.contrastCv, class_name(t.cls), kind);
+                std::fprintf(dump, "%ld,%d,%d,%.1f,%.1f,%d,%.2f,%.2f,%.1f,%.3f,%.2f,%.1f,%.2f,%d,%d,%.0f,%d,%s,%s\n", n ? i / n : 0,
+                             fi, t.id, t.x, t.y, t.hits, t.speed, t.resid, t.contrast, t.contrastCv, t.flapR2,
+                             t.flapPeriod, t.flapDepth, (int)t.hovering, (int)t.flock,
+                             t.obs.empty() ? 0.f : t.obs.back().e, t.obs.empty() ? 0 : t.obs.back().level, class_name(t.cls), kind);
             }
         }
     }

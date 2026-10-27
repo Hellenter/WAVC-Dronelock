@@ -14,7 +14,10 @@
 // Классификатор: по последним cls_window попаданиям трека строится плавная
 // траектория (квадратичная по времени). Дрон летит плавно и отклоняется от неё
 // на 1-2 пикселя (квантование пулинга), ласточка дёргается и разворачивается,
-// а взмахи крыльев меняют её контраст. Пороги — в TrackerConfig.
+// а взмахи крыльев меняют её контраст. Птицу, которая летит ровно, выдают взмахи:
+// суммарный контраст пятна пульсирует с их частотой (flap_features). Махавшая недавно
+// птица и её попутчики по стае остаются птицами; зависший после полёта — дрон.
+// Пороги — в TrackerConfig.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -117,11 +120,13 @@ bool Tracker::loadStatic(const std::string& path) {
 }
 
 // МНК-парабола p(t) = a + b t + c t^2; возвращает сумму квадратов остатков, b — скорость в середине окна
-static double fit_quad(const std::deque<Track::Obs>& o, bool useX, double& slope) {
-    const int n = (int)o.size();
-    const double tm = 0.5 * (o.front().t + o.back().t);
+static double fit_quad(const std::deque<Track::Obs>& obs, size_t from, bool useX, double& slope) {
+    const auto o0 = obs.begin() + (std::ptrdiff_t)from;
+    const int n = (int)(obs.size() - from);
+    const double tm = 0.5 * (o0->t + obs.back().t);
     double S[5] = {0, 0, 0, 0, 0}, B[3] = {0, 0, 0};
-    for (const auto& q : o) {
+    for (auto it = o0; it != obs.end(); ++it) {
+        const auto& q = *it;
         const double t = q.t - tm, v = useX ? q.x : q.y;
         double tp = 1;
         for (int i = 0; i < 5; ++i) { S[i] += tp; if (i < 3) B[i] += tp * v; tp *= t; }
@@ -144,7 +149,8 @@ static double fit_quad(const std::deque<Track::Obs>& o, bool useX, double& slope
     for (int c = 0; c < m; ++c) coef[c] = A[c][3] / A[c][c];
     slope = coef[1];
     double ss = 0;
-    for (const auto& q : o) {
+    for (auto it = o0; it != obs.end(); ++it) {
+        const auto& q = *it;
         const double t = q.t - tm, v = useX ? q.x : q.y;
         const double r = v - (coef[0] + coef[1] * t + coef[2] * t * t);
         ss += r * r;
@@ -152,19 +158,81 @@ static double fit_quad(const std::deque<Track::Obs>& o, bool useX, double& slope
     return ss;
 }
 
+// Взмахи: суммарный контраст за последние W кадров (пропуски не мешают) без линейного
+// тренда (цель приближается, уходит в облако) приближается синусоидой; перебор частот
+// от 1/16 до 1/2 цикла на кадр, косинус и синус — поворотом, без тригонометрии в цикле.
+// ~40 частот x 48 точек — пара тысяч умножений на трек.
+struct FlapFit { float r2 = 0, period = 0, depth = 0; };
+
+static FlapFit flap_fit(const std::deque<Track::Obs>& obs, int W) {
+    FlapFit f;
+    W = std::min(W, 64);
+    const int tEnd = obs.back().t;
+    double ee[64];
+    bool ok[64] = {};
+    int n = 0;
+    for (auto it = obs.rbegin(); it != obs.rend() && tEnd - it->t < W; ++it, ++n) {
+        ok[tEnd - it->t] = true;
+        ee[tEnd - it->t] = it->e;
+    }
+    if (n < std::max(12, W * 2 / 3)) return f;
+    double st = 0, se = 0, stt = 0, ste = 0;
+    for (int i = 0; i < W; ++i)
+        if (ok[i]) { st += i; se += ee[i]; stt += (double)i * i; ste += i * ee[i]; }
+    const double mean = se / n;
+    if (mean <= 0) return f;
+    const double den = n * stt - st * st;
+    const double b = den > 0 ? (n * ste - st * se) / den : 0, a = (se - b * st) / n;
+    double var = 0;
+    for (int i = 0; i < W; ++i)
+        if (ok[i]) { ee[i] -= a + b * i; var += ee[i] * ee[i]; }
+    if (var <= 0) return f;
+    const int steps = 2 * W;   // шаг по частоте 1/(2W) цикла на кадр
+    for (int k = std::max(1, steps / 16); k <= steps / 2; ++k) {
+        const double w = 2 * 3.14159265358979323846 * k / steps, rc = std::cos(w), rs = std::sin(w);
+        double c = 1, s = 0, cc = 0, ss = 0, cs = 0, ec = 0, es = 0;
+        for (int i = 0; i < W; ++i) {
+            if (ok[i]) { cc += c * c; ss += s * s; cs += c * s; ec += ee[i] * c; es += ee[i] * s; }
+            const double c2 = c * rc - s * rs;
+            s = s * rc + c * rs;
+            c = c2;
+        }
+        // МНК e = p cos + q sin; на частоте 1/2 синус вырожден — только косинус
+        double p, q;
+        const double d = cc * ss - cs * cs;
+        if (d > 1e-6 * cc * ss) { p = (ec * ss - es * cs) / d; q = (es * cc - ec * cs) / d; }
+        else { p = cc > 0 ? ec / cc : 0; q = 0; }
+        const double r2 = (p * ec + q * es) / var;   // доля объяснённой дисперсии
+        if (r2 > f.r2) {
+            f.r2 = (float)r2;
+            f.period = (float)steps / k;
+            f.depth = (float)(2 * std::sqrt(p * p + q * q) / mean);
+        }
+    }
+    return f;
+}
+
 void Tracker::classify(Track& t) const {
     const auto& o = t.obs;
-    const int n = (int)o.size();
+    const size_t from = o.size() > (size_t)cfg_.cls_window ? o.size() - cfg_.cls_window : 0;
+    const int n = (int)(o.size() - from);
     if (n >= 3) {
         double sx, sy;
-        const double ss = fit_quad(o, true, sx) + fit_quad(o, false, sy);
+        const double ss = fit_quad(o, from, true, sx) + fit_quad(o, from, false, sy);
         t.resid = (float)std::sqrt(ss / n);
         t.speed = (float)std::hypot(sx, sy);
         double mc = 0, vc = 0;
-        for (const auto& q : o) mc += q.c;
+        for (size_t i = from; i < o.size(); ++i) mc += o[i].c;
         mc /= n;
-        for (const auto& q : o) vc += (q.c - mc) * (q.c - mc);
+        for (size_t i = from; i < o.size(); ++i) vc += (o[i].c - mc) * (o[i].c - mc);
         t.contrastCv = mc > 0 ? (float)(std::sqrt(vc / n) / mc) : 0.f;
+    }
+    if (cfg_.flap_window > 0 && !o.empty()) {
+        const FlapFit ff = flap_fit(o, cfg_.flap_window);
+        t.flapR2 = ff.r2;
+        t.flapPeriod = ff.period;
+        t.flapDepth = ff.depth;
+        if (ff.r2 >= cfg_.flap_r2 && ff.depth >= cfg_.flap_depth) t.flapT = frame_;
     }
     // стоит в горячей ячейке или за cls_min_hits попаданий так и не сдвинулся по сцене
     // (фонарь, угол дома, когда камера ведёт панораму) — помеха
@@ -178,11 +246,15 @@ void Tracker::classify(Track& t) const {
     }
     // крупная цель найдена на грубом масштабе: позиция квантуется сильнее, порог шире
     double lf = 0;
-    for (const auto& q : o) lf += (double)(1 << std::min(4, q.level));
+    for (size_t i = from; i < o.size(); ++i) lf += (double)(1 << std::min(4, o[i].level));
     lf /= n;
     float e = std::max(t.resid / (cfg_.bird_resid * (float)lf), t.contrastCv / cfg_.bird_contrast_cv);
     if (cfg_.bird_speed > 0) e = std::max(e, t.speed / cfg_.bird_speed);
-    const float inst = e > 1.f ? 1.f : 0.f;
+    const bool flapped = frame_ - t.flapT <= cfg_.flap_hold;
+    t.hovering = cfg_.hover_speed > 0 && t.everMover && t.speed < cfg_.hover_speed;
+    float inst = e > 1.f ? 1.f : 0.f;
+    if (flapped || t.flock) inst = 1.f;
+    else if (t.hovering) inst = 0.f;
     // сглаживание, чтобы класс не мигал от кадра к кадру
     if (t.cls == TargetClass::Unknown || t.cls == TargetClass::Clutter) t.birdScore = inst;
     else t.birdScore = 0.8f * t.birdScore + 0.2f * inst;
@@ -371,8 +443,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         while (tr.path.size() > 30) tr.path.pop_front();
         const float sx = d.x - gx_, sy = d.y - gy_;
         tr.travel = std::max(tr.travel, std::hypot(sx - tr.bx, sy - tr.by));
-        tr.obs.push_back({frame_, sx, sy, d.contrast, d.level});
-        while ((int)tr.obs.size() > cfg_.cls_window) tr.obs.pop_front();
+        tr.obs.push_back({frame_, sx, sy, d.contrast, d.level, d.energy});
+        while ((int)tr.obs.size() > std::max(cfg_.cls_window, cfg_.flap_window)) tr.obs.pop_front();
         // полетел — его отклики не помеха; стоит долго — уже ясно, что помеха
         if (mover(tr)) {
             tr.everMover = true;
@@ -421,10 +493,20 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         t.by = d.y - gy_;
         t.hist.push_back(true);
         t.path.push_back({t.x, t.y});
-        t.obs.push_back({frame_, t.bx, t.by, t.contrast, d.level});
+        t.obs.push_back({frame_, t.bx, t.by, t.contrast, d.level, d.energy});
         t.edgeBorn = d.edge;
         if (learn) t.pend.push_back((uint32_t)cellOf(d));
         tracks_.push_back(std::move(t));
+    }
+    // стая: по взмахам соседей с прошлого кадра
+    for (auto& tr : tracks_) {
+        tr.flock = false;
+        const float v = std::hypot(tr.vsx, tr.vsy);
+        if (cfg_.flock_px <= 0 || !tr.confirmed || v < 0.5f) continue;
+        for (const auto& o : tracks_)
+            if (&o != &tr && o.confirmed && frame_ - o.flapT <= cfg_.flap_hold &&
+                std::fabs(o.x - tr.x) < cfg_.flock_px && std::fabs(o.y - tr.y) < cfg_.flock_px &&
+                std::hypot(o.vsx - tr.vsx, o.vsy - tr.vsy) < cfg_.flock_dv * v) { tr.flock = true; break; }
     }
     out_.clear();
     std::vector<char> inTrack(dets.size(), 0);
@@ -442,8 +524,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         classify(tr);
         // весомость: средний контраст попаданий, растёт со стажем до 10 попаданий
         double mc = 0;
-        for (const auto& q : tr.obs) mc += q.c;
-        mc /= std::max<size_t>(1, tr.obs.size());
+        const size_t from = tr.obs.size() > (size_t)cfg_.cls_window ? tr.obs.size() - cfg_.cls_window : 0;
+        for (size_t i = from; i < tr.obs.size(); ++i) mc += tr.obs[i].c;
+        mc /= std::max<size_t>(1, tr.obs.size() - from);
         tr.score = tr.cls == TargetClass::Clutter ? 0.f
                                                   : (float)(mc * std::min(1.0, tr.hits / 10.0) /
                                                             (1.0 + 0.25 * tr.miss));

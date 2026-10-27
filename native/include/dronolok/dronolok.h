@@ -33,6 +33,7 @@ typedef struct {
     float x, y, contrast, snr;
     int polarity; /* -1 тёмная, +1 яркая */
     int level;    /* масштаб, на котором найдена */
+    float energy; /* суммарный контраст пятна: по нему трекер видит взмахи крыльев */
 } dl_candidate;
 
 /* cls: 0 unknown, 1 drone, 2 bird, 3 clutter */
@@ -48,6 +49,7 @@ typedef struct {
     float sigma;  /* СКО ошибки прогноза позиции, пикс. */
     float score;  /* весомость цели */
     int locked;   /* 1 — захваченная цель */
+    float flap_r2, flap_period; /* взмахи: доля объяснённой дисперсии, период в кадрах */
 } dl_track;
 
 typedef struct {

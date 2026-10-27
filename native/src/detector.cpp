@@ -35,6 +35,33 @@ static inline uint32_t div_round_even(uint32_t num, uint32_t den) {
     return q + (2 * r > den || (2 * r == den && (q & 1)));
 }
 
+// Суммарный контраст: центр — самый тёмный (яркий) пиксель возле кандидата (координаты
+// кандидата квантованы пулингом), окно (2r+1)^2, фон — среднее по рамке на 2 пикс. дальше
+static void measure_energy(const uint8_t* g, int w, int h, int stride, Candidate& c) {
+    const int r = 2 << std::min(2, c.level), R = r + 2, srch = 1 << std::min(2, c.level + 1);
+    int cx = (int)std::lround(c.x), cy = (int)std::lround(c.y);
+    if (cx - R - srch < 0 || cy - R - srch < 0 || cx + R + srch >= w || cy + R + srch >= h) return;
+    int best = -1, bx = cx, by = cy;
+    for (int y = cy - srch; y <= cy + srch; ++y)
+        for (int x = cx - srch; x <= cx + srch; ++x) {
+            const int v = c.polarity > 0 ? g[(size_t)y * stride + x] : 255 - g[(size_t)y * stride + x];
+            if (v > best) { best = v; bx = x; by = y; }
+        }
+    cx = bx;
+    cy = by;
+    int64_t ring = 0;
+    for (int x = cx - R; x <= cx + R; ++x) ring += g[(size_t)(cy - R) * stride + x] + g[(size_t)(cy + R) * stride + x];
+    for (int y = cy - R + 1; y < cy + R; ++y) ring += g[(size_t)y * stride + cx - R] + g[(size_t)y * stride + cx + R];
+    const double bg = (double)ring / (8.0 * R);
+    int64_t in = 0;
+    for (int y = cy - r; y <= cy + r; ++y) {
+        const uint8_t* row = g + (size_t)y * stride;
+        for (int x = cx - r; x <= cx + r; ++x) in += row[x];
+    }
+    const double n = (double)(2 * r + 1) * (2 * r + 1);
+    c.energy = (float)std::max(0.0, c.polarity * ((double)in - bg * n));
+}
+
 static DetectorConfig sanitize(DetectorConfig c) {
     c.k = std::max(3, std::min(31, c.k | 1));
     c.pool = c.pool == 1 ? 1 : 2;
@@ -222,6 +249,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             out.resize(keep);
         }
     }
+    if (!learning_)
+        for (Candidate& c : out) measure_energy(gray, w, h, stride, c);
     if (learning_) ++texN_;
     const double t2 = now_ms();
     timing_.response_ms = t1 - t0;
