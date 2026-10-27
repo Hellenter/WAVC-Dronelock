@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 
 #include "dronolok/fileutil.hpp"
@@ -458,8 +459,13 @@ void Pipeline::processLoop() {
     // чтобы второй просмотр шёл как первый (иначе память выучивает пути целей этого ролика)
     std::vector<float> statSnap;
     // при закрытии и пересоздании трекера память помех сохраняется рядом с видео
+    // виртуальная поворотка (Settings::follow): смещение окна в кадре — дробное, чтобы
+    // поворот был плавным, — и целое смещение окна на прошлом кадре
+    float fox = 0, foy = 0;
+    int fix = -1, fiy = -1, fcw = 0, fch = 0, noAim = 0;
+    bool trkFollow = false;   // трекер считает в окне поворотки: память помех не того размера
     auto saveStatic = [&] {
-        if (!trk || trk->config().static_frames <= 0 || !s.staticFile) return;
+        if (!trk || trkFollow || trk->config().static_frames <= 0 || !s.staticFile) return;
         trk->staticCells(statCells);
         if (!statCells.empty()) trk->saveStatic(staticPath());
     };
@@ -488,8 +494,49 @@ void Pipeline::processLoop() {
                 if (trk) trk->config() = s.trk;
             }
         }
-        const Frame& f = *p.frame;
-        const Effective ef = effective(s, f.w, f.h);
+        const Frame& src = *p.frame;
+        Effective ef = effective(s, src.w, src.h);
+        // камера ведёт цель: детектор и трекер видят окно кадра, повёрнутое за целью, а
+        // поворот окна от прошлого кадра — известный сдвиг камеры
+        FramePtr view = p.frame;
+        float cropDx = 0, cropDy = 0;
+        if (s.follow) {
+            const float fr = std::min(1.f, std::max(0.2f, s.followFrac));
+            const int cw = std::min(src.w, std::max(64, (int)(fr * (float)src.w) & ~1));
+            const int ch = std::min(src.h, std::max(64, (int)(fr * (float)src.h) & ~1));
+            if (cw != fcw || ch != fch || p.loopStart || p.seekStart || fix < 0) {
+                fcw = cw;
+                fch = ch;
+                fox = 0.5f * (float)(src.w - cw);
+                foy = 0.5f * (float)(src.h - ch);
+                fix = -1;
+            }
+            fox = std::min(std::max(fox, 0.f), (float)(src.w - cw));
+            foy = std::min(std::max(foy, 0.f), (float)(src.h - ch));
+            const int ix = (int)std::lround(fox), iy = (int)std::lround(foy);
+            if (fix >= 0) {
+                cropDx = (float)(ix - fix);
+                cropDy = (float)(iy - fiy);
+            }
+            fix = ix;
+            fiy = iy;
+            auto c = std::make_shared<Frame>();
+            c->w = cw;
+            c->h = ch;
+            c->index = src.index;
+            c->decodeMs = src.decodeMs;
+            c->px.resize((size_t)cw * ch);
+            for (int y = 0; y < ch; ++y)
+                memcpy(&c->px[(size_t)y * cw], &src.px[(size_t)(iy + y) * src.w + ix], (size_t)cw);
+            view = c;
+            // камера ведёт цель поворачивается, как в руке: маски неба нет, зоны (авто) — да;
+            // масштабы (авто) — по размеру окна: в узком поле цель крупнее
+            ef.scales = effective(s, cw, ch).scales;
+            if (s.zones < 0) ef.zones = true;
+        } else {
+            fix = -1;
+        }
+        const Frame& f = *view;
         DetectorConfig want = s.det;
         want.scales = ef.scales;
         want.zones = ef.zones;
@@ -506,13 +553,14 @@ void Pipeline::processLoop() {
             backend_ = det.backendName();
             threads_ = det.threads();
         }
-        if (!trk || trkW != f.w || trkH != f.h || trkCell != s.trk.clutter_cell) {
+        if (!trk || trkW != f.w || trkH != f.h || trkCell != s.trk.clutter_cell || trkFollow != s.follow) {
             saveStatic();
             trk.reset(new Tracker(f.w, f.h, s.trk));
             trkW = f.w;
             trkH = f.h;
             trkCell = s.trk.clutter_cell;
-            if (s.staticFile && trk->loadStatic(staticPath())) {
+            trkFollow = s.follow;
+            if (s.staticFile && !trkFollow && trk->loadStatic(staticPath())) {
                 trk->staticCells(statCells);
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = "память помех загружена: " + std::to_string(statCells.size()) + " ячеек";
@@ -543,11 +591,13 @@ void Pipeline::processLoop() {
         }
         // Маска неба привязана к кадру и годится только для неподвижной камеры: при съёмке с рук
         // земля через секунду окажется там, где было небо, и наоборот (дрон пропадёт в "маске").
-        if (ef.motion != motionWas) {
-            if (!ef.motion) relearn_ = true;
-            motionWas = ef.motion;
+        // камера, ведущая цель, тоже поворачивается: маска неба не годится
+        const bool camMoves = ef.motion || s.follow;
+        if (camMoves != motionWas) {
+            if (!camMoves) relearn_ = true;
+            motionWas = camMoves;
         }
-        if (ef.motion) {
+        if (camMoves) {
             if (maskOn) {
                 det.clearMask();
                 maskOn = false;
@@ -576,7 +626,7 @@ void Pipeline::processLoop() {
         double t0 = now_ms(), t3 = t0;
         if (dup) {
             r = std::make_shared<Result>(*lastR);
-            r->frame = p.frame;
+            r->frame = view;
             r->loop = p.loop;
             r->seq = ++seq;
             r->dup = true;
@@ -590,14 +640,16 @@ void Pipeline::processLoop() {
             // сдвиг картинки от прошлого кадра: прогноз треков переносится вместе с камерой
             MotionEstimate me;
             const bool autoMotion = s.motion < 0;
-            if (ef.motion || autoMotion) me = gm.estimate(f.px.data(), f.w, f.h, f.w);
+            if (ef.motion || autoMotion) me = gm.estimate(src.px.data(), src.w, src.h, src.w);
             else gm.reset();
-            if (autoMotion) {
+            if (autoMotion || s.follow) {
                 // крупный кадр: сдвиг трекеру не передаём (оценка по облакам и веткам на
                 // ветру неточна, а камера, ведущая цель, держит её почти на месте кадра),
                 // но, пока камера поворачивается, память помех не учится — иначе она
                 // запомнила бы ведомую камерой цель как неподвижную
-                camHist.push_back(me.valid ? std::fabs(me.dx) + std::fabs(me.dy) : 0.f);
+                float mv = autoMotion && me.valid ? std::fabs(me.dx) + std::fabs(me.dy) : 0.f;
+                mv += std::fabs(cropDx) + std::fabs(cropDy);
+                camHist.push_back(mv);
                 while (camHist.size() > 60) camHist.pop_front();
                 float recent = 0;
                 for (float d : camHist) recent += d;
@@ -606,6 +658,10 @@ void Pipeline::processLoop() {
                 trk->setMovingCamera(ef.motion);
             }
             if (!ef.motion) me.dx = me.dy = 0;   // камера стоит: трекеру сдвиг не нужен
+            // поворот окна известен точно: картинка в нём сдвинулась навстречу
+            me.dx -= cropDx;
+            me.dy -= cropDy;
+            trk->setFollowing(s.follow);
             const double tm = now_ms();
             focus.clear();
             if (s.focus) trk->focus(me.dx, me.dy, focus);
@@ -626,6 +682,25 @@ void Pipeline::processLoop() {
             }
             const double t1 = now_ms();
             const auto& tracks = trk->update(cands, me.dx, me.dy);
+            // поворотка на следующий кадр: со скоростью цели плюс доля ошибки до центра окна
+            if (s.follow) {
+                float ax, ay, avx, avy, sx = 0, sy = 0;
+                // за непроверенной целью не поворачиваемся: окно уведёт на помеху, и настоящая
+                // цель окажется за краем узкого поля зрения
+                const bool verified =
+                    !s.followVerified || !trk->config().hard_lock || trk->lockState() == LockState::Hard;
+                if (trk->aim(ax, ay, avx, avy) && verified) {
+                    noAim = 0;
+                    sx = avx + s.followGain * (ax - 0.5f * (float)fcw);
+                    sy = avy + s.followGain * (ay - 0.5f * (float)fch);
+                } else if (++noAim > 120) {   // цели давно нет — поворотка медленно возвращается
+                    sx = 0.05f * (0.5f * (float)(src.w - fcw) - fox);
+                    sy = 0.05f * (0.5f * (float)(src.h - fch) - foy);
+                }
+                const float lim = std::max(1.f, s.followMaxPan * (float)fcw);
+                fox += std::min(lim, std::max(-lim, sx));
+                foy += std::min(lim, std::max(-lim, sy));
+            }
             const double t2 = now_ms();
             const bool learning = det.learningMask();
             if (learnLeft > 0 && --learnLeft == 0) {
@@ -675,6 +750,11 @@ void Pipeline::processLoop() {
             r->noiseLvl = det.noiseLevel();
             r->thr = det.threshold();
             r->fullEvery = dc.full_every;
+            r->follow = s.follow;
+            r->fx = s.follow ? fix : 0;
+            r->fy = s.follow ? fiy : 0;
+            r->srcW = src.w;
+            r->srcH = src.h;
             r->coarseEvery = dc.scales > 1 ? dc.coarse_every : 0;
             r->focus = focus;
             r->staticOn = trk->config().static_frames > 0;
@@ -693,8 +773,15 @@ void Pipeline::processLoop() {
         const bool gtFrame = gt && f.index < (int64_t)gt->frames.size();
         if (gtFrame) {
             r->gt = gt->frames[f.index];
-            r->gsx = gt->w ? (float)f.w / gt->w : 1.f;
-            r->gsy = gt->h ? (float)f.h / gt->h : 1.f;
+            r->gsx = gt->w ? (float)src.w / gt->w : 1.f;
+            r->gsy = gt->h ? (float)src.h / gt->h : 1.f;
+            if (r->follow) {   // разметка — в координатах окна поворотки
+                for (auto& g : r->gt) {
+                    g.x = g.x * r->gsx - (float)r->fx;
+                    g.y = g.y * r->gsy - (float)r->fy;
+                }
+                r->gsx = r->gsy = 1.f;
+            }
         }
         FrameRec rec;
         rec.decodeMs = (float)f.decodeMs;
@@ -744,22 +831,23 @@ void Pipeline::processLoop() {
         if (log_.size() < 500000) log_.push_back(rec);
         // качество считаем после первого прохода (как run_demo.py) или после обучения маски
         // при съёмке с рук маска неба не учится — качество считаем сразу (своя разметка роликов)
-        const bool evalOn = ef.motion || (s.loop ? p.loop >= 1 : f.index >= s.learnMaskFrames);
+        const bool evalOn = camMoves || (s.loop ? p.loop >= 1 : f.index >= s.learnMaskFrames);
         if (gtFrame && evalOn) eval_.add(r->gt, tracks, r->gsx, r->gsy);
         if (!s.trackLog.empty()) {
             if (!tlog) {
                 tlog.reset(open_file(s.trackLog, "w"));
-                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp\n");
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y\n");
             }
             if (tlog) {
                 if (tracks.empty())
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,\n", p.loop, (long long)f.index, r->lockId, (int)r->lockState,
-                            statCells.size());
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d\n", p.loop, (long long)f.index, r->lockId,
+                            (int)r->lockState, statCells.size(), r->fx, r->fy);
+                // координаты — исходного кадра (и при виртуальной поворотке)
                 for (const auto& t : tracks)
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f\n", p.loop,
-                            (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x, t.y,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d\n", p.loop,
+                            (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x + (float)r->fx, t.y + (float)r->fy,
                             t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits, t.travel, t.score, statCells.size(), t.bw,
-                            t.bh, t.expectedSize());
+                            t.bh, t.expectedSize(), r->fx, r->fy);
             }
         }
         latest_ = r;

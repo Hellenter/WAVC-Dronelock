@@ -335,6 +335,51 @@ static void test_size_expect() {
     std::printf("size expectation: ok (%.0f / %.0f px)\n", exp, size * 1.02f);
 }
 
+// Камера на поворотке ведёт захваченную цель (setFollowing, aim): цель стоит в центре
+// кадра, неподвижные точки сцены едут навстречу. Без setFollowing такую цель трекер счёл
+// бы наложением на кадр (стоит в кадре, пока камера поворачивается) и снял захват
+static void test_follow() {
+    for (int follow = 0; follow <= 1; ++follow) {
+        TrackerConfig tc;
+        tc.verify_frames = 10;
+        Tracker t(1280, 720, tc);
+        t.setFollowing(follow != 0);
+        auto cand = [](float x, float y, float c) {
+            Candidate d{};
+            d.x = x; d.y = y; d.contrast = c; d.snr = 5; d.polarity = -1; d.margin = c / 10.f;
+            return d;
+        };
+        float ox = 0, oy = 0, step = 0, err = 0;   // поворот камеры: точка сцены (x, y) — в кадре (x - ox, y - oy), по вертикали стоит
+        int lock = 0;
+        bool kept = true;
+        for (int i = 0; i < 200; ++i) {
+            const float sx = 500 + 3.f * i, sy = 360;   // цель летит по сцене
+            const std::vector<Candidate> dets = {cand(sx - ox, sy - oy, 30), cand(300 - ox, 200 - oy, 20),
+                                                 cand(1100 - ox, 600 - oy, 20)};
+            t.update(dets, -step, 0);
+            float ax, ay, vx, vy;
+            step = 0;
+            if (t.aim(ax, ay, vx, vy)) {
+                step = vx + 0.3f * (ax - 640.f);
+                if (i >= 150) {
+                    if (!lock) lock = t.lockedId();
+                    kept &= t.lockedId() == lock;
+                    err = std::max(err, std::fabs(ax - 640.f));
+                }
+            }
+            ox += step;
+        }
+        if (follow) {
+            CHECK(kept && lock && t.lockState() == LockState::Hard, "камера ведёт цель: захват %d, состояние %d", lock,
+                  (int)t.lockState());
+            CHECK(err < 30, "камера ведёт цель: цель ушла от центра на %.0f пикс.", err);
+        } else {
+            CHECK(!(kept && lock && t.lockState() == LockState::Hard), "без setFollowing цель не сочтена наложением");
+        }
+    }
+    std::printf("follow: ok\n");
+}
+
 // Регулятор нагрузки: при перегрузке упрощает до предела, при запасе возвращает; профили
 static void test_governor() {
     LoadGovernor g;
@@ -390,6 +435,7 @@ int main() {
     test_silhouette();
     test_hard_lock();
     test_size_expect();
+    test_follow();
     test_governor();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;

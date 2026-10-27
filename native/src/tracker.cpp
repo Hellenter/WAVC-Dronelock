@@ -401,6 +401,18 @@ bool Tracker::lockSearch(float camDx, float camDy, float& x, float& y, float& r,
     return false;
 }
 
+bool Tracker::aim(float& x, float& y, float& vx, float& vy) const {
+    for (const Track& t : out_) {
+        if (t.id != lockId_) continue;
+        x = t.x;
+        y = t.y;
+        vx = t.vsx;
+        vy = t.vsy;
+        return true;
+    }
+    return false;
+}
+
 const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, float camDx, float camDy) {
     ++frame_;
     gx_ += camDx;
@@ -652,7 +664,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             for (size_t i = from; i < tr.obs.size(); ++i)
                 vv += (tr.obs[i].fx - mx) * (tr.obs[i].fx - mx) + (tr.obs[i].fy - my) * (tr.obs[i].fy - my);
             const float spread = std::hypot(tr.obs.back().x - tr.obs[from].x, tr.obs.back().y - tr.obs[from].y);
-            if (std::sqrt(vv / no) < cfg_.overlay_px && spread > cfg_.overlay_cam) tr.overlay = true;
+            // за захваченной целью камера следит сама (setFollowing): стоять в кадре — её дело
+            if (std::sqrt(vv / no) < cfg_.overlay_px && spread > cfg_.overlay_cam && !(following_ && tr.id == lockId_))
+                tr.overlay = true;
         }
         if (tr.overlay && cfg_.static_frames > 0) staticAdd(cellOf(d));
         // полетел — его отклики не помеха; стоит долго — уже ясно, что помеха

@@ -904,6 +904,29 @@ void tab_algorithm(App& a, bool& changed) {
     help_marker("Каждая полярность — отдельный проход морфологии. Дрон на фоне неба почти всегда темнее неба, "
                 "поэтому на слабом железе можно оставить только тёмные: вдвое быстрее.");
 
+    heading("Камера ведёт цель");
+    changed |= ImGui::Checkbox("виртуальная поворотка", &a.s.follow);
+    help_marker("Проверка захвата для камеры на поворотном устройстве, которая следует за целью. Алгоритм видит "
+                "не весь кадр, а окно, и окно, как камера на подвесе, поворачивается за захваченной целью: цель "
+                "стоит почти в центре, фон едет навстречу её движению. Поворот окна трекер знает точно — как "
+                "показания датчиков поворотки. На экране — то, что видит такая камера.");
+    if (a.s.follow) {
+        label("поле зрения", "Окно — эта доля ширины и высоты кадра: узкое поле камеры на поворотке.");
+        float fr = a.s.followFrac * 100.f;
+        if (ImGui::SliderFloat("##ffrac", &fr, 20.f, 100.f, "%.0f%% кадра")) {
+            a.s.followFrac = fr / 100.f;
+            changed = true;
+        }
+        label("резкость поворота", "Какую долю отклонения цели от центра поворотка выбирает за кадр (сверх "
+                                   "скорости цели). Больше — цель ближе к центру, но поворот дёрганее.");
+        changed |= ImGui::SliderFloat("##fgain", &a.s.followGain, 0.05f, 1.f, "%.2f");
+        label("предел поворота", "Сколько окно может повернуться за кадр, доля его ширины.");
+        changed |= ImGui::SliderFloat("##fpan", &a.s.followMaxPan, 0.005f, 0.2f, "%.3f");
+        changed |= ImGui::Checkbox("только за проверенным дроном", &a.s.followVerified);
+        help_marker("Поворачиваться только при жёстком захвате (цель проверена как дрон). Иначе окно уходит за "
+                    "первой попавшейся помехой, и настоящая цель оказывается за краем узкого поля зрения.");
+    }
+
     heading("Неподвижная камера");
     label("кадров на маску неба", "Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не "
                                   "просматриваются. При учёте движения камеры маска не строится.");
@@ -1591,6 +1614,8 @@ void draw_view(App& a, const Result* r) {
                                 f.w, f.h, (long long)f.index, r->loop + 1, r->dt.total_ms, r->procMs);
     if (r->motionOn && r->camValid)
         len += snprintf(st + len, sizeof(st) - len, "  камера %+.1f %+.1f", r->camDx, r->camDy);
+    if (r->follow)
+        len += snprintf(st + len, sizeof(st) - len, "  поворотка: окно %d,%d из %dx%d", r->fx, r->fy, r->srcW, r->srcH);
     if (a.s.pace == Pace::Realtime && std::fabs(a.s.speed - 1) > 1e-3)
         len += snprintf(st + len, sizeof(st) - len, "  x%.2f", a.s.speed);
     int hf, hl;
@@ -1826,6 +1851,10 @@ int run_bench(int argc, char** argv) {
         else if (a == "--dedup") s.skipDuplicates = true;
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
+        else if (a == "--follow") s.follow = true;
+        else if (a == "--follow-frac") s.followFrac = (float)atof(val().c_str());
+        else if (a == "--follow-gain") s.followGain = (float)atof(val().c_str());
+        else if (a == "--follow-any") s.followVerified = false;
         else video = a;
     }
     if (preload > 0) {
@@ -1988,6 +2017,11 @@ int run_stress(int argc, char** argv) {
                 s.trk.size_predict = R(3) != 0;
                 s.trk.silh_max = F(50, 1000);
                 s.skipDuplicates = R(2);
+                s.follow = R(3) == 0;
+                s.followFrac = F(0.1f, 1.2f);
+                s.followGain = F(0, 2);
+                s.followMaxPan = F(0, 0.5f);
+                s.followVerified = R(2);
                 break;
             case 25:
                 s.trk.confirm = 1 + R(s.trk.window);

@@ -387,6 +387,16 @@ public:
     void setLockSilhouette(const Silhouette& s) { lockSilh_ = s; }
     // При движущейся камере долгая память учится только наложениям на кадр (см. overlay_hits)
     void setMovingCamera(bool m) { movingCam_ = m; }
+    // Камера на поворотном устройстве ведёт захваченную цель: цель стоит почти на месте
+    // кадра, а фон едет навстречу её движению (сдвиг камеры — в update как camDx/camDy, от
+    // датчиков поворотки или GlobalMotion). Захваченная цель тогда не считается наложением
+    // на кадр (см. overlay_hits) — она и должна стоять в кадре, пока сцена уезжает
+    void setFollowing(bool f) { following_ = f; }
+    bool following() const { return following_; }
+    // Куда вести камеру: захваченная цель на этом кадре (x, y — пикс. кадра) и её скорость
+    // по сцене (пикс./кадр). Поворотка, сдвинувшая кадр на vx, vy плюс долю ошибки до
+    // центра, держит цель в центре. false — захвата нет
+    bool aim(float& x, float& y, float& vx, float& vy) const;
     const std::vector<Candidate>& clutterDets() const { return clutterDets_; }
     // кандидаты, не попавшие ни в клаттер, ни в подтверждённый трек
     const std::vector<Candidate>& noiseDets() const { return noiseDets_; }
@@ -432,6 +442,7 @@ private:
     bool hard_ = false;
     Silhouette lockSilh_;
     bool movingCam_ = false;
+    bool following_ = false;
     bool partial_ = false;
     float lastX_ = 0, lastY_ = 0, lastVx_ = 0, lastVy_ = 0;
     float lastLs_ = 0, lastDls_ = 0;   // ожидание размера захвата: передаётся треку, подхватившему цель
