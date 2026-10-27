@@ -30,6 +30,8 @@ struct Packet {
     FramePtr frame;
     int loop = 0;
     bool loopStart = false;
+    bool seekStart = false;   // первый кадр после перемотки: треки начинаются заново
+    bool force = false;       // обработать и на паузе (перемотка на паузе)
     double readyAt = 0;
 };
 struct BufPool;
@@ -58,6 +60,10 @@ struct Settings {
     int motion = -1;           // компенсация движения камеры: -1 авто, 0 выкл., 1 вкл.
     bool focus = false;        // пониженный порог возле прогноза треков (эксперимент)
     int zones = -1;            // зоны кадра небо/смешанные/земля: -1 авто, 0 выкл., 1 вкл.
+    // память помех из файла рядом с видео: загружать при открытии и сохранять при закрытии.
+    // В замерах выключено: зацикленный ролик повторяет те же позиции целей, и память,
+    // накопленная прошлыми запусками, искажала бы результат
+    bool staticFile = true;
 };
 
 // Что реально включено для кадра w x h. Авто: кадр до ~2 Мп (Full HD и меньше) —
@@ -107,6 +113,17 @@ struct FrameRec {
     float camDx, camDy;
 };
 
+// Отметки на шкале видео, по номеру кадра (биты)
+enum Mark : uint8_t {
+    MARK_DONE = 1,      // кадр обработан
+    MARK_TARGET = 2,    // есть цель (не помеха), класс неясен
+    MARK_DRONE = 4,
+    MARK_BIRD = 8,
+    MARK_LOCK = 16,     // есть захват
+    MARK_GT = 32,       // по разметке на кадре есть дрон
+    MARK_MISS = 64,     // ...и он не найден
+};
+
 struct Stat {
     double mean = 0, p50 = 0, p95 = 0, max = 0;
 };
@@ -142,6 +159,12 @@ public:
     void setPaused(bool p);
     bool paused() const { return paused_; }
     void step();                         // один кадр на паузе
+    // Перемотка на кадр frame: чтение продолжается оттуда, треки начинаются заново.
+    // На паузе этот кадр обрабатывается и показывается.
+    void seek(int64_t frame);
+    int64_t length() const;              // кадров на шкале (0 — неизвестно)
+    void marks(std::vector<uint8_t>& out) const;
+    int findInHistory(int64_t frame) const;   // seq последнего обработанного кадра frame или -1
     void relearnMask();
     // Память статичных помех лежит рядом с видео (<видео>.static.bin): загружается при
     // открытии и сохраняется при закрытии, если включена
@@ -183,6 +206,8 @@ private:
     std::atomic<int> steps_{0};
     std::atomic<bool> relearn_{true};
     std::atomic<int> staticCmd_{0};
+    std::atomic<int64_t> seekReq_{-1};
+    std::atomic<int64_t> preN_{0};       // кадров в предзагрузке (0 — читаем файл)
     std::string staticMsg_;
 
     // очередь кадров
@@ -199,6 +224,7 @@ private:
     std::deque<std::shared_ptr<const Result>> hist_;
     size_t histBytes_ = 0;
     std::vector<FrameRec> log_;
+    std::vector<uint8_t> marks_;
     long dropped_ = 0, decoded_ = 0;
     std::deque<double> decodeTimes_;   // моменты выдачи кадров декодером
     std::string backend_, status_;

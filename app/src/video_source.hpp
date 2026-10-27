@@ -29,6 +29,10 @@ public:
     // false — конец файла или ошибка.
     bool read(uint8_t* dst, int outW, int outH, int dstStride);
     bool rewind();
+    // Перейти к кадру frame (от 0): к ближайшему ключевому кадру до него, затем
+    // декодировать вперёд; следующий read() вернёт frame (или ближайший после него).
+    bool seek(int64_t frame);
+    int64_t index() const { return index_; }   // номер кадра, который вернул последний read()
 
 private:
     bool decodeNext();
@@ -41,6 +45,9 @@ private:
     SwsContext* sws_ = nullptr;
     int stream_ = -1;
     bool eof_ = false;
+    double tb_ = 0;                 // единица времени потока, с
+    int64_t start_ = 0;             // pts первого кадра
+    int64_t index_ = -1, skipTo_ = 0;
     VideoInfo info_;
 };
 

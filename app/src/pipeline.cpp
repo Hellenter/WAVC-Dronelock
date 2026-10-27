@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 
 #include "platform.hpp"
@@ -88,6 +89,7 @@ void Pipeline::close() {
     latest_.reset();
     hist_.clear();
     histBytes_ = 0;
+    marks_.clear();
 }
 
 VideoInfo Pipeline::info() const { return info_; }
@@ -151,6 +153,28 @@ void Pipeline::step() {
 
 void Pipeline::relearnMask() { relearn_ = true; }
 
+void Pipeline::seek(int64_t frame) {
+    seekReq_ = std::max<int64_t>(0, frame);
+    qspace_.notify_all();
+}
+
+int64_t Pipeline::length() const {
+    const int64_t n = preN_;
+    return n > 0 ? n : info_.frames;
+}
+
+void Pipeline::marks(std::vector<uint8_t>& out) const {
+    std::lock_guard<std::mutex> lk(rm_);
+    out = marks_;
+}
+
+int Pipeline::findInHistory(int64_t frame) const {
+    std::lock_guard<std::mutex> lk(rm_);
+    for (auto it = hist_.rbegin(); it != hist_.rend(); ++it)
+        if ((*it)->frame->index == frame) return (*it)->seq;
+    return -1;
+}
+
 void Pipeline::resetStats() {
     std::lock_guard<std::mutex> lk(rm_);
     log_.clear();
@@ -188,18 +212,20 @@ void Pipeline::decodeLoop() {
         return;
     }
     const int W = s.procW > 0 ? s.procW : info_.w, H = s.procH > 0 ? s.procH : info_.h;
-    int64_t idx = 0;
     int loop = 0;
+    bool wrapped = false, first = true;
+    preN_ = 0;
     auto decodeOne = [&](FramePtr& f) -> bool {
         f = allocFrame(W, H);
         const double t = now_ms();
+        wrapped = false;
         if (!src.read(f->px.data(), W, H, W)) {
             if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W)) return false;
-            idx = 0;
             ++loop;
+            wrapped = true;
         }
         f->decodeMs = now_ms() - t;
-        f->index = idx++;
+        f->index = std::max<int64_t>(0, src.index());
         std::lock_guard<std::mutex> lk(rm_);
         ++decoded_;
         decodeTimes_.push_back(now_ms());
@@ -221,6 +247,9 @@ void Pipeline::decodeLoop() {
             status_ = b;
         }
         s.loop = loopSave;
+        // номера кадров в памяти — подряд с 0, шкала видео — по ним
+        for (size_t i = 0; i < pre.size(); ++i) pre[i]->index = (int64_t)i;
+        preN_ = (int64_t)pre.size();
         std::lock_guard<std::mutex> lk(rm_);
         status_.clear();
         if (pre.empty()) status_ = "не удалось прочитать ни одного кадра";
@@ -229,10 +258,30 @@ void Pipeline::decodeLoop() {
     size_t pi = 0;
     int ploop = 0;
     double next = now_ms();
-    bool wasPaused = false;
+    bool wasPaused = false, seeked = false;
     while (!stop_) {
+        const int64_t sk = seekReq_.exchange(-1);
+        if (sk >= 0) {   // перемотка: кадры, что уже в очереди, больше не нужны
+            {
+                std::lock_guard<std::mutex> lk(qm_);
+                q_.clear();
+            }
+            qspace_.notify_all();
+            if (s.source == Source::Preload) {
+                if (!pre.empty()) pi = (size_t)std::min<int64_t>(sk, (int64_t)pre.size() - 1);
+            } else if (!src.seek(sk)) {
+                std::lock_guard<std::mutex> lk(rm_);
+                status_ = "не удалось перемотать";
+            }
+            seeked = true;
+            next = now_ms();
+            {
+                std::lock_guard<std::mutex> lk(rm_);
+                if (status_ == "видео закончилось") status_.clear();
+            }
+        }
         // на паузе в очереди держим один кадр — для покадрового режима
-        if (paused_) {
+        if (paused_ && !seeked) {
             bool have;
             {
                 std::lock_guard<std::mutex> lk(qm_);
@@ -253,7 +302,14 @@ void Pipeline::decodeLoop() {
         if (s.source == Source::Preload) {
             if (pre.empty()) break;
             if (pi == pre.size()) {
-                if (!s.loop) break;
+                if (!s.loop) {
+                    {
+                        std::lock_guard<std::mutex> lk(rm_);
+                        status_ = "видео закончилось";
+                    }
+                    while (!stop_ && seekReq_ < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    continue;
+                }
                 pi = 0;
                 ++ploop;
             }
@@ -263,11 +319,23 @@ void Pipeline::decodeLoop() {
             ++pi;
         } else {
             FramePtr f;
-            if (!decodeOne(f)) break;
+            if (!decodeOne(f)) {
+                // конец файла без повтора: ждём перемотку
+                {
+                    std::lock_guard<std::mutex> lk(rm_);
+                    status_ = "видео закончилось";
+                }
+                while (!stop_ && seekReq_ < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
             p.frame = f;
             p.loop = loop;
-            p.loopStart = f->index == 0;
+            p.loopStart = (first || wrapped) && !seeked;
+            first = false;
         }
+        p.seekStart = seeked;
+        p.force = seeked && paused_;
+        seeked = false;
         const bool realtime = cur.pace == Pace::Realtime && !paused_;
         if (realtime) {
             const double fps = cur.targetFps > 0 ? cur.targetFps : info_.fps;
@@ -278,11 +346,8 @@ void Pipeline::decodeLoop() {
             if (now_ms() - next > period) next = now_ms();   // декодер не успевает — без рывков вдогонку
         }
         p.readyAt = now_ms();
-        push(std::move(p), realtime);
-    }
-    if (!stop_) {
-        std::lock_guard<std::mutex> lk(rm_);
-        if (status_.empty()) status_ = "видео закончилось";
+        const bool drop = realtime && !p.force;
+        push(std::move(p), drop);
     }
 }
 
@@ -312,7 +377,7 @@ void Pipeline::processLoop() {
     std::vector<TrackPoint> statCells;
     // при закрытии и пересоздании трекера память помех сохраняется рядом с видео
     auto saveStatic = [&] {
-        if (!trk || trk->config().static_frames <= 0) return;
+        if (!trk || trk->config().static_frames <= 0 || !s.staticFile) return;
         trk->staticCells(statCells);
         if (!statCells.empty()) trk->saveStatic(staticPath());
     };
@@ -322,12 +387,12 @@ void Pipeline::processLoop() {
         {
             std::unique_lock<std::mutex> lk(qm_);
             qcv_.wait_for(lk, std::chrono::milliseconds(50),
-                          [&] { return stop_ || (!q_.empty() && (!paused_ || steps_ > 0)); });
+                          [&] { return stop_ || (!q_.empty() && (!paused_ || steps_ > 0 || q_.front().force)); });
             if (stop_) break;
-            if (q_.empty() || (paused_ && steps_ <= 0)) continue;
+            if (q_.empty() || (paused_ && steps_ <= 0 && !q_.front().force)) continue;
             p = std::move(q_.front());
             q_.pop_front();
-            if (paused_) --steps_;
+            if (paused_ && !p.force && steps_ > 0) --steps_;
         }
         qspace_.notify_one();
         {
@@ -357,7 +422,7 @@ void Pipeline::processLoop() {
             trkW = f.w;
             trkH = f.h;
             trkCell = s.trk.clutter_cell;
-            if (trk->loadStatic(staticPath())) {
+            if (s.staticFile && trk->loadStatic(staticPath())) {
                 trk->staticCells(statCells);
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = "память помех загружена: " + std::to_string(statCells.size()) + " ячеек";
@@ -377,7 +442,7 @@ void Pipeline::processLoop() {
                          : ok     ? "сохранено " + std::to_string(statCells.size()) + " ячеек: " + staticPath()
                                   : "не удалось сохранить " + staticPath();
         }
-        if (p.loopStart) {   // склейка зацикленного видео — треки не должны "прыгать"
+        if (p.loopStart || p.seekStart) {   // склейка зацикленного видео или перемотка — треки не должны "прыгать"
             trk->resetTracks();
             gm.reset();
         }
@@ -488,7 +553,25 @@ void Pipeline::processLoop() {
         rec.lockId = r->lockId;
         rec.camDx = r->camDx;
         rec.camDy = r->camDy;
+        uint8_t mk = MARK_DONE;
+        if (rec.drones) mk |= MARK_DRONE;
+        if (rec.birds) mk |= MARK_BIRD;
+        if (rec.unknown) mk |= MARK_TARGET;
+        if (r->lockId) mk |= MARK_LOCK;
+        for (const auto& g : r->gt) {
+            if (g.bird) continue;
+            mk |= MARK_GT;
+            bool found = false;
+            for (const auto& t : tracks)
+                found |= !t.clutter && t.cls != TargetClass::Clutter && std::fabs(t.x - g.x * r->gsx) < 10 &&
+                         std::fabs(t.y - g.y * r->gsy) < 10;
+            if (!found) mk |= MARK_MISS;
+        }
         std::lock_guard<std::mutex> lk(rm_);
+        if (f.index >= 0 && f.index < (int64_t)4 << 20) {
+            if ((size_t)f.index >= marks_.size()) marks_.resize((size_t)f.index + 1, 0);
+            marks_[(size_t)f.index] = mk;
+        }
         rec.t = t3 - t0_;
         if (log_.size() < 500000) log_.push_back(rec);
         // качество считаем после первого прохода (как run_demo.py) или после обучения маски

@@ -1,5 +1,7 @@
 #include "video_source.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 extern "C" {
@@ -83,6 +85,10 @@ bool VideoSource::open(const std::string& path, int threads, std::string& err) {
     info_.h = ctx_->height;
     AVRational fr = av_guess_frame_rate(fmt_, st, nullptr);
     info_.fps = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 25.0;
+    tb_ = av_q2d(st->time_base);
+    start_ = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
+    index_ = -1;
+    skipTo_ = 0;
     if (st->nb_frames > 0) info_.frames = st->nb_frames;
     else if (fmt_->duration > 0) info_.frames = (int64_t)(fmt_->duration / 1e6 * info_.fps);
     info_.codec = codec->name;
@@ -138,9 +144,30 @@ void VideoSource::convert(uint8_t* dst, int outW, int outH, int dstStride) {
 }
 
 bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride) {
-    if (!fmt_ || !decodeNext()) return false;
+    if (!fmt_) return false;
+    for (;;) {
+        if (!decodeNext()) return false;
+        // номер кадра — по времени показа: после перемотки счёт кадров с начала неизвестен
+        const int64_t pts = frame_->best_effort_timestamp;
+        index_ = pts != AV_NOPTS_VALUE && tb_ > 0 ? (int64_t)std::llround((pts - start_) * tb_ * info_.fps) : index_ + 1;
+        if (index_ >= skipTo_) break;
+        av_frame_unref(frame_);   // до нужного кадра после перемотки — без преобразования
+    }
+    skipTo_ = 0;
     convert(dst, outW, outH, dstStride);
     av_frame_unref(frame_);
+    return true;
+}
+
+bool VideoSource::seek(int64_t frame) {
+    if (!fmt_) return false;
+    frame = std::max<int64_t>(0, frame);
+    const int64_t ts = start_ + (tb_ > 0 ? (int64_t)(frame / info_.fps / tb_) : 0);
+    if (av_seek_frame(fmt_, stream_, ts, AVSEEK_FLAG_BACKWARD) < 0 && !rewind()) return false;
+    avcodec_flush_buffers(ctx_);
+    eof_ = false;
+    index_ = -1;
+    skipTo_ = frame;
     return true;
 }
 
@@ -151,5 +178,7 @@ bool VideoSource::rewind() {
         return false;
     avcodec_flush_buffers(ctx_);
     eof_ = false;
+    index_ = -1;
+    skipTo_ = 0;
     return true;
 }

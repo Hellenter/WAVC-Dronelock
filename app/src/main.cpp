@@ -94,6 +94,10 @@ struct App {
     bool showNoise = true, showClutter = true, showTracks = true, showPaths = true, showIds = true;
     bool showMask = false, showGt = true, showCrops = true, showPred = true, showFocus = false;
     int viewSeq = -1;      // кадр из истории на паузе (Result::seq), -1 — последний обработанный
+    // шкала видео
+    std::vector<uint8_t> marks;
+    int64_t scrub = -1;    // куда тянут ползунок шкалы
+    double scrubAt = 0;
     int displayMode = 1;   // 0 каждый кадр, 1 до 30 FPS, 2 до 10 FPS, 3 не показывать
     float zoom = 1.f, panX = 0, panY = 0;
     // текстуры
@@ -183,6 +187,29 @@ void set_speed(App& a, double sp) {
     a.s.speed = std::min(2.0, std::max(0.05, sp));
     a.s.pace = Pace::Realtime;   // замедление имеет смысл только в темпе камеры
     a.pipe.setSettings(a.s);
+}
+
+// перемотка: на паузе кадр из истории (уже обработан, с разметкой) показывается сразу,
+// иначе чтение продолжается с этого кадра и треки начинаются заново
+void seek_to(App& a, int64_t frame, bool preferHistory) {
+    frame = std::max<int64_t>(0, frame);
+    if (preferHistory && a.pipe.paused()) {
+        const int seq = a.pipe.findInHistory(frame);
+        if (seq >= 0) {
+            int first, last;
+            a.viewSeq = a.pipe.historyRange(first, last) && seq == last ? -1 : seq;
+            return;
+        }
+    }
+    a.viewSeq = -1;
+    a.pipe.seek(frame);
+}
+
+std::string fmt_time(double s) {
+    char b[32];
+    const int m = (int)(s / 60);
+    snprintf(b, sizeof(b), "%d:%04.1f", m, s - m * 60);
+    return b;
 }
 
 // ------------------------------------------------------------ текстура кадра
@@ -374,7 +401,7 @@ void panel_controls(App& a) {
             ImGui::SameLine();
             if (ImGui::Button("кадр >")) step_forward(a);
             ImGui::SameLine();
-            if (ImGui::Button("С начала")) open_video(a, a.pipe.path());
+            if (ImGui::Button("С начала")) seek_to(a, 0, false);
             // скорость
             static const double speeds[] = {0.1, 0.25, 0.5, 1.0};
             static const char* speedNames[] = {"x0.1", "x0.25", "x0.5", "x1"};
@@ -1054,6 +1081,106 @@ void draw_view(App& a, const Result* r) {
     }
 }
 
+// ------------------------------------------------------------ шкала видео
+
+// Шкала под видео: перемотка в любое место файла, отметки целей, захвата и пропусков по разметке
+void draw_timeline(App& a, const Result* r, const Metrics& m) {
+    ImGuiIO& io = ImGui::GetIO();
+    const VideoInfo vi = a.pipe.info();
+    const double fps = vi.fps > 0 ? vi.fps : 25;
+    a.pipe.marks(a.marks);
+    const int64_t cur = r ? r->frame->index : 0;
+    int64_t n = a.pipe.length();
+    const bool known = n > 0;
+    n = std::max<int64_t>({n, (int64_t)a.marks.size(), cur + 1, 1});
+    const float pad = 8;
+    ImGui::SetCursorPos(ImVec2(pad, ImGui::GetCursorPosY() + 4));
+    // кнопки плеера
+    const bool paused = a.pipe.paused();
+    if (ImGui::Button("|<")) seek_to(a, 0, false);
+    ImGui::SetItemTooltip("В начало (Home)");
+    ImGui::SameLine();
+    if (ImGui::Button("<")) step_back(a);
+    ImGui::SetItemTooltip("Кадр назад (стрелка влево)");
+    ImGui::SameLine();
+    if (ImGui::Button(paused ? "  Пуск  " : " Пауза ")) {
+        if (paused && m.status == "видео закончилось") seek_to(a, 0, false);
+        toggle_pause(a);
+    }
+    ImGui::SetItemTooltip("Пробел");
+    ImGui::SameLine();
+    if (ImGui::Button(">")) step_forward(a);
+    ImGui::SetItemTooltip("Кадр вперёд (стрелка вправо)");
+    ImGui::SameLine();
+    const int64_t shown = a.scrub >= 0 ? a.scrub : cur;
+    ImGui::Text("%s / %s   кадр %lld / %lld%s", fmt_time(shown / fps).c_str(), fmt_time(n / fps).c_str(),
+                (long long)shown, (long long)n, known ? "" : "+");
+    if (a.s.pace == Pace::Realtime && std::fabs(a.s.speed - 1) > 1e-3) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "x%.2f", a.s.speed);
+    }
+    if (a.viewSeq >= 0) {
+        int hf, hl;
+        if (a.pipe.historyRange(hf, hl)) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "история: %d кадр. назад", hl - a.viewSeq);
+        }
+    }
+    // полоса: сверху — что нашёл алгоритм, снизу — разметка (зелёный найден, красный пропущен)
+    ImGui::SetCursorPosX(pad);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = std::max(10.f, ImGui::GetContentRegionAvail().x - pad), h = ImGui::GetFrameHeight() * 1.3f;
+    ImGui::InvisibleButton("timeline", ImVec2(w, h));
+    const bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p1(p0.x + w, p0.y + h);
+    dl->AddRectFilled(p0, p1, IM_COL32(40, 42, 48, 255), 3);
+    const float hTop = h * 0.62f;
+    const int cols = (int)w;
+    for (int x = 0; x < cols; ++x) {
+        const int64_t i0 = (int64_t)((double)x / cols * n), i1 = std::max(i0 + 1, (int64_t)((double)(x + 1) / cols * n));
+        uint8_t acc = 0;
+        for (int64_t i = i0; i < i1 && i < (int64_t)a.marks.size(); ++i) acc |= a.marks[(size_t)i];
+        if (!acc) continue;
+        const ImU32 c = acc & MARK_LOCK    ? COL_LOCK
+                        : acc & MARK_DRONE ? COL_DRONE
+                        : acc & MARK_BIRD  ? COL_BIRD
+                        : acc & MARK_TARGET ? COL_UNKNOWN
+                                            : IM_COL32(85, 88, 98, 255);
+        const float fx = p0.x + x;
+        dl->AddRectFilled(ImVec2(fx, p0.y + 2), ImVec2(fx + 1, p0.y + hTop), c);
+        if (acc & MARK_GT)
+            dl->AddRectFilled(ImVec2(fx, p0.y + hTop + 2), ImVec2(fx + 1, p1.y - 2),
+                              acc & MARK_MISS ? IM_COL32(255, 60, 60, 255) : COL_GT);
+    }
+    // текущий кадр
+    const float cx = p0.x + (float)((cur + 0.5) / n * w);
+    dl->AddLine(ImVec2(cx, p0.y - 2), ImVec2(cx, p1.y + 2), IM_COL32(255, 255, 255, 255), 2);
+    auto frameAt = [&](float mx) { return std::min<int64_t>(n - 1, std::max<int64_t>(0, (int64_t)((mx - p0.x) / w * n))); };
+    if (hov || act) {
+        const int64_t f = frameAt(io.MousePos.x);
+        const float hx = p0.x + (float)((f + 0.5) / n * w);
+        dl->AddLine(ImVec2(hx, p0.y), ImVec2(hx, p1.y), IM_COL32(255, 255, 255, 110), 1);
+        const uint8_t mk = f < (int64_t)a.marks.size() ? a.marks[(size_t)f] : 0;
+        ImGui::SetTooltip("кадр %lld, %s%s%s%s%s", (long long)f, fmt_time(f / fps).c_str(),
+                          !(mk & MARK_DONE) ? ", не обработан" : "", mk & MARK_LOCK ? ", захват" : "",
+                          mk & MARK_DRONE ? ", дрон" : "", mk & MARK_MISS ? ", дрон по разметке пропущен" : "");
+    }
+    // щелчок или перетаскивание — перемотка (при перетаскивании не чаще 10 раз в секунду)
+    if (act) {
+        const int64_t f = frameAt(io.MousePos.x);
+        const double t = now_ms();
+        if (f != a.scrub && t - a.scrubAt > 100) {
+            seek_to(a, f, true);
+            a.scrubAt = t;
+        }
+        a.scrub = f;
+    } else if (a.scrub >= 0) {
+        seek_to(a, a.scrub, true);
+        a.scrub = -1;
+    }
+}
+
 // ------------------------------------------------------------ режим замера без окна
 
 int run_bench(int argc, char** argv) {
@@ -1063,6 +1190,7 @@ int run_bench(int argc, char** argv) {
     Settings s;
     s.pace = Pace::MaxSpeed;
     s.loop = true;
+    s.staticFile = false;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -1078,6 +1206,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--motion") s.motion = atoi(val().c_str());
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
+        else if (a == "--static-file") s.staticFile = true;
         else if (a == "--full-every") s.det.full_every = atoi(val().c_str());
         else if (a == "--zones") s.zones = atoi(val().c_str());
         else if (a == "--coarse-every") s.det.coarse_every = atoi(val().c_str());
@@ -1125,10 +1254,150 @@ int run_bench(int argc, char** argv) {
     return 0;
 }
 
+// Стресс-проверка: случайно крутит настройки, паузу, историю и память помех, как
+// пользователь в интерфейсе, только много раз в секунду. Для поиска падений
+// (в сборке с -fsanitize=address) и в CI.
+int run_stress(int argc, char** argv) {
+    plat::attach_console();
+    std::string video;
+    double seconds = 20;
+    unsigned seed = 1;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--seconds" && i + 1 < argc) seconds = atof(argv[++i]);
+        else if (a == "--seed" && i + 1 < argc) seed = (unsigned)atoi(argv[++i]);
+        else video = a;
+    }
+    Pipeline p;
+    Settings s;
+    s.staticFile = false;
+    p.setSettings(s);
+    std::string err;
+    if (!p.open(video, err)) {
+        printf("ошибка: %s\n", err.c_str());
+        return 1;
+    }
+    const VideoInfo vi = p.info();
+    uint64_t st = seed * 0x9E3779B97F4A7C15ull + 1;
+    auto R = [&](int n) {   // xorshift: одинаково на всех платформах
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        return (int)(st % (uint64_t)n);
+    };
+    auto F = [&](float lo, float hi) { return lo + (hi - lo) * R(1001) / 1000.f; };
+    const std::vector<Isa> isas = available_isas();
+    const std::string tmp = video + ".stress.csv";
+    const double end = now_ms() + seconds * 1000;
+    long actions = 0, seen = 0;
+    int viewSeq = -1;
+    unsigned sum = 0;
+    while (now_ms() < end) {
+        SDL_Delay(2 + R(40));
+        // как интерфейс: последний кадр, кадр из истории, метрики
+        auto r = p.latest();
+        int first, last;
+        if (p.historyRange(first, last)) {
+            if (viewSeq < 0 || R(4) == 0) viewSeq = first + R(last - first + 1);
+            if (auto h = p.at(viewSeq)) r = h;
+        }
+        if (r) {
+            ++seen;
+            const Frame& f = *r->frame;
+            sum += f.px[(size_t)R(f.h) * f.w + R(f.w)];
+            for (const auto& t : r->tracks) sum += (unsigned)t.path.size();
+        }
+        p.metrics();
+        bool set = true;
+        int a = R(36);
+        // перезапуск чтения (источник, разрешение) и сброс — реже, иначе кадры почти не идут
+        if ((a >= 12 && a <= 15) || a == 30 || a == 32) a = R(6) ? 35 : a;
+        switch (a) {
+            case 0: s.scales = R(5); break;
+            case 1: s.motion = R(3) - 1; break;
+            case 2: s.zones = R(3) - 1; break;
+            case 3: s.det.full_every = 1 + R(4); break;
+            case 4: s.det.coarse_every = 1 + R(4); break;
+            case 5: s.focus = !s.focus; break;
+            case 6: s.trk.static_frames = R(2) ? 0 : 300 + R(30000); break;
+            case 7: s.trk.static_hits = F(3, 40); break;
+            case 8: s.det.threads = 1 + R(std::max(1, plat::logical_cpus())); break;
+            case 9: s.det.isa = R(3) ? isas[(size_t)R((int)isas.size())] : Isa::Auto; break;
+            case 10: s.pace = R(2) ? Pace::Realtime : Pace::MaxSpeed; break;
+            case 11: s.speed = F(0.05f, 2.f); break;
+            case 12:
+                s.source = R(3) ? Source::Stream : Source::Preload;
+                s.preloadFrames = 10 + R(40);
+                break;
+            case 13: {   // разрешение обработки, как в списке "разрешение"
+                static const float sc[] = {1.f, 0.75f, 0.5f, 0.25f, 0.33f, 1.5f};
+                const float k = sc[R(6)];
+                s.procW = k == 1.f ? 0 : std::max(64, (int)(vi.w * k) & ~1);
+                s.procH = k == 1.f ? 0 : std::max(64, (int)(vi.h * k) & ~1);
+                break;
+            }
+            case 14: s.decoderThreads = R(4); break;
+            case 15: s.loop = R(4) != 0; break;
+            case 16: s.emulateMs = R(3) ? 0 : F(0, 60); break;
+            case 17: s.learnMaskFrames = R(3) ? 25 : R(100); break;
+            case 18: s.det.thr = F(3, 40); break;
+            case 19: s.det.k = (3 + R(13)) | 1; break;
+            case 20: s.det.pool = R(2) ? 2 : 1; break;
+            case 21:
+                s.det.dark = R(4) != 0;
+                s.det.bright = R(4) != 0;
+                break;
+            case 22: s.det.clutter_k = F(1, 8); s.det.max_density = F(0.002f, 0.05f); break;
+            case 23: s.det.coarse_thr_k = F(1, 6); s.det.focus_k = F(0.2f, 1); break;
+            case 24:
+                s.trk.gate = F(5, 150);
+                s.trk.q_accel = F(0.25f, 20);
+                s.trk.max_miss = 1 + R(60);
+                s.trk.lock_switch = F(1, 5);
+                break;
+            case 25:
+                s.trk.confirm = 1 + R(s.trk.window);
+                s.trk.cls_min_hits = 3 + R(s.trk.cls_window - 2);
+                s.trk.bird_resid = F(0.5f, 10);
+                s.trk.bird_speed = R(2) ? 0 : F(0, 40);
+                break;
+            case 26: p.setPaused(!p.paused()); set = false; break;
+            case 27: p.step(); set = false; break;
+            case 28: p.relearnMask(); set = false; break;
+            case 29: R(2) ? p.staticSave() : p.staticClear(); set = false; break;
+            case 30: p.resetStats(); set = false; break;
+            case 31: p.exportCsv(tmp); p.reportJson(); set = false; break;
+            case 32:   // "С начала"
+                if (R(8) == 0 && !p.open(video, err)) {
+                    printf("ошибка: %s\n", err.c_str());
+                    return 1;
+                }
+                set = R(2);
+                break;
+            case 33:
+            case 34:   // перемотка по шкале
+                p.seek(R((int)std::max<int64_t>(1, std::min<int64_t>(p.length() + 20, 1 << 30))));
+                set = false;
+                break;
+            default: s.targetFps = R(2) ? 0 : F(1, 120); break;
+        }
+        if (set) p.setSettings(s);
+        ++actions;
+    }
+    const Metrics m = p.metrics(0);
+    p.close();
+    std::remove(tmp.c_str());
+    std::remove(p.staticPath().c_str());   // "сохранить память" пишет файл и без staticFile
+    printf("стресс: %.0f с, действий %ld, кадров обработано %ld, просмотрено %ld (%u) — без падений\n", seconds,
+           actions, m.processed, seen, sum & 1);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return run_bench(argc, argv);
+    if (argc > 1 && std::string(argv[1]) == "--stress") return run_stress(argc, argv);
 
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
@@ -1220,7 +1489,11 @@ int main(int argc, char** argv) {
             a.texAt = nw;
             a.shown = r;
         }
-        const Result* shown = a.shown.get();
+        // своя ссылка на кадр: кнопка "Открыть видео..." посреди кадра интерфейса сбрасывает
+        // a.shown, а панели ниже ещё рисуют этот кадр (раньше — обращение к удалённой памяти
+        // и вылет при открытии видео)
+        const std::shared_ptr<const Result> shownRef = a.shown;
+        const Result* shown = shownRef.get();
         const Metrics m = a.pipe.metrics();
 
         ImGui_ImplSDLRenderer2_NewFrame();
@@ -1228,8 +1501,13 @@ int main(int argc, char** argv) {
         ImGui::NewFrame();
         if (!io.WantTextInput && a.pipe.isOpen()) {
             if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) toggle_pause(a);
-            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) step_back(a);
-            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step_forward(a);
+            const int64_t curIdx = shown ? shown->frame->index : 0;
+            const int64_t sec = (int64_t)std::max(1.0, a.pipe.info().fps);
+            if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) seek_to(a, curIdx - sec, true);
+            else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_RightArrow)) seek_to(a, curIdx + sec, false);
+            else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) step_back(a);
+            else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step_forward(a);
+            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) seek_to(a, 0, false);
             if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
                 set_speed(a, a.s.speed * 2);
             if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
@@ -1253,7 +1531,12 @@ int main(int argc, char** argv) {
         ImGui::SetNextWindowSize(ImVec2(std::max(50.f, ds.x - lw - rw), ds.y));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("Видео", nullptr, fixed | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        const float barH = a.pipe.isOpen() ? ImGui::GetFrameHeightWithSpacing() + ImGui::GetFrameHeight() * 1.3f + 16 : 0;
+        ImGui::BeginChild("view", ImVec2(0, -barH), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         draw_view(a, shown);
+        ImGui::EndChild();
+        if (a.pipe.isOpen()) draw_timeline(a, shown, m);
         ImGui::End();
         ImGui::PopStyleVar();
 
