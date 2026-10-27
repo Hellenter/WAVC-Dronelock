@@ -267,8 +267,17 @@ static void test_silhouette() {
     CHECK(s.valid, "силуэт: не найден");
     CHECK(std::fabs(s.x - 400) < 12 && std::fabs(s.y - 300) < 15, "силуэт: центр %.0f,%.0f", s.x, s.y);
     CHECK(s.w > 180 && s.w < 230 && s.h > 70 && s.h < 120, "силуэт: размер %.0fx%.0f", s.w, s.h);
+    CHECK(!s.attached, "силуэт: БПЛА принят за светильник на мачте");
     const Silhouette e = measure_silhouette(img.data(), W, H, W, 150, 150, 6, -1);
     CHECK(!e.valid, "силуэт на пустом небе");
+    // прожектор на мачте: голова 20x14, мачта 3 пикс. вниз на 250 пикс. с наклоном
+    rect(590, 100, 610, 114);
+    for (int y = 114; y < 364; ++y) {
+        const int x = 599 + (y - 114) / 25;
+        for (int xx = x; xx < x + 3; ++xx) img[(size_t)y * W + xx] = 90;
+    }
+    const Silhouette m = measure_silhouette(img.data(), W, H, W, 600, 107, 6, -1);
+    CHECK(m.valid && m.attached, "прожектор на мачте не распознан: valid %d attached %d", m.valid, m.attached);
     std::printf("silhouette: ok\n");
 }
 

@@ -1035,6 +1035,10 @@ void tab_fine(App& a, bool& changed) {
         label("силуэт до, пикс.", "Больше этого — уже не цель, а земля, крона или облако.");
         changed |= ImGui::SliderFloat("##silhmax", &t.silh_max, 50, 1000, "%.0f");
     }
+    changed |= ImGui::Checkbox("на мачте или столбе — не дрон", &t.anchor_check);
+    help_marker("Если от захваченной цели вверх или вниз тянется длинная тонкая линия (мачта прожектора, столб, "
+                "ствол), это светильник или что-то на конструкции: захват снимается, цель становится помехой. "
+                "При съёмке с рук такая цель «летит» по кадру и иначе может пройти проверку на дрона.");
 
     heading("Жёсткий захват дрона");
     changed |= ImGui::Checkbox("включён", &t.hard_lock);
@@ -1808,6 +1812,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--csv") csv = val();
         else if (a == "--tracks") s.trackLog = val();
         else if (a == "--dedup") s.skipDuplicates = true;
+        else if (a == "--no-anchor") s.trk.anchor_check = false;
         else video = a;
     }
     if (preload > 0) {
@@ -1966,6 +1971,7 @@ int run_stress(int argc, char** argv) {
                 s.trk.hard_miss = 5 + R(296);
                 s.trk.hard_full_every = 1 + R(30);
                 s.trk.silhouette = R(3) != 0;
+                s.trk.anchor_check = R(3) != 0;
                 s.trk.silh_max = F(50, 1000);
                 s.skipDuplicates = R(2);
                 break;

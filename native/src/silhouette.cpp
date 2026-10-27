@@ -18,6 +18,39 @@ static float median_of(std::vector<float>& v) {
     return v[m];
 }
 
+// Тонкая линия от края силуэта: шаг за шагом по направлению (dx, dy) ищем самую тёмную
+// (светлую) точку в ±1 пикс. поперёк от прошлой (наклон линии до 45°) и сравниваем с фоном по бокам (±7..10 пикс.):
+// небо с градиентом не мешает. Линия есть, если тянется len шагов почти без разрывов.
+static bool stem(const uint8_t* gray, int w, int h, int stride, int x, int y, int dx, int dy, int len, float pol,
+                 float thr) {
+    int gaps = 0, run = 0;
+    const int px = dy != 0, py = dx != 0;   // поперечное направление
+    for (int k = 0; k < len; ++k) {
+        x += dx;
+        y += dy;
+        if (x < 12 || y < 12 || x >= w - 12 || y >= h - 12) return false;
+        float best = -1e9f;
+        int bo = 0;
+        for (int o = -1; o <= 1; ++o) {
+            const float v = pol * (float)gray[(size_t)(y + o * py) * stride + x + o * px];
+            if (v > best) { best = v; bo = o; }
+        }
+        float bg = 0;
+        for (int o = 7; o <= 10; ++o)
+            bg += (float)gray[(size_t)(y + o * py) * stride + x + o * px] +
+                  (float)gray[(size_t)(y - o * py) * stride + x - o * px];
+        bg *= 0.125f;
+        if (best - pol * bg > thr) {
+            x += bo * px;
+            y += bo * py;
+            ++run;
+        } else if (++gaps > len / 8) {
+            return false;
+        }
+    }
+    return run >= len * 3 / 4;
+}
+
 Silhouette measure_silhouette(const uint8_t* gray, int w, int h, int stride, float x, float y, float r, int polarity,
                               float minContrast, float maxR) {
     Silhouette out;
@@ -134,6 +167,53 @@ Silhouette measure_silhouette(const uint8_t* gray, int w, int h, int stride, flo
         out.h = (float)((y1 - y0 + 1) * s);
         out.area = area * s * s;
         out.contrast = (float)(sw / area);
+        // мачта, столб, ствол: из верха или низа силуэта уходит линия длиннее цели в
+        // несколько раз. Только вверх и вниз: вбок тянутся крылья крупного БПЛА, если
+        // силуэт собрал не всё крыло. Начинаем с самой контрастной точки стороны
+        {
+            const int bx0 = ox + x0 * s, bx1 = ox + (x1 + 1) * s - 1, by0 = oy + y0 * s, by1 = oy + (y1 + 1) * s - 1;
+            const int len = (int)std::max(30.f, 2.5f * std::max(out.w, out.h));
+            const float lthr = std::max(0.5f * minContrast, 0.25f * out.contrast);
+            const int cx = (int)std::lround(out.x), cy = (int)std::lround(out.y);
+            auto from = [&](int sx, int sy, int dx, int dy) {
+                // по стороне силуэта ищем, где вдоль неё темнее всего (основание мачты)
+                const int span = dx ? (by1 - by0) / 2 : (bx1 - bx0) / 2;
+                int bxs = sx, bys = sy;
+                float bv = -1e9f;
+                for (int o = -span; o <= span; ++o) {
+                    const int xx = dx ? sx : cx + o, yy = dx ? cy + o : sy;
+                    if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                    const float v = pol * (float)gray[(size_t)yy * stride + xx];
+                    if (v > bv) { bv = v; bxs = xx; bys = yy; }
+                }
+                return stem(gray, w, h, stride, bxs, bys, dx, dy, len, pol, lthr);
+            };
+            out.attached = from(cx, by1, 0, 1) || from(cx, by0, 0, -1);
+            // контрастная мачта попала в сам силуэт: по строкам габарита ширина тёмного
+            // (светлого) — длинный участок узкий, как мачта, а над ним голова прожектора
+            if (!out.attached && by1 - by0 >= 30) {
+                const int x0c = std::max(0, bx0), x1c = std::min(w - 1, bx1);
+                const int y0c = std::max(0, by0), y1c = std::min(h - 1, by1);
+                std::vector<int> wid((size_t)(y1c - y0c + 1), 0);
+                int maxW = 0;
+                for (int y = y0c; y <= y1c; ++y) {
+                    const uint8_t* row = gray + (size_t)y * stride;
+                    int n = 0;
+                    for (int x = x0c; x <= x1c; ++x) n += pol * ((float)row[x] - bg) > thr;
+                    wid[(size_t)(y - y0c)] = n;
+                    maxW = std::max(maxW, n);
+                }
+                const int narrow = std::max(4, (int)(0.3f * (float)maxW));
+                int run = 0, bestRun = 0, wide = 0;
+                for (int v : wid) {
+                    wide += v > narrow;
+                    run = v > 0 && v <= narrow ? run + 1 : 0;
+                    bestRun = std::max(bestRun, run);
+                }
+                // мачта длиннее и высоты, и ширины головы (фюзеляж БПЛА короче размаха крыла)
+                out.attached = wide > 0 && bestRun >= std::max({30, (int)(2.5f * (float)wide), maxW});
+            }
+        }
         return out;
     }
     return out;

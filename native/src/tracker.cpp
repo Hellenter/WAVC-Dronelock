@@ -254,7 +254,7 @@ void Tracker::classify(Track& t) const {
     // (фонарь, угол дома, когда камера ведёт панораму) — помеха; наложение на кадр — тоже.
     // Цель жёсткого захвата уже признана дроном: зависшая, она помехой не становится
     const bool held = hard_ && t.id == lockId_;
-    if (t.overlay || (!held && (t.clutter || (n >= cfg_.cls_min_hits && t.travel < std::max(3.f, 0.25f * (float)t.age))))) {
+    if (t.overlay || t.anchored || (!held && (t.clutter || (n >= cfg_.cls_min_hits && t.travel < std::max(3.f, 0.25f * (float)t.age))))) {
         t.cls = TargetClass::Clutter;
         return;
     }
@@ -377,9 +377,9 @@ bool Tracker::silhouetteFor(const Track& t) const {
 }
 
 bool Tracker::lockSearch(float camDx, float camDy, float& x, float& y, float& r, int& polarity) const {
-    if (!cfg_.silhouette || !lockId_) return false;
+    if (!lockId_ || !(cfg_.silhouette || cfg_.anchor_check)) return false;
     for (const Track& t0 : tracks_) {
-        if (t0.id != lockId_ || !silhouetteFor(t0)) continue;
+        if (t0.id != lockId_ || t0.anchored || (!silhouetteFor(t0) && !cfg_.anchor_check)) continue;
         Track t = t0;
         kf_predict(t, camDx, camDy, cfg_.q_accel * cfg_.q_accel);
         x = t.x;
@@ -427,7 +427,15 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // силуэт, резко сменивший размер, — захватил соседнее (облако, крону): не верим
     const bool silOk = sil.valid && (lockIdx < 0 || tracks_[lockIdx].bw <= 0 ||
                                      std::max(sil.w, sil.h) < 2.5f * std::max(tracks_[lockIdx].bw, tracks_[lockIdx].bh) + 16.f);
-    if (cfg_.silhouette && lockIdx >= 0 && silOk && silhouetteFor(tracks_[lockIdx])) {
+    // захваченное на мачте или столбе: большинство замеров с линией от силуэта
+    if (cfg_.anchor_check && lockIdx >= 0 && sil.valid) {
+        Track& L = tracks_[lockIdx];
+        if (L.silN >= 30) { L.silN /= 2; L.attN /= 2; }
+        ++L.silN;
+        L.attN += sil.attached;
+        if (L.silN >= 4 && L.attN * 10 >= L.silN * 6) L.anchored = true;
+    }
+    if (cfg_.silhouette && lockIdx >= 0 && silOk && silhouetteFor(tracks_[lockIdx]) && !tracks_[lockIdx].anchored) {
         Track& L = tracks_[lockIdx];
         const float size = std::max(sil.w, sil.h);
         const float m = std::max(6.f, 0.15f * size);
@@ -516,7 +524,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
 
     // клаттер: всё, что не продолжает движущуюся цель, греет карту; в горячих ячейках —
     // помеха (её не отдаём ни трекам, ни в новые треки)
-    auto mover = [&](const Track& t) { return t.confirmed && t.travel >= cfg_.mover_px && !t.overlay; };
+    auto mover = [&](const Track& t) { return t.confirmed && t.travel >= cfg_.mover_px && !t.overlay && !t.anchored; };
     std::vector<char> isMover(dets.size(), 0);
     for (size_t di = 0; di < dets.size(); ++di) {
         isMover[di] = (owner[di] >= 0 && mover(tracks_[owner[di]])) || (int)di == silhDet;
@@ -769,7 +777,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             else if (t.cls == TargetClass::Bird || t.cls == TargetClass::Clutter) verify_ = 0;
         }
         if (cfg_.hard_lock && verify_ >= cfg_.verify_frames) hard_ = true;
-        if (!cfg_.hard_lock || t.overlay || (hard_ && t.cls == TargetClass::Bird && t.birdScore > 0.8f)) {
+        if (!cfg_.hard_lock || t.overlay || t.anchored || (hard_ && t.cls == TargetClass::Bird && t.birdScore > 0.8f)) {
             hard_ = false;
             if (t.cls == TargetClass::Bird) verify_ = 0;
         }
