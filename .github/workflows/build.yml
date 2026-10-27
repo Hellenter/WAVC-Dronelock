@@ -72,9 +72,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Пакеты
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config nasm mingw-w64 
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends cmake ninja-build pkg-config nasm mingw-w64
       - name: Кэш FFmpeg
         id: ffcache
         uses: actions/cache@v4
@@ -158,9 +159,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Пакеты
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build qemu-user-static g++-${{ matrix.triple }}
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends cmake ninja-build qemu-user-static g++-${{ matrix.triple }}
       - name: Сборка и тесты NEON
         run: |
           cmake -S native -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/native/cmake/${{ matrix.triple }}.cmake
