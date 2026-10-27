@@ -1,5 +1,6 @@
 // Проверка: каждое SIMD-ядро совпадает со скалярным побайтно, а детектор даёт
 // одинаковых кандидатов при любом наборе инструкций, числе потоков и размере заданий.
+#include <cmath>
 #include <cstdio>
 #include <algorithm>
 #include <cstdlib>
@@ -249,6 +250,59 @@ static void test_static_map() {
     std::printf("static map: ok\n");
 }
 
+// Силуэт крупного БПЛА: от кончика крыла к центру всей цели; на чистом небе — ничего
+static void test_silhouette() {
+    const int W = 800, H = 600;
+    std::mt19937 g(7);
+    std::vector<uint8_t> img((size_t)W * H);
+    for (auto& v : img) v = (uint8_t)(180 + (int)(g() % 7) - 3);
+    auto rect = [&](int x0, int y0, int x1, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) img[(size_t)y * W + x] = 60;
+    };
+    rect(300, 290, 500, 304);   // крыло 200 пикс.
+    rect(390, 260, 410, 350);   // фюзеляж
+    rect(370, 340, 430, 346);   // хвост
+    const Silhouette s = measure_silhouette(img.data(), W, H, W, 305, 297, 6, -1);
+    CHECK(s.valid, "силуэт: не найден");
+    CHECK(std::fabs(s.x - 400) < 12 && std::fabs(s.y - 300) < 15, "силуэт: центр %.0f,%.0f", s.x, s.y);
+    CHECK(s.w > 180 && s.w < 230 && s.h > 70 && s.h < 120, "силуэт: размер %.0fx%.0f", s.w, s.h);
+    const Silhouette e = measure_silhouette(img.data(), W, H, W, 150, 150, 6, -1);
+    CHECK(!e.valid, "силуэт на пустом небе");
+    std::printf("silhouette: ok\n");
+}
+
+// Жёсткий захват: плавно летящий дрон проверяется verify_frames кадров, после этого захват
+// не уходит на более яркую цель; без жёсткого захвата — уходит
+static void test_hard_lock() {
+    for (int hard = 0; hard <= 1; ++hard) {
+        TrackerConfig tc;
+        tc.hard_lock = hard != 0;
+        tc.verify_frames = 10;
+        Tracker t(1280, 720, tc);
+        auto cand = [](float x, float y, float c) {
+            Candidate d{};
+            d.x = x; d.y = y; d.contrast = c; d.snr = 5; d.polarity = -1; d.margin = c / 10.f;
+            return d;
+        };
+        int lock = 0;
+        for (int i = 0; i < 80; ++i) {
+            t.update({cand(100 + 3.f * i, 300 + 0.5f * i, 25)});
+            lock = t.lockedId();
+        }
+        if (hard) CHECK(t.lockState() == LockState::Hard, "жёсткий захват не наступил");
+        else CHECK(t.lockState() == LockState::Tracking, "захват без жёсткого: %d", (int)t.lockState());
+        bool kept = true;
+        for (int i = 80; i < 140; ++i) {   // рядом летит цель вдвое контрастнее
+            t.update({cand(100 + 3.f * i, 300 + 0.5f * i, 25), cand(900 - 3.f * (i - 80), 500, 80)});
+            if (t.lockedId() != lock) kept = false;
+        }
+        if (hard) CHECK(kept, "жёсткий захват ушёл на другую цель");
+        else CHECK(!kept, "без жёсткого захвата лок не перешёл на сильную цель");
+    }
+    std::printf("hard lock: ok\n");
+}
+
 // Регулятор нагрузки: при перегрузке упрощает до предела, при запасе возвращает; профили
 static void test_governor() {
     LoadGovernor g;
@@ -301,6 +355,8 @@ int main() {
     test_detector();
     test_scales_focus();
     test_static_map();
+    test_silhouette();
+    test_hard_lock();
     test_governor();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;

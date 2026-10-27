@@ -726,6 +726,11 @@ void tab_video(App& a, bool& changed) {
     }
     heading("Проигрывание");
     changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
+    changed |= ImGui::Checkbox("Пропускать повторы кадра", &a.s.skipDuplicates);
+    help_marker("Запись экрана 60 к/с с ролика 25-30 к/с повторяет каждый кадр 2-3 раза. Включено — повтор не "
+                "обрабатывается, трекер видит ролик с его настоящей частотой, как с камеры 25-30 к/с. Выключено — "
+                "повторы обрабатываются как новые кадры (у тусклой цели больше попыток найтись, но скорость цели "
+                "скачет: то стоит, то прыгнула вдвое).");
     int first, last;
     if (a.pipe.paused() && a.pipe.historyRange(first, last) && last > first) {
         int cur = a.viewSeq >= 0 ? a.viewSeq : last;
@@ -1023,6 +1028,31 @@ void tab_fine(App& a, bool& changed) {
     changed |= ImGui::SliderFloat("##lockswitch", &t.lock_switch, 1, 5, "%.1f");
     label("подтверждение, кадров");
     changed |= ImGui::SliderInt("##confirm", &t.confirm, 1, t.window);
+    changed |= ImGui::Checkbox("крупная цель целиком (силуэт)", &t.silhouette);
+    help_marker("У крупного БПЛА детектор находит части: крыло, хвост, подвес. Силуэт собирает их в один объект: "
+                "захват держится за центр всей цели, а части не становятся отдельными целями.");
+    if (t.silhouette) {
+        label("силуэт до, пикс.", "Больше этого — уже не цель, а земля, крона или облако.");
+        changed |= ImGui::SliderFloat("##silhmax", &t.silh_max, 50, 1000, "%.0f");
+    }
+
+    heading("Жёсткий захват дрона");
+    changed |= ImGui::Checkbox("включён", &t.hard_lock);
+    help_marker("Когда захваченная цель достаточно долго подряд классифицируется как дрон, захват становится "
+                "жёстким: «Захвачен дрон», на другие цели не переключается, дольше держится на прогнозе, "
+                "детектор смотрит в основном вокруг неё. Снимается, если цель оказалась надписью на кадре или "
+                "уверенно птицей.");
+    if (t.hard_lock) {
+        label("проверка: дрон подряд, кадров", "Сколько обработанных кадров подряд цель должна быть дроном (и уже "
+                                                "пролететь по сцене), прежде чем захват станет жёстким. Больше — "
+                                                "надёжнее, но дольше до жёсткого захвата.");
+        changed |= ImGui::SliderInt("##verify", &t.verify_frames, 1, 120);
+        label("держать на прогнозе, кадров", "Сколько кадров жёстко захваченный дрон может не находиться.");
+        changed |= ImGui::SliderInt("##hardmiss", &t.hard_miss, 5, 300);
+        label("весь кадр раз в, кадров", "Остальное время детектор смотрит только вокруг захваченного дрона: "
+                                         "быстрее и не отвлекается.");
+        changed |= ImGui::SliderInt("##hardfull", &t.hard_full_every, 1, 30);
+    }
 
     heading("Птица или дрон");
     label("отклонение от траектории, пикс.", "Средний разброс точек трека вокруг плавной траектории за последние "
@@ -1122,17 +1152,21 @@ void lock_banner(const Result* r, const Metrics& m) {
     const ImGuiStyle& st = ImGui::GetStyle();
     const float h = FONT_BASE * 1.6f * st.FontScaleDpi + ImGui::GetTextLineHeight() + st.ItemSpacing.y +
                     st.WindowPadding.y * 2;
-    const ImVec4 bg = lk ? ImVec4(0.45f, 0.10f, 0.40f, 1) : ImVec4(0.13f, 0.14f, 0.17f, 1);
+    const bool hard = lk && r->lockState == LockState::Hard;
+    const ImVec4 bg = hard ? ImVec4(0.62f, 0.08f, 0.22f, 1) : lk ? ImVec4(0.45f, 0.10f, 0.40f, 1) : ImVec4(0.13f, 0.14f, 0.17f, 1);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 5);
     ImGui::BeginChild("lock", ImVec2(-FLT_MIN, h), ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     {
         FontSize f(1.6f);
-        if (lk) ImGui::TextColored(ImVec4(1, 0.85f, 0.98f, 1), "ЗАХВАТ  #%d %s", lk->id, class_ru(*lk));
+        if (lk && hard) ImGui::TextColored(ImVec4(1, 0.85f, 0.98f, 1), "ЗАХВАЧЕН ДРОН  #%d", lk->id);
+        else if (lk) ImGui::TextColored(ImVec4(1, 0.85f, 0.98f, 1), "ЗАХВАТ  #%d %s", lk->id, class_ru(*lk));
         else ImGui::TextColored(TXT_DIM, "Захвата нет");
     }
     if (lk && lk->miss) ImGui::TextColored(TXT_WARN, "на прогнозе %d кадр.", lk->miss);
+    else if (lk && hard) ImGui::TextUnformatted("проверен, на другие цели не отвлекается");
+    else if (lk && r->verifyNeed > 0) ImGui::Text("проверка, дрон ли это: %d из %d кадров", r->verify, r->verifyNeed);
     else if (lk) ImGui::TextUnformatted("цель ведётся");
     else ImGui::TextDisabled("нет подтверждённой цели");
     char pct[48];
@@ -1457,8 +1491,8 @@ void draw_view(App& a, const Result* r) {
                 dl->AddLine(q, e, col, 1.5f);
                 dl->AddCircleFilled(e, 3.f, col);
             }
-            if (t.id == r->lockId) {   // прицел захвата: уголки и перекрестие
-                const float g = h + 9, l = 8;
+            if (t.id == r->lockId) {   // прицел захвата: уголки (по габариту силуэта) и перекрестие
+                const float g = std::max(h + 9, 0.5f * std::max(t.bw, t.bh) * sc + 6), l = std::max(8.f, 0.25f * g);
                 for (int sx = -1; sx <= 1; sx += 2)
                     for (int sy = -1; sy <= 1; sy += 2) {
                         const ImVec2 c(q.x + sx * g, q.y + sy * g);
@@ -1469,8 +1503,13 @@ void draw_view(App& a, const Result* r) {
                 dl->AddLine(ImVec2(q.x + h + 3, q.y), ImVec2(q.x + g + 10, q.y), COL_LOCK, 1.5f);
                 dl->AddLine(ImVec2(q.x, q.y - g - 10), ImVec2(q.x, q.y - h - 3), COL_LOCK, 1.5f);
                 dl->AddLine(ImVec2(q.x, q.y + h + 3), ImVec2(q.x, q.y + g + 10), COL_LOCK, 1.5f);
-                char b[48];
-                snprintf(b, sizeof(b), t.miss ? "ЗАХВАТ (прогноз %d)" : "ЗАХВАТ", t.miss);
+                char b[64];
+                const bool hard = r->lockState == dronolok::LockState::Hard;
+                const char* what = hard ? "ЗАХВАЧЕН ДРОН" : "ЗАХВАТ";
+                if (t.miss) snprintf(b, sizeof(b), "%s (прогноз %d)", what, t.miss);
+                else if (!hard && r->verifyNeed > 0 && r->verify > 0)
+                    snprintf(b, sizeof(b), "ЗАХВАТ: дрон? %d/%d", r->verify, r->verifyNeed);
+                else snprintf(b, sizeof(b), "%s", what);
                 dl->AddText(ImVec2(q.x - g, q.y + g + 2), COL_LOCK, b);
             }
             if (!t.clutter && a.showPaths && t.path.size() > 1) {
@@ -1530,8 +1569,10 @@ void draw_view(App& a, const Result* r) {
     dl->PopClipRect();
     // строка состояния и легенда поверх видео
     char st[320];
-    int len = snprintf(st, sizeof(st), "%dx%d  кадр %lld  проход %d  детекция %.2f мс  обработка %.2f мс", f.w, f.h,
-                       (long long)f.index, r->loop + 1, r->dt.total_ms, r->procMs);
+    int len = r->dup ? snprintf(st, sizeof(st), "%dx%d  кадр %lld  проход %d  повтор прошлого кадра", f.w, f.h,
+                                (long long)f.index, r->loop + 1)
+                     : snprintf(st, sizeof(st), "%dx%d  кадр %lld  проход %d  детекция %.2f мс  обработка %.2f мс",
+                                f.w, f.h, (long long)f.index, r->loop + 1, r->dt.total_ms, r->procMs);
     if (r->motionOn && r->camValid)
         len += snprintf(st + len, sizeof(st) - len, "  камера %+.1f %+.1f", r->camDx, r->camDy);
     if (a.s.pace == Pace::Realtime && std::fabs(a.s.speed - 1) > 1e-3)
@@ -1766,7 +1807,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--json") json = val();
         else if (a == "--csv") csv = val();
         else if (a == "--tracks") s.trackLog = val();
-        else if (a == "--no-dedup") s.skipDuplicates = false;
+        else if (a == "--dedup") s.skipDuplicates = true;
         else video = a;
     }
     if (preload > 0) {
@@ -1920,6 +1961,13 @@ int run_stress(int argc, char** argv) {
                 s.trk.q_accel = F(0.25f, 20);
                 s.trk.max_miss = 1 + R(60);
                 s.trk.lock_switch = F(1, 5);
+                s.trk.hard_lock = R(3) != 0;
+                s.trk.verify_frames = 1 + R(120);
+                s.trk.hard_miss = 5 + R(296);
+                s.trk.hard_full_every = 1 + R(30);
+                s.trk.silhouette = R(3) != 0;
+                s.trk.silh_max = F(50, 1000);
+                s.skipDuplicates = R(2);
                 break;
             case 25:
                 s.trk.confirm = 1 + R(s.trk.window);

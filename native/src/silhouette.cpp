@@ -24,7 +24,7 @@ Silhouette measure_silhouette(const uint8_t* gray, int w, int h, int stride, flo
     if (!gray || w <= 0 || h <= 0 || x < 0 || y < 0 || x >= w || y >= h) return out;
     const float pol = polarity < 0 ? -1.f : 1.f;
     float H = std::min(maxR, std::max(24.f, 2.5f * std::max(r, 8.f)));
-    for (int attempt = 0; attempt < 4; ++attempt) {
+    for (int attempt = 0; attempt < 8; ++attempt) {   // 24 -> maxR удвоениями
         const int s = std::max(1, (int)std::ceil(H / 48.f));   // ячейка сетки, пикс.
         const int half = (int)std::ceil(H / s);
         const int n = 2 * half + 1;

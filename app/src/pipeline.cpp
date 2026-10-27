@@ -720,6 +720,7 @@ void Pipeline::processLoop() {
         rec.camDx = r->camDx;
         rec.camDy = r->camDy;
         rec.govLevel = r->govLevel;
+        rec.dup = r->dup;
         uint8_t mk = MARK_DONE;
         if (rec.drones) mk |= MARK_DRONE;
         if (rec.birds) mk |= MARK_BIRD;
@@ -831,14 +832,15 @@ Metrics Pipeline::metrics(int histLen) const {
     for (size_t i = from; i < n; ++i) {
         const FrameRec& r = log_[i];
         dec.push_back(r.decodeMs);
+        lat.push_back(r.latencyMs);
+        locked += r.lockId != 0;
+        if (r.dup) continue;   // повтор кадра: работы не было, времена обработки не занижаем
         det.push_back(r.detectMs);
         resp.push_back(r.responseMs);
         sel.push_back(r.selectMs);
         trk.push_back(r.trackMs);
         proc.push_back(r.procMs);
-        lat.push_back(r.latencyMs);
         mot.push_back(r.motionMs);
-        locked += r.lockId != 0;
     }
     m.lockPct = n > from ? 100.0 * locked / (n - from) : 0;
     m.motion = stat_of(mot);
@@ -859,6 +861,7 @@ Metrics Pipeline::metrics(int histLen) const {
     m.decodeFps = cnt / std::min(1.0, std::max(1e-3, tnow / 1000.0));
     const size_t hf = n > (size_t)histLen ? n - histLen : 0;
     for (size_t i = hf; i < n; ++i) {
+        if (log_[i].dup) continue;
         m.histDecode.push_back(log_[i].decodeMs);
         m.histDetect.push_back(log_[i].detectMs);
         m.histTrack.push_back(log_[i].trackMs);
@@ -871,13 +874,13 @@ bool Pipeline::exportCsv(const std::string& path) const {
     FILE* f = open_file(path, "w");
     if (!f) return false;
     fprintf(f, "t_ms,frame,decode_ms,motion_ms,detect_ms,response_ms,select_ms,track_ms,proc_ms,latency_ms,"
-               "candidates,drones,birds,unknown,clutter,noise,lock_id,cam_dx,cam_dy,gov_level\n");
+               "candidates,drones,birds,unknown,clutter,noise,lock_id,cam_dx,cam_dy,gov_level,dup\n");
     std::lock_guard<std::mutex> lk(rm_);
     for (const auto& r : log_)
-        fprintf(f, "%.2f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d\n", r.t,
+        fprintf(f, "%.2f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d\n", r.t,
                 (long long)r.index, r.decodeMs, r.motionMs, r.detectMs, r.responseMs, r.selectMs, r.trackMs, r.procMs,
                 r.latencyMs, r.cands, r.drones, r.birds, r.unknown, r.clutter, r.noise, r.lockId, r.camDx, r.camDy,
-                r.govLevel);
+                r.govLevel, (int)r.dup);
     fclose(f);
     return true;
 }
