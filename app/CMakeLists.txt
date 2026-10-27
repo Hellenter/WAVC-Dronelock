@@ -64,7 +64,7 @@ add_executable(dronolok_app
 target_include_directories(dronolok_app PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../native/tools ${FFMPEG_INCLUDE_DIRS})
 target_link_libraries(dronolok_app PRIVATE dronolok_static imgui)
 if(MINGW)
-  target_link_libraries(dronolok_app PRIVATE ${FFMPEG_STATIC_LDFLAGS} comdlg32 psapi advapi32 winmm)
+  target_link_libraries(dronolok_app PRIVATE ${FFMPEG_STATIC_LDFLAGS} comdlg32 ole32 psapi advapi32 winmm)
   target_link_options(dronolok_app PRIVATE -static -mwindows)
   set_target_properties(dronolok_app PROPERTIES OUTPUT_NAME "Dronolok")
 else()

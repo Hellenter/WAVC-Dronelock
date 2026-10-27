@@ -8,6 +8,9 @@
 //                [--focus] [--camera] [--slowdown K] [--governor] [--profile 0..3] [--json out.json]
 //   dronolok_app --stress видео [--seconds 30] [--seed N]
 #include <SDL.h>
+#if defined(_WIN32)
+#include <SDL_syswm.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -134,6 +137,7 @@ struct App {
     float zoom = 1.f, panX = 0, panY = 0;
     // текстуры
     SDL_Renderer* ren = nullptr;
+    void* owner = nullptr;   // окно приложения для диалога выбора файла (HWND)
     SDL_Texture* tex = nullptr;
     int texW = 0, texH = 0, texDs = 1, texSeq = -1;
     double texAt = 0;
@@ -597,10 +601,10 @@ void panel_main(App& a, bool& changed) {
     {
         FontSize f(1.25f);
         push_accent();
-        if (ImGui::Button(a.pipe.isOpen() ? "Открыть другое видео..." : "Открыть видео...", ImVec2(-FLT_MIN, bigH))) {
-            std::string p = plat::open_video_dialog();
-            if (!p.empty()) open_video(a, p);
-        }
+        const char* cap = plat::video_dialog_open() ? "Выбор файла открыт..."
+                          : a.pipe.isOpen()          ? "Открыть другое видео..."
+                                                     : "Открыть видео...";
+        if (ImGui::Button(cap, ImVec2(-FLT_MIN, bigH))) plat::open_video_dialog(a.owner);
         pop_accent();
     }
     ImGui::SetItemTooltip("Или перетащите файл в окно");
@@ -2082,6 +2086,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     App a;
+#if defined(_WIN32)
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (SDL_GetWindowWMInfo(win, &wm)) a.owner = wm.info.win.window;
+#endif
     a.ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!a.ren) a.ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     if (!a.ren) {
@@ -2162,6 +2171,8 @@ int main(int argc, char** argv) {
                 SDL_free(e.drop.file);
             }
         }
+        std::string picked;
+        if (plat::video_dialog_result(picked) && !picked.empty()) open_video(a, picked);
         if (SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED) {
             SDL_Delay(20);
             continue;

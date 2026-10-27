@@ -23,7 +23,12 @@ bool set_cpu_cap(int percent);
 // -2 низкий, -1 ниже среднего, 0 обычный, 1 выше среднего, 2 высокий
 void set_process_priority(int level);
 
-std::string open_video_dialog();       // "" — отменено или недоступно
+// Диалог выбора видео в отдельном потоке, интерфейс продолжает работать. owner — окно приложения
+// (HWND на Windows): диалог модальный для него и всегда поверх. Если диалог уже открыт, он
+// поднимается поверх, второй не открывается (тогда false).
+bool open_video_dialog(void* owner);
+bool video_dialog_open();
+bool video_dialog_result(std::string& path);   // true — диалог закрыт; path пустой, если отменили
 std::vector<std::string> ui_fonts();   // системные шрифты с кириллицей, по убыванию предпочтения
 void attach_console();                 // Windows: вывод --bench в консоль, из которой запустили
 
