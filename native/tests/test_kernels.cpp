@@ -203,7 +203,7 @@ static void test_static_map() {
     Tracker t(640, 480, tc);
     auto cand = [](float x, float y, float c) {
         Candidate d{};
-        d.x = x; d.y = y; d.contrast = c; d.snr = 5; d.polarity = -1;
+        d.x = x; d.y = y; d.contrast = c; d.snr = 5; d.polarity = -1; d.margin = c / 10.f;   // как от Detector с порогом 10
         return d;
     };
     for (int i = 0; i < 200; ++i) {   // катушка: отклик в 4 кадрах из 5

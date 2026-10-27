@@ -267,6 +267,14 @@ int Tracker::coastLimit(const Track& t) const {
     return t.hits < cfg_.cls_min_hits || t.travel < cfg_.mover_px ? 1 : std::min(cfg_.max_miss, t.hits);
 }
 
+// вклад попадания в уверенность: ~ логарифм отношения правдоподобия "цель / шум" для
+// отклика в margin раз выше порога. Кандидат не от Detector (margin неизвестен) —
+// подтверждается как раньше, по одному счёту попаданий.
+float Tracker::evidenceOf(const Candidate& d) const {
+    if (d.margin <= 0) return cfg_.ev_confirm;
+    return std::min(9.f, d.margin * d.margin) - 1.f + cfg_.ev_hit;
+}
+
 float Tracker::measVar(int level) const {
     const float r = cfg_.r_meas * (float)(1 << std::max(0, std::min(4, level)));
     return r * r;
@@ -419,9 +427,11 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         ++tr.age;
         if (best < 0) {
             ++tr.miss;
+            tr.evidence = std::max(0.f, tr.evidence - cfg_.ev_miss);
             continue;
         }
         const Candidate& d = dets[best];
+        tr.evidence = std::min(100.f, tr.evidence + evidenceOf(d));
         // обновление Калмана, измеряется только позиция
         const float R = measVar(d.level), S = tr.p00 + R;
         const float k0 = tr.p00 / S, k1 = tr.p01 / S;
@@ -488,6 +498,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         t.p01 = 0;
         t.p11 = v0 * v0;
         t.hits = 1;
+        t.evidence = std::max(0.f, evidenceOf(d));
         t.det = di;
         t.bx = d.x - gx_;
         t.by = d.y - gy_;
@@ -515,7 +526,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
         for (bool b : tr.hist) nh += b;
         // "надёжный" трек: confirm попаданий из window; на пропусках признак сохраняется,
         // чтобы цель держалась на прогнозе, а не исчезала
-        if (tr.miss == 0) tr.solid = nh >= cfg_.confirm;
+        if (tr.miss == 0) tr.solid = nh >= cfg_.confirm && (tr.confirmed || tr.evidence >= cfg_.ev_confirm);
         if (tr.solid) tr.confirmed = true;
         tr.clutter = tr.miss == 0 && !mover(tr) && (hot(tr.x, tr.y) || staticHot(tr.x, tr.y));
         tr.vx = tr.vsx + camDx;

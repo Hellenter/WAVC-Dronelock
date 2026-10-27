@@ -72,6 +72,9 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.full_every = std::max(1, std::min(16, c.full_every));
     c.coarse_every = std::max(1, std::min(16, c.coarse_every));
     c.mixed_k = std::max(1.f, std::min(5.f, c.mixed_k));
+    c.noise_k = std::max(1.f, std::min(20.f, c.noise_k));
+    c.thr_min = std::max(1.f, c.thr_min);
+    c.thr_max = std::max(c.thr_min, c.thr_max);
     return c;
 }
 
@@ -142,7 +145,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         if (learning_) texSum_.assign((size_t)tw_ * th_, 0.f);
     }
     // как cv2.threshold(R, thr*0.6) на u8: горячий, если R > floor(thr*0.6)
-    const float ht = std::floor(cfg_.thr * 0.6f);
+    const float ht = std::floor(hotLevel());
     ResponseParams p;
     p.k = cfg_.k;
     p.pool = s;
@@ -163,6 +166,18 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     }
     backend_->compute(FrameView{gray, w, h, stride}, p, m, stats_->dark, stats_->bright,
                       timing_.jobs, timing_.jobs_skipped);
+    if (cfg_.auto_thr && !timing_.partial) {
+        const bool first = thrEff_ <= 0;
+        updateNoise();
+        // первый кадр: порога по шуму ещё не было — пересчитать с ним, иначе маска неба
+        // и текстура этого кадра посчитаны со случайным порогом
+        const uint8_t ht2 = (uint8_t)std::max(0.f, std::min(255.f, std::floor(hotLevel())));
+        if (first && ht2 != p.hot_thr) {
+            p.hot_thr = ht2;
+            backend_->compute(FrameView{gray, w, h, stride}, p, m, stats_->dark, stats_->bright,
+                              timing_.jobs, timing_.jobs_skipped);
+        }
+    }
 
     // грубые масштабы: кадр уменьшается min/max-пулингом, обе полярности считаются
     // как "тёмные" (яркая — на инвертированном 255-max кадре)
@@ -258,6 +273,26 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     timing_.total_ms = t2 - t0;
 }
 
+// Шум отклика: медиана среднего отклика по посчитанным тайлам основного масштаба.
+// Лес, облака и цели занимают меньшую часть кадра, медиана их не видит. Сглаживание
+// по кадрам — чтобы порог не дёргался от кадра к кадру.
+void Detector::updateNoise() {
+    const TileStats& a = cfg_.dark ? stats_->dark : stats_->bright;
+    const TileStats* b = cfg_.dark && cfg_.bright ? &stats_->bright : nullptr;
+    const size_t n = a.sum.size();
+    noiseTmp_.clear();
+    const float inv = 1.f / (float)(cfg_.tile * cfg_.tile * (b ? 2 : 1));
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t s = a.sum[i] + (b ? b->sum[i] : 0);
+        if (s) noiseTmp_.push_back((float)s * inv);   // 0 — тайл не считался (маска)
+    }
+    if (noiseTmp_.size() < 8) return;
+    auto mid = noiseTmp_.begin() + noiseTmp_.size() / 2;
+    std::nth_element(noiseTmp_.begin(), mid, noiseTmp_.end());
+    noise_ = thrEff_ > 0 ? 0.9f * noise_ + 0.1f * *mid : *mid;
+    thrEff_ = std::max(cfg_.thr_min, std::min(cfg_.thr_max, cfg_.noise_k * noise_));
+}
+
 // Зоны по тайлам основного масштаба (см. DetectorConfig::zones)
 void Detector::computeZones() {
     const size_t n = (size_t)tw_ * th_;
@@ -347,7 +382,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
     // до k*k/2 "горячих" пикселей. Основной масштаб — строго как в detector.py.
     const float maxDens = fineGrid ? cfg_.max_density : cfg_.max_density + 0.5f * cfg_.k * cfg_.k / (float)area;
     const float ck = fineGrid ? 1.f : cfg_.coarse_thr_k;
-    const float thr0 = cfg_.thr * ck, thrF = cfg_.thr * ck * cfg_.focus_k;
+    const float thr0 = threshold() * ck, thrF = threshold() * ck * cfg_.focus_k;
     const size_t first = out.size();
     const bool useMask = fineGrid && !learning_ && !mask_.empty();
     for (int ty = 0; ty < th; ++ty)
@@ -369,6 +404,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             c.x = (float)((tx * T + bx) * f) + (f - 1) * 0.5f;
             c.y = (float)((ty * T + by) * f) + (f - 1) * 0.5f;
             c.contrast = mx;
+            c.margin = mx / thr0;
             c.snr = mx / (level + 1.f);
             c.polarity = pol ? 1 : -1;
             c.level = lvl;

@@ -35,6 +35,14 @@ struct DetectorConfig {
     int scales = 1;
     float coarse_thr_k = 3.f;   // на грубых масштабах порог выше: крупная близкая цель контрастна
     float focus_k = 0.6f;       // возле прогноза трека (setFocus) порог = thr * focus_k
+    // Порог по шуму (CFAR, как в радарах и ИК-поиске): уровень шума отклика оценивается
+    // по медиане тайлов неба на каждом кадре, порог следующего кадра = noise_k * шум, но
+    // не ниже thr_min и не выше thr_max. Порог "горячих" пикселей (текстура, маска неба)
+    // масштабируется так же. Чистое небо — порог ниже, видны тусклые цели; шумная матрица
+    // (вечер, высокий ISO) — выше, кадр не засыпает ложными. false — постоянный thr.
+    bool auto_thr = false;
+    float noise_k = 12.f;       // шум 2 уровня (типичная матрица днём) -> порог ~8
+    float thr_min = 5.f, thr_max = 40.f;
     // Экономия: весь кадр (основной масштаб) и грубые масштабы просматриваются раз в
     // full_every / coarse_every кадров, в остальные — только тайлы вокруг прогнозов
     // треков (setRoi). Цель, которую уже ведём, не теряется, новая находится с
@@ -69,6 +77,7 @@ struct Candidate {
     // в 1-4 пикс. пиковый контраст почти не меняется, а суммарный следует за площадью
     // силуэта, то есть за взмахами крыльев.
     float energy = 0;
+    float margin = 0;  // во сколько раз отклик выше действующего порога (0 — неизвестно: не из Detector)
 };
 
 // Область, где ждём цель (прогноз трека): там порог ниже, см. DetectorConfig::focus_k
@@ -122,6 +131,9 @@ public:
     void reconfigure(const DetectorConfig& cfg);
     const DetectorConfig& config() const { return cfg_; }
     const DetectTiming& timing() const { return timing_; }
+    // Оценка шума отклика (средний отклик тайла неба, медиана) и действующий порог
+    float noiseLevel() const { return noise_; }
+    float threshold() const { return cfg_.auto_thr && thrEff_ > 0 ? thrEff_ : cfg_.thr; }
     std::string backendName() const;
     int threads() const;
 
@@ -143,6 +155,16 @@ private:
     std::vector<int> fill_;
     void computeZones();
     long frameNo_ = 0;
+    float noise_ = 0, thrEff_ = 0;
+    std::vector<float> noiseTmp_;
+    // "горячий" пиксель (оценка текстуры тайла): 0.6 порога; с порогом по шуму — не ниже
+    // уровня, при котором чистое небо даёт столько же горячих, сколько при thr 10 и шуме 2
+    // (иначе низкий порог превращает небо в "текстуру" и маска выключает весь кадр)
+    float hotLevel() const {
+        const float h = threshold() * 0.6f;
+        return cfg_.auto_thr && thrEff_ > 0 ? std::max(h, 8.5f * noise_) : h;
+    }
+    void updateNoise();
     void roiMask(int tw, int th, int tilePx, const uint8_t* base);
     struct Stats;
     std::unique_ptr<Stats> stats_;
@@ -169,6 +191,14 @@ struct TrackerConfig {
     int window = 5;
     int max_miss = 12;          // подтверждённый трек держится на прогнозе до стольких кадров (не дольше, чем было попаданий)
     int tentative_miss = 2;     // неподтверждённый — столько
+    // Подтверждение по накопленной "уверенности" (последовательный тест отношения
+    // правдоподобия, как в track-before-detect): попадание добавляет margin^2 - 1 + ev_hit
+    // (отклик у самого порога — почти ничего, вдвое выше — много), пропуск отнимает ev_miss.
+    // Трек выдаётся, когда набрал ev_confirm. Шум, проскочивший у порога, и случайные
+    // совпадения 3 из 5 так не подтверждаются, а тусклая, но устойчивая цель — да,
+    // за несколько кадров. Позволяет держать порог детектора ниже. 0 — выключено.
+    float ev_confirm = 3.f;
+    float ev_hit = 0.f, ev_miss = 1.f;
     float mover_px = 16.f;      // трек, ушедший по сцене дальше, — движущаяся цель, а не помеха
     float dup_px = 8.f;         // ближе к существующему треку новый трек не рождается
     float lock_switch = 1.5f;   // захват переходит на другую цель, если она весомее во столько раз
@@ -225,6 +255,7 @@ struct Track {
     bool clutter = false;    // стоит в "горячей" ячейке карты клаттера и никуда не летал
     float sigma = 0;         // СКО ошибки прогноза позиции, пикс.
     float score = 0;         // "весомость" цели для захвата: контраст, стаж, не помеха
+    float evidence = 0;      // накопленная уверенность, см. TrackerConfig::ev_confirm
     float travel = 0;        // как далеко ушёл по сцене от точки рождения, пикс.
     TargetClass cls = TargetClass::Unknown;
     float birdScore = 0;     // сглаженная "птичность", 0..1
@@ -291,6 +322,7 @@ private:
     void classify(Track& t) const;
     void shiftHeat(float dx, float dy);
     float measVar(int level) const;
+    float evidenceOf(const Candidate& d) const;
     int coastLimit(const Track& t) const;
 
     TrackerConfig cfg_;

@@ -72,7 +72,7 @@ int dl_detect(dl_detector* d, const uint8_t* gray, int w, int h, int stride, dl_
     const int n = (int)d->cands.size();
     for (int i = 0; i < std::min(n, cap); ++i) {
         const Candidate& c = d->cands[i];
-        out[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level, c.energy};
+        out[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level, c.energy, c.margin};
     }
     return n;
 }
@@ -114,6 +114,7 @@ int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* 
         const dl_candidate& c = dets[i];
         t->dets[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level};
         t->dets[i].energy = c.energy;
+        t->dets[i].margin = c.margin;
     }
     const auto& tr = t->trk.update(t->dets, t->dx, t->dy);
     t->dx = t->dy = 0;
@@ -129,7 +130,7 @@ int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* 
 int dl_tracker_clutter(dl_tracker* t, dl_candidate* out, int cap) {
     const auto& c = t->trk.clutterDets();
     for (int i = 0; i < std::min((int)c.size(), cap); ++i)
-        out[i] = {c[i].x, c[i].y, c[i].contrast, c[i].snr, c[i].polarity, c[i].level, c[i].energy};
+        out[i] = {c[i].x, c[i].y, c[i].contrast, c[i].snr, c[i].polarity, c[i].level, c[i].energy, c[i].margin};
     return (int)c.size();
 }
 

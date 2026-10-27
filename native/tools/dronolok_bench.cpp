@@ -40,6 +40,9 @@ static void usage() {
         "  --isa auto|scalar|sse2|avx2|neon\n"
         "  --pool 1|2 --k 7 --thr 10 --tile 32 --job RxC\n"
         "  --polarity dark|bright|both\n"
+        "  --auto-thr [--noise-k 4.5 --thr-min 5]   порог по оценке шума (CFAR)\n"
+        "  --ev 3 [--ev-hit 0.3]   подтверждение трека по накопленной уверенности\n"
+        "  --confirm 3 --window 5  подтверждение трека: попаданий из окна кадров\n"
         "  --learn-mask N          авто-маска неба по первым N кадрам\n"
         "  --scales 1..4           доп. масштабы для крупных целей\n"
         "  --focus                 пониженный порог возле прогноза треков\n"
@@ -117,6 +120,13 @@ int main(int argc, char** argv) {
         else if (a == "--pool") cfg.pool = std::atoi(val().c_str());
         else if (a == "--k") cfg.k = std::atoi(val().c_str());
         else if (a == "--thr") cfg.thr = (float)std::atof(val().c_str());
+        else if (a == "--auto-thr") cfg.auto_thr = true;
+        else if (a == "--noise-k") cfg.noise_k = (float)std::atof(val().c_str());
+        else if (a == "--thr-min") cfg.thr_min = (float)std::atof(val().c_str());
+        else if (a == "--ev") tcfg.ev_confirm = (float)std::atof(val().c_str());
+        else if (a == "--ev-hit") tcfg.ev_hit = (float)std::atof(val().c_str());
+        else if (a == "--confirm") tcfg.confirm = std::atoi(val().c_str());
+        else if (a == "--window") tcfg.window = std::atoi(val().c_str());
         else if (a == "--tile") cfg.tile = std::atoi(val().c_str());
         else if (a == "--job") { std::string v = val(); std::sscanf(v.c_str(), "%dx%d", &cfg.job_rows, &cfg.job_cols); }
         else if (a == "--polarity") { std::string v = val(); cfg.dark = v != "bright"; cfg.bright = v != "dark"; }
@@ -274,6 +284,7 @@ int main(int argc, char** argv) {
                 pt.p50, pt.p95, pt.max, pt.mean > 0 ? 1000 / pt.mean : 0);
     std::printf("  отклик (бэкенд) %.2f мс, выбор кандидатов %.3f мс, трекер %.3f мс\n", pr.mean, ps.mean, pk.mean);
     if (stream) std::printf("  чтение кадра %.2f мс\n", pct(readMs).mean);
+    std::printf("  шум отклика %.2f, порог %.1f%s\n", det.noiseLevel(), det.threshold(), cfg.auto_thr ? " (по шуму)" : "");
     char json[1024];
     int len = std::snprintf(json, sizeof(json),
                             "{\"resolution\": \"%dx%d\", \"backend\": \"%s\", \"threads\": %d, \"pool\": %d, \"k\": %d, "

@@ -34,6 +34,7 @@ typedef struct {
     int polarity; /* -1 тёмная, +1 яркая */
     int level;    /* масштаб, на котором найдена */
     float energy; /* суммарный контраст пятна: по нему трекер видит взмахи крыльев */
+    float margin; /* отклик / порог детектора; 0 — неизвестно */
 } dl_candidate;
 
 /* cls: 0 unknown, 1 drone, 2 bird, 3 clutter */
