@@ -162,6 +162,7 @@ static void test_scales_focus() {
     d1.detect(f.data(), w, h, w, out);
     CHECK(out.empty(), "scales=1: %zu кандидатов, ждали 0", out.size());
     c.scales = 2;
+    c.coarse_every = 1;   // грубый масштаб в каждом кадре: тут проверяется только фокус
     Detector d2(c);
     d2.detect(f.data(), w, h, w, out);
     CHECK(out.size() == 1 && out[0].level == 1 && std::fabs(out[0].x - 306) < 6 && std::fabs(out[0].y - 206) < 6,
@@ -172,7 +173,25 @@ static void test_scales_focus() {
     d2.setFocus({{400, 400, 10}});
     d2.detect(f.data(), w, h, w, out);
     CHECK(out.size() == 1, "focus мимо: %zu кандидатов, ждали 1", out.size());
-    std::printf("scales + focus: ok\n");
+    // экономия: в кадр между полными просмотрами ищем только вокруг треков
+    c.scales = 1;
+    c.full_every = 2;
+    c.job_rows = 1;
+    c.job_cols = 1;
+    Detector d3(c);
+    for (int y = 100; y < 103; ++y)
+        for (int x = 100; x < 103; ++x) f[(size_t)y * w + x] = 120;   // точка, контраст 40
+    d3.detect(f.data(), w, h, w, out);
+    CHECK(out.size() == 1, "full_every: полный кадр %zu кандидатов", out.size());
+    d3.setRoi({{400, 400, 20}});
+    d3.detect(f.data(), w, h, w, out);
+    CHECK(out.empty() && d3.timing().partial, "full_every: вне треков %zu кандидатов", out.size());
+    d3.detect(f.data(), w, h, w, out);
+    CHECK(out.size() == 1 && !d3.timing().partial, "full_every: снова полный кадр");
+    d3.setRoi({{101, 101, 10}});
+    d3.detect(f.data(), w, h, w, out);
+    CHECK(out.size() == 1, "full_every: у трека %zu кандидатов", out.size());
+    std::printf("scales + focus + roi: ok\n");
 }
 
 // Долгая память статичных помех: неподвижная точка выучивается и не даёт трека, летящая

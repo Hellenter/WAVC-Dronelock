@@ -296,7 +296,7 @@ void Pipeline::processLoop() {
     DetectorConfig dc = s.det;   // то, что сейчас стоит в детекторе (с учётом "авто")
     bool dirty = true;
     GlobalMotion gm;
-    std::vector<FocusArea> focus;
+    std::vector<FocusArea> focus, roi;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
@@ -411,7 +411,12 @@ void Pipeline::processLoop() {
         focus.clear();
         if (s.focus) trk->focus(me.dx, me.dy, focus);
         det.setFocus(focus);
+        // экономия: между полными просмотрами кадра детектор смотрит только вокруг треков
+        roi.clear();
+        if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) trk->roi(me.dx, me.dy, roi);
+        det.setRoi(roi);
         det.detect(f.px.data(), f.w, f.h, f.w, cands);
+        trk->setPartial(det.timing().partial);
         const double t1 = now_ms();
         const auto& tracks = trk->update(cands, me.dx, me.dy);
         const double t2 = now_ms();

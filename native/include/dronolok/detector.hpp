@@ -35,6 +35,12 @@ struct DetectorConfig {
     int scales = 1;
     float coarse_thr_k = 3.f;   // на грубых масштабах порог выше: крупная близкая цель контрастна
     float focus_k = 0.6f;       // возле прогноза трека (setFocus) порог = thr * focus_k
+    // Экономия: весь кадр (основной масштаб) и грубые масштабы просматриваются раз в
+    // full_every / coarse_every кадров, в остальные — только тайлы вокруг прогнозов
+    // треков (setRoi). Цель, которую уже ведём, не теряется, новая находится с
+    // задержкой до N-1 кадров. 1 — каждый кадр целиком.
+    int full_every = 1;
+    int coarse_every = 2;       // крупная цель за кадр смещается мало, а грубые масштабы недёшевы
     // ресурсы
     int threads = 0;            // 0 = все аппаратные потоки
     std::vector<int> cpus;      // привязка рабочих потоков к ядрам (пусто = как решит ОС)
@@ -55,6 +61,7 @@ struct Candidate {
 // Область, где ждём цель (прогноз трека): там порог ниже, см. DetectorConfig::focus_k
 struct FocusArea {
     float x, y, r;     // пиксели кадра
+    int level = 0;     // масштаб, на котором ведётся цель (для setRoi)
 };
 
 struct DetectTiming {
@@ -62,6 +69,8 @@ struct DetectTiming {
     double response_ms = 0;  // пулинг + морфология + статистика тайлов (бэкенд)
     double select_ms = 0;    // выбор кандидатов
     int jobs = 0, jobs_skipped = 0;   // задания бэкенда, пропущенные по маске
+    bool partial = false;    // основной масштаб — только вокруг треков (full_every)
+    bool coarsePartial = false;
 };
 
 class Backend;
@@ -86,6 +95,8 @@ public:
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
+    // Где искать в кадры между полными просмотрами (Tracker::roi)
+    void setRoi(const std::vector<FocusArea>& areas) { roi_ = areas; }
     const std::vector<uint8_t>& tileMask() const { return mask_; }   // tilesY x tilesX, 1 = искать
     int tilesX() const { return tw_; }
     int tilesY() const { return th_; }
@@ -112,8 +123,10 @@ private:
     bool learning_ = false;
     std::vector<float> texSum_;
     int texN_ = 0;
-    std::vector<FocusArea> focus_;
-    std::vector<uint8_t> focusTiles_;
+    std::vector<FocusArea> focus_, roi_;
+    std::vector<uint8_t> focusTiles_, roiMask_;
+    long frameNo_ = 0;
+    void roiMask(int tw, int th, int tilePx, const uint8_t* base);
     struct Stats;
     std::unique_ptr<Stats> stats_;
 };
@@ -203,6 +216,12 @@ public:
     const std::vector<Track>& update(const std::vector<Candidate>& dets, float camDx = 0, float camDy = 0);
     // Где ждать подтверждённые цели на следующем кадре (до update): для Detector::setFocus
     void focus(float camDx, float camDy, std::vector<FocusArea>& out) const;
+    // Где ждать все живые треки (и новые, и на прогнозе) на следующем кадре: для
+    // Detector::setRoi — между полными просмотрами кадра ищем только там
+    void roi(float camDx, float camDy, std::vector<FocusArea>& out) const;
+    // Следующий кадр детектор смотрел только вокруг треков (DetectTiming::partial):
+    // карта клаттера в этот кадр не остывает, иначе помехи вне треков "забываются"
+    void setPartial(bool p) { partial_ = p; }
     const std::vector<Track>& confirmed() const { return out_; }
     // Захваченная цель: самая весомая из подтверждённых, держится, пока трек жив и его
     // не превзошёл другой в lock_switch раз. 0 — захвата нет.
@@ -243,6 +262,7 @@ private:
     int nextId_ = 1;
     int frame_ = 0;
     int lockId_ = 0, lostFor_ = 0;
+    bool partial_ = false;
     float lastX_ = 0, lastY_ = 0, lastVx_ = 0, lastVy_ = 0;
 };
 

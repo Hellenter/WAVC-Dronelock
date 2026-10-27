@@ -42,6 +42,8 @@ static void usage() {
         "  --scales 1..4           доп. масштабы для крупных целей\n"
         "  --focus                 пониженный порог возле прогноза треков\n"
         "  --motion                компенсация движения камеры\n"
+        "  --full-every N          весь кадр раз в N кадров, между ними — только вокруг треков\n"
+        "  --coarse-every N        грубые масштабы целиком раз в N кадров\n"
         "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
@@ -80,7 +82,7 @@ int main(int argc, char** argv) {
     int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0;
     bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false;
     GlobalMotion gm;
-    std::vector<FocusArea> focusAreas;
+    std::vector<FocusArea> focusAreas, roiAreas;
     DetectorConfig cfg;
     TrackerConfig tcfg;
     for (int i = 1; i < argc; ++i) {
@@ -116,6 +118,8 @@ int main(int argc, char** argv) {
         else if (a == "--q") tcfg.q_accel = (float)std::atof(val().c_str());
         else if (a == "--gate-sigma") tcfg.gate_sigma = (float)std::atof(val().c_str());
         else if (a == "--motion") motion = true;
+        else if (a == "--full-every") cfg.full_every = std::atoi(val().c_str());
+        else if (a == "--coarse-every") cfg.coarse_every = std::atoi(val().c_str());
         else if (a == "--static") tcfg.static_frames = std::atoi(val().c_str());
         else if (a == "--static-hits") tcfg.static_hits = (float)std::atof(val().c_str());
         else if (a == "--gt") gtPath = val();
@@ -216,7 +220,12 @@ int main(int argc, char** argv) {
             trk.focus(me.dx, me.dy, focusAreas);
             det.setFocus(focusAreas);
         }
+        if (cfg.full_every > 1 || cfg.coarse_every > 1) {
+            trk.roi(me.dx, me.dy, roiAreas);
+            det.setRoi(roiAreas);
+        }
         det.detect(g, W, H, W, cands);
+        trk.setPartial(det.timing().partial);
         const double t1 = now_ms();
         const auto& tracks = trk.update(cands, me.dx, me.dy);
         const double t2 = now_ms();

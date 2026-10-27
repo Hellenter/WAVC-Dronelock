@@ -248,6 +248,20 @@ void Tracker::focus(float camDx, float camDy, std::vector<FocusArea>& out) const
     }
 }
 
+void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
+    out.clear();
+    const float q = cfg_.q_accel * cfg_.q_accel;
+    for (const Track& t0 : tracks_) {
+        Track t = t0;
+        kf_predict(t, camDx, camDy, q);
+        const float S = t.p00 + measVar(t.level);
+        const float gmin = cfg_.gate_min * (float)(1 << std::min(4, t.level));
+        // запас на размер цели: на грубом масштабе её отклик гуляет по корпусу
+        out.push_back({t.x, t.y, std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << t.level),
+                       t.level});
+    }
+}
+
 const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, float camDx, float camDy) {
     ++frame_;
     gx_ += camDx;
@@ -255,7 +269,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets, fl
     const float q = cfg_.q_accel * cfg_.q_accel;
     const float decay = cfg_.clutter_decay;
     shiftHeat(camDx, camDy);
-    for (auto& v : heat_) v *= decay;
+    if (!partial_)
+        for (auto& v : heat_) v *= decay;
+    partial_ = false;
     const int cell = cfg_.clutter_cell;
     auto cellOf = [&](const Candidate& d) {
         const int cx = std::min(gw_ - 1, std::max(0, (int)d.x / cell));

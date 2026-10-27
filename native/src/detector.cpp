@@ -42,6 +42,8 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.max_cands = std::max(1, c.max_cands);
     c.scales = std::max(1, std::min(4, c.scales));
     c.focus_k = std::max(0.2f, std::min(1.f, c.focus_k));
+    c.full_every = std::max(1, std::min(16, c.full_every));
+    c.coarse_every = std::max(1, std::min(16, c.coarse_every));
     return c;
 }
 
@@ -123,6 +125,14 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     p.job_rows = cfg_.job_rows;
     p.job_cols = cfg_.job_cols;
     const uint8_t* m = (!learning_ && !mask_.empty()) ? mask_.data() : nullptr;
+    // между полными просмотрами — только тайлы вокруг треков (маска неба тоже действует)
+    const long fn = frameNo_++;
+    timing_.partial = !learning_ && cfg_.full_every > 1 && fn % cfg_.full_every != 0;
+    timing_.coarsePartial = cfg_.coarse_every > 1 && fn % cfg_.coarse_every != 0;
+    if (timing_.partial) {
+        roiMask(tw_, th_, T * s, m);
+        m = roiMask_.data();
+    }
     backend_->compute(FrameView{gray, w, h, stride}, p, m, stats_->dark, stats_->bright,
                       timing_.jobs, timing_.jobs_skipped);
 
@@ -130,7 +140,13 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     // как "тёмные" (яркая — на инвертированном 255-max кадре)
     auto& lv = stats_->lv;
     lv.resize(cfg_.scales - 1);
-    for (size_t l = 0; l < lv.size(); ++l) {
+    // между полными просмотрами грубые масштабы нужны, только если по ним ведётся цель
+    bool coarseRun = !lv.empty();
+    if (coarseRun && timing_.coarsePartial) {
+        coarseRun = false;
+        for (const FocusArea& a : roi_) coarseRun |= a.level > 0;
+    }
+    for (size_t l = 0; coarseRun && l < lv.size(); ++l) {
         Level& L = lv[l];
         const int sw = l ? lv[l - 1].w : w, sh = l ? lv[l - 1].h : h;
         L.w = sw / 2;
@@ -157,15 +173,23 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         q.dark = true;
         q.bright = false;
         int jobs = 0, skipped = 0;
-        if (cfg_.dark) backend_->compute(FrameView{L.d.data(), L.w, L.h, L.w}, q, nullptr, L.sd, stats_->unused, jobs, skipped);
-        if (cfg_.bright) backend_->compute(FrameView{L.b.data(), L.w, L.h, L.w}, q, nullptr, L.sb, stats_->unused, jobs, skipped);
+        const uint8_t* cm = nullptr;
+        if (timing_.coarsePartial) {
+            roiMask(L.tw, L.th, L.tile * (s << (l + 1)), nullptr);
+            cm = roiMask_.data();
+        }
+        if (cfg_.dark) backend_->compute(FrameView{L.d.data(), L.w, L.h, L.w}, q, cm, L.sd, stats_->unused, jobs, skipped);
         timing_.jobs += jobs;
+        timing_.jobs_skipped += skipped;
+        if (cfg_.bright) backend_->compute(FrameView{L.b.data(), L.w, L.h, L.w}, q, cm, L.sb, stats_->unused, jobs, skipped);
+        timing_.jobs += jobs;
+        timing_.jobs_skipped += skipped;
     }
     const double t1 = now_ms();
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
-    if (!lv.empty()) {
+    if (coarseRun) {
         for (size_t l = 0; l < lv.size(); ++l) {
             const Level& L = lv[l];
             if (L.tw == 0 || L.th == 0) continue;
@@ -197,6 +221,22 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     timing_.response_ms = t1 - t0;
     timing_.select_ms = t2 - t1;
     timing_.total_ms = t2 - t0;
+}
+
+// маска тайлов вокруг треков (и внутри маски неба base, если она есть)
+void Detector::roiMask(int tw, int th, int tilePx, const uint8_t* base) {
+    roiMask_.assign((size_t)tw * th, 0);
+    for (const FocusArea& a : roi_) {
+        const int x0 = std::max(0, (int)std::floor((a.x - a.r) / tilePx));
+        const int x1 = std::min(tw - 1, (int)std::floor((a.x + a.r) / tilePx));
+        const int y0 = std::max(0, (int)std::floor((a.y - a.r) / tilePx));
+        const int y1 = std::min(th - 1, (int)std::floor((a.y + a.r) / tilePx));
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x) {
+                const size_t i = (size_t)y * tw + x;
+                roiMask_[i] = base ? base[i] : 1;
+            }
+    }
 }
 
 // тайлы, задетые областями прогноза треков

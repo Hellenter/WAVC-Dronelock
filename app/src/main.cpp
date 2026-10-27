@@ -618,6 +618,16 @@ void panel_controls(App& a) {
         changed |= ImGui::SliderFloat("порог крупных, раз", &d.coarse_thr_k, 1, 6, "%.1f");
         help_marker("Во сколько раз порог контраста выше на уменьшенных масштабах: крупная близкая цель "
                     "контрастна, а пятна облаков на них дают ложные цели.");
+        ImGui::SeparatorText("Экономия");
+        ImGui::SetNextItemWidth(w);
+        changed |= ImGui::SliderInt("весь кадр раз в, кадров", &d.full_every, 1, 4, d.full_every > 1 ? "%d" : "каждый");
+        help_marker("В остальные кадры детектор смотрит только вокруг уже найденных целей. Ведомая цель не "
+                    "теряется, новая находится с задержкой до N-1 кадров. На 16 Мп раз в 2 кадра — минус ~35% "
+                    "времени; на синтетике полнота 96.7% -> 95%. Для Raspberry Pi.");
+        ImGui::SetNextItemWidth(w);
+        changed |= ImGui::SliderInt("крупные масштабы раз в, кадров", &d.coarse_every, 1, 4, d.coarse_every > 1 ? "%d" : "каждый");
+        help_marker("Уменьшенные копии кадра (поиск крупной цели) целиком — раз в N кадров, а между ними только "
+                    "если крупная цель уже ведётся. 16 Мп, 3 масштаба: 7.4 мс -> 5.7 (раз в 2) -> 4.8 (раз в 4).");
         changed |= ImGui::Checkbox("искать возле прогноза", &a.s.focus);
         help_marker("Эксперимент: там, где трек ожидается на следующем кадре, порог ниже, чтобы не терять "
                     "бледнеющую цель. На ваших роликах пока чуть хуже, поэтому выключено.");
@@ -1048,6 +1058,8 @@ int run_bench(int argc, char** argv) {
         else if (a == "--motion") s.motion = atoi(val().c_str());
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
+        else if (a == "--full-every") s.det.full_every = atoi(val().c_str());
+        else if (a == "--coarse-every") s.det.coarse_every = atoi(val().c_str());
         else if (a == "--json") json = val();
         else if (a == "--csv") csv = val();
         else video = a;
