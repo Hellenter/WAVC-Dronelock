@@ -16,13 +16,14 @@ permissions:
   contents: read
 
 # Сторонние действия закреплены по коммиту (тег можно перевесить), скачиваемые архивы —
-# по sha256: при смене версии обновить и сумму. FFmpeg: сумма архива ffmpeg.org, подпись
-# проверена ключом релизов FFmpeg (FCF986EA15E6E293A5644F10B4322F04D67658D8).
+# по sha256, пакеты pip — по версии: при смене версии обновить и сумму. FFmpeg: сумма
+# архива ffmpeg.org, подпись проверена ключом релизов FFmpeg (FCF986EA15E6E293A5644F10B4322F04D67658D8).
+# SDL2: сумма снята при первой загрузке в CI 2026-10-28 (подпись не проверялась).
 env:
   FFMPEG_VERSION: '7.1.1'
   FFMPEG_SHA256: '733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1'
   SDL2_VERSION: '2.30.11'
-  SDL2_SHA256: ''
+  SDL2_SHA256: '0590db0a47b564aab92499ed03eaa75db9aee17c371080caa3b05df9d49d9ff9'
 
 jobs:
   # Ядро + тесты + приложение под Linux x64, синтетическое видео для проверки
@@ -42,8 +43,7 @@ jobs:
       - name: Python-пакеты
         timeout-minutes: 10
         run: |
-          pip install --quiet --timeout 60 --retries 3 numpy opencv-python-headless
-          pip freeze | grep -iE '^(numpy|opencv)'
+          pip install --quiet --timeout 60 --retries 3 numpy==2.5.4 opencv-python-headless==5.0.0.93
       - name: Ядро и тесты
         run: |
           cmake -S native -B build-native -G Ninja
@@ -108,8 +108,7 @@ jobs:
         run: |
           f="$RUNNER_TEMP/sdl2.tar.gz"
           curl -fsSL -o "$f" https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz
-          sha256sum "$f"
-          if [ -n "$SDL2_SHA256" ]; then echo "$SDL2_SHA256  $f" | sha256sum -c -; fi
+          echo "$SDL2_SHA256  $f" | sha256sum -c -
           tar xzf "$f" -C "$RUNNER_TEMP"
       - name: Сборка
         run: |
