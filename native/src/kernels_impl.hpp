@@ -227,7 +227,56 @@ static void k_tile_stats(const uint8_t* band, int stride, int T, int rows, int r
     }
 }
 
+// |a - b| = max(a -s b, b -s a); пропуск: (|a - b| -s 0xFF) = 0, число пропущенных —
+// сумма маски / 255. Хвост — последний вектор с перекрытием, уже посчитанные точки
+// закрыты маской из sad_head (и вычтены из числа пропущенных). Короткая строка n < W —
+// скалярно без ветвлений: маска случайная, ветвление на каждой точке стоит дороже счёта.
+alignas(64) static const uint8_t sad_head[64] = {
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+
+static void k_sad_masked(const uint8_t* a, const uint8_t* b, const uint8_t* skip, int n, uint32_t* sum,
+                         uint32_t* nskip) {
+    if (n < W) {
+        uint32_t rs = 0, rk = 0;
+        for (int x = 0; x < n; ++x) {
+            const uint32_t keep = skip ? 1u - (skip[x] & 1u) : 1u;
+            rs += keep * (uint32_t)(a[x] > b[x] ? a[x] - b[x] : b[x] - a[x]);
+            rk += 1u - keep;
+        }
+        *sum = rs;
+        *nskip = rk;
+        return;
+    }
+    S s = szero(), k = szero();
+    int x = 0;
+    if (!skip) {
+        for (; x + W <= n; x += W) {
+            const V va = ld(a + x), vb = ld(b + x);
+            s = sacc(s, vmax(vsubs(va, vb), vsubs(vb, va)));
+        }
+    } else {
+        for (; x + W <= n; x += W) {
+            const V va = ld(a + x), vb = ld(b + x), m = ld(skip + x);
+            s = sacc(s, vsubs(vmax(vsubs(va, vb), vsubs(vb, va)), m));
+            k = sacc(k, m);
+        }
+    }
+    int head = 0;   // сколько первых точек последнего вектора уже посчитано
+    if (x < n) {
+        head = W - (n - x);
+        x = n - W;
+        const V va = ld(a + x), vb = ld(b + x), h = ld(sad_head + 32 - head);
+        const V m = skip ? vmax(ld(skip + x), h) : h;
+        s = sacc(s, vsubs(vmax(vsubs(va, vb), vsubs(vb, va)), m));
+        k = sacc(k, m);
+    }
+    *sum = shsum(s);
+    *nskip = shsum(k) / 255 - (uint32_t)head;
+}
+
 static const dronolok::Kernels* make_table(const char* name) {
-    static const dronolok::Kernels k = {name, W, k_pool2, k_pool1, k_dilate4, k_erode4_sub, k_tile_stats};
+    static const dronolok::Kernels k = {name,       W,           k_pool2,      k_pool1,
+                                        k_dilate4,  k_erode4_sub, k_tile_stats, k_sad_masked};
     return &k;
 }

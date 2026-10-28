@@ -26,6 +26,11 @@ struct Kernels {
     // Накопительная: перед первой частью тайла все счётчики должны быть нулевыми.
     void (*tile_stats)(const uint8_t* band, int stride, int tile, int rows, int r0, int ntiles, uint8_t hot_thr,
                        uint32_t* sum, uint8_t* maxv, uint16_t* hot, uint16_t* argmax);
+    // Сумма |a - b| по n точкам строки без точек, где skip = 0xFF (skip = 0 — считать;
+    // других значений нет). skip может быть nullptr — считать все. В nskip — число
+    // пропущенных точек. Для оценки сдвига камеры (motion.cpp), n не больше 1 << 20.
+    void (*sad_masked)(const uint8_t* a, const uint8_t* b, const uint8_t* skip, int n, uint32_t* sum,
+                       uint32_t* nskip);
 };
 
 const Kernels* kernels_scalar();

@@ -91,6 +91,34 @@ static void test_kernels(const Kernels* ref, const Kernels* K) {
     }
 }
 
+// SAD с маской против прямого счёта: маска 0 / 0xFF, nullptr, разные длины и смещения
+static void test_sad(const Kernels* K) {
+    std::mt19937 g(7);
+    for (int n : {0, 1, 7, 15, 16, 17, 31, 32, 33, 64, 100, 236, 316, 1000}) {
+        for (int off : {0, 1, 5}) {
+            auto a = rnd(n + off, g), b = rnd(n + off, g), m = rnd(n + off, g);
+            for (auto& x : m) x = (x & 3) == 0 ? 0xFF : 0;
+            uint32_t es = 0, ek = 0, ea = 0;
+            for (int x = off; x < n + off; ++x) {
+                const uint32_t d = (uint32_t)std::abs(a[x] - b[x]);
+                ea += d;
+                if (m[x]) ++ek;
+                else es += d;
+            }
+            uint32_t s = 1, k = 1;
+            K->sad_masked(a.data() + off, b.data() + off, m.data() + off, n, &s, &k);
+            CHECK(s == es && k == ek, "%s sad_masked n=%d off=%d: %u/%u против %u/%u", K->name, n, off, s, k, es, ek);
+            K->sad_masked(a.data() + off, b.data() + off, nullptr, n, &s, &k);
+            CHECK(s == ea && k == 0, "%s sad n=%d off=%d: %u против %u", K->name, n, off, s, ea);
+        }
+    }
+    // худший случай: все разности 255
+    std::vector<uint8_t> z(4096, 0), f(4096, 255), m0(4096, 0);
+    uint32_t s = 0, k = 0;
+    K->sad_masked(z.data(), f.data(), m0.data(), 4096, &s, &k);
+    CHECK(s == 255u * 4096 && k == 0, "%s sad_masked max: %u", K->name, s);
+}
+
 static std::vector<uint8_t> synth_frame(int w, int h, unsigned seed) {
     std::mt19937 g(seed);
     std::vector<uint8_t> f((size_t)w * h);
@@ -634,10 +662,12 @@ static void test_scene() {
 
 int main() {
     const Kernels* ref = kernels_scalar();
+    test_sad(ref);
     for (Isa isa : available_isas()) {
         if (isa == Isa::Scalar) continue;
         const Kernels* K = select_kernels(isa);
         test_kernels(ref, K);
+        test_sad(K);
         std::printf("kernels %s: ok\n", K->name);
     }
     test_detector();
