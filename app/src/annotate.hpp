@@ -22,6 +22,9 @@ struct Annotation {
     double fps = 25;
     std::vector<AnnObject> objs;
     bool editable = true;      // false — разметка без опорных точек (синтетика), править нельзя
+    // В ролике нет ни дронов, ни птиц: любая цель и любой захват — ложные. Сохраняется как
+    // разметка из пустых кадров, поэтому её понимают и качество в приложении, и мультитест
+    bool noDrones = false;
 
     // Загрузить из <видео>.gt.json. Нет файла — пустая разметка; есть, но без "objects" — не правится
     void load(const std::string& path, int vw, int vh, double vfps);

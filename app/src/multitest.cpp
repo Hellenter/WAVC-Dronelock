@@ -334,6 +334,8 @@ struct Collector {
     long fp = 0, lockEv = 0, lockOnD = 0, hardOnD = 0, falseLockF = 0;
     std::map<int, bool> life;   // трек -> хоть раз был на настоящей цели
     long firstGt = -1, firstDet = -1, firstLock = -1;
+    double skySum = 0;
+    long skyN = 0;
 
     static bool live(const Track& t) { return !t.clutter && t.cls != TargetClass::Clutter; }
 
@@ -362,6 +364,12 @@ struct Collector {
         lastLock = r.lockId;
 
         const int64_t idx = r.frame->index;
+        if (!r.mask.empty() && idx >= warmup) {   // маска неба после обучения: сколько неба осталось в поиске
+            long on = 0;
+            for (uint8_t m : r.mask) on += m != 0;
+            skySum += (double)on / r.mask.size();
+            ++skyN;
+        }
         if (gtN <= 0 || idx < 0 || idx >= gtN) return;
         const float R = radius;
         auto near = [&](const Track& t, const GtObj& g) {
@@ -448,6 +456,10 @@ static VideoMeta probe(const std::string& path) {
     }
     GroundTruth g;
     m.gt = g.load(path + ".gt.json");
+    if (m.gt) {
+        m.noDrones = true;
+        for (const auto& f : g.frames) m.noDrones &= f.empty();
+    }
     return m;
 }
 
@@ -538,6 +550,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     rr.lockPct = 100.0 * col.lockF / F;
     rr.hardPct = 100.0 * col.hardF / F;
     rr.lockAcq = col.acq;
+    rr.skyPct = col.skyN ? 100.0 * col.skySum / col.skyN : -1;
     rr.gt = col.gtN > 0 && col.evF > 0;
     if (rr.gt) {
         rr.evalFrames = col.evF;
@@ -556,7 +569,11 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
         if (col.firstGt >= 0 && col.firstDet >= 0) rr.firstDetectS = std::max(0.0, (col.firstDet - col.firstGt) / fps);
         if (col.firstGt >= 0 && col.firstLock >= 0) rr.firstLockS = std::max(0.0, (col.firstLock - col.firstGt) / fps);
         // оценка 0..100: обнаружение и захват на дроне, минус ложные захваты и ложные цели
-        if (rr.recallDrone >= 0) {
+        if (col.dObj == 0 && col.bObj == 0) {
+            // ролик без дронов: найти нечего (полные 40), любой захват ложный
+            const double lockEv = 100.0 * col.lockEv / col.evF;
+            rr.score = std::max(0.0, 40 + 0.6 * (100 - lockEv) - std::min(20.0, 5 * rr.falsePerFrame));
+        } else if (rr.recallDrone >= 0) {
             const double lockOn = std::max(0.0, rr.lockOnDrone);
             rr.score = 0.4 * rr.recallDrone + 0.4 * lockOn + 0.2 * (100 - rr.falseLock) -
                        std::min(20.0, 5 * rr.falsePerFrame);
@@ -572,7 +589,8 @@ const std::vector<Metric>& metrics() {
     static const std::vector<Metric> m = {
         {"score", "Оценка", "", +1, true, 1, [](const RunResult& r) { return r.score; },
          "0..100: 0.4·обнаружение дрона + 0.4·захват на дроне + 0.2·(100 − ложный захват) − 5·ложных целей на кадр "
-         "(не больше 20). Только по разметке."},
+         "(не больше 20). На ролике без дронов: 40 + 0.6·(100 − кадров с захватом) − 5·ложных целей на кадр. "
+         "Только по разметке."},
         {"recall_drone", "Дрон найден", "%", +1, true, 1, [](const RunResult& r) { return r.recallDrone; },
          "Доля кадров разметки, где рядом с дроном есть цель (не помеха)."},
         {"lock_on_drone", "Захват на дроне", "%", +1, true, 1, [](const RunResult& r) { return r.lockOnDrone; },
@@ -593,6 +611,9 @@ const std::vector<Metric>& metrics() {
          "От первого кадра с дроном в разметке до первого кадра, где он найден."},
         {"first_lock_s", "До захвата", "с", -1, true, 2, [](const RunResult& r) { return r.firstLockS; },
          "От первого кадра с дроном в разметке до первого захвата на нём."},
+        {"sky_pct", "Небо в поиске", "%", 0, false, 1, [](const RunResult& r) { return r.skyPct; },
+         "Доля кадра, где детектор ищет: не закрыта маской неба как лес, дома, земля, текстура. Меньше целей при "
+         "меньшем «небе в поиске» — это не чище, а просто меньше смотрим. Прочерк — маски нет (камера движется)."},
         {"lock_pct", "Кадров с захватом", "%", 0, false, 1, [](const RunResult& r) { return r.lockPct; },
          "Доля всех кадров, где есть захват (любой цели)."},
         {"hard_pct", "Кадров с жёстким", "%", 0, false, 1, [](const RunResult& r) { return r.hardPct; },

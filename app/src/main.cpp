@@ -131,6 +131,17 @@ struct App {
     Annotation ann;
     int annCur = 0;        // выбранный объект (AnnObject::id)
     std::string annMsg;
+    // разметка по треку: после щелчка по цели точки ставятся сами, пока трек виден
+    bool annAuto = true;
+    int annStep = 10;          // точка раз в столько кадров
+    int annFollowId = 0;       // трек (Track::id), за которым идёт разметка; 0 — нет
+    int annFollowObj = 0;      // объект разметки
+    int annFollowSeq = 0;      // последний просмотренный результат (Result::seq)
+    int64_t annFollowKey = 0;  // кадр последней поставленной точки
+    int64_t annSeenFrame = -1; // последний кадр, где трек был найден
+    float annSeenX = 0, annSeenY = 0;
+    bool annDirty = false;     // точки добавлены, файл ещё не записан
+    double annSavedAt = 0;
     // шкала видео
     std::vector<uint8_t> marks;
     int64_t scrub = -1;    // куда тянут ползунок шкалы
@@ -250,6 +261,8 @@ void open_video(App& a, const std::string& path) {
     a.ann.load(a.pipe.gtPath(), vi.w, vi.h, vi.fps);
     a.annCur = a.ann.objs.empty() ? 0 : a.ann.objs[0].id;
     a.annMsg.clear();
+    a.annFollowId = 0;
+    a.annDirty = false;
 }
 
 // разметку поменяли: сохранить в <видео>.gt.json и сразу считать по ней качество
@@ -263,6 +276,89 @@ void ann_changed(App& a) {
     int keys = 0;
     for (const auto& o : a.ann.objs) keys += (int)o.keys.size();
     a.annMsg = "сохранено: объектов " + std::to_string(a.ann.objs.size()) + ", точек " + std::to_string(keys);
+}
+
+// ------------------------------------------------------------ разметка по треку
+
+// координаты цели результата r — в пикселях видео
+static void track_to_video(const App& a, const Result& r, const Track& t, float& x, float& y) {
+    const VideoInfo vi = a.pipe.info();
+    const int W = r.follow ? r.srcW : r.frame->w, H = r.follow ? r.srcH : r.frame->h;
+    x = (t.x + (float)r.fx) * (W > 0 ? (float)vi.w / W : 1.f);
+    y = (t.y + (float)r.fy) * (H > 0 ? (float)vi.h / H : 1.f);
+}
+
+void ann_follow_start(App& a, const Result& r, const Track& t) {
+    a.annFollowId = t.id;
+    a.annFollowObj = a.annCur;
+    a.annFollowSeq = r.seq;
+    a.annFollowKey = r.frame->index;
+    a.annSeenFrame = r.frame->index;
+    track_to_video(a, r, t, a.annSeenX, a.annSeenY);
+    a.annMsg = "разметка идёт за целью #" + std::to_string(t.id) + ": пустите видео (пробел)";
+}
+
+void ann_follow_stop(App& a, const char* why) {
+    if (!a.annFollowId) return;
+    // последняя точка — где цель видели в последний раз, чтобы объект не тянулся по прямой дальше
+    if (AnnObject* ob = a.ann.find(a.annFollowObj))
+        if (a.annSeenFrame > a.annFollowKey) {
+            ob->keys[a.annSeenFrame] = {a.annSeenX, a.annSeenY};
+            a.annDirty = true;
+        }
+    a.annFollowId = 0;
+    if (a.annDirty) ann_changed(a);
+    a.annDirty = false;
+    if (why) a.annMsg = why;
+}
+
+// Каждый кадр интерфейса: пройти по новым результатам и поставить точки, пока трек виден.
+// Трек пропал — остановиться на паузе там, где его потеряли: найти дрон и щёлкнуть снова
+void ann_follow_update(App& a) {
+    if (!a.annFollowId) return;
+    if (!a.annotate || !a.ann.find(a.annFollowObj)) {
+        ann_follow_stop(a, nullptr);
+        return;
+    }
+    int first, last;
+    if (!a.pipe.historyRange(first, last)) return;
+    AnnObject* ob = a.ann.find(a.annFollowObj);
+    for (int seq = std::max(first, a.annFollowSeq + 1); seq <= last; ++seq) {
+        auto r = a.pipe.at(seq);
+        if (!r) continue;
+        a.annFollowSeq = seq;
+        const int64_t idx = r->frame->index;
+        if (idx <= a.annSeenFrame) {   // перемотали назад или видео пошло сначала
+            ann_follow_stop(a, "разметка за целью остановлена: видео перемотали");
+            return;
+        }
+        const Track* t = nullptr;
+        for (const auto& x : r->tracks)
+            if (x.id == a.annFollowId) t = &x;
+        if (!t) {
+            char b[160];
+            snprintf(b, sizeof(b), "цель потеряна после кадра %lld: найдите дрон и щёлкните по нему снова",
+                     (long long)a.annSeenFrame);
+            ann_follow_stop(a, b);
+            a.pipe.setPaused(true);
+            return;
+        }
+        if (t->miss > 0) continue;   // на прогнозе: точку не ставим, ждём, найдётся ли
+        track_to_video(a, *r, *t, a.annSeenX, a.annSeenY);
+        a.annSeenFrame = idx;
+        if (idx - a.annFollowKey >= a.annStep) {
+            ob->keys[idx] = {a.annSeenX, a.annSeenY};
+            a.annFollowKey = idx;
+            a.annDirty = true;
+        }
+    }
+    // файл — не чаще раза в секунду: на нём пересчитывается качество
+    if (a.annDirty && now_ms() - a.annSavedAt > 1000) {
+        ann_changed(a);
+        a.annMsg = "разметка идёт за целью #" + std::to_string(a.annFollowId) + ": " + a.annMsg;
+        a.annDirty = false;
+        a.annSavedAt = now_ms();
+    }
 }
 
 // ------------------------------------------------------------ плеер: пауза, покадрово, скорость
@@ -577,11 +673,38 @@ void panel_annotate(App& a) {
                 "по прямой, поэтому точку достаточно ставить раз в 10-30 кадров и на поворотах; объект есть "
                 "от первой до последней точки. Правый щелчок — убрать точку на этом кадре. Сохраняется сразу "
                 "в <видео>.gt.json, рядом с видео.");
-    ImGui::TextWrapped("Пауза, щелчок по дрону — опорная точка, правый щелчок — убрать. Точку достаточно ставить "
-                       "раз в 10-30 кадров.");
+    ImGui::TextWrapped("Пауза, щелчок по дрону — опорная точка, правый щелчок — убрать. Щелчок по цели алгоритма — "
+                       "дальше точки ставятся сами, пока цель видна.");
     if (!a.annotate) {
-        if (!a.ann.objs.empty()) ImGui::TextDisabled("размечено объектов: %d", (int)a.ann.objs.size());
+        ann_follow_stop(a, nullptr);
+        if (a.ann.noDrones) ImGui::TextDisabled("ролик отмечен: дронов нет");
+        else if (!a.ann.objs.empty()) ImGui::TextDisabled("размечено объектов: %d", (int)a.ann.objs.size());
         return;
+    }
+    ImGui::BeginDisabled(!a.ann.objs.empty());
+    if (ImGui::Checkbox("В ролике нет дронов", &a.ann.noDrones)) ann_changed(a);
+    ImGui::EndDisabled();
+    help_marker("Для роликов, где дрона нет совсем (пустое небо, только птицы и самолёты вдалеке): тогда любая цель "
+                "и любой захват считаются ложными, и мультитест сравнивает варианты и на таком ролике. Доступно, "
+                "пока в разметке нет объектов.");
+    if (a.ann.noDrones) {
+        ImGui::TextDisabled("размечено: дронов нет — любой захват ложный");
+        if (!a.annMsg.empty()) ImGui::TextDisabled("%s", a.annMsg.c_str());
+        return;
+    }
+    ImGui::Checkbox("Вести точки по цели", &a.annAuto);
+    help_marker("Щелчок по цели алгоритма (рамке) — и дальше, пока видео идёт, точки ставятся сами по её треку раз "
+                "в N кадров. Цель потерялась — видео встаёт на паузу: найдите дрон и щёлкните снова. Если трек "
+                "ушёл на другой объект — пауза, отмотайте назад и «стереть точки дальше».");
+    if (a.annAuto) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderInt("##annstep", &a.annStep, 2, 60, "раз в %d кадр.");
+    }
+    if (a.annFollowId) {
+        ImGui::TextColored(TXT_OK, "идёт за целью #%d, кадр %lld", a.annFollowId, (long long)a.annSeenFrame);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("стоп")) ann_follow_stop(a, "разметка за целью остановлена");
     }
     const float bw = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3;
     if (ImGui::Button("+ дрон", ImVec2(bw, 0))) a.annCur = a.ann.add(false);
@@ -597,6 +720,19 @@ void panel_annotate(App& a) {
         ann_changed(a);
     }
     ImGui::EndDisabled();
+    {
+        const std::shared_ptr<const Result> sh = a.shown;
+        AnnObject* ob = a.ann.find(a.annCur);
+        ImGui::BeginDisabled(!ob || !sh || ob->keys.empty() || ob->keys.rbegin()->first <= sh->frame->index);
+        if (ImGui::Button("стереть точки дальше этого кадра", ImVec2(-FLT_MIN, 0)) && ob && sh) {
+            ann_follow_stop(a, nullptr);
+            ob->keys.erase(ob->keys.upper_bound(sh->frame->index), ob->keys.end());
+            ann_changed(a);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Если трек ушёл с дрона на другой объект: отмотайте к месту, где он ещё на дроне, "
+                              "сотрите точки дальше и щёлкните по дрону снова");
+    }
     heading("Объекты");
     for (const auto& o : a.ann.objs) {
         char b[128];
@@ -607,7 +743,11 @@ void panel_annotate(App& a) {
         if (ImGui::Selectable(b, a.annCur == o.id)) a.annCur = o.id;
     }
     if (a.ann.objs.empty()) ImGui::TextDisabled("щёлкните по дрону на кадре — появится объект #1");
-    if (!a.annMsg.empty()) ImGui::TextDisabled("%s", a.annMsg.c_str());
+    if (!a.annMsg.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
+        ImGui::TextWrapped("%s", a.annMsg.c_str());
+        ImGui::PopStyleColor();
+    }
 }
 
 // главное, всегда на виду: видео, устройство, профиль, темп камеры
@@ -2002,16 +2142,21 @@ void draw_view(App& a, const Result* r) {
         if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16) {
             float fx = (io.MousePos.x - o.x) / sc, fy = (io.MousePos.y - o.y) / sc;
             float best = 14.f / sc;
+            const Track* snap = nullptr;
             for (const auto& t : r->tracks)
                 if (!t.clutter && std::hypot(t.x - fx, t.y - fy) < best) {
                     best = std::hypot(t.x - fx, t.y - fy);
                     fx = t.x;
                     fy = t.y;
+                    snap = &t;
                 }
             if (fx >= 0 && fy >= 0 && fx < f.w && fy < f.h) {
+                ann_follow_stop(a, nullptr);
                 if (!a.ann.find(a.annCur)) a.annCur = a.ann.add(false);
                 a.ann.find(a.annCur)->keys[f.index] = {fx / kx, fy / ky};
                 ann_changed(a);
+                // по последнему кадру — его результаты дальше и пойдут; кадр из истории — нет
+                if (snap && a.annAuto && a.viewSeq < 0 && !r->follow) ann_follow_start(a, *r, *snap);
             }
         }
         if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
@@ -2631,6 +2776,7 @@ int main(int argc, char** argv) {
         // своя ссылка на кадр: кнопка "Открыть видео..." посреди кадра интерфейса сбрасывает
         // a.shown, а панели ниже ещё рисуют этот кадр (раньше — обращение к удалённой памяти
         // и вылет при открытии видео)
+        ann_follow_update(a);
         const std::shared_ptr<const Result> shownRef = a.shown;
         const Result* shown = shownRef.get();
         const Metrics m = a.pipe.metrics();
