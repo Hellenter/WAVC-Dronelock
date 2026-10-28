@@ -86,6 +86,7 @@ struct VideoMeta {
     double fps = 0;
     long frames = 0;
     bool gt = false;
+    bool noDrones = false;   // по разметке в ролике нет ни одной цели
 };
 
 // Итог одного прогона «видео x вариант». Отрицательное значение — нет данных
@@ -101,6 +102,7 @@ struct RunResult {
     long tracks = 0, droneIds = 0, birdIds = 0;
     double lockPct = 0, hardPct = 0;
     long lockAcq = 0;   // сколько раз захват брал новую цель
+    double skyPct = -1; // доля кадра, где детектор ищет (не закрыто маской неба); -1 — маски нет
     // по разметке
     bool gt = false;
     long evalFrames = 0, gtDroneFrames = 0;

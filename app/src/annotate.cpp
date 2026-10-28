@@ -14,6 +14,7 @@ void Annotation::load(const std::string& path, int vw, int vh, double vfps) {
     fps = vfps;
     objs.clear();
     editable = true;
+    noDrones = false;
     FILE* f = open_file(path, "rb");
     if (!f) return;
     std::string text;
@@ -22,6 +23,7 @@ void Annotation::load(const std::string& path, int vw, int vh, double vfps) {
     fclose(f);
     minijson::Value v;
     if (!minijson::parse(text, v)) return;
+    noDrones = v["no_drones"].num() != 0;
     const auto& ob = v["objects"];
     if (ob.type != minijson::Value::Arr) {
         editable = v["frames"].a.empty();   // разметка из synth_sky.py: только по кадрам
@@ -71,21 +73,22 @@ GroundTruth Annotation::toGroundTruth(int64_t frames) const {
     for (const auto& o : objs)
         if (!o.keys.empty()) last = std::max(last, o.keys.rbegin()->first);
     frames = std::max(frames, last + 1);
-    if (objs.empty()) return g;
+    if (objs.empty() && !noDrones) return g;
     g.frames.resize((size_t)frames);
     for (int64_t f = 0; f < frames; ++f) frameObjects(f, g.frames[(size_t)f]);
     return g;
 }
 
 bool Annotation::save(const std::string& path, int64_t frames) const {
-    if (objs.empty()) {   // всё стёрли — файла разметки больше нет
+    if (objs.empty() && !noDrones) {   // всё стёрли — файла разметки больше нет
         remove_file(path);
         return true;
     }
     const GroundTruth g = toGroundTruth(frames);
     FILE* f = open_file(path, "w");
     if (!f) return false;
-    fprintf(f, "{\"w\": %d, \"h\": %d, \"fps\": %g, \"source\": \"dronolok_app\",\n \"objects\": [", w, h, fps);
+    fprintf(f, "{\"w\": %d, \"h\": %d, \"fps\": %g, \"source\": \"dronolok_app\",%s\n \"objects\": [", w, h, fps,
+            noDrones ? " \"no_drones\": true," : "");
     for (size_t i = 0; i < objs.size(); ++i) {
         fprintf(f, "%s\n  {\"id\": %d, \"kind\": \"%s\", \"keys\": [", i ? "," : "", objs[i].id,
                 objs[i].bird ? "bird" : "drone");

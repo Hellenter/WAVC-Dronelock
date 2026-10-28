@@ -52,7 +52,7 @@ bool has(const Metric& m, const RunResult& r, double& v) {
     if (!r.done) return false;
     if (m.gtOnly && !r.gt) return false;
     v = m.get(r);
-    return !(m.gtOnly && v < 0) && std::isfinite(v);
+    return v >= 0 && std::isfinite(v);   // отрицательное — нет данных
 }
 
 std::string jnum(const Metric& m, const RunResult& r) {
@@ -201,7 +201,7 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
         const auto& v = videos[i];
         j += "    {\"index\": " + std::to_string(i) + ", \"file\": " + jstr(v.file) + ", \"w\": " + std::to_string(v.w) +
              ", \"h\": " + std::to_string(v.h) + ", \"fps\": " + num(v.fps, 3) + ", \"frames\": " +
-             std::to_string(v.frames) + ", \"gt\": " + (v.gt ? "true" : "false") + "}" +
+             std::to_string(v.frames) + ", \"gt\": " + (v.gt ? "true" : "false") + ", \"no_drones\": " + (v.noDrones ? "true" : "false") + "}" +
              (i + 1 < videos.size() ? ",\n" : "\n");
     }
     j += "  ],\n  \"variants\": [\n";
@@ -390,7 +390,7 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
         const auto& v = videos[vi];
         h += "<h3>" + html(v.file) + "</h3><div class=muted>" + std::to_string(v.w) + "x" + std::to_string(v.h) + ", " +
              num(v.fps, 2) + " к/с, " + (v.frames ? "~" + std::to_string(v.frames) + " кадров, " : "") +
-             (v.gt ? "есть разметка" : "без разметки") + "</div>";
+             (v.noDrones ? "разметка: дронов нет" : v.gt ? "есть разметка" : "без разметки") + "</div>";
         const RunResult* br = find_run(res, (int)vi, 0);
         const auto& vc = v.gt ? cols : colsNoGt;
         h += "<div class=wrap><table class=sort>" + header(vc) + "<tbody>";
