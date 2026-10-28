@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -14,6 +15,8 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <objbase.h>
+#include <shlobj.h>
+#include <shellapi.h>
 #include <psapi.h>
 #else
 #include <dirent.h>
@@ -120,6 +123,32 @@ static std::string dialog_blocking(void* owner) {
     if (SUCCEEDED(co)) CoUninitialize();
     g_dlgThread = 0;
     return ok ? to_utf8(file) : "";
+}
+
+static std::string folder_blocking(void* owner) {
+    g_dlgThread = GetCurrentThreadId();
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    BROWSEINFOW bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.hwndOwner = (HWND)owner;
+    bi.lpszTitle = L"Папка с видео для мультитеста";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    std::string out;
+    if (PIDLIST_ABSOLUTE id = SHBrowseForFolderW(&bi)) {
+        wchar_t path[MAX_PATH * 4] = L"";
+        if (SHGetPathFromIDListW(id, path)) out = to_utf8(path);
+        CoTaskMemFree(id);
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    g_dlgThread = 0;
+    return out;
+}
+
+bool open_in_browser(const std::string& path) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? n : 1, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &w[0], n);
+    return (INT_PTR)ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL) > 32;
 }
 
 static BOOL CALLBACK raise_window(HWND w, LPARAM) {
@@ -232,6 +261,24 @@ static std::string dialog_blocking(void*) {
     return s;
 }
 
+static std::string folder_blocking(void*) {
+    FILE* p = popen("zenity --file-selection --directory --title='Папка с видео' 2>/dev/null || "
+                    "kdialog --getexistingdirectory . 2>/dev/null", "r");
+    if (!p) return "";
+    char buf[4096] = {0};
+    std::string s = fgets(buf, sizeof(buf), p) ? buf : "";
+    pclose(p);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
+}
+
+bool open_in_browser(const std::string& path) {
+    std::string q = "'";
+    for (char c : path) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    q += "'";
+    return system(("xdg-open " + q + " >/dev/null 2>&1 &").c_str()) == 0;
+}
+
 static void dialog_to_front() {}
 
 std::vector<std::string> ui_fonts() {
@@ -248,38 +295,60 @@ void attach_console() {}
 // Раньше диалог открывался прямо в кадре интерфейса: пока он был открыт, окно приложения не
 // перерисовывалось, а щелчки по нему копились и после закрытия открывали диалог снова и снова.
 
-static std::mutex g_dlgMu;
-static std::atomic<int> g_dlgState{0};   // 0 — нет диалога, 1 — открыт, 2 — закрыт, результат не забран
-static std::string g_dlgResult;
+namespace {
+struct Dialog {
+    std::mutex mu;
+    std::atomic<int> state{0};   // 0 — нет диалога, 1 — открыт, 2 — закрыт, результат не забран
+    std::string result;
+
+    bool open(std::string (*run)(void*), void* owner) {
+        int expected = 0;
+        if (!state.compare_exchange_strong(expected, 1)) {
+            if (expected == 1) dialog_to_front();
+            return false;
+        }
+        std::thread([this, run, owner] {
+            std::string p = run(owner);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                result = std::move(p);
+            }
+            state = 2;
+        }).detach();
+        return true;
+    }
+    bool take(std::string& path) {
+        if (state != 2) return false;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            path = std::move(result);
+            result.clear();
+        }
+        state = 0;
+        return true;
+    }
+};
+Dialog g_video, g_folder;
+}  // namespace
 
 bool open_video_dialog(void* owner) {
-    int expected = 0;
-    if (!g_dlgState.compare_exchange_strong(expected, 1)) {
-        if (expected == 1) dialog_to_front();
+    if (g_folder.state == 1) {   // один диалог за раз
+        dialog_to_front();
         return false;
     }
-    std::thread([owner] {
-        std::string p = dialog_blocking(owner);
-        {
-            std::lock_guard<std::mutex> lk(g_dlgMu);
-            g_dlgResult = std::move(p);
-        }
-        g_dlgState = 2;
-    }).detach();
-    return true;
+    return g_video.open(dialog_blocking, owner);
 }
+bool video_dialog_open() { return g_video.state == 1; }
+bool video_dialog_result(std::string& path) { return g_video.take(path); }
 
-bool video_dialog_open() { return g_dlgState == 1; }
-
-bool video_dialog_result(std::string& path) {
-    if (g_dlgState != 2) return false;
-    {
-        std::lock_guard<std::mutex> lk(g_dlgMu);
-        path = std::move(g_dlgResult);
-        g_dlgResult.clear();
+bool open_folder_dialog(void* owner) {
+    if (g_video.state == 1) {
+        dialog_to_front();
+        return false;
     }
-    g_dlgState = 0;
-    return true;
+    return g_folder.open(folder_blocking, owner);
 }
+bool folder_dialog_open() { return g_folder.state == 1; }
+bool folder_dialog_result(std::string& path) { return g_folder.take(path); }
 
 }  // namespace plat

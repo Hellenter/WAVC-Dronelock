@@ -923,6 +923,7 @@ void Pipeline::processLoop() {
                             t.bh, t.expectedSize(), r->fx, r->fy);
             }
         }
+        if (observer_) observer_(*r);
         latest_ = r;
         hist_.push_back(r);
         histBytes_ += f.px.size();
@@ -932,6 +933,19 @@ void Pipeline::processLoop() {
         }
     }
     saveStatic();
+}
+
+Pipeline::Progress Pipeline::progress() const {
+    Progress pr;
+    {
+        std::lock_guard<std::mutex> lk(qm_);
+        pr.queue = (int)q_.size();
+    }
+    std::lock_guard<std::mutex> lk(rm_);
+    pr.processed = (long)log_.size();
+    pr.decoded = decoded_;
+    pr.status = status_;
+    return pr;
 }
 
 std::shared_ptr<const Result> Pipeline::latest() const {

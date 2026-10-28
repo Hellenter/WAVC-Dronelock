@@ -7,6 +7,7 @@
 //   dronolok_app --bench видео [--frames N] [--threads N] [--isa avx2] [--scales 0..4] [--motion 0|1]
 //                [--focus] [--camera] [--slowdown K] [--governor] [--profile 0..3] [--json out.json]
 //   dronolok_app --stress видео [--seconds 30] [--seed N]
+//   dronolok_app --multitest папка [--vary ключ[=знач,...]]... [--frames N] [--out папка]  (--help, --list)
 #include <SDL.h>
 #if defined(_WIN32)
 #include <SDL_syswm.h>
@@ -23,6 +24,7 @@
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
+#include "multitest.hpp"
 #include "dronolok/fileutil.hpp"
 #include "dronolok/tuning.hpp"
 #include "pipeline.hpp"
@@ -146,6 +148,20 @@ struct App {
     int maxTexW = 4096, maxTexH = 4096;
     // загрузка CPU
     double cpuT = 0, cpuWall = 0, cpuPct = 0;
+    // мультитест
+    mt::Runner mt;
+    char mtFolder[1024] = "";
+    struct MtSel {
+        bool on = false;
+        char vals[128] = "";
+    };
+    std::vector<MtSel> mtSel;   // по mt::params()
+    int mtMode = 0, mtFrames = 0, mtParallel = 1;
+    bool mtRealtime = false, mtEmulate = false;
+    std::vector<std::string> mtVideos;
+    int mtGt = 0;
+    std::string mtMsg, mtScanned;
+    bool mtOpen = false;
 };
 
 void apply_resources(App& a) {
@@ -608,6 +624,14 @@ void panel_main(App& a, bool& changed) {
         pop_accent();
     }
     ImGui::SetItemTooltip("Или перетащите файл в окно");
+    {
+        const mt::Runner::Status st = a.mt.status();
+        char cap[96];
+        if (a.mt.running()) snprintf(cap, sizeof(cap), "Мультитест: %d из %d прогонов###mt", st.done, st.total);
+        else snprintf(cap, sizeof(cap), "Мультитест: подобрать настройки на папке видео...###mt");
+        if (ImGui::Button(cap, ImVec2(-FLT_MIN, 0))) a.mtOpen = !a.mtOpen;
+        ImGui::SetItemTooltip("Прогнать каждое видео из папки с разными настройками и получить отчёт");
+    }
     if (!a.err.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, TXT_BAD);
         ImGui::TextWrapped("%s", a.err.c_str());
@@ -1188,6 +1212,301 @@ void tab_view(App& a) {
         item("вырезки целей", &a.showCrops);
         ImGui::EndTable();
     }
+}
+
+// ------------------------------------------------------------ мультитест
+
+void mt_scan(App& a) {
+    a.mtScanned = a.mtFolder;
+    a.mtVideos = a.mtScanned.empty() ? std::vector<std::string>() : mt::list_videos(a.mtScanned);
+    a.mtGt = 0;
+    for (const auto& v : a.mtVideos)
+        if (FILE* f = open_file(v + ".gt.json", "rb")) {
+            fclose(f);
+            ++a.mtGt;
+        }
+}
+
+mt::Setup mt_base(const App& a) {
+    mt::Setup u;
+    u.s = a.s;
+    const ResOpt& r = RES_OPTS[a.resIdx];
+    u.scale = r.scale > 0 ? r.scale : 1.f;
+    return u;
+}
+
+std::vector<mt::Choice> mt_choices(const App& a, bool& bad) {
+    std::vector<mt::Choice> ch;
+    bad = false;
+    const auto& P = mt::params();
+    for (size_t i = 0; i < P.size() && i < a.mtSel.size(); ++i) {
+        if (!a.mtSel[i].on) continue;
+        mt::Choice c;
+        c.key = P[i].key;
+        if (!mt::parse_values(P[i], a.mtSel[i].vals, c.values)) {
+            bad = true;
+            continue;
+        }
+        ch.push_back(c);
+    }
+    return ch;
+}
+
+void mt_start(App& a) {
+    mt::Config c;
+    c.folder = a.mtScanned;
+    c.videos = a.mtVideos;
+    c.base = mt_base(a);
+    bool bad;
+    c.choices = mt_choices(a, bad);
+    c.mode = a.mtMode ? mt::Mode::Grid : mt::Mode::OneAtATime;
+    c.maxFrames = a.mtFrames;
+    c.parallel = a.mtParallel;
+    c.realtime = a.mtRealtime;
+    c.emulate = a.mtEmulate;
+    std::string err;
+    if (!a.mt.start(c, err)) {
+        a.mtMsg = err;
+        return;
+    }
+    a.mtMsg.clear();
+    // просмотр на паузе, чтобы не отнимать ядра у прогонов
+    if (a.pipe.isOpen()) a.pipe.setPaused(true);
+}
+
+void mt_setup(App& a) {
+    const auto& P = mt::params();
+    const bool run = a.mt.running();
+    ImGui::TextWrapped("Каждое видео из папки прогоняется с несколькими вариантами настроек, и складывается отчёт: "
+                       "что лучше находит и держит дрона. База — текущие настройки приложения.");
+    heading("Папка с видео");
+    ImGui::BeginDisabled(run);
+    const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+    if (ImGui::Button(plat::folder_dialog_open() ? "Выбор открыт..." : "Выбрать папку...", ImVec2(bw, 0)))
+        plat::open_folder_dialog(a.owner);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!a.pipe.isOpen());
+    if (ImGui::Button("Папка открытого видео", ImVec2(-FLT_MIN, 0))) {
+        std::string d = a.pipe.path();
+        const size_t sl = d.find_last_of("/\\");
+        d = sl == std::string::npos ? "." : d.substr(0, sl);
+        snprintf(a.mtFolder, sizeof(a.mtFolder), "%s", d.c_str());
+    }
+    ImGui::EndDisabled();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##mtfolder", "путь к папке", a.mtFolder, sizeof(a.mtFolder));
+    ImGui::EndDisabled();
+    if (a.mtScanned != a.mtFolder) mt_scan(a);
+    if (a.mtScanned.empty()) ImGui::TextDisabled("выберите папку");
+    else if (a.mtVideos.empty()) ImGui::TextColored(TXT_WARN, "в папке нет видео");
+    else {
+        ImGui::TextDisabled("видео: %d, с разметкой (.gt.json): %d", (int)a.mtVideos.size(), a.mtGt);
+        if (!a.mtGt)
+            help_marker("Без разметки видно только, как меняются число целей, захват и смены захвата. Чтобы мультитест "
+                        "считал точность (дрон найден, захват на дроне, ложный захват), разметьте ролики на вкладке "
+                        "«Разметка».");
+    }
+
+    heading("Что менять");
+    ImGui::BeginDisabled(run);
+    static const char* modes[] = {"По одной", "Все сочетания"};
+    static const char* modeTips[] = {
+        "База и каждое значение каждой отмеченной настройки по отдельности, остальное — как в базе. Видно, что "
+        "даёт каждая настройка.",
+        "Все сочетания значений отмеченных настроек (не больше 256). Для 2-3 настроек, чтобы найти лучшее вместе.",
+    };
+    segmented("mtmode", modes, 2, a.mtMode, 0, modeTips);
+    ImGui::TextDisabled("отметьте настройки и через запятую — значения");
+    const char* groups[] = {"Главное", "Железо", "Алгоритм", "Видео", "Тонко"};
+    for (const char* g : groups) {
+        int on = 0;
+        for (size_t i = 0; i < P.size(); ++i) on += !strcmp(P[i].group, g) && a.mtSel[i].on;
+        char title[96];
+        if (on) snprintf(title, sizeof(title), "%s (%d)###mtg%s", g, on, g);
+        else snprintf(title, sizeof(title), "%s###mtg%s", g, g);
+        if (!ImGui::CollapsingHeader(title, !strcmp(g, "Алгоритм") ? ImGuiTreeNodeFlags_DefaultOpen : 0)) continue;
+        for (size_t i = 0; i < P.size(); ++i) {
+            if (strcmp(P[i].group, g)) continue;
+            ImGui::PushID((int)i);
+            ImGui::Checkbox(P[i].name, &a.mtSel[i].on);
+            if (a.mtSel[i].on) {
+                ImGui::Indent();
+                std::vector<double> v;
+                const bool ok = mt::parse_values(P[i], a.mtSel[i].vals, v);
+                if (!ok) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.45f, 0.12f, 0.12f, 1));
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+                ImGui::InputText("##vals", a.mtSel[i].vals, sizeof(a.mtSel[i].vals));
+                if (!ok) ImGui::PopStyleColor();
+                ImGui::SameLine();
+                const mt::Setup b = mt_base(a);
+                if (strcmp(P[i].key, "profile")) ImGui::TextDisabled("сейчас %s", mt::fmt_value(P[i], P[i].get(b)).c_str());
+                ImGui::Unindent();
+            }
+            ImGui::PopID();
+        }
+    }
+    bool bad;
+    const auto ch = mt_choices(a, bad);
+    const int nv = mt::count_variants(mt_base(a), ch, a.mtMode ? mt::Mode::Grid : mt::Mode::OneAtATime);
+    const int nvc = std::min(nv, a.mtMode ? mt::GRID_MAX + 1 : nv);
+    ImGui::Text("вариантов %d x видео %d = %d прогонов", nvc, (int)a.mtVideos.size(), nvc * (int)a.mtVideos.size());
+    if (bad) ImGui::TextColored(TXT_BAD, "не разобрать значения (подсвечены)");
+    if (a.mtMode && nv > mt::GRID_MAX) ImGui::TextColored(TXT_WARN, "сочетаний больше %d: возьмутся первые", mt::GRID_MAX);
+
+    heading("Прогон");
+    label("кадров с каждого видео", "0 — видео целиком. Меньше — быстрее, но короткий кусок может не дойти до дрона.");
+    ImGui::SliderInt("##mtframes", &a.mtFrames, 0, 3000, a.mtFrames ? "%d" : "всё видео");
+    label("прогонов одновременно", "Несколько прогонов сразу делят ядра ПК: всё вместе быстрее (декодирование видео "
+                                   "идёт параллельно), но время обработки кадра в отчёте выше.");
+    ImGui::SliderInt("##mtpar", &a.mtParallel, 1, std::max(1, std::min(8, plat::logical_cpus())));
+    ImGui::Checkbox("как камера: с пропусками кадров", &a.mtRealtime);
+    help_marker("Кадры подаются в темпе видео, и что обработка не успела — пропускается, как на устройстве. Прогон "
+                "длится столько же, сколько видео. Выключено — каждый кадр обрабатывается, так быстро, как может ПК.");
+    ImGui::Checkbox("с имитацией устройства", &a.mtEmulate);
+    help_marker("Оставить замедление выбранного устройства (Raspberry Pi). Имеет смысл вместе с «как камера» — тогда "
+                "видно, сколько захвата теряется из-за пропущенных кадров. Иначе только дольше.");
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    {
+        FontSize f(1.15f);
+        if (!run) {
+            ImGui::BeginDisabled(a.mtVideos.empty() || bad);
+            push_accent();
+            if (ImGui::Button("Запустить мультитест", ImVec2(-FLT_MIN, ImGui::GetFrameHeight() * 1.6f))) mt_start(a);
+            pop_accent();
+            ImGui::EndDisabled();
+        } else if (ImGui::Button("Остановить", ImVec2(-FLT_MIN, ImGui::GetFrameHeight() * 1.6f))) {
+            a.mt.stop();
+        }
+    }
+    if (!a.mtMsg.empty()) ImGui::TextColored(TXT_BAD, "%s", a.mtMsg.c_str());
+}
+
+// ход и итоги мультитеста
+void mt_progress(App& a, bool& changed) {
+    const bool run = a.mt.running();
+    const mt::Runner::Status st = a.mt.status();
+    if (st.total == 0) {
+        ImGui::TextWrapped("Здесь будут ход прогона и итоги. Полный отчёт — report.html в папке multitest-<дата> "
+                           "рядом с видео, а results.json оттуда можно прислать на разбор.");
+        return;
+    }
+    if (st.total == 0) return;
+    char ov[96];
+    snprintf(ov, sizeof(ov), "%d из %d прогонов", st.done, st.total);
+    ImGui::ProgressBar((float)st.frac, ImVec2(-FLT_MIN, 0), ov);
+    if (run) {
+        if (st.etaS >= 0) ImGui::TextDisabled("прошло %s, осталось ~%s", fmt_time(st.elapsedS).c_str(), fmt_time(st.etaS).c_str());
+        if (!st.current.empty()) ImGui::TextWrapped("%s", st.current.c_str());
+        if (st.stopped) ImGui::TextColored(TXT_WARN, "останавливается после текущих кадров...");
+    } else {
+        ImGui::TextColored(st.done == st.total ? TXT_OK : TXT_WARN, "%s за %s", st.done == st.total ? "готово" : "остановлен",
+                           fmt_time(st.elapsedS).c_str());
+    }
+    if (!st.error.empty()) ImGui::TextColored(TXT_WARN, "%s", st.error.c_str());
+    ImGui::BeginDisabled(st.html.empty());
+    const float hw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+    if (ImGui::Button("Открыть отчёт", ImVec2(hw, 0))) plat::open_in_browser(st.html);
+    ImGui::SameLine();
+    if (ImGui::Button("Открыть папку", ImVec2(-FLT_MIN, 0))) plat::open_in_browser(st.outDir);
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("report.html — посмотреть, results.json — прислать на разбор");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.outDir.c_str());
+
+    // короткая сводка: главная метрика, среднее по видео
+    std::vector<mt::VideoMeta> vids;
+    std::vector<mt::Variant> vars;
+    std::vector<mt::RunResult> res;
+    a.mt.snapshot(vids, vars, res);
+    bool anyGt = false;
+    for (const auto& r : res) anyGt |= r.done && r.gt;
+    const char* key = anyGt ? "score" : "lock_pct";
+    const mt::Metric* M = nullptr;
+    for (const auto& m : mt::metrics())
+        if (!strcmp(m.key, key)) M = &m;
+    heading(anyGt ? "Итоги: оценка (по разметке)" : "Итоги: кадров с захватом, %");
+    std::vector<std::pair<double, int>> rows;
+    for (size_t k = 0; k < vars.size(); ++k) {
+        double s = 0;
+        int n = 0;
+        for (const auto& r : res)
+            if (r.variant == (int)k && r.done && (!M->gtOnly || r.gt) && M->get(r) >= 0) {
+                s += M->get(r);
+                ++n;
+            }
+        if (n) rows.push_back({s / n, (int)k});
+    }
+    if (rows.empty()) {
+        ImGui::TextDisabled("пока нет готовых прогонов");
+        return;
+    }
+    double base = -1;
+    for (const auto& r : rows)
+        if (r.second == 0) base = r.first;
+    std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    if (ImGui::BeginTable("mtres", 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("вариант", ImGuiTableColumnFlags_WidthStretch, 3.f);
+        ImGui::TableSetupColumn(anyGt ? "оценка" : "захват", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 7);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("взять").x + ImGui::GetStyle().FramePadding.x * 2);
+        ImGui::TableHeadersRow();
+        for (const auto& [v, k] : rows) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (k == 0) ImGui::TextColored(TXT_HEAD, "%s", vars[k].name.c_str());
+            else ImGui::TextWrapped("%s", vars[k].name.c_str());
+            ImGui::TableNextColumn();
+            if (k == 0 || base < 0) ImGui::Text("%.1f", v);
+            else ImGui::TextColored(!anyGt ? ImVec4(0.85f, 0.88f, 0.95f, 1) : v > base + 0.5 ? TXT_OK : v < base - 0.5 ? TXT_BAD : TXT_DIM,
+                                    "%.1f (%+.1f)", v, v - base);
+            ImGui::TableNextColumn();
+            if (k != 0) {
+                ImGui::PushID(k);
+                if (ImGui::SmallButton("взять")) {
+                    mt::apply_algo(a.s, vars[k].setup.s);
+                    for (int i = 0; i < (int)(sizeof(RES_OPTS) / sizeof(RES_OPTS[0])); ++i)
+                        if (RES_OPTS[i].scale > 0 && std::fabs(RES_OPTS[i].scale - vars[k].setup.scale) < 1e-3f) a.resIdx = i;
+                    set_resolution(a);
+                    a.profIdx = -1;
+                    changed = true;
+                }
+                ImGui::SetItemTooltip("Поставить в приложении настройки этого варианта");
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
+// окно мультитеста поверх видео: слева что перебирать, справа ход и итоги
+void window_multitest(App& a, ImVec2 pos, ImVec2 size) {
+    ImGui::SetNextWindowPos(pos);
+    ImGui::SetNextWindowSize(size);
+    if (!ImGui::Begin("Мультитест: подбор настроек на папке видео", &a.mtOpen,
+                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                          ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::End();
+        return;
+    }
+    bool changed = false;
+    const float w = ImGui::GetContentRegionAvail().x;
+    if (w > 700) {
+        const float lw = std::min(w * 0.5f, ImGui::GetFontSize() * 30);
+        ImGui::BeginChild("mtsetup", ImVec2(lw, 0));
+        mt_setup(a);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("mtprog", ImVec2(0, 0));
+        mt_progress(a, changed);
+        ImGui::EndChild();
+    } else {
+        ImGui::BeginChild("mtall", ImVec2(0, 0));
+        mt_setup(a);
+        heading("Ход и итоги");
+        mt_progress(a, changed);
+        ImGui::EndChild();
+    }
+    ImGui::End();
+    if (changed) a.pipe.setSettings(a.s);
 }
 
 void panel_controls(App& a) {
@@ -2148,6 +2467,7 @@ int run_stress(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return run_bench(argc, argv);
     if (argc > 1 && std::string(argv[1]) == "--stress") return run_stress(argc, argv);
+    if (argc > 1 && std::string(argv[1]) == "--multitest") return mt::run_cli(argc, argv);
 
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
@@ -2234,6 +2554,14 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < a.cpuOn.size(); ++i) a.cpuOn[i] = (aff >> i) & 1;
     a.s.det.threads = 0;
     a.pipe.setSettings(a.s);
+    {   // мультитест: что перебирать по умолчанию — то, что чаще всего меняли на роликах
+        const auto& P = mt::params();
+        a.mtSel.resize(P.size());
+        for (size_t i = 0; i < P.size(); ++i) {
+            snprintf(a.mtSel[i].vals, sizeof(a.mtSel[i].vals), "%s", P[i].values);
+            for (const char* k : {"auto_thr", "thr", "skyline", "lock_slow"}) a.mtSel[i].on |= !strcmp(P[i].key, k);
+        }
+    }
     if (argc > 1) open_video(a, argv[1]);
     a.cpuWall = now_ms();
     a.cpuT = plat::process_cpu_seconds();
@@ -2251,6 +2579,8 @@ int main(int argc, char** argv) {
         }
         std::string picked;
         if (plat::video_dialog_result(picked) && !picked.empty()) open_video(a, picked);
+        if (plat::folder_dialog_result(picked) && !picked.empty())
+            snprintf(a.mtFolder, sizeof(a.mtFolder), "%s", picked.c_str());
         if (SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED) {
             SDL_Delay(20);
             continue;
@@ -2326,6 +2656,10 @@ int main(int argc, char** argv) {
         if (a.pipe.isOpen()) draw_timeline(a, shown, m);
         ImGui::End();
         ImGui::PopStyleVar();
+        if (a.mtOpen) {
+            const float pad = 12 * scale;
+            window_multitest(a, ImVec2(lw + pad, pad), ImVec2(std::max(300.f, ds.x - lw - 2 * pad), ds.y - 2 * pad));
+        }
 
         ImGui::Render();
         SDL_RenderSetScale(a.ren, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);

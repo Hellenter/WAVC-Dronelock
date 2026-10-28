@@ -58,13 +58,15 @@ pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libswscale libavutil)
 add_executable(dronolok_app
   src/annotate.cpp
   src/main.cpp
+  src/multitest.cpp
+  src/multitest_report.cpp
   src/pipeline.cpp
   src/platform.cpp
   src/video_source.cpp)
 target_include_directories(dronolok_app PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../native/tools ${FFMPEG_INCLUDE_DIRS})
 target_link_libraries(dronolok_app PRIVATE dronolok_static imgui)
 if(MINGW)
-  target_link_libraries(dronolok_app PRIVATE ${FFMPEG_STATIC_LDFLAGS} comdlg32 ole32 psapi advapi32 winmm)
+  target_link_libraries(dronolok_app PRIVATE ${FFMPEG_STATIC_LDFLAGS} comdlg32 ole32 shell32 psapi advapi32 winmm)
   target_link_options(dronolok_app PRIVATE -static -mwindows)
   set_target_properties(dronolok_app PROPERTIES OUTPUT_NAME "Dronolok")
 else()
