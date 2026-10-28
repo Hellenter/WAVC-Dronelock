@@ -15,9 +15,14 @@ on:
 permissions:
   contents: read
 
+# Сторонние действия закреплены по коммиту (тег можно перевесить), скачиваемые архивы —
+# по sha256: при смене версии обновить и сумму. FFmpeg: сумма архива ffmpeg.org, подпись
+# проверена ключом релизов FFmpeg (FCF986EA15E6E293A5644F10B4322F04D67658D8).
 env:
   FFMPEG_VERSION: '7.1.1'
+  FFMPEG_SHA256: '733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1'
   SDL2_VERSION: '2.30.11'
+  SDL2_SHA256: ''
 
 jobs:
   # Ядро + тесты + приложение под Linux x64, синтетическое видео для проверки
@@ -25,8 +30,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.12' }
       # установка пакетов иногда зависает на зеркалах — ограничиваем время и повторяем
       - name: Пакеты
@@ -36,7 +41,9 @@ jobs:
             libswscale-dev libavutil-dev
       - name: Python-пакеты
         timeout-minutes: 10
-        run: pip install --quiet --timeout 60 --retries 3 numpy opencv-python-headless
+        run: |
+          pip install --quiet --timeout 60 --retries 3 numpy opencv-python-headless
+          pip freeze | grep -iE '^(numpy|opencv)'
       - name: Ядро и тесты
         run: |
           cmake -S native -B build-native -G Ninja
@@ -63,12 +70,12 @@ jobs:
         run: |
           ./build-app/dronolok_app --multitest sample --vary auto_thr --vary thr=8,14 --vary lock_slow --frames 40 --parallel 2 --out mt-linux
           python -c "import json; d=json.load(open('mt-linux/results.json')); r=d['runs']; assert len(r)==5 and all(x['done'] for x in r) and r[0]['recall_drone'] is not None, r; print('прогонов', len(r), 'оценка базы', r[0]['score'])"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: multitest-linux
           path: mt-linux/
           retention-days: 14
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sample-video
           path: sample/
@@ -78,25 +85,32 @@ jobs:
   windows:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Пакеты
         timeout-minutes: 35
         run: .github/scripts/apt.sh cmake ninja-build pkg-config nasm mingw-w64
       - name: Кэш FFmpeg
         id: ffcache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/ffmpeg-mingw
-          key: ffmpeg-mingw-${{ env.FFMPEG_VERSION }}-${{ hashFiles('app/scripts/build_ffmpeg_mingw.sh') }}
+          key: ffmpeg-mingw-${{ env.FFMPEG_VERSION }}-${{ env.FFMPEG_SHA256 }}-${{ hashFiles('app/scripts/build_ffmpeg_mingw.sh') }}
       - name: FFmpeg (статический, только декодеры)
         if: steps.ffcache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz | tar xJ -C "$RUNNER_TEMP"
+          f="$RUNNER_TEMP/ffmpeg.tar.xz"
+          curl -fsSL -o "$f" https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz
+          echo "$FFMPEG_SHA256  $f" | sha256sum -c -
+          tar xJf "$f" -C "$RUNNER_TEMP"
           app/scripts/build_ffmpeg_mingw.sh "$RUNNER_TEMP/ffmpeg-${FFMPEG_VERSION}" ~/ffmpeg-mingw
           rm -rf ~/ffmpeg-mingw.build
       - name: SDL2
         run: |
-          curl -fsSL https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz | tar xz -C "$RUNNER_TEMP"
+          f="$RUNNER_TEMP/sdl2.tar.gz"
+          curl -fsSL -o "$f" https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz
+          sha256sum "$f"
+          if [ -n "$SDL2_SHA256" ]; then echo "$SDL2_SHA256  $f" | sha256sum -c -; fi
+          tar xzf "$f" -C "$RUNNER_TEMP"
       - name: Сборка
         run: |
           export PKG_CONFIG_LIBDIR=$HOME/ffmpeg-mingw/lib/pkgconfig
@@ -114,11 +128,11 @@ jobs:
           cp native/include/dronolok/dronolok.h native/python/dronolok_native.py $d/
           x86_64-w64-mingw32-objdump -p $d/Dronolok.exe | grep -i "DLL Name" | sort -u
           mkdir -p win-tests && cp build-win/native/test_kernels.exe win-tests/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Dronolok-win64
           path: Dronolok-win64/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: win-tests
           path: win-tests/
@@ -129,11 +143,11 @@ jobs:
     needs: [linux, windows]
     runs-on: windows-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: Dronolok-win64, path: app }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: win-tests, path: tests }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: sample-video, path: sample }
       - name: Тесты ядер (SSE2/AVX2 на реальном CPU)
         run: ./tests/test_kernels.exe
@@ -172,7 +186,7 @@ jobs:
           - triple: arm-linux-gnueabihf
             qemu: qemu-arm-static
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Пакеты
         timeout-minutes: 35
         run: .github/scripts/apt.sh cmake ninja-build qemu-user-static g++-${{ matrix.triple }}
@@ -184,7 +198,7 @@ jobs:
           d=dronolok-${{ matrix.triple }}
           mkdir -p $d && cp build/dronolok_bench build/libdronolok.so native/include/dronolok/*.h* native/python/dronolok_native.py $d/
           tar czf $d.tar.gz $d
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dronolok-${{ matrix.triple }}
           path: dronolok-${{ matrix.triple }}.tar.gz
@@ -196,22 +210,31 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { path: dist }
       - name: Архивы
         run: |
           cd dist
           zip -r Dronolok-win64.zip Dronolok-win64
           ls -la
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('preview-{0}', github.run_number) }}
-          target_commitish: ${{ github.sha }}
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('Дронолок preview {0}', github.run_number) }}
-          files: |
-            dist/Dronolok-win64.zip
-            dist/dronolok-*/dronolok-*.tar.gz
+      # релиз через gh (есть на раннере): стороннему действию не нужен доступ на запись
+      - name: Релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('preview-{0}', github.run_number) }}
+          TITLE: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('Дронолок preview {0}', github.run_number) }}
+          PRE: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          cd dist
+          files="Dronolok-win64.zip $(ls dronolok-*/dronolok-*.tar.gz)"
+          flags=()
+          [ "$PRE" = true ] && flags+=(--prerelease)
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" $files --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" $files "${flags[@]}" --target "$GITHUB_SHA" --title "$TITLE" \
+              --generate-notes -R "$GITHUB_REPOSITORY"
+          fi
 
   # Последняя сборка по постоянной ссылке .../releases/tag/latest-build: обновляется после
   # каждого изменения в main и в открытом PR из этого репозитория
@@ -223,7 +246,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { path: dist }
       - name: Обновить релиз latest-build
         env:
