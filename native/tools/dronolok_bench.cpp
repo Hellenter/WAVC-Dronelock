@@ -165,6 +165,8 @@ int main(int argc, char** argv) {
         else if (a == "--per-tile") cfg.per_tile = std::atoi(val().c_str());
         else if (a == "--bg-map") cfg.bg_map = true;
         else if (a == "--no-bg-map") cfg.bg_map = false;
+        else if (a == "--no-skyline") cfg.skyline = false;
+        else if (a == "--edge-mover-k") tcfg.edge_mover_k = (float)std::atof(val().c_str());
         else if (a == "--bg-k") cfg.bg_k = (float)std::atof(val().c_str());
         else if (a == "--bg-frames") cfg.bg_frames = std::atoi(val().c_str());
         else if (a == "--tbd") cfg.tbd = cfg.bg_map = true;

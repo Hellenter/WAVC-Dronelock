@@ -155,6 +155,23 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
     if (n == 0 || texSum_.size() != (size_t)tw_ * th_) return;
     std::vector<uint8_t> bad(texSum_.size());
     for (size_t i = 0; i < bad.size(); ++i) bad[i] = texSum_[i] / n > frac;
+    if (cfg_.skyline) {
+        std::vector<int> edge(tw_, th_);
+        for (int x = 0; x < tw_; ++x) {
+            int below = 0;   // текстурных тайлов от y до низа кадра
+            for (int y = th_ - 1; y >= 0; --y) {
+                below += bad[(size_t)y * tw_ + x] != 0;
+                if (bad[(size_t)y * tw_ + x] && 2 * below > th_ - y) edge[x] = y;
+            }
+        }
+        // столбец, где кромки не нашлось или она много ниже, чем у обоих соседей (гладкая
+        // поляна в просвете между деревьями), берёт кромку пониже из соседних
+        for (int x = 0; x < tw_; ++x) {
+            const int l = x > 0 ? edge[x - 1] : edge[x + (tw_ > 1)], r = x + 1 < tw_ ? edge[x + 1] : edge[x - (tw_ > 1)];
+            const int e = std::min(edge[x], std::max(l, r));
+            for (int y = e; y < th_; ++y) bad[(size_t)y * tw_ + x] = 1;
+        }
+    }
     // расширяем "плохую" зону на 1 тайл (dilate 3x3). С фоном по ячейкам запас не нужен:
     // тайлы у кромки смотрятся по ячейкам, и мерцающие ячейки сами поднимают себе порог
     out.assign(bad.size(), 1);

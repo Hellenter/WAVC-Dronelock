@@ -384,7 +384,10 @@ void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
     out.clear();
     const float q = cfg_.q_accel * cfg_.q_accel;
     for (const Track& t0 : tracks_) {
-        if (hard_ && t0.id != lockId_) continue;   // жёсткий захват: смотрим только вокруг цели
+        // жёсткий захват: весь кадр смотрим редко, но вокруг других живых треков — каждый кадр,
+        // иначе вторая цель (дальний дрон рядом с захваченным самолётом) не набирает попаданий
+        // на подтверждение и не находится никогда. Помехи и наложения пропускаем.
+        if (hard_ && t0.id != lockId_ && (t0.clutter || t0.overlay || t0.cls == TargetClass::Clutter)) continue;
         Track t = t0;
         kf_predict(t, camDx, camDy, q);
         const float S = t.p00 + measVar(t.level);
@@ -603,7 +606,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
 
     // клаттер: всё, что не продолжает движущуюся цель, греет карту; в горячих ячейках —
     // помеха (её не отдаём ни трекам, ни в новые треки)
-    auto mover = [&](const Track& t) { return t.confirmed && t.travel >= cfg_.mover_px && !t.overlay && !t.anchored; };
+    auto mover = [&](const Track& t) {
+        return t.confirmed && t.travel >= cfg_.mover_px * (t.edgeBorn ? cfg_.edge_mover_k : 1.f) && !t.overlay && !t.anchored;
+    };
     std::vector<char> isMover(dets.size(), 0);
     for (size_t di = 0; di < dets.size(); ++di) {
         isMover[di] = (owner[di] >= 0 && mover(tracks_[owner[di]])) || (int)di == silhDet;
