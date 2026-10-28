@@ -70,6 +70,8 @@ def _load():
     lib.dl_mask_begin.argtypes = [C.c_void_p]
     lib.dl_mask_end.argtypes = [C.c_void_p, C.c_float]
     lib.dl_mask_get.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.POINTER(C.c_int), C.POINTER(C.c_int)]
+    lib.dl_mask_follow.argtypes = [C.c_void_p, C.c_int]
+    lib.dl_mask_shift.argtypes = [C.c_void_p, C.c_float, C.c_float]
     lib.dl_tracker_create.restype = C.c_void_p
     lib.dl_tracker_create.argtypes = [C.c_int, C.c_int]
     lib.dl_tracker_destroy.argtypes = [C.c_void_p]
@@ -89,6 +91,8 @@ def _load():
     lib.dl_motion_destroy.argtypes = [C.c_void_p]
     lib.dl_motion_estimate.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_float),
                                        C.POINTER(C.c_float), C.POINTER(C.c_float)]
+    lib.dl_motion_set_anchored.argtypes = [C.c_void_p, C.c_int]
+    lib.dl_motion_set_region.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int]
     lib.dl_tracker_set_motion.argtypes = [C.c_void_p, C.c_float, C.c_float]
     lib.dl_tracker_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
     lib.dl_detector_set_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
@@ -167,6 +171,25 @@ class NativePointDetector:
         L.dl_mask_get(self._h, m.ctypes.data, m.size, None, None)
         self.tile_mask = m.astype(bool)
         return self.tile_mask
+
+    def mask_follow(self, on=True):
+        """Маска неба за камерой: сдвигается с картинкой (mask_shift) и доучивается на ходу"""
+        lib().dl_mask_follow(self._h, int(bool(on)))
+
+    def mask_shift(self, dx, dy):
+        """Сдвиг земли за кадр (NativeMotion с anchored и region), до detect"""
+        lib().dl_mask_shift(self._h, float(dx), float(dy))
+
+    def mask(self):
+        """Текущая маска тайлов (True — искать) или None"""
+        L = lib()
+        tw, th = C.c_int(), C.c_int()
+        n = L.dl_mask_get(self._h, None, 0, C.byref(tw), C.byref(th))
+        if n <= 0:
+            return None
+        m = np.zeros((th.value, tw.value), np.uint8)
+        L.dl_mask_get(self._h, m.ctypes.data, m.size, None, None)
+        return m.astype(bool)
 
 
 class NativeTracker:
@@ -257,6 +280,18 @@ class NativeMotion:
         if getattr(self, "_h", None):
             lib().dl_motion_destroy(self._h)
             self._h = None
+
+    def set_anchored(self, on=True):
+        """Сдвиг от опорного кадра: медленный поворот не теряется в сумме по кадрам"""
+        lib().dl_motion_set_anchored(self._h, int(bool(on)))
+
+    def set_region(self, tile_mask=None, tile_px=64):
+        """Считать только по земле: tile_mask — маска тайлов (True — небо), None — весь кадр"""
+        if tile_mask is None:
+            lib().dl_motion_set_region(self._h, None, 0, 0, 0)
+            return
+        m = np.ascontiguousarray(tile_mask, dtype=np.uint8)
+        lib().dl_motion_set_region(self._h, m.ctypes.data, m.shape[1], m.shape[0], int(tile_px))
 
     def estimate(self, gray):
         g = np.ascontiguousarray(gray, dtype=np.uint8)

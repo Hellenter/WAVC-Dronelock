@@ -71,6 +71,10 @@ DL_API const char* dl_detector_backend(dl_detector* d);
 DL_API int dl_detector_threads(dl_detector* d);
 DL_API void dl_mask_begin(dl_detector* d);
 DL_API void dl_mask_end(dl_detector* d, float frac);
+/* Маска неба за камерой (камера плавно поворачивается): on = 1 — маска сдвигается вместе с
+   картинкой (dl_mask_shift — сдвиг земли за кадр, до dl_detect) и доучивается на ходу; 0 — остаётся как есть. */
+DL_API void dl_mask_follow(dl_detector* d, int on);
+DL_API void dl_mask_shift(dl_detector* d, float dx, float dy);
 /* Маска тайлов (1 = искать). Возвращает tw*th или 0, если маски нет. */
 DL_API int dl_mask_get(dl_detector* d, uint8_t* out, int cap, int* tw, int* th);
 
@@ -88,6 +92,10 @@ DL_API dl_motion* dl_motion_create(void);
 DL_API void dl_motion_destroy(dl_motion* m);
 DL_API int dl_motion_estimate(dl_motion* m, const uint8_t* gray, int w, int h, int stride, float* dx, float* dy,
                               float* quality);
+/* Сдвиг от опорного кадра (точнее при медленном повороте; для маски за камерой) и только по
+   земле: tiles — маска тайлов dl_mask_get (0 — земля), tiles = NULL — весь кадр. */
+DL_API void dl_motion_set_anchored(dl_motion* m, int on);
+DL_API void dl_motion_set_region(dl_motion* m, const uint8_t* tiles, int tw, int th, int tile_px);
 DL_API void dl_tracker_set_motion(dl_tracker* t, float dx, float dy);
 /* Области прогноза подтверждённых треков (x, y, r тройками) для dl_detector_set_focus. */
 DL_API int dl_tracker_focus(dl_tracker* t, float* xyr, int cap);

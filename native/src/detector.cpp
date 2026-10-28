@@ -45,6 +45,7 @@ struct Detector::Stats {
     std::vector<uint8_t> comp;   // тайлы, посчитанные бэкендом в этом кадре (пусто — все)
     std::vector<uint8_t> excl;   // ячейки вокруг треков: фон не учат
     std::vector<uint8_t> tex[2]; // тайлы, текстурные в этом кадре (облака, кромки), по полярностям
+    std::vector<uint8_t> roll[2];  // ...для маски за камерой: без одиночного компактного пятна
     std::vector<float> e;        // превышение ячеек над фоном в этом кадре (накопление)
 };
 
@@ -175,6 +176,7 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.per_tile = std::max(1, std::min(4, c.per_tile));
     c.bg_k = std::max(0.5f, c.bg_k);
     c.bg_frames = std::max(2, c.bg_frames);
+    c.roll_frames = std::max(1, std::min(100000, c.roll_frames));
     c.tbd_decay = std::max(0.f, std::min(0.95f, c.tbd_decay));
     c.band_px = std::max(0, c.band_px);
     c.band_k = std::max(0.3f, std::min(2.f, c.band_k));
@@ -207,6 +209,7 @@ void Detector::reconfigure(const DetectorConfig& c0) {
 
 void Detector::beginMaskLearning() {
     mask_.clear();
+    rolling_ = false;
     learning_ = true;
     texSum_.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
@@ -225,8 +228,16 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
     out.clear();
     const int n = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
     if (n == 0 || texSum_.size() != (size_t)tw_ * th_) return;
-    std::vector<uint8_t> bad(texSum_.size());
-    for (size_t i = 0; i < bad.size(); ++i) bad[i] = texSum_[i] / n > frac;
+    std::vector<float> tex(texSum_.size());
+    for (size_t i = 0; i < tex.size(); ++i) tex[i] = texSum_[i] / n;
+    buildMaskFrom(tex, frac, out);
+}
+
+void Detector::buildMaskFrom(const std::vector<float>& tex, float frac, std::vector<uint8_t>& out) const {
+    out.clear();
+    if (tex.size() != (size_t)tw_ * th_) return;
+    std::vector<uint8_t> bad(tex.size());
+    for (size_t i = 0; i < bad.size(); ++i) bad[i] = tex[i] > frac;
     if (cfg_.skyline) {
         std::vector<int> edge(tw_, th_);
         for (int x = 0; x < tw_; ++x) {
@@ -308,11 +319,104 @@ bool Detector::loadMask(const std::string& path, int verify) {
     th_ = hdr[5];
     mask_.swap(m);
     learning_ = false;
+    endMaskTracking();
     maskReplaced_ = false;
     verifyLeft_ = std::max(0, verify);
     texSum_.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
     return true;
+}
+
+void Detector::beginMaskTracking() {
+    const size_t n = (size_t)tw_ * th_;
+    rollTex_.assign(n, 0.f);
+    rollN_.assign(n, 0.f);
+    rollFix_.assign(n, 0.f);
+    offX_ = offY_ = 0;
+    const float full = (float)std::max(1, cfg_.roll_frames);
+    const int npol = (int)cfg_.dark + (int)cfg_.bright;
+    if (learning_ && texN_ > 0 && npol > 0 && texSum_.size() == n) {   // учили маску — накопленное не пропадает
+        const float k = std::min((float)texN_, full);
+        for (size_t i = 0; i < n; ++i) {
+            rollN_[i] = k;
+            rollTex_[i] = k * texSum_[i] / (float)(texN_ * npol);
+            rollFix_[i] = texSum_[i] / (float)(texN_ * npol);
+        }
+    } else if (!learning_ && mask_.size() == n) {   // выученная маска — как полпамяти уверенных кадров
+        for (size_t i = 0; i < n; ++i) {
+            rollN_[i] = 0.5f * full;
+            rollTex_[i] = mask_[i] ? 0.f : rollN_[i];
+            rollFix_[i] = mask_[i] ? 0.f : 1.f;
+        }
+    }
+    learning_ = false;
+    verifyLeft_ = 0;
+    rolling_ = true;
+}
+
+void Detector::endMaskTracking() {
+    rolling_ = false;
+    rollTex_.clear();
+    rollN_.clear();
+    rollFix_.clear();
+}
+
+void Detector::shiftMask(float dx, float dy) {
+    if (!rolling_ || tw_ <= 0 || th_ <= 0 || !std::isfinite(dx) || !std::isfinite(dy)) return;
+    const float P = (float)(cfg_.tile * cfg_.pool);
+    offX_ += dx;
+    offY_ += dy;
+    const int kx = (int)std::lround(offX_ / P), ky = (int)std::lround(offY_ / P);
+    if (!kx && !ky) return;
+    offX_ -= kx * P;
+    offY_ -= ky * P;
+    // картинка ушла на (kx, ky) тайлов: тайл (x, y) теперь там, где был (x - kx, y - ky);
+    // открывшиеся тайлы — без истории (маска — "искать", пока не посмотрим)
+    auto roll = [&](auto& v, auto fill) {
+        if (v.size() != (size_t)tw_ * th_) return;
+        auto old = v;
+        for (int y = 0; y < th_; ++y)
+            for (int x = 0; x < tw_; ++x) {
+                const int sx = x - kx, sy = y - ky;
+                v[(size_t)y * tw_ + x] = sx >= 0 && sx < tw_ && sy >= 0 && sy < th_ ? old[(size_t)sy * tw_ + sx] : fill;
+            }
+    };
+    roll(rollTex_, 0.f);
+    roll(rollN_, 0.f);
+    roll(mask_, (uint8_t)1);
+}
+
+// Маска за камерой: текстура этого кадра (полный просмотр) — в память тайлов, маска заново
+void Detector::updateRolling() {
+    const size_t n = (size_t)tw_ * th_;
+    const int npol = (int)cfg_.dark + (int)cfg_.bright;
+    if (!n || !npol) return;
+    if (rollTex_.size() != n || rollFix_.size() != n) {
+        rollTex_.assign(n, 0.f);
+        rollN_.assign(n, 0.f);
+        rollFix_.assign(n, 0.f);
+    }
+    const auto& td = stats_->roll[0];
+    const auto& tb = stats_->roll[1];
+    const float a = 1.f / (float)std::max(1, cfg_.roll_frames);
+    std::vector<float> frac(n);
+    for (size_t i = 0; i < n; ++i) {
+        float t = 0;
+        if (cfg_.dark && td.size() == n) t += td[i];
+        if (cfg_.bright && tb.size() == n) t += tb[i];
+        rollTex_[i] = rollTex_[i] * (1.f - a) + t / (float)npol;
+        rollN_[i] = rollN_[i] * (1.f - a) + 1.f;
+        rollFix_[i] = rollFix_[i] * (1.f - a) + a * t / (float)npol;
+        frac[i] = rollTex_[i] / rollN_[i];
+    }
+    std::vector<uint8_t> m;
+    buildMaskFrom(frac, 0.3f, m);
+    // Надписи, логотипы, ствол орудия стоят в кадре, а не в сцене: сдвиг маски уносит их
+    // текстуру, и под ними оказывается "небо". Тайл, где текстура почти всегда на месте кадра, — закрыт
+    if (!m.empty())
+        for (size_t i = 0; i < n; ++i)
+            if (rollFix_[i] > 0.8f) m[i] = 0;
+    if (!m.empty()) mask_.swap(m);
 }
 
 void Detector::resetBackground() {
@@ -325,6 +429,7 @@ void Detector::clearMask() {
     mask_.clear();
     learning_ = false;
     verifyLeft_ = 0;
+    endMaskTracking();
 }
 
 void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector<Candidate>& out) {
@@ -339,6 +444,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         mask_.clear();
         verifyLeft_ = 0;
         if (learning_) texSum_.assign((size_t)tw_ * th_, 0.f);
+        if (rolling_) beginMaskTracking();
     }
     // как cv2.threshold(R, thr*0.6) на u8: горячий, если R > floor(thr*0.6)
     const float ht = std::floor(hotLevel());
@@ -358,7 +464,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         p.cell_thr = (uint8_t)std::max(1.f, std::min(254.f, std::floor(lo) - 1.f));
     }
     // при проверке загруженной маски текстуру считаем по всему кадру, как при обучении
-    const uint8_t* m = (!learning_ && !verifyLeft_ && !mask_.empty()) ? mask_.data() : nullptr;
+    // маска за камерой доучивается каждый кадр: текстура нужна по всему кадру
+    const uint8_t* m = (!learning_ && !verifyLeft_ && !rolling_ && !mask_.empty()) ? mask_.data() : nullptr;
     updateBand();
     if (m && !edgeG_.empty()) {   // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам
         compMask_.resize(mask_.size());
@@ -462,7 +569,9 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     // фон ячеек читают кромка маски неба и накопление (tbd). Без маски и без накопления (камера
     // движется, поворотка) его не учим — это заметная доля последовательной части кадра; когда
     // маска появится, фон учится заново: выученный на движущейся картинке ей всё равно чужой
-    const bool bgUsed = cfg_.tbd || learning_ || verifyLeft_ || !mask_.empty();
+    // маска за камерой: ячейки привязаны к кадру, а картинка плывёт — фон не учим
+    const bool bgUsed = (cfg_.tbd || learning_ || verifyLeft_ || !mask_.empty()) && !rolling_;
+    if (rolling_ && !timing_.partial) updateRolling();
     if (p.cells && cfg_.bg_map && !bgUsed) {
         bgIdle_ = true;
     } else if (p.cells && (cfg_.bg_map || cfg_.tbd)) {
@@ -683,10 +792,16 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
     const int sep = cfg_.k + 1;   // кандидаты одного тайла не ближе, пикс. после пулинга
     const float hotB = std::floor(hotLevel());   // "горячий" отклик основного масштаба
     uint8_t* texOut = nullptr;
+    uint8_t* rollOut = nullptr;
     if (fineGrid) {
         auto& t = stats_->tex[pol ? 1 : 0];
         t.assign((size_t)tw * th, 0);
         texOut = t.data();
+        if (rolling_) {
+            auto& r = stats_->roll[pol ? 1 : 0];
+            r.assign((size_t)tw * th, 0);
+            rollOut = r.data();
+        }
     }
     for (int ty = 0; ty < th; ++ty)
         for (int tx = 0; tx < tw; ++tx) {
@@ -703,14 +818,20 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             // текстура: листва и кромка облака рассыпаны по тайлу. У земли не проверяем — там
             // одиночная верхушка дерева тоже компактное пятно. Маска неба учится по исходному
             // признаку текстуры: пятно на земле не должно открывать её для поиска
-            if (textured && cells && cfg_.compact_tex && !(nearOn && nearGround_[i]) && (zones_.empty() || zones_[i] == 2)) {
+            // Маска за камерой учится по такому же признаку, но везде: камера ведёт цель, и цель
+            // неделями сидела бы в одном тайле сцены (медленный поворот) — тайл стал бы «землёй»
+            auto spreadTex = [&] {
                 const int ax = tx * cpt + (ts.argmax[i] % T) / CELL, ay = ty * cpt + (ts.argmax[i] / T) / CELL;
                 bool spread = false;
                 for (int cy = ty * cpt; cy < (ty + 1) * cpt && !spread; ++cy)
                     for (int cx = tx * cpt; cx < (tx + 1) * cpt && !spread; ++cx)
                         spread = (std::abs(cx - ax) > 1 || std::abs(cy - ay) > 1) && ts.cmax[(size_t)cy * ctw + cx] > hotB;
-                textured = spread;
-            }
+                return spread;
+            };
+            const bool compactOk = textured && cells && cfg_.compact_tex;
+            const bool spread = compactOk ? spreadTex() : textured;
+            if (rollOut) rollOut[i] = spread;
+            if (compactOk && !(nearOn && nearGround_[i]) && (zones_.empty() || zones_[i] == 2)) textured = spread;
             // тайл земли у кромки, где уточнение нашло ячейки неба: только эти ячейки, по их фону
             bool fineTile = false;
             if (useMask && !mask_[i]) {
@@ -994,7 +1115,7 @@ void Detector::updateBand() {
         fineTex_.clear();
         fineN_.clear();
     }
-    if (cfg_.bg_map && cfg_.fine_mask && cfg_.tile % CELL == 0) {
+    if (cfg_.bg_map && cfg_.fine_mask && cfg_.tile % CELL == 0 && !rolling_) {
         const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt;
         const bool fs = fineSky_.size() == (size_t)ctw * th_ * cpt;
         std::vector<uint8_t> open(mask_.size(), 0);   // небо или тайл земли с найденным небом

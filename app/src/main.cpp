@@ -1335,6 +1335,12 @@ void tab_algorithm(App& a, bool& changed) {
                 "кадров обучения (ложных треков в первые 3 с — в 6 раз меньше). Пока идут эти кадры, маска "
                 "сверяется с видимым; если камеру сдвинули и больше 10% тайлов не совпало — учится заново и "
                 "перезаписывается. «Заново» учит, не глядя в файл.");
+    blk |= ImGui::Checkbox("Маска едет за камерой", &a.s.panMask);
+    help_marker("Камера плавно поворачивается (игра, поворотка ведёт цель): маска неба не выключается, а "
+                "сдвигается вместе с землёй и всё время доучивается — старое небо переезжает, достраиваются только "
+                "открывшиеся тайлы; надписи и логотипы на кадре держатся отдельно. Сдвиг земли считается по самой "
+                "земле от опорного кадра (по всему кадру оценку тянут облака). Ложных целей при повороте меньше "
+                "(wt15: 25 -> 16 на кадр), после остановки маску не нужно учить заново.");
     bool pt2 = d.per_tile > 1;
     if (ImGui::Checkbox("Два кандидата в тайле", &pt2)) {
         d.per_tile = pt2 ? 2 : 1;
@@ -2669,6 +2675,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-scene-shift") s.sceneShift = false;
         else if (a == "--no-pan") s.panDetect = false;
         else if (a == "--pan-motion") s.panMotion = true;
+        else if (a == "--no-pan-mask") s.panMask = false;
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--static-file") s.staticFile = true;
@@ -2839,7 +2846,10 @@ int run_stress(int argc, char** argv) {
                 s.slowdown = R(3) ? 1 : F(1, 20);
                 s.governor = R(2);
                 break;
-            case 17: s.learnMaskFrames = R(3) ? 25 : R(100); break;
+            case 17:
+                s.learnMaskFrames = R(3) ? 25 : R(100);
+                s.panMask = R(3) != 0;
+                break;
             case 18: s.det.thr = F(3, 40); break;
             case 19: s.det.k = (3 + R(13)) | 1; break;
             case 20: s.det.pool = R(2) ? 2 : 1; break;
