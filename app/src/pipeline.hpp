@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -218,6 +219,18 @@ public:
     // Возвращает число вырезок, msg — что и куда сохранено
     int exportCrops(const std::string& dir, std::string& msg) const;
 
+    // Каждый обработанный кадр, по порядку, в потоке обработки (мультитест считает по ним
+    // свои метрики). Задавать до open(); вызывается под внутренней блокировкой — из f
+    // к самому Pipeline не обращаться
+    void setObserver(std::function<void(const Result&)> f) { observer_ = std::move(f); }
+    // Лёгкий опрос хода без копирования метрик
+    struct Progress {
+        long processed = 0, decoded = 0;
+        int queue = 0;
+        std::string status;
+    };
+    Progress progress() const;
+
     std::shared_ptr<const Result> latest() const;
     // Последние обработанные кадры для просмотра назад на паузе (номера seq подряд).
     // Держим не больше HIST_MAX кадров и HIST_BYTES памяти.
@@ -277,6 +290,7 @@ private:
     int threads_ = 0;
     dronolok::EvalStats eval_;
     double t0_ = 0;
+    std::function<void(const Result&)> observer_;
 };
 
 double now_ms();

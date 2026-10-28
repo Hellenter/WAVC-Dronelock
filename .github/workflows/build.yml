@@ -59,6 +59,15 @@ jobs:
           ./build-app/dronolok_app --bench sample/sky16mp.mp4 --preload 60 --frames 240 --json bench-linux.json
       - name: Стресс-проверка приложения (случайные настройки, перемотка, пауза)
         run: timeout 120 ./build-app/dronolok_app --stress sample/sky16mp.mp4 --seconds 30
+      - name: Мультитест (без окна, синтетика с разметкой)
+        run: |
+          ./build-app/dronolok_app --multitest sample --vary auto_thr --vary thr=8,14 --vary lock_slow --frames 40 --parallel 2 --out mt-linux
+          python -c "import json; d=json.load(open('mt-linux/results.json')); r=d['runs']; assert len(r)==5 and all(x['done'] for x in r) and r[0]['recall_drone'] is not None, r; print('прогонов', len(r), 'оценка базы', r[0]['score'])"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multitest-linux
+          path: mt-linux/
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: sample-video
@@ -137,6 +146,15 @@ jobs:
           $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--bench','sample/sky16mp.mp4','--frames','60','--threads','2','--isa','sse2','--json','bench-win-2t.json' -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
           Get-Content bench-win-2t.json
+      - name: Dronolok.exe --multitest
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--multitest','sample','--vary','auto_thr','--vary','lock_slow','--frames','30','--out','mt-win' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
+          $d = Get-Content mt-win/results.json -Raw | ConvertFrom-Json
+          if ($d.runs.Count -ne 3) { throw "прогонов $($d.runs.Count)" }
+          if (-not (Test-Path mt-win/report.html)) { throw "нет report.html" }
+          Write-Output "прогонов $($d.runs.Count), оценка базы $($d.runs[0].score)"
       - name: Dronolok.exe --stress
         shell: pwsh
         run: |
