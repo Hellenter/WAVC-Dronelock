@@ -896,6 +896,16 @@ void tab_algorithm(App& a, bool& changed) {
     TrackerConfig& t = a.s.trk;
     bool blk = false;   // блок поменяли вручную — профиль "свой"
     ImGui::TextWrapped("Блоки, из которых собран профиль. Любой можно переключить — профиль станет «свой».");
+    heading("Подстройка под сцену");
+    blk |= ImGui::Checkbox("Подстраиваться под сцену и погоду", &a.s.adapt);
+    help_marker("Раз в 0.2 с по кадру оцениваются свет (день, сумерки, ночь), шум матрицы, облачность, качание "
+                "кромки леса на ветру, осадки, дымка и что ниже горизонта (лес, город, поле). Под них "
+                "подстраиваются выставленные здесь настройки: в сумерки и в дымку — порог по шуму, ночью — только "
+                "светлые цели (огни), в снегопад — только тёмные, в осадки — строже подтверждение, в ветер цель у "
+                "крон должна пролететь дальше, а в штиль выдаётся раньше, в городе быстрее запоминаются антенны и "
+                "фонари. Облако закрыло солнце — фон ячеек учится заново; камеру повернули — маска неба заново. "
+                "Синтетика: сумерки 0% -> 28% дронов, ночь 0% -> 20%, снег 45 тыс. ложных в минуту -> 0. Что "
+                "сейчас подстроено — справа, вкладка «Цели».");
     heading("Крупные цели и движение камеры");
     static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
     label("размер цели (масштабов)",
@@ -1632,6 +1642,17 @@ void metrics_targets(App& a, const Metrics& m, const Result* r) {
     } else {
         ImGui::TextDisabled("движение камеры не учитывается");
     }
+    if (r->adapt && r->scene.ready) {
+        const SceneState& sc = r->scene;
+        ImGui::Text("сцена: %s, %s; неба %.0f%% кадра", light_name(sc.light), terrain_name(sc.terrain),
+                    100 * sc.skyFrac);
+        ImGui::TextDisabled("шум %.1f, облака %.0f%%, ветер у кромки %.1f пикс., осадки %.1f, дымка %.0f%%", sc.noise,
+                            100 * sc.clouds, sc.wind, sc.precip, 100 * sc.haze);
+        if (!r->sceneWhy.empty()) ImGui::TextWrapped("подстроено: %s", r->sceneWhy.c_str());
+        if (!sc.lastEvent.empty()) ImGui::TextColored(TXT_WARN, "перемена: %s", sc.lastEvent.c_str());
+    } else if (r->adapt) {
+        ImGui::TextDisabled("сцена: оценивается...");
+    }
     if (r->autoThr) ImGui::Text("шум неба %.2f, порог %.1f", r->noiseLvl, r->thr);
     else ImGui::Text("порог %.0f (постоянный)", r->thr);
     ImGui::TextDisabled("масштабов %d, весь кадр раз в %d%s", r->scales, r->fullEvery,
@@ -2226,6 +2247,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
         else if (a == "--no-skyline") s.det.skyline = false;
+        else if (a == "--no-adapt") s.adapt = false;
         else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
         else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());
         else if (a == "--hard-switch") s.trk.hard_switch = (float)atof(val().c_str());

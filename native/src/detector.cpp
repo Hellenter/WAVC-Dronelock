@@ -234,6 +234,12 @@ bool Detector::loadMask(const std::string& path, int verify) {
     return true;
 }
 
+void Detector::resetBackground() {
+    stats_->cb[0].reset(0);
+    stats_->cb[1].reset(0);
+    thrEff_ = 0;
+}
+
 void Detector::clearMask() {
     mask_.clear();
     learning_ = false;

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/scene.hpp"
 #include "dronolok/tuning.hpp"
 #include "kernels.hpp"
 
@@ -476,6 +477,58 @@ static void test_stationary() {
     std::printf("stationary camera (mask file, per_tile, fps): ok\n");
 }
 
+// Оценка сцены: небо сверху, рваная кромка леса, ночь, резкая смена света, сдвиг камеры
+static void test_scene() {
+    const int w = 640, h = 480;
+    std::mt19937 g(5);
+    std::normal_distribution<float> n(0.f, 2.f);
+    auto frame = [&](float sky, float gain, int shift, std::vector<uint8_t>& f) {
+        f.resize((size_t)w * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const int xs = (x + shift) % w;
+                const int top = 300 - shift + (int)(20 * std::sin(xs * 0.05f) + 15 * std::sin(xs * 0.31f));
+                float v = y < top ? sky + 0.05f * y
+                                 : 50.f + 30.f * (((xs / 3) * 7 + (y / 3) * 13) % 5 == 0) + 25.f * ((((xs / 37) * 73856093u) ^ ((y / 23) * 19349663u)) % 7 < 3);
+                v = v * gain + n(g);
+                f[(size_t)y * w + x] = (uint8_t)std::min(255.f, std::max(0.f, v));
+            }
+    };
+    std::vector<uint8_t> f;
+    SceneAnalyzer sa;
+    for (int i = 0; i < 40; ++i) {
+        frame(170, 1.f, 0, f);
+        sa.update(f.data(), w, h, w, 25.f);
+    }
+    const SceneState& s = sa.state();
+    CHECK(s.ready && s.light == Light::Day && s.skyFrac > 0.5f && s.skyFrac < 0.75f && s.noise > 1.f && s.noise < 3.f,
+          "сцена днём: свет %d, неба %.2f, шум %.2f", (int)s.light, s.skyFrac, s.noise);
+    DetectorConfig d0, d;
+    TrackerConfig t0, t;
+    scene_profile(s, d0, t0, d, t);
+    CHECK(d.dark && d.bright && !d.auto_thr, "днём профиль не трогает порог и полярность");
+    bool jump = false, moved = false;
+    for (int i = 0; i < 40; ++i) {
+        frame(170, 0.6f, 0, f);
+        jump |= sa.update(f.data(), w, h, w, 25.f) && sa.state().lightJump;
+    }
+    CHECK(jump, "смена света не замечена");
+    for (int i = 0; i < 40; ++i) {
+        frame(170, 0.6f, 80, f);   // камеру подняли и повернули
+        moved |= sa.update(f.data(), w, h, w, 25.f) && sa.state().moved;
+    }
+    CHECK(moved, "сдвиг камеры не замечен");
+    SceneAnalyzer night;
+    for (int i = 0; i < 40; ++i) {
+        frame(25, 0.4f, 0, f);
+        night.update(f.data(), w, h, w, 25.f);
+    }
+    scene_profile(night.state(), d0, t0, d, t);
+    CHECK(night.state().light == Light::Night && !d.dark && d.bright && d.auto_thr, "ночь: свет %d",
+          (int)night.state().light);
+    std::printf("scene: ok\n");
+}
+
 int main() {
     const Kernels* ref = kernels_scalar();
     for (Isa isa : available_isas()) {
@@ -493,6 +546,7 @@ int main() {
     test_follow();
     test_governor();
     test_stationary();
+    test_scene();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

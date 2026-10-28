@@ -440,6 +440,8 @@ void Pipeline::processLoop() {
     bool dirty = true;
     GlobalMotion gm;
     LoadGovernor gov;
+    SceneAnalyzer scene;
+    std::string sceneWhy;
     std::vector<FocusArea> focus, roi;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
@@ -552,8 +554,34 @@ void Pipeline::processLoop() {
         else gov.reset();
         // жёсткий захват: весь кадр — реже, между ними детектор смотрит только вокруг цели
         if (trk) want.full_every = std::max(want.full_every, trk->hardFullEvery());
+        // подстройка под сцену: оценка по кадру, настройки — относительно выставленных
+        bool sceneMoved = false, sceneLight = false;
+        if (p.loopStart || p.seekStart) scene.reset();
+        if (s.adapt) {
+            const double base = s.targetFps > 0 ? s.targetFps : info_.fps;
+            if (scene.update(f.px.data(), f.w, f.h, f.w, (float)base, ef.motion || s.follow)) {
+                sceneMoved = scene.state().moved;
+                sceneLight = scene.state().lightJump;
+            }
+            DetectorConfig sd;
+            TrackerConfig st;
+            scene_profile(scene.state(), want, trkCfg(s), sd, st, &sceneWhy);
+            if (!dirty && scene_mask_stale(dc, sd) && maskOn && !ef.motion && !s.follow) {
+                maskForce_ = true;   // маска выучена с другим порогом или полярностью — учить заново
+                relearn_ = true;
+            }
+            want = sd;
+            if (trk) {
+                const int sf = trk->config().static_frames;
+                trk->config() = st;
+                trk->config().static_frames = sf;
+            }
+        } else {
+            sceneWhy.clear();
+        }
         if (dirty || want.scales != dc.scales || want.zones != dc.zones || want.full_every != dc.full_every ||
-            want.coarse_every != dc.coarse_every) {
+            want.coarse_every != dc.coarse_every || want.auto_thr != dc.auto_thr || want.dark != dc.dark ||
+            want.bright != dc.bright || want.thr != dc.thr) {
             dc = want;
             det.reconfigure(dc);
             dirty = false;
@@ -601,6 +629,11 @@ void Pipeline::processLoop() {
         // земля через секунду окажется там, где было небо, и наоборот (дрон пропадёт в "маске").
         // камера, ведущая цель, тоже поворачивается: маска неба не годится
         const bool camMoves = ef.motion || s.follow;
+        if (sceneLight) det.resetBackground();   // облако закрыло солнце: старый фон ячеек только мешает
+        if (sceneMoved && !camMoves && maskOn) {   // камеру повернули: маска неба — заново, не из файла
+            maskForce_ = true;
+            relearn_ = true;
+        }
         if (camMoves != motionWas) {
             if (!camMoves) relearn_ = true;
             motionWas = camMoves;
@@ -786,6 +819,10 @@ void Pipeline::processLoop() {
             r->noiseLvl = det.noiseLevel();
             r->thr = det.threshold();
             r->fullEvery = dc.full_every;
+            r->adapt = s.adapt;
+            r->scene = scene.state();
+            r->scene.skyline.clear();
+            r->sceneWhy = sceneWhy;
             r->follow = s.follow;
             r->fx = s.follow ? fix : 0;
             r->fy = s.follow ? fiy : 0;

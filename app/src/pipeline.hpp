@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/scene.hpp"
 #include "gt_eval.hpp"
 #include "video_source.hpp"
 
@@ -89,6 +90,11 @@ struct Settings {
     float followGain = 0.3f;      // доля ошибки до центра, выбираемая за кадр (плюс скорость цели)
     float followMaxPan = 0.05f;   // предел поворота за кадр, доля ширины окна
     bool followVerified = true;   // поворачиваться только за проверенной целью (жёсткий захват)
+    // Подстройка под сцену (dronolok::SceneAnalyzer): раз в 0.2 с оценивается свет, шум, облака,
+    // ветер у кромки, осадки, дымка и окружение, и пороги, полярность, строгость подтверждения
+    // подстраиваются относительно выставленных здесь. Резкая смена света — фон ячеек заново;
+    // камеру сдвинули — маска неба заново
+    bool adapt = true;
     // журнал треков (замеры): по строке на подтверждённый трек каждого кадра, CSV
     std::string trackLog;
 };
@@ -135,6 +141,10 @@ struct Result {
     bool autoThr = false;         // порог по шуму
     float noiseLvl = 0, thr = 0;  // шум отклика неба и порог, с которым искали на этом кадре
     int fullEvery = 1, coarseEvery = 1;   // что сейчас стоит в детекторе (с учётом упрощения)
+    // сцена и подстройка под неё
+    bool adapt = false;
+    dronolok::SceneState scene;
+    std::string sceneWhy;         // что подстроено и почему ("" — как выставлено)
     // камера ведёт цель: frame — окно исходного кадра srcW x srcH со смещением fx, fy
     bool follow = false;
     int fx = 0, fy = 0, srcW = 0, srcH = 0;

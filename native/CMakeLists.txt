@@ -31,6 +31,7 @@ set(DL_SOURCES
   src/kernels_avx2.cpp
   src/kernels_neon.cpp
   src/motion.cpp
+  src/scene.cpp
   src/thread_pool.cpp
   src/tracker.cpp
   src/silhouette.cpp
