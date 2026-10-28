@@ -328,7 +328,10 @@ struct Dialog {
         return true;
     }
 };
-Dialog g_video, g_folder;
+// Поток диалога отсоединён и может ещё работать, когда приложение закрывают с открытым
+// диалогом: объекты не разрушаются при выходе, чтобы поток не писал в удалённый мьютекс.
+Dialog& g_video = *new Dialog;
+Dialog& g_folder = *new Dialog;
 }  // namespace
 
 bool open_video_dialog(void* owner) {
