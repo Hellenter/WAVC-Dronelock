@@ -223,6 +223,7 @@ private:
     int texN_ = 0;
     int verifyLeft_ = 0;
     bool maskReplaced_ = false;
+    bool bgIdle_ = false;   // фон ячеек не учился (не было маски): при появлении маски — заново
     long maskVer_ = 0, bandVer_ = -1;
     std::vector<uint8_t> band_, nearGround_;   // тайлы полосы у горизонта; тайлы рядом с маской
     // уточнение маски по ячейкам (fine_mask): тайлы земли рядом с небом, маска для бэкенда

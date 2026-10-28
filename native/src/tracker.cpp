@@ -358,6 +358,13 @@ void Tracker::shiftHeat(float dx, float dy) {
     heat_.swap(heatTmp_);
 }
 
+// Прогноз позиции и её дисперсии без изменения трека (те же формулы, что kf_predict): трек
+// не копируется ради прогноза — в нём очереди точек, копия выделяет память на каждый трек
+struct KfPeek { float x, y, p00; };
+static inline KfPeek kf_peek(const Track& t, float camDx, float camDy, float q) {
+    return {t.x + (t.vsx + camDx), t.y + (t.vsy + camDy), t.p00 + 2 * t.p01 + t.p11 + 0.25f * q};
+}
+
 // Прогноз на один кадр вперёд: позиция += скорость по сцене + сдвиг камеры
 static inline void kf_predict(Track& t, float camDx, float camDy, float q) {
     t.x += t.vsx + camDx;
@@ -374,29 +381,27 @@ static inline void kf_predict(Track& t, float camDx, float camDy, float q) {
 void Tracker::focus(float camDx, float camDy, std::vector<FocusArea>& out) const {
     out.clear();
     const float q = cfg_.q_accel * cfg_.q_accel;
-    for (const Track& t0 : tracks_) {
+    for (const Track& t : tracks_) {
         // только устоявшиеся летящие цели: иначе пониженный порог подкармливает шумовые треки
-        if (!t0.solid || t0.cls == TargetClass::Clutter) continue;
-        if (t0.id != lockId_ && (t0.hits < cfg_.cls_min_hits || t0.travel < cfg_.mover_px)) continue;
-        Track t = t0;
-        kf_predict(t, camDx, camDy, q);
-        const float S = t.p00 + measVar(t.level);
+        if (!t.solid || t.cls == TargetClass::Clutter) continue;
+        if (t.id != lockId_ && (t.hits < cfg_.cls_min_hits || t.travel < cfg_.mover_px)) continue;
+        const KfPeek k = kf_peek(t, camDx, camDy, q);
+        const float S = k.p00 + measVar(t.level);
         const float r = std::min(cfg_.gate, std::max(cfg_.gate_min, cfg_.gate_sigma * std::sqrt(S)));
-        out.push_back({t.x, t.y, r});
+        out.push_back({k.x, k.y, r});
     }
 }
 
 void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
     out.clear();
     const float q = cfg_.q_accel * cfg_.q_accel;
-    for (const Track& t0 : tracks_) {
+    for (const Track& t : tracks_) {
         // жёсткий захват: весь кадр смотрим редко, но вокруг других живых треков — каждый кадр,
         // иначе вторая цель (дальний дрон рядом с захваченным самолётом) не набирает попаданий
         // на подтверждение и не находится никогда. Помехи и наложения пропускаем.
-        if (hard_ && t0.id != lockId_ && (t0.clutter || t0.overlay || t0.cls == TargetClass::Clutter)) continue;
-        Track t = t0;
-        kf_predict(t, camDx, camDy, q);
-        const float S = t.p00 + measVar(t.level);
+        if (hard_ && t.id != lockId_ && (t.clutter || t.overlay || t.cls == TargetClass::Clutter)) continue;
+        const KfPeek k = kf_peek(t, camDx, camDy, q);
+        const float S = k.p00 + measVar(t.level);
         const float gmin = cfg_.gate_min * (float)(1 << std::min(4, t.level));
         // захват с ожиданием размера: смотрим на масштабе, подходящем размеру на этом кадре
         const float e = cfg_.size_predict && t.id == lockId_ ? t.expectedSize() : 0.f;
@@ -406,7 +411,7 @@ void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
             while (lv < 4 && e > 14.f * (float)(1 << lv)) ++lv;
         }
         // запас на размер цели: на грубом масштабе её отклик гуляет по корпусу
-        out.push_back({t.x, t.y,
+        out.push_back({k.x, k.y,
                        std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << lv) +
                            0.5f * std::max(e, std::max(t.bw, t.bh)),
                        lv});
@@ -422,15 +427,14 @@ bool Tracker::silhouetteFor(const Track& t) const {
 
 bool Tracker::lockSearch(float camDx, float camDy, float& x, float& y, float& r, int& polarity) const {
     if (!lockId_ || !(cfg_.silhouette || cfg_.anchor_check)) return false;
-    for (const Track& t0 : tracks_) {
-        if (t0.id != lockId_ || t0.anchored || (!silhouetteFor(t0) && !cfg_.anchor_check)) continue;
-        Track t = t0;
-        kf_predict(t, camDx, camDy, cfg_.q_accel * cfg_.q_accel);
-        x = t.x;
-        y = t.y;
+    for (const Track& t : tracks_) {
+        if (t.id != lockId_ || t.anchored || (!silhouetteFor(t) && !cfg_.anchor_check)) continue;
+        const KfPeek k = kf_peek(t, camDx, camDy, cfg_.q_accel * cfg_.q_accel);
+        x = k.x;
+        y = k.y;
         // ожидаемый радиус: прошлый силуэт или размер по масштабу, плюс ошибка прогноза
         const float size = t.bw > 0 ? 0.5f * std::max(t.bw, t.bh) : 4.f * (float)(1 << std::min(4, t.level));
-        r = size + 2.f * std::sqrt(std::max(0.f, t.p00));
+        r = size + 2.f * std::sqrt(std::max(0.f, k.p00));
         polarity = t.polarity;
         return true;
     }

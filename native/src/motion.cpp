@@ -53,14 +53,22 @@ double sad(const std::vector<uint8_t>& cur, const std::vector<uint8_t>& prev, in
     for (int y = y0; y < y1; ++y) {
         const uint8_t* c = &cur[(size_t)y * w];
         const uint8_t* p = prev.data() + (std::ptrdiff_t)(y - v) * w - u;
+        // сумма по строке — в int (строка не длиннее MAX_SIDE), без ветвлений: компилятор
+        // векторизует цикл; с ветвлением на каждой точке оценка стоила 7 мс на кадр
+        int rs = 0, rn = 0;
         if (skip.empty()) {
-            for (int x = x0; x < x1; ++x) s += std::abs(c[x] - p[x]);
-            n += x1 - x0;
+            for (int x = x0; x < x1; ++x) rs += std::abs(c[x] - p[x]);
+            rn = x1 - x0;
         } else {
             const uint8_t* k = &skip[(size_t)y * w];
-            for (int x = x0; x < x1; ++x)
-                if (!k[x]) { s += std::abs(c[x] - p[x]); ++n; }
+            for (int x = x0; x < x1; ++x) {
+                const int keep = 1 - k[x];   // k — 0 или 1
+                rs += keep * std::abs(c[x] - p[x]);
+                rn += keep;
+            }
         }
+        s += rs;
+        n += rn;
     }
     return n < 64 ? 1e9 : (double)s / (double)n;
 }

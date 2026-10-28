@@ -359,6 +359,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         q.tile = L.tile;
         q.dark = true;
         q.bright = false;
+        q.cells = false;   // ячейки грубых масштабов никто не читает (selectTiles берёт их только с основного)
         int jobs = 0, skipped = 0;
         const uint8_t* cm = nullptr;
         if (timing_.coarsePartial) {
@@ -378,7 +379,18 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
-    if (p.cells && (cfg_.bg_map || cfg_.tbd)) {
+    // фон ячеек читают кромка маски неба и накопление (tbd). Без маски и без накопления (камера
+    // движется, поворотка) его не учим — это заметная доля последовательной части кадра; когда
+    // маска появится, фон учится заново: выученный на движущейся картинке ей всё равно чужой
+    const bool bgUsed = cfg_.tbd || learning_ || verifyLeft_ || !mask_.empty();
+    if (p.cells && cfg_.bg_map && !bgUsed) {
+        bgIdle_ = true;
+    } else if (p.cells && (cfg_.bg_map || cfg_.tbd)) {
+        if (bgIdle_) {
+            stats_->cb[0].reset(0);
+            stats_->cb[1].reset(0);
+            bgIdle_ = false;
+        }
         markExcl();
         for (int pol = 0; pol < 2; ++pol) {
             if (!(pol ? cfg_.bright : cfg_.dark)) continue;
