@@ -103,9 +103,26 @@ public:
         ResponseParams q = p;
         q.k = k;
         pool_.run(nbr * nbc, [&](int j, int wi) {
-            const int tr0 = (j / nbc) * jr, tr1 = std::min(th, tr0 + jr);
-            const int tc0 = (j % nbc) * jc, tc1 = std::min(tw, tc0 + jc);
-            if (mask) {
+            int tr0 = (j / nbc) * jr, tr1 = std::min(th, tr0 + jr);
+            int tc0 = (j % nbc) * jc, tc1 = std::min(tw, tc0 + jc);
+            if (mask && p.trim) {
+                // блок сужается до рамки своих тайлов из маски: у кромки леса это часть
+                // строк и столбцов блока; результат по тайлу от границ блока не зависит
+                int r0 = tr1, r1 = tr0, c0 = tc1, c1 = tc0;
+                for (int ty = tr0; ty < tr1; ++ty)
+                    for (int tx = tc0; tx < tc1; ++tx)
+                        if (mask[(size_t)ty * tw + tx]) {
+                            r0 = std::min(r0, ty);
+                            r1 = std::max(r1, ty + 1);
+                            c0 = std::min(c0, tx);
+                            c1 = std::max(c1, tx + 1);
+                        }
+                if (r0 >= r1) {   // весь блок вне зоны неба — статистика остаётся нулевой
+                    nskip.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                tr0 = r0, tr1 = r1, tc0 = c0, tc1 = c1;
+            } else if (mask) {
                 bool any = false;
                 for (int ty = tr0; ty < tr1 && !any; ++ty)
                     for (int tx = tc0; tx < tc1 && !any; ++tx) any = mask[(size_t)ty * tw + tx] != 0;

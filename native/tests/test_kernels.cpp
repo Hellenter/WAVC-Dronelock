@@ -484,6 +484,32 @@ static void test_stationary() {
     m.loadMask(path, 10);
     for (int i = 0; i < 10; ++i) m.detect(ground_frame(w, h, 0.3f, 200 + i).data(), w, h, w, c);
     CHECK(m.maskReplaced() && m.tileMask() != a.tileMask(), "mask verify, moved camera");
+    // с маской неба задание сужается до своих тайлов маски: кандидаты при любом размере
+    // заданий те же (на полном кадре и между полными просмотрами, full_every 2)
+    for (int fe : {1, 2}) {
+        std::vector<Candidate> ref;
+        int run = 0;
+        for (auto jj : {std::pair<int, int>{1000, 1000}, std::pair<int, int>{1, 1}, std::pair<int, int>{4, 0},
+                        std::pair<int, int>{3, 5}}) {
+            DetectorConfig k = cfg;
+            k.job_rows = jj.first;
+            k.job_cols = jj.second;
+            k.full_every = fe;
+            Detector d(k);
+            d.loadMask(path, 0);
+            std::vector<Candidate> all;
+            for (int i = 0; i < 6; ++i) {
+                auto f = ground_frame(w, h, 0.6f, 300 + i);
+                for (int y = 0; y < 3; ++y)   // точка в небе, по кадру сдвигается
+                    for (int x = 0; x < 3; ++x) f[(size_t)(60 + y) * w + 100 + 9 * i + x] = 40;
+                d.detect(f.data(), w, h, w, c);
+                all.insert(all.end(), c.begin(), c.end());
+            }
+            if (run++ == 0) ref = all;
+            CHECK(!all.empty() && same(ref, all), "mask + jobs %dx%d full_every %d: %zu vs %zu candidates", jj.first,
+                  jj.second, fe, all.size(), ref.size());
+        }
+    }
     std::remove(path.c_str());
 
     // две тёмные точки в одном тайле 64x64: при per_tile 2 обе

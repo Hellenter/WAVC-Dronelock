@@ -308,6 +308,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     }
     if (m) stats_->comp.assign(m, m + (size_t)tw_ * th_);
     else stats_->comp.clear();
+    // полный кадр по маске неба: закрытые тайлы не читаются (кроме кромки, она в compMask_)
+    p.trim = m && !timing_.partial;
     backend_->compute(FrameView{gray, w, h, stride}, p, m, stats_->dark, stats_->bright,
                       timing_.jobs, timing_.jobs_skipped);
     if (cfg_.auto_thr && !timing_.partial) {
@@ -360,6 +362,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         q.dark = true;
         q.bright = false;
         q.cells = false;   // ячейки грубых масштабов никто не читает (selectTiles берёт их только с основного)
+        q.trim = false;
         int jobs = 0, skipped = 0;
         const uint8_t* cm = nullptr;
         if (timing_.coarsePartial) {
