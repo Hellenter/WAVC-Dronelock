@@ -50,9 +50,10 @@ void dl_config_default(dl_config* c) {
 
 dl_detector* dl_detector_create(const dl_config* c) {
     DetectorConfig d;
-    // C API повторяет детектор Python (detector/): один кандидат на тайл, маска с запасом
+    // C API повторяет детектор Python (detector/): один кандидат на тайл, маска с запасом, без линии горизонта
     d.per_tile = 1;
     d.bg_map = false;
+    d.skyline = false;
     if (c) {
         d.k = c->k; d.pool = c->pool; d.thr = c->thr; d.clutter_k = c->clutter_k; d.tile = c->tile;
         d.max_density = c->max_density; d.dark = c->dark != 0; d.bright = c->bright != 0;

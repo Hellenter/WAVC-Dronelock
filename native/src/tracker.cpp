@@ -50,6 +50,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref) {
     c.q_accel *= v * std::sqrt(v);
     c.bird_speed *= v;
     c.hover_speed *= v;
+    c.lock_slow *= v;
     c.size_rate_max = std::min(0.5f, c.size_rate_max * v);
     c.clutter_decay = std::pow(c.clutter_decay, v);
     c.max_miss = frames(c.max_miss, 3);
@@ -384,7 +385,10 @@ void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
     out.clear();
     const float q = cfg_.q_accel * cfg_.q_accel;
     for (const Track& t0 : tracks_) {
-        if (hard_ && t0.id != lockId_) continue;   // жёсткий захват: смотрим только вокруг цели
+        // жёсткий захват: весь кадр смотрим редко, но вокруг других живых треков — каждый кадр,
+        // иначе вторая цель (дальний дрон рядом с захваченным самолётом) не набирает попаданий
+        // на подтверждение и не находится никогда. Помехи и наложения пропускаем.
+        if (hard_ && t0.id != lockId_ && (t0.clutter || t0.overlay || t0.cls == TargetClass::Clutter)) continue;
         Track t = t0;
         kf_predict(t, camDx, camDy, q);
         const float S = t.p00 + measVar(t.level);
@@ -603,7 +607,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
 
     // клаттер: всё, что не продолжает движущуюся цель, греет карту; в горячих ячейках —
     // помеха (её не отдаём ни трекам, ни в новые треки)
-    auto mover = [&](const Track& t) { return t.confirmed && t.travel >= cfg_.mover_px && !t.overlay && !t.anchored; };
+    auto mover = [&](const Track& t) {
+        return t.confirmed && t.travel >= cfg_.mover_px * (t.edgeBorn ? cfg_.edge_mover_k : 1.f) && !t.overlay && !t.anchored;
+    };
     std::vector<char> isMover(dets.size(), 0);
     for (size_t di = 0; di < dets.size(); ++di) {
         isMover[di] = (owner[di] >= 0 && mover(tracks_[owner[di]])) || (int)di == silhDet;
@@ -783,6 +789,15 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         tr.score = tr.cls == TargetClass::Clutter ? 0.f
                                                   : (float)(mc * std::min(1.0, tr.hits / 10.0) /
                                                             (1.0 + 0.25 * tr.miss));
+        tr.lockW = tr.score;
+        if (cfg_.lock_cmax > 0 && mc > cfg_.lock_cmax) tr.lockW *= (float)(cfg_.lock_cmax / mc);
+        // медленную цель предпочитаем, только если она уже пролетела по сцене: дрожащий отклик
+        // в кроне тоже "медленный"
+        // в кроне тоже "медленный", а зависший на месте (неподвижная точка в кроне, к которой
+        // перешёл трек пролетевшей цели) уступает летящим
+        if (cfg_.lock_slow > 0)
+            tr.lockW *= std::min(1.f, tr.travel / 64.f) * (tr.speed < cfg_.hover_speed ? 0.2f : 1.f) /
+                        (1.f + tr.speed / cfg_.lock_slow);
         // родился у кромки неба (кроны, крыши): цель, только если полетела
         if (!tr.solid || tr.miss > coastLimit(tr) || (tr.edgeBorn && !tr.everMover)) continue;
         out_.push_back(tr);
@@ -795,7 +810,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     const Track* best = nullptr;
     for (const Track& t : out_) {
         if (t.id == lockId_) cur = &t;
-        if (t.score > 0 && (!best || t.score > best->score)) best = &t;
+        if (t.score > 0 && (!best || t.lockW > best->lockW)) best = &t;
     }
     // захваченное оказалось помехой (неподвижное, наложение на кадр) — не ждём его, как
     // пропавшую цель, а сразу отпускаем
@@ -820,8 +835,11 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         lastX_ = cur->x; lastY_ = cur->y; lastVx_ = cur->vsx; lastVy_ = cur->vsy;
         if (cur->miss >= 2) {   // цель на прогнозе, а рядом её уже ведёт свежий трек
             if (const Track* n = nearest(cur->x, cur->y, std::max(cfg_.gate, 4 * cur->sigma))) { cur = n; same = true; }
-        } else if (!hard_ && best && best != cur && best->score > cfg_.lock_switch * cur->score) {
-            cur = best;   // при жёстком захвате на другие цели не переходим
+        } else if (best && best != cur &&
+                   (hard_ ? cfg_.hard_switch > 0 && best->lockW > cfg_.hard_switch * cur->lockW &&
+                                best->speed < 0.5f * cur->speed   // с самолёта на медленный дрон, не на яркую
+                          : best->lockW > cfg_.lock_switch * cur->lockW)) {
+            cur = best;   // при жёстком захвате — только если задан hard_switch
         }
         lockId_ = cur->id;
     } else if (lockId_ && !lockClutter && lostFor_ < (hard_ ? cfg_.hard_miss : cfg_.max_miss)) {
@@ -873,6 +891,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             // дрон по классификатору и уже летал по сцене (неподвижное — не проверить)
             if (t.cls == TargetClass::Drone && t.birdScore < 0.3f && t.everMover) ++verify_;
             else if (t.cls == TargetClass::Bird || t.cls == TargetClass::Clutter) verify_ = 0;
+            // с приоритетом летящих (lock_slow) зависшая цель жёсткий захват не держит: иначе
+            // трек пролетевшей цели, перешедший на неподвижную точку в кроне, держит его до конца
+            if (cfg_.lock_slow > 0 && t.speed < cfg_.hover_speed) verify_ = 0, hard_ = false;
         }
         if (cfg_.hard_lock && verify_ >= cfg_.verify_frames) hard_ = true;
         if (!cfg_.hard_lock || t.overlay || t.anchored || (hard_ && t.cls == TargetClass::Bird && t.birdScore > 0.8f)) {

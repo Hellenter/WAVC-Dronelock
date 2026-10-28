@@ -955,6 +955,11 @@ void tab_algorithm(App& a, bool& changed) {
     help_marker("Кроме самого сильного отклика тайла 64x64 берётся ещё один, из ячейки 16x16 подальше от первого: "
                 "дрон рядом с бликом, птицей или вторым дроном. Пара дронов в 20 пикс.: 65% -> 99%. Цена ~0.5 мс на "
                 "16 Мп.");
+    blk |= ImGui::Checkbox("Всё ниже горизонта — земля", &d.skyline);
+    help_marker("Маска неба: в каждом столбце всё ниже кромки леса или крыш считается землёй, даже гладкие места "
+                "(трава, поляна, дорога, просветы между стволами). Дрон прилетает из-за горизонта и бывает над "
+                "кромкой, ниже почти никогда. Записи War Thunder: ложных целей на кадр 8 -> ~1. Действует со "
+                "следующего обучения маски.");
     blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
     help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
                 "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
@@ -1123,6 +1128,16 @@ void tab_fine(App& a, bool& changed) {
                                          "быстрее и не отвлекается.");
         changed |= ImGui::SliderInt("##hardfull", &t.hard_full_every, 1, 30);
     }
+    bool slow = t.lock_slow > 0;
+    if (ImGui::Checkbox("захват: сначала мелкий медленный дрон", &slow)) {
+        t.lock_slow = slow ? 1.f : 0.f;
+        t.hard_switch = slow ? 2.f : 0.f;
+        changed = true;
+    }
+    help_marker("Из нескольких целей захват берёт ту, что медленнее и уже пролетела по сцене, а не самую "
+                "контрастную: самолёт и вертолёт крупнее и быстрее дрона. Зависшая на месте точка уступает "
+                "летящим, и жёсткий захват переходит на цель вдвое весомее и вдвое медленнее. Записи War Thunder: дроны в захвате "
+                "31% -> 47%, самолёты и вертолёты 53% -> 45%. Выключено — захват на самой контрастной цели.");
 
     heading("Птица или дрон");
     label("отклонение от траектории, пикс.", "Средний разброс точек трека вокруг плавной траектории за последние "
@@ -1891,6 +1906,10 @@ int run_bench(int argc, char** argv) {
         else if (a == "--dedup") s.skipDuplicates = true;
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
+        else if (a == "--no-skyline") s.det.skyline = false;
+        else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
+        else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());
+        else if (a == "--hard-switch") s.trk.hard_switch = (float)atof(val().c_str());
         else if (a == "--follow") s.follow = true;
         else if (a == "--follow-frac") s.followFrac = (float)atof(val().c_str());
         else if (a == "--follow-gain") s.followGain = (float)atof(val().c_str());
