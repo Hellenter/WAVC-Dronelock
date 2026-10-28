@@ -278,6 +278,11 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     // при проверке загруженной маски текстуру считаем по всему кадру, как при обучении
     const uint8_t* m = (!learning_ && !verifyLeft_ && !mask_.empty()) ? mask_.data() : nullptr;
     updateBand();
+    if (m && !edgeG_.empty()) {   // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам
+        compMask_.resize(mask_.size());
+        for (size_t i = 0; i < mask_.size(); ++i) compMask_[i] = mask_[i] | edgeG_[i];
+        m = compMask_.data();
+    }
     // между полными просмотрами — только тайлы вокруг треков (маска неба тоже действует);
     // полоса у горизонта — всегда, небо выше неё — раз в upper_every кадров
     const long fn = frameNo_++;
@@ -372,6 +377,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             if (cfg_.tbd && !learning_) selectTbd(ts, pol, out);
             updateBg(ts, pol);
         }
+        if (!timing_.partial) updateFine();
     }
     if (coarseRun) {
         for (size_t l = 0; l < lv.size(); ++l) {
@@ -562,12 +568,20 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const bool textured = dens > maxDens;
             if (fineGrid && (learning_ || verifyLeft_)) texSum_[i] += textured;
             if (texOut) texOut[i] = textured;
-            if (useMask && !mask_[i]) continue;
+            // тайл земли у кромки, где уточнение нашло ячейки неба: только эти ячейки, по их фону
+            bool fineTile = false;
+            if (useMask && !mask_[i]) {
+                if (!(cells && bgOn && fineSky_.size() == (size_t)ctw * th * cpt && edgeG_.size() == mask_.size() && edgeG_[i]))
+                    continue;
+                for (int cy = ty * cpt; cy < (ty + 1) * cpt && !fineTile; ++cy)
+                    for (int cx = tx * cpt; cx < (tx + 1) * cpt && !fineTile; ++cx) fineTile = fineSky_[(size_t)cy * ctw + cx] != 0;
+                if (!fineTile) continue;
+            }
             const uint8_t zone = fineGrid && !zones_.empty() ? zones_[i] : 2;
             if (zone == 0) continue;
             // текстурный тайл у самой земли (кромка леса): с фоном по ячейкам смотрим его
             // по ячейкам, иначе выбрасываем целиком, как раньше
-            const bool edgeTex = textured && nearOn && nearGround_[i];
+            const bool edgeTex = fineTile || (textured && nearOn && nearGround_[i]);
             if (textured && !edgeTex) continue;
             const float zk = zone == 1 ? cfg_.mixed_k : 1.f;
             const float bk = bandOn && band_[i] ? cfg_.band_k : 1.f;
@@ -592,7 +606,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 ++taken;
             };
             const float mx = ts.maxv[i];
-            if (!textured && mx >= thr && mx >= cfg_.clutter_k * level + thr * 0.5f) {
+            if (!fineTile && !textured && mx >= thr && mx >= cfg_.clutter_k * level + thr * 0.5f) {
                 const int gx = tx * T + ts.argmax[i] % T, gy = ty * T + ts.argmax[i] / T;
                 push(gx, gy, mx, false);
             } else if (!edgeTex) {
@@ -607,6 +621,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
                     for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx) {
                         const size_t ci = (size_t)cy * ctw + cx;
+                        if (fineTile && !fineSky_[ci]) continue;
                         const float v = ts.cmax[ci];
                         if (v <= bm || ts.carg[ci] == 255 || !(v >= thr)) continue;
                         if (!edgeTex && !(v >= cfg_.clutter_k * level + thr * 0.5f)) continue;
@@ -695,7 +710,7 @@ void Detector::updateBg(const TileStats& ts, int pol) {
         for (int tx = 0; tx < tw_; ++tx) {
             const size_t ti = (size_t)ty * tw_ + tx;
             if (!comp.empty() && !comp[ti]) continue;
-            if (edgeOnly && !nearGround_[ti]) continue;
+            if (edgeOnly && !nearGround_[ti] && !(edgeG_.size() == nearGround_.size() && edgeG_[ti])) continue;
             for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
                 for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx) {
                     const size_t ci = (size_t)cy * ctw + cx;
@@ -804,7 +819,14 @@ void Detector::selectTbd(const TileStats& ts, int pol, std::vector<Candidate>& o
 void Detector::updateBand() {
     band_.clear();
     nearGround_.clear();
-    if (mask_.empty() || learning_ || mask_.size() != (size_t)tw_ * th_) return;
+    if (mask_.empty() || learning_ || mask_.size() != (size_t)tw_ * th_) {
+        fineBase_.clear();
+        edgeG_.clear();
+        fineSky_.clear();
+        fineTex_.clear();
+        fineN_.clear();
+        return;
+    }
     if (cfg_.bg_map) {
         nearGround_.assign(mask_.size(), 0);
         for (int y = 0; y < th_; ++y)
@@ -817,6 +839,41 @@ void Detector::updateBand() {
                 nearGround_[(size_t)y * tw_ + x] = g;
             }
     }
+    // тайлы земли рядом с небом — там уточняется маска по ячейкам. Тайл, где уже нашлись
+    // ячейки неба, сам считается небом для соседей: уточнение со временем спускается ниже,
+    // пока не упрётся в кроны
+    if (mask_ != fineBase_) {   // маска тайлов сменилась — уточнение копится заново
+        fineBase_ = mask_;
+        edgeG_.clear();
+        fineSky_.clear();
+        fineTex_.clear();
+        fineN_.clear();
+    }
+    if (cfg_.bg_map && cfg_.fine_mask && cfg_.tile % CELL == 0) {
+        const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt;
+        const bool fs = fineSky_.size() == (size_t)ctw * th_ * cpt;
+        std::vector<uint8_t> open(mask_.size(), 0);   // небо или тайл земли с найденным небом
+        for (int y = 0; y < th_; ++y)
+            for (int x = 0; x < tw_; ++x) {
+                const size_t i = (size_t)y * tw_ + x;
+                bool o = mask_[i] != 0;
+                for (int cy = y * cpt; fs && !o && cy < (y + 1) * cpt; ++cy)
+                    for (int cx = x * cpt; !o && cx < (x + 1) * cpt; ++cx) o = fineSky_[(size_t)cy * ctw + cx] != 0;
+                open[i] = o;
+            }
+        edgeG_.resize(mask_.size(), 0);
+        for (int y = 0; y < th_; ++y)
+            for (int x = 0; x < tw_; ++x) {
+                if (mask_[(size_t)y * tw_ + x]) continue;
+                bool g = false;
+                for (int yy = std::max(0, y - 1); yy <= std::min(th_ - 1, y + 1) && !g; ++yy)
+                    for (int xx = std::max(0, x - 1); xx <= std::min(tw_ - 1, x + 1) && !g; ++xx)
+                        g = open[(size_t)yy * tw_ + xx] != 0;
+                edgeG_[(size_t)y * tw_ + x] |= g;   // раз начав, тайл не бросаем
+            }
+    } else {
+        edgeG_.clear();
+    }
     if (cfg_.band_px <= 0) return;
     const int tilePx = cfg_.tile * cfg_.pool, bt = (cfg_.band_px + tilePx - 1) / tilePx;
     band_.assign(mask_.size(), 0);
@@ -825,6 +882,65 @@ void Detector::updateBand() {
         while (y >= 0 && !mask_[(size_t)y * tw_ + x]) --y;
         if (y < 0) continue;
         for (int yy = std::max(0, y + 1 - bt); yy <= y; ++yy) band_[(size_t)yy * tw_ + x] = 1;
+    }
+}
+
+// Уточнение маски по ячейкам: в тайлах земли у кромки — доля кадров, когда в ячейке есть
+// текстура (максимум отклика выше уровня "горячих" пикселей хоть одной полярности). Небо — ячейка,
+// где текстуры почти не бывает и над которой небо (тайл неба или такая же ячейка): одинокая
+// тихая ячейка внутри кроны небом не станет
+void Detector::updateFine() {
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt, cth = th_ * cpt;
+    const size_t n = (size_t)ctw * cth;
+    if (edgeG_.size() != (size_t)tw_ * th_ || stats_->dark.cmax.size() != n) return;
+    if (fineTex_.size() != n) {
+        fineTex_.assign(n, 0.f);
+        fineN_.assign(n, 0);
+        fineSky_.assign(n, 0);
+    }
+    const auto& comp = stats_->comp;
+    const auto& ex = stats_->excl;
+    const bool exOn = ex.size() == n;
+    const float hot = hotLevel();
+    const float rate = 1.f / (float)std::max(10, cfg_.fine_frames);
+    for (int cy = 0; cy < cth; ++cy) {
+        const int ty = cy / cpt;
+        for (int cx = 0; cx < ctw; ++cx) {
+            const int tx = cx / cpt;
+            const size_t ti = (size_t)ty * tw_ + tx, ci = (size_t)cy * ctw + cx;
+            if (!edgeG_[ti] || (!comp.empty() && !comp[ti])) continue;
+            if (exOn && ex[ci]) continue;   // вокруг треков: цель — не текстура
+            float v = cfg_.dark ? stats_->dark.cmax[ci] : 0.f;
+            if (cfg_.bright && stats_->bright.cmax.size() == n) v = std::max(v, (float)stats_->bright.cmax[ci]);
+            const float t = v > hot ? 1.f : 0.f;
+            if (fineN_[ci] < 65535) ++fineN_[ci];
+            // первые кадры — среднее, дальше — забывание за fine_frames кадров
+            const float a = std::max(rate, 1.f / (float)fineN_[ci]);
+            fineTex_[ci] += a * (t - fineTex_[ci]);
+        }
+    }
+    // сверху вниз: небо, если тихо давно и рядом сверху (или сбоку в той же строке) небо —
+    // так небо обтекает облачко или ветку, но в одинокий просвет внутри кроны не попадает
+    const int need = std::max(10, cfg_.fine_frames / 2);
+    auto sky = [&](int cx, int cy) {   // ячейка — небо: в тайле неба или уже найдена
+        if (cx < 0 || cx >= ctw) return false;
+        if (cy < 0) return true;
+        const size_t ti = (size_t)(cy / cpt) * tw_ + cx / cpt;
+        return mask_[ti] != 0 || (edgeG_[ti] && fineSky_[(size_t)cy * ctw + cx] != 0);
+    };
+    for (int cy = 0; cy < cth; ++cy) {
+        const int ty = cy / cpt;
+        auto quiet = [&](int cx) {
+            const size_t ti = (size_t)ty * tw_ + cx / cpt, ci = (size_t)cy * ctw + cx;
+            return edgeG_[ti] && fineN_[ci] >= need && fineTex_[ci] < cfg_.fine_tex;
+        };
+        for (int cx = 0; cx < ctw; ++cx)
+            fineSky_[(size_t)cy * ctw + cx] = quiet(cx) && (sky(cx - 1, cy - 1) || sky(cx, cy - 1) || sky(cx + 1, cy - 1));
+        // в строке — от найденного неба вбок по тихим ячейкам
+        for (int cx = 1; cx < ctw; ++cx)
+            if (!fineSky_[(size_t)cy * ctw + cx] && quiet(cx) && sky(cx - 1, cy)) fineSky_[(size_t)cy * ctw + cx] = 1;
+        for (int cx = ctw - 2; cx >= 0; --cx)
+            if (!fineSky_[(size_t)cy * ctw + cx] && quiet(cx) && sky(cx + 1, cy)) fineSky_[(size_t)cy * ctw + cx] = 1;
     }
 }
 

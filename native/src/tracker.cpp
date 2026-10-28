@@ -796,7 +796,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         // в кроне тоже "медленный", а зависший на месте (неподвижная точка в кроне, к которой
         // перешёл трек пролетевшей цели) уступает летящим
         if (cfg_.lock_slow > 0)
-            tr.lockW *= std::min(1.f, tr.travel / 64.f) * (tr.speed < cfg_.hover_speed ? 0.2f : 1.f) /
+            tr.lockW *= std::min(1.f, tr.travel / 64.f) * (tr.speed < cfg_.hover_speed ? 0.05f : 1.f) /
                         (1.f + tr.speed / cfg_.lock_slow);
         // родился у кромки неба (кроны, крыши): цель, только если полетела
         if (!tr.solid || tr.miss > coastLimit(tr) || (tr.edgeBorn && !tr.everMover)) continue;

@@ -994,6 +994,11 @@ void tab_algorithm(App& a, bool& changed) {
                 "(трава, поляна, дорога, просветы между стволами). Дрон прилетает из-за горизонта и бывает над "
                 "кромкой, ниже почти никогда. Записи War Thunder: ложных целей на кадр 8 -> ~1. Действует со "
                 "следующего обучения маски.");
+    blk |= ImGui::Checkbox("Маска уточняется по ячейкам", &d.fine_mask);
+    help_marker("Тайлы земли 64x64 у самой кромки делятся на ячейки 16x16: ячейка, где несколько секунд "
+                "подряд не бывает листвы и веток и над которой небо, становится небом (просветы между кронами, "
+                "небо над низкой крышей). Маска так детализируется со временем, пока работает камера. Нужен "
+                "фон по ячейкам у кромки.");
     blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
     help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
                 "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
@@ -1871,9 +1876,24 @@ void draw_view(App& a, const Result* r) {
     if (a.showMask && !r->mask.empty()) {
         for (int ty = 0; ty < r->tilesY; ++ty)
             for (int tx = 0; tx < r->tilesX; ++tx)
-                if (!r->mask[(size_t)ty * r->tilesX + tx])
-                    dl->AddRectFilled(P((float)tx * r->tilePx, (float)ty * r->tilePx),
-                                      P((float)(tx + 1) * r->tilePx, (float)(ty + 1) * r->tilePx), IM_COL32(0, 60, 120, 90));
+                if (!r->mask[(size_t)ty * r->tilesX + tx]) {
+                    // тайл земли с уточнением: закрашиваем только ячейки, не ставшие небом
+                    const int cpt = r->cellsPerTile, ctw = r->tilesX * cpt;
+                    bool any = false;
+                    if (cpt > 0 && r->fineSky.size() == (size_t)ctw * r->tilesY * cpt)
+                        for (int cy = ty * cpt; cy < (ty + 1) * cpt && !any; ++cy)
+                            for (int cx = tx * cpt; cx < (tx + 1) * cpt && !any; ++cx) any = r->fineSky[(size_t)cy * ctw + cx] != 0;
+                    if (!any) {
+                        dl->AddRectFilled(P((float)tx * r->tilePx, (float)ty * r->tilePx),
+                                          P((float)(tx + 1) * r->tilePx, (float)(ty + 1) * r->tilePx), IM_COL32(0, 60, 120, 90));
+                        continue;
+                    }
+                    const float c = (float)r->tilePx / cpt;
+                    for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
+                        for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx)
+                            if (!r->fineSky[(size_t)cy * ctw + cx])
+                                dl->AddRectFilled(P(cx * c, cy * c), P((cx + 1) * c, (cy + 1) * c), IM_COL32(0, 60, 120, 90));
+                }
     }
     if (a.showNoise)
         for (const auto& c : r->noise) dl->AddCircleFilled(P(c.x, c.y), 2.f, COL_NOISE);
@@ -2247,6 +2267,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
         else if (a == "--no-skyline") s.det.skyline = false;
+        else if (a == "--no-fine-mask") s.det.fine_mask = false;
         else if (a == "--no-adapt") s.adapt = false;
         else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
         else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());

@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
         else if (a == "--bg-map") cfg.bg_map = true;
         else if (a == "--no-bg-map") cfg.bg_map = false;
         else if (a == "--no-skyline") cfg.skyline = false;
+        else if (a == "--no-fine-mask") cfg.fine_mask = false;
         else if (a == "--lock-slow") tcfg.lock_slow = (float)std::atof(val().c_str());
         else if (a == "--hard-switch") tcfg.hard_switch = (float)std::atof(val().c_str());
         else if (a == "--edge-mover-k") tcfg.edge_mover_k = (float)std::atof(val().c_str());

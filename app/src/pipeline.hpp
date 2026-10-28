@@ -117,6 +117,8 @@ struct Result {
     dronolok::DetectTiming dt;
     double trackMs = 0, procMs = 0, latencyMs = 0;
     std::vector<uint8_t> mask;
+    std::vector<uint8_t> fineSky;   // ячейки 16x16 неба в тайлах земли (уточнение маски), см. Detector::fineSky
+    int cellsPerTile = 0;
     int tilesX = 0, tilesY = 0, tilePx = 0;
     bool learning = false;
     std::vector<dronolok::GtObj> gt;
