@@ -59,11 +59,14 @@ static void usage() {
         "  --bg-map [--bg-k 3 --bg-frames 250]  фон по ячейкам у кромки: порог ячейки = медиана + K*СКО\n"
         "  --tbd [--tbd-thr 7 --tbd-z0 1.5 --tbd-decay 0.7 --tbd-min 0.5]   накопление по кадрам (включает --bg-map)\n"
         "  --band PX [--band-k 1 --upper-every N]   полоса у горизонта каждый кадр, небо выше — раз в N\n"
+        "  --smooth [--smooth-k 0.5] / --no-smooth   сглаживание 3x3 перед пулингом (согласованный фильтр)\n"
         "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
         "  --flap-window 48 --flap-r2 0.45 --flap-depth 0.3 --flap-hold 50   взмахи (окно 0 — выкл.)\n"
         "  --hover 0.3 --flock 150     зависание = дрон, стая с машущей = птицы (0 — выкл.)\n"
+        "  --quiet N [--quiet-max 750]  новая неподвижная точка в спокойном небе (N кадров без\n"
+        "                          откликов вокруг) — зависший дрон (0 — выкл.)\n"
         "  --fps-scale             параметры трекера в секундах: пересчитать под частоту кадров ролика\n"
         "  --scene                 оценивать сцену и погоду (свет, шум, облака, ветер, осадки, окружение)\n"
         "  --adapt                 ...и подстраивать под неё параметры (включает --scene)\n"
@@ -153,6 +156,9 @@ int main(int argc, char** argv) {
         else if (a == "--flap-depth") tcfg.flap_depth = (float)std::atof(val().c_str());
         else if (a == "--flap-hold") tcfg.flap_hold = std::atoi(val().c_str());
         else if (a == "--hover") tcfg.hover_speed = (float)std::atof(val().c_str());
+        else if (a == "--quiet") tcfg.quiet_frames = std::atoi(val().c_str());
+        else if (a == "--edge-straight") tcfg.edge_straight = (float)std::atof(val().c_str());
+        else if (a == "--quiet-max") tcfg.quiet_max = std::atoi(val().c_str());
         else if (a == "--flock") tcfg.flock_px = (float)std::atof(val().c_str());
         else if (a == "--learn-mask") learn = std::atoi(val().c_str());
         else if (a == "--learn-live") learnLive = std::atoi(val().c_str());
@@ -186,6 +192,13 @@ int main(int argc, char** argv) {
         else if (a == "--band") cfg.band_px = std::atoi(val().c_str());
         else if (a == "--band-k") cfg.band_k = (float)std::atof(val().c_str());
         else if (a == "--upper-every") cfg.upper_every = std::atoi(val().c_str());
+        else if (a == "--smooth") cfg.smooth = true;
+        else if (a == "--no-smooth") cfg.smooth = false;
+        else if (a == "--smooth-k") cfg.smooth_k = (float)std::atof(val().c_str());
+        else if (a == "--no-compact") cfg.smooth_compact = false;
+        else if (a == "--no-compact-tex") cfg.compact_tex = false;
+        else if (a == "--compact") { cfg.compact_r0 = (float)std::atof(val().c_str()); cfg.compact_r1 = (float)std::atof(val().c_str()); }
+        else if (a == "--subpixel") cfg.subpixel = true;
         else if (a == "--static") tcfg.static_frames = std::atoi(val().c_str());
         else if (a == "--static-hits") tcfg.static_hits = (float)std::atof(val().c_str());
         else if (a == "--gt") gtPath = val();
@@ -363,6 +376,7 @@ int main(int argc, char** argv) {
         const bool evalFrame = haveGt && fi < (int)gt.frames.size() && (stream || evalAll || i >= n);
         if (evalFrame) {
             ev.add(gt.frames[fi], tracks, gsx, gsy);
+            ev.addCands(gt.frames[fi], cands, gsx, gsy);
             if (i < (long)std::lround(3 * rd.fps())) ev3.add(gt.frames[fi], tracks, gsx, gsy);
         }
         if (dump && haveGt && fi < (int)gt.frames.size()) {
@@ -423,12 +437,15 @@ int main(int argc, char** argv) {
         std::printf("  ложные тревоги (треки, ни разу не бывшие на цели): %ld за %.0f с = %.1f в минуту, висят %.3f на кадр\n",
                     ev.falseAlarms(), ev.frames / gfps, ev.falseAlarms() * 60.0 * gfps / std::max(1L, ev.frames),
                     ev.falseAlarmPerFrame());
+        std::printf("  кандидаты детектора ближе 6 пикс.: дроны %.1f%%, птицы %.1f%%\n", 100 * ev.candRecall(0),
+                    100 * ev.candRecall(1));
         std::printf("  классы найденных дронов: дрон %ld, птица %ld, неясно %ld; птиц: птица %ld, дрон %ld, неясно %ld\n",
                     ev.conf[0][1], ev.conf[0][2], ev.conf[0][0], ev.conf[1][2], ev.conf[1][1], ev.conf[1][0]);
         len += std::snprintf(json + len, sizeof(json) - len,
                              ", \"recall_drone\": %.3f, \"recall_bird\": %.3f, \"false_tracks_per_frame\": %.2f, "
-                             "\"drone_cls_acc\": %.3f, \"bird_cls_acc\": %.3f",
-                             ev.recall(0), ev.recall(1), ev.falsePerFrame(), ev.clsAccuracy(0), ev.clsAccuracy(1));
+                             "\"drone_cls_acc\": %.3f, \"bird_cls_acc\": %.3f, \"cand_recall_drone\": %.3f",
+                             ev.recall(0), ev.recall(1), ev.falsePerFrame(), ev.clsAccuracy(0), ev.clsAccuracy(1),
+                             ev.candRecall(0));
     }
     std::snprintf(json + len, sizeof(json) - len, "}");
     std::printf("%s\n", json);

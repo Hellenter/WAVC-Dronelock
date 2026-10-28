@@ -45,6 +45,17 @@ static void test_kernels(const Kernels* ref, const Kernels* K) {
         ref->pool1(a.data(), d0.data(), b0.data(), n);
         K->pool1(a.data(), d1.data(), b1.data(), n);
         CHECK(d0 == d1 && b0 == b1, "%s pool1 n=%d", K->name, n);
+        {   // сглаживание 3x3: читает столбцы -1..n трёх строк; эталон — формула
+            auto r0 = rnd(n + 2, g), r1 = rnd(n + 2, g), r2 = rnd(n + 2, g);
+            std::vector<uint8_t> s0(n), s1(n);
+            for (int x = 0; x < n; ++x) {
+                const uint8_t *a0 = r0.data() + 1 + x, *a1 = r1.data() + 1 + x, *a2 = r2.data() + 1 + x;
+                const unsigned v = a0[-1] + 2u * a0[0] + a0[1] + 2u * (a1[-1] + 2u * a1[0] + a1[1]) + a2[-1] + 2u * a2[0] + a2[1];
+                s0[x] = (uint8_t)((v + 8) >> 4);
+            }
+            K->smooth3(r0.data() + 1, r1.data() + 1, r2.data() + 1, s1.data(), n);
+            CHECK(s0 == s1, "%s smooth3 n=%d", K->name, n);
+        }
         for (int k : {3, 5, 7, 9, 11}) {
             const int A = k / 2, os = n + 2 * A + 5;
             // k строк с полями по A слева и справа: ядро читает [-A, n + A)
@@ -147,6 +158,7 @@ static bool same(const std::vector<Candidate>& a, const std::vector<Candidate>& 
 }
 
 static void test_detector() {
+    for (int smooth : {0, 1})
     for (int scales : {1, 3})
     for (int pool : {1, 2})
         for (auto wh : {std::pair<int, int>{1001, 777}, std::pair<int, int>{640, 480}}) {
@@ -155,6 +167,7 @@ static void test_detector() {
             DetectorConfig base;
             base.scales = scales;
             base.pool = pool;
+            base.smooth = smooth != 0;
             base.threads = 1;
             base.isa = Isa::Scalar;
             base.job_rows = 1000;
@@ -176,8 +189,8 @@ static void test_detector() {
                         CHECK(same(r, c), "detector %s threads=%d job=%dx%d pool=%d %dx%d: %zu vs %zu",
                               isa_name(isa), th, j.first, j.second, pool, w, h, r.size(), c.size());
                     }
-            std::printf("detector scales=%d pool=%d %dx%d: %zu кандидатов, все варианты совпали\n", scales, pool, w,
-                        h, r.size());
+            std::printf("detector smooth=%d scales=%d pool=%d %dx%d: %zu кандидатов, все варианты совпали\n", smooth,
+                        scales, pool, w, h, r.size());
         }
 }
 
@@ -192,6 +205,7 @@ static void test_scales_focus() {
         for (int x = 100; x < 103; ++x) f[(size_t)y * w + x] = 152;
     DetectorConfig c;
     c.threads = 1;
+    c.compact_tex = false;   // иначе квадрат находится и на основном масштабе (см. test_compact_tex)
     std::vector<Candidate> out;
     Detector d1(c);
     d1.detect(f.data(), w, h, w, out);
@@ -686,6 +700,33 @@ static void test_scene() {
     std::printf("scene: ok\n");
 }
 
+// Крупная контрастная цель сама набирает "горячих" пикселей больше max_density: без compact_tex
+// её тайл — текстура и цели нет, с ним — есть. Россыпь точек по тайлу (листва) остаётся текстурой.
+static void test_compact_tex() {
+    const int w = 640, h = 480;
+    std::vector<uint8_t> f((size_t)w * h, 160);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const float r2 = (float)((x - 330) * (x - 330) + (y - 210) * (y - 210));
+            f[(size_t)y * w + x] = (uint8_t)std::lround(160.f - 40.f * std::exp(-r2 / (2.f * 2.5f * 2.5f)));
+        }
+    for (int y = 0; y < 64; y += 12)   // тайл (64..128, 320..384): точки с шагом 12 пикс.
+        for (int x = 0; x < 64; x += 12) f[(size_t)(320 + y) * w + 64 + x] = f[(size_t)(321 + y) * w + 64 + x] = 120;
+    DetectorConfig c;
+    c.threads = 1;
+    std::vector<Candidate> out;
+    c.compact_tex = false;
+    Detector d0(c);
+    d0.detect(f.data(), w, h, w, out);
+    CHECK(out.empty(), "compact_tex=0: %zu кандидатов, ждали 0", out.size());
+    c.compact_tex = true;
+    Detector d1(c);
+    d1.detect(f.data(), w, h, w, out);
+    CHECK(out.size() == 1 && std::fabs(out[0].x - 330) < 3 && std::fabs(out[0].y - 210) < 3,
+          "compact_tex=1: %zu кандидатов, ждали 1 у (330, 210)", out.size());
+    std::printf("compact_tex: ok\n");
+}
+
 int main() {
     const Kernels* ref = kernels_scalar();
     test_sad(ref);
@@ -698,6 +739,7 @@ int main() {
     }
     test_detector();
     test_scales_focus();
+    test_compact_tex();
     test_static_map();
     test_silhouette();
     test_hard_lock();

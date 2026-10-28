@@ -33,6 +33,8 @@ struct ResponseParams {
     // не читает. Без этого флага закрытые маской тайлы внутри задания считаются, как раньше
     // (кадры «только вокруг треков» берут из них кандидатов).
     bool trim = false;
+    // Сглаживание 3x3 [1 2 1]x[1 2 1] кадра перед пулингом (DetectorConfig::smooth)
+    bool smooth = false;
 };
 
 constexpr int CELL = 8;

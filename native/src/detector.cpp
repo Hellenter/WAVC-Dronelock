@@ -88,6 +88,77 @@ static void measure_energy(const uint8_t* g, int w, int h, int stride, Candidate
     c.energy = (float)std::max(0.0, c.polarity * ((double)in - bg * n));
 }
 
+// Уточнение положения цели основного масштаба: в окне 5x5 вокруг кандидата — экстремум
+// сглаженного 3x3 кадра, затем вершина по трём точкам гаусса (логарифм амплитуды над фоном
+// рамки) вдоль x и y. Амплитуды не положительны (шум, плоское пятно) — по параболе.
+static void refine_position(const uint8_t* g, int w, int h, int stride, Candidate& c) {
+    if (c.level != 0) return;
+    const int R = 5;   // рамка фона
+    int cx = (int)std::lround(c.x), cy = (int)std::lround(c.y);
+    if (cx - R - 3 < 0 || cy - R - 3 < 0 || cx + R + 3 >= w || cy + R + 3 >= h) return;
+    auto sm = [&](int x, int y) {   // сглаженное значение x16
+        const uint8_t* a = g + (size_t)(y - 1) * stride + x;
+        const uint8_t* b = a + stride;
+        const uint8_t* d = b + stride;
+        return (int)a[-1] + 2 * a[0] + a[1] + 2 * (b[-1] + 2 * b[0] + b[1]) + d[-1] + 2 * d[0] + d[1];
+    };
+    int best = c.polarity > 0 ? -1 : 1 << 30, bx = cx, by = cy;
+    for (int y = cy - 2; y <= cy + 2; ++y)
+        for (int x = cx - 2; x <= cx + 2; ++x) {
+            const int v = sm(x, y);
+            if (c.polarity > 0 ? v > best : v < best) { best = v; bx = x; by = y; }
+        }
+    int64_t ring = 0;
+    for (int x = bx - R; x <= bx + R; ++x) ring += g[(size_t)(by - R) * stride + x] + g[(size_t)(by + R) * stride + x];
+    for (int y = by - R + 1; y < by + R; ++y) ring += g[(size_t)y * stride + bx - R] + g[(size_t)y * stride + bx + R];
+    const float bg16 = 16.f * (float)ring / (8.f * R);
+    auto amp = [&](int x, int y) { return (float)c.polarity * ((float)sm(x, y) - bg16); };
+    auto vertex = [](float m, float z, float p) {   // амплитуды слева, в центре, справа
+        if (m > 0 && z > 0 && p > 0) {
+            const float lm = std::log(m), lz = std::log(z), lp = std::log(p), den = lm - 2 * lz + lp;
+            if (den < -1e-6f) return std::max(-0.75f, std::min(0.75f, 0.5f * (lm - lp) / den));
+        }
+        const float den = m - 2 * z + p;
+        return den < -1e-6f ? std::max(-0.75f, std::min(0.75f, 0.5f * (m - p) / den)) : 0.f;
+    };
+    const float a0 = amp(bx, by);
+    if (a0 <= 0) return;
+    c.x = (float)bx + vertex(amp(bx - 1, by), a0, amp(bx + 1, by));
+    c.y = (float)by + vertex(amp(bx, by - 1), a0, amp(bx, by + 1));
+}
+
+// Ширина пятна кандидата основного масштаба: амплитуда сглаженного кадра в 2 пикс. от
+// пика (среднее по 4 сторонам) к амплитуде пика. Точка с размытием оптики (FWHM до ~3
+// пикс.) — 0.2-0.4, пятно облака шире 5 пикс. — 0.6 и выше. -1 — не измерить.
+static float spot_width(const uint8_t* g, int w, int h, int stride, const Candidate& c) {
+    if (c.level != 0) return -1.f;
+    const int R = 6;   // рамка фона
+    const int cx = (int)std::lround(c.x), cy = (int)std::lround(c.y);
+    if (cx - R - 4 < 0 || cy - R - 4 < 0 || cx + R + 4 >= w || cy + R + 4 >= h) return -1.f;
+    auto sm = [&](int x, int y) {   // сглаженное значение x16
+        const uint8_t* a = g + (size_t)(y - 1) * stride + x;
+        const uint8_t* b = a + stride;
+        const uint8_t* d = b + stride;
+        return (int)a[-1] + 2 * a[0] + a[1] + 2 * (b[-1] + 2 * b[0] + b[1]) + d[-1] + 2 * d[0] + d[1];
+    };
+    int best = c.polarity > 0 ? -1 : 1 << 30, bx = cx, by = cy;
+    for (int y = cy - 2; y <= cy + 2; ++y)
+        for (int x = cx - 2; x <= cx + 2; ++x) {
+            const int v = sm(x, y);
+            if (c.polarity > 0 ? v > best : v < best) { best = v; bx = x; by = y; }
+        }
+    // фон — медиана рамки (облако или кромка на краю рамки не сдвигают его)
+    int ring[8 * R], n = 0;
+    for (int x = bx - R; x < bx + R; ++x) { ring[n++] = sm(x, by - R); ring[n++] = sm(x + 1, by + R); }
+    for (int y = by - R; y < by + R; ++y) { ring[n++] = sm(bx - R, y + 1); ring[n++] = sm(bx + R, y); }
+    std::nth_element(ring, ring + n / 2, ring + n);
+    const float bg = (float)ring[n / 2];
+    auto amp = [&](int x, int y) { return (float)c.polarity * ((float)sm(x, y) - bg); };
+    const float a0 = amp(bx, by);
+    if (a0 <= 0) return -1.f;
+    return 0.25f * (amp(bx - 2, by) + amp(bx + 2, by) + amp(bx, by - 2) + amp(bx, by + 2)) / a0;
+}
+
 static DetectorConfig sanitize(DetectorConfig c) {
     c.k = std::max(3, std::min(31, c.k | 1));
     c.pool = c.pool == 1 ? 1 : 2;
@@ -108,6 +179,7 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.band_px = std::max(0, c.band_px);
     c.band_k = std::max(0.3f, std::min(2.f, c.band_k));
     c.upper_every = std::max(1, std::min(16, c.upper_every));
+    c.smooth_k = std::max(0.1f, std::min(1.f, c.smooth_k));
     return c;
 }
 
@@ -280,6 +352,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     p.job_rows = cfg_.job_rows;
     p.job_cols = cfg_.job_cols;
     p.cells = (cfg_.per_tile > 1 || cfg_.bg_map || cfg_.tbd) && T % CELL == 0;
+    p.smooth = cfg_.smooth;
     {   // место максимума ячейки нужно, если она может дать кандидата: от пониженных порогов
         const float lo = threshold() * std::min({1.f, cfg_.tbd ? cfg_.tbd_min : 1.f, cfg_.focus_k, cfg_.band_k});
         p.cell_thr = (uint8_t)std::max(1.f, std::min(254.f, std::floor(lo) - 1.f));
@@ -363,6 +436,10 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         q.bright = false;
         q.cells = false;   // ячейки грубых масштабов никто не читает (selectTiles берёт их только с основного)
         q.trim = false;
+        if (q.smooth) {   // грубые масштабы — без сглаживания, "горячий" пиксель в уровнях яркости
+            q.smooth = false;
+            q.hot_thr = (uint8_t)std::max(0.f, std::min(255.f, std::floor(hotLevel() / smoothK())));
+        }
         int jobs = 0, skipped = 0;
         const uint8_t* cm = nullptr;
         if (timing_.coarsePartial) {
@@ -433,8 +510,31 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             out.resize(keep);
         }
     }
-    if (!learning_)
-        for (Candidate& c : out) measure_energy(gray, w, h, stride, c);
+    if (!learning_) {
+        // Сглаживание выгоднее всего широким пятнам: облако или блик шириной 5+ пикс. с
+        // контрастом ниже обычного порога проходит половинный. Бонус сглаживания — только
+        // компактным (точка с размытием оптики), широкое пятно должно пройти полный порог
+        // (как без сглаживания), между ними — плавно. Слабым у прогноза трека не мешаем.
+        if (cfg_.smooth && cfg_.smooth_compact) {
+            const float k = smoothK();
+            size_t keep = 0;
+            for (size_t i = 0; i < out.size(); ++i) {
+                Candidate c = out[i];
+                const float r = c.weak ? -1.f : spot_width(gray, w, h, stride, c);
+                if (r > cfg_.compact_r0) {
+                    const float t = std::min(1.f, (r - cfg_.compact_r0) / std::max(0.01f, cfg_.compact_r1 - cfg_.compact_r0));
+                    c.margin *= 1.f / (1.f + t * (1.f / k - 1.f));
+                    if (c.margin < 1.f) continue;
+                }
+                out[keep++] = c;
+            }
+            out.resize(keep);
+        }
+        for (Candidate& c : out) {
+            measure_energy(gray, w, h, stride, c);
+            if (cfg_.subpixel) refine_position(gray, w, h, stride, c);
+        }
+    }
     if (learning_ || verifyLeft_) ++texN_;
     if (verifyLeft_ && --verifyLeft_ == 0) {   // сверка загруженной маски с тем, что видно сейчас
         std::vector<uint8_t> fresh;
@@ -567,8 +667,11 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
     // на грубых масштабах крупная цель сама занимает заметную долю тайла: ей прощаем
     // до k*k/2 "горячих" пикселей. Основной масштаб — строго как в detector.py.
     const float maxDens = fineGrid ? cfg_.max_density : cfg_.max_density + 0.5f * cfg_.k * cfg_.k / (float)area;
-    const float ck = fineGrid ? 1.f : cfg_.coarse_thr_k;
+    // грубые масштабы не сглаживаются: их порог — в уровнях яркости, без smooth_k
+    const float ck = fineGrid ? 1.f : cfg_.coarse_thr_k / smoothK();
     const float thr0 = threshold() * ck, thrF = threshold() * ck * cfg_.focus_k;
+    // отклик сглаженного кадра меньше, контраст кандидата — в уровнях, как без сглаживания
+    const float cScale = fineGrid ? 1.f / smoothK() : 1.f;
     const size_t first = out.size();
     const bool useMask = fineGrid && !learning_ && !mask_.empty();
     // ячейки основного масштаба: второй кандидат, фон по ячейкам
@@ -578,6 +681,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
     const bool bandOn = fineGrid && band_.size() == (size_t)tw * th;
     const bool nearOn = bgOn && nearGround_.size() == (size_t)tw * th;
     const int sep = cfg_.k + 1;   // кандидаты одного тайла не ближе, пикс. после пулинга
+    const float hotB = std::floor(hotLevel());   // "горячий" отклик основного масштаба
     uint8_t* texOut = nullptr;
     if (fineGrid) {
         auto& t = stats_->tex[pol ? 1 : 0];
@@ -589,9 +693,24 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const size_t i = (size_t)ty * tw + tx;
             const float level = (float)std::min<uint32_t>(255, div_round_even(ts.sum[i], area));
             const float dens = (float)div_round_even(ts.hot[i] * 255u, area) / 255.f;
-            const bool textured = dens > maxDens;
-            if (fineGrid && (learning_ || verifyLeft_)) texSum_[i] += textured;
-            if (texOut) texOut[i] = textured;
+            const bool texRaw = dens > maxDens;
+            if (fineGrid && (learning_ || verifyLeft_)) texSum_[i] += texRaw;
+            if (texOut) texOut[i] = texRaw;
+            bool textured = texRaw;
+            // Крупная контрастная цель (FWHM 5+ пикс.) сама набирает "горячих" пикселей больше
+            // max_density, и тайл с ней считался текстурой — цель терялась. Если все горячие
+            // ячейки тайла — вокруг его максимума (3x3 ячейки), это одно компактное пятно, а не
+            // текстура: листва и кромка облака рассыпаны по тайлу. У земли не проверяем — там
+            // одиночная верхушка дерева тоже компактное пятно. Маска неба учится по исходному
+            // признаку текстуры: пятно на земле не должно открывать её для поиска
+            if (textured && cells && cfg_.compact_tex && !(nearOn && nearGround_[i]) && (zones_.empty() || zones_[i] == 2)) {
+                const int ax = tx * cpt + (ts.argmax[i] % T) / CELL, ay = ty * cpt + (ts.argmax[i] / T) / CELL;
+                bool spread = false;
+                for (int cy = ty * cpt; cy < (ty + 1) * cpt && !spread; ++cy)
+                    for (int cx = tx * cpt; cx < (tx + 1) * cpt && !spread; ++cx)
+                        spread = (std::abs(cx - ax) > 1 || std::abs(cy - ay) > 1) && ts.cmax[(size_t)cy * ctw + cx] > hotB;
+                textured = spread;
+            }
             // тайл земли у кромки, где уточнение нашло ячейки неба: только эти ячейки, по их фону
             bool fineTile = false;
             if (useMask && !mask_[i]) {
@@ -616,7 +735,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 Candidate c;
                 c.x = (float)(gx * f) + (f - 1) * 0.5f;
                 c.y = (float)(gy * f) + (f - 1) * 0.5f;
-                c.contrast = mx;
+                c.contrast = mx * cScale;
                 c.margin = mx / thrB;
                 c.snr = mx / (level + 1.f);
                 c.polarity = pol ? 1 : -1;
@@ -671,6 +790,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
         out.resize(first + cfg_.max_cands);
     }
 }
+
+const std::vector<uint8_t>& Detector::texturedTiles(int pol) const { return stats_->tex[pol ? 1 : 0]; }
 
 bool Detector::cellInfo(int pol, float x, float y, float& cmax, float& mu, float& sd, float& A) const {
     const TileStats& ts = pol ? stats_->bright : stats_->dark;
@@ -829,7 +950,7 @@ void Detector::selectTbd(const TileStats& ts, int pol, std::vector<Candidate>& o
         Candidate cd;
         cd.x = gx;
         cd.y = gy;
-        cd.contrast = ts.cmax[ci];
+        cd.contrast = ts.cmax[ci] / smoothK();
         cd.margin = std::sqrt(1.f + A / cfg_.tbd_thr);
         cd.snr = E[ci] + cfg_.tbd_z0;
         cd.polarity = pl;

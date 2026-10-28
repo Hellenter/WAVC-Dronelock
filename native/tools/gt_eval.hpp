@@ -112,6 +112,17 @@ struct EvalStats {
         }
         ++frames;
     }
+    // полнота детектора (до трекера): есть кандидат ближе r пикс.
+    long candHit[2] = {0, 0}, candTotal[2] = {0, 0};
+    void addCands(const std::vector<GtObj>& gt, const std::vector<Candidate>& cands, float sx = 1, float sy = 1, float r = 6) {
+        for (const auto& o : gt) {
+            const int k = o.bird ? 1 : 0;
+            ++candTotal[k];
+            for (const auto& c : cands)
+                if (std::fabs(c.x - o.x * sx) < r && std::fabs(c.y - o.y * sy) < r) { ++candHit[k]; break; }
+        }
+    }
+    double candRecall(int k) const { return candTotal[k] ? (double)candHit[k] / candTotal[k] : 0; }
     double recall(int k) const { return total[k] ? (double)hit[k] / total[k] : 0; }
     double falsePerFrame() const { return frames ? (double)fp / frames : 0; }
     // ложные тревоги: сколько их было и сколько кадров на кадр они в среднем висели

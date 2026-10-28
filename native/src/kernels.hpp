@@ -31,6 +31,9 @@ struct Kernels {
     // пропущенных точек. Для оценки сдвига камеры (motion.cpp), n не больше 1 << 20.
     void (*sad_masked)(const uint8_t* a, const uint8_t* b, const uint8_t* skip, int n, uint32_t* sum,
                        uint32_t* nskip);
+    // Сглаживание 3x3 [1 2 1]x[1 2 1]/16 с округлением: out[x] по строкам a (выше), b, c (ниже).
+    // Читает столбцы -1..n каждой строки.
+    void (*smooth3)(const uint8_t* a, const uint8_t* b, const uint8_t* c, uint8_t* out, int n);
 };
 
 const Kernels* kernels_scalar();
