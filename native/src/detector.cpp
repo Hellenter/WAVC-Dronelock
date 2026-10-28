@@ -199,6 +199,7 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
 
 namespace {
 const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
+const int32_t kMaxSide = 1 << 16;   // сторона кадра в файле маски, пикс.
 }
 
 bool Detector::saveMask(const std::string& path) const {
@@ -219,7 +220,9 @@ bool Detector::loadMask(const std::string& path, int verify) {
     int32_t hdr[6];
     bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, kMaskMagic, 8) == 0 &&
               std::fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 &&
-              hdr[5] > 0 && hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile;
+              hdr[5] > 0 && hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
+              // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
+              hdr[0] <= kMaxSide && hdr[1] <= kMaxSide;
     std::vector<uint8_t> m;
     if (ok) {
         m.resize((size_t)hdr[4] * hdr[5]);

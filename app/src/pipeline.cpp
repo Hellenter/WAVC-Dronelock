@@ -786,7 +786,7 @@ void Pipeline::processLoop() {
             if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, s.targetFps > 0 ? s.targetFps : info_.fps));
 
             r = std::make_shared<Result>();
-            r->frame = p.frame;
+            r->frame = view;
             r->loop = p.loop;
             r->cands = cands;
             r->clutter = trk->clutterDets();
@@ -928,7 +928,7 @@ void Pipeline::processLoop() {
         if (observer_) observer_(*r);
         latest_ = r;
         hist_.push_back(r);
-        histBytes_ += f.px.size();
+        histBytes_ += r->frame->px.size();
         while (hist_.size() > 1 && (hist_.size() > HIST_MAX || histBytes_ > HIST_BYTES)) {
             histBytes_ -= hist_.front()->frame->px.size();
             hist_.pop_front();
@@ -1161,12 +1161,15 @@ std::string Pipeline::reportJson() const {
         m.detect.p95, m.response.mean, m.track.mean, m.proc.mean, m.detect.mean > 0 ? 1000 / m.detect.mean : 0,
         m.latency.mean, s.emulateMs, r ? r->scales : 0, r && r->motionOn ? "true" : "false", m.motion.mean, m.lockPct, s.slowdown,
         r ? r->govLevel : -1);
+    // при обрезке snprintf возвращает полную длину: дальше писать за концом буфера нельзя
+    len = std::min(std::max(len, 0), (int)sizeof(buf) - 1);
     if (m.haveGt)
         len += snprintf(buf + len, sizeof(buf) - len,
                         ", \"recall_drone\": %.3f, \"recall_bird\": %.3f, \"false_tracks_per_frame\": %.2f, "
                         "\"drone_cls_acc\": %.3f, \"bird_cls_acc\": %.3f",
                         m.eval.recall(0), m.eval.recall(1), m.eval.falsePerFrame(), m.eval.clsAccuracy(0),
                         m.eval.clsAccuracy(1));
+    len = std::min(std::max(len, 0), (int)sizeof(buf) - 2);
     snprintf(buf + len, sizeof(buf) - len, "}");
     return buf;
 }

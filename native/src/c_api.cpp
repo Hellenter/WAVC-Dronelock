@@ -71,8 +71,15 @@ dl_detector* dl_detector_create(const dl_config* c) {
 
 void dl_detector_destroy(dl_detector* d) { delete d; }
 
+// исключения не должны уходить через границу C (Python, другие языки): на ошибке — 0 / nullptr
 int dl_detect(dl_detector* d, const uint8_t* gray, int w, int h, int stride, dl_candidate* out, int cap) {
-    d->det.detect(gray, w, h, stride, d->cands);
+    if (!d || !gray || w <= 0 || h <= 0 || stride < w) return 0;
+    try {
+        d->det.detect(gray, w, h, stride, d->cands);
+    } catch (...) {
+        d->cands.clear();
+        return 0;
+    }
     const int n = (int)d->cands.size();
     for (int i = 0; i < std::min(n, cap); ++i) {
         const Candidate& c = d->cands[i];
@@ -108,19 +115,33 @@ int dl_available_isas(int* out, int cap) {
     return (int)v.size();
 }
 
-dl_tracker* dl_tracker_create(int w, int h) { return new dl_tracker(w, h); }
+dl_tracker* dl_tracker_create(int w, int h) {
+    if (w <= 0 || h <= 0) return nullptr;
+    try {
+        return new dl_tracker(w, h);
+    } catch (...) {
+        return nullptr;
+    }
+}
 void dl_tracker_destroy(dl_tracker* t) { delete t; }
 void dl_tracker_reset(dl_tracker* t) { t->trk.resetTracks(); }
 
 int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* out, int cap) {
-    t->dets.resize(n);
+    if (!dets || n < 0) n = 0;   // resize(-1) — это 4 миллиарда элементов
+    t->dets.resize((size_t)n);
     for (int i = 0; i < n; ++i) {
         const dl_candidate& c = dets[i];
         t->dets[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level};
         t->dets[i].energy = c.energy;
         t->dets[i].margin = c.margin;
     }
-    const auto& tr = t->trk.update(t->dets, t->dx, t->dy);
+    const std::vector<Track>* trp;
+    try {
+        trp = &t->trk.update(t->dets, t->dx, t->dy);
+    } catch (...) {
+        return 0;
+    }
+    const auto& tr = *trp;
     t->dx = t->dy = 0;
     for (int i = 0; i < std::min((int)tr.size(), cap); ++i) {
         const Track& s = tr[i];
@@ -163,6 +184,7 @@ int dl_tracker_focus(dl_tracker* t, float* xyr, int cap) {
 }
 
 void dl_detector_set_focus(dl_detector* d, const float* xyr, int n) {
+    if (!xyr) n = 0;
     std::vector<FocusArea> a(std::max(0, n));
     for (int i = 0; i < n; ++i) a[i] = {xyr[3 * i], xyr[3 * i + 1], xyr[3 * i + 2]};
     d->det.setFocus(a);

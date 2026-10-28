@@ -1,5 +1,6 @@
 // Минимальный JSON-парсер для файлов разметки (*.gt.json). Без зависимостей.
 #pragma once
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -59,42 +60,20 @@ private:
         ++i_;
         return true;
     }
+    // глубина вложенности ограничена: иначе "[[[[..." из файла переполняет стек рекурсией
+    static constexpr int MAX_DEPTH = 64;
+    struct Depth {
+        int& d;
+        explicit Depth(int& x) : d(++x) {}
+        ~Depth() { --d; }
+    };
     bool value(Value& v) {
         if (i_ >= s_.size()) return false;
         const char c = s_[i_];
-        if (c == '{') {
-            v.type = Value::Obj;
-            ++i_;
-            ws();
-            if (s_[i_] == '}') { ++i_; return true; }
-            for (;;) {
-                ws();
-                std::string k;
-                if (!str(k)) return false;
-                ws();
-                if (s_[i_++] != ':') return false;
-                ws();
-                if (!value(v.o[k])) return false;
-                ws();
-                if (s_[i_] == ',') { ++i_; continue; }
-                if (s_[i_] == '}') { ++i_; return true; }
-                return false;
-            }
-        }
-        if (c == '[') {
-            v.type = Value::Arr;
-            ++i_;
-            ws();
-            if (s_[i_] == ']') { ++i_; return true; }
-            for (;;) {
-                ws();
-                v.a.emplace_back();
-                if (!value(v.a.back())) return false;
-                ws();
-                if (s_[i_] == ',') { ++i_; continue; }
-                if (s_[i_] == ']') { ++i_; return true; }
-                return false;
-            }
+        if (c == '{' || c == '[') {
+            Depth g(depth_);
+            if (depth_ > MAX_DEPTH) return false;
+            return c == '{' ? object(v) : array(v);
         }
         if (c == '"') { v.type = Value::Str; return str(v.s); }
         if (lit("true")) { v.type = Value::Bool; v.b = true; return true; }
@@ -102,14 +81,50 @@ private:
         if (lit("null")) { v.type = Value::Null; return true; }
         char* end = nullptr;
         v.n = std::strtod(s_.c_str() + i_, &end);
-        if (end == s_.c_str() + i_) return false;
+        // strtod принимает и nan/inf: в разметке это мусор, дальше он уходит в (int) — неопределённое поведение
+        if (end == s_.c_str() + i_ || !std::isfinite(v.n)) return false;
         v.type = Value::Num;
         i_ = end - s_.c_str();
         return true;
     }
+    bool object(Value& v) {
+        v.type = Value::Obj;
+        ++i_;
+        ws();
+        if (s_[i_] == '}') { ++i_; return true; }
+        for (;;) {
+            ws();
+            std::string k;
+            if (!str(k)) return false;
+            ws();
+            if (s_[i_++] != ':') return false;
+            ws();
+            if (!value(v.o[k])) return false;
+            ws();
+            if (s_[i_] == ',') { ++i_; continue; }
+            if (s_[i_] == '}') { ++i_; return true; }
+            return false;
+        }
+    }
+    bool array(Value& v) {
+        v.type = Value::Arr;
+        ++i_;
+        ws();
+        if (s_[i_] == ']') { ++i_; return true; }
+        for (;;) {
+            ws();
+            v.a.emplace_back();
+            if (!value(v.a.back())) return false;
+            ws();
+            if (s_[i_] == ',') { ++i_; continue; }
+            if (s_[i_] == ']') { ++i_; return true; }
+            return false;
+        }
+    }
 
     const std::string& s_;
     size_t i_ = 0;
+    int depth_ = 0;
 };
 
 inline bool parse(const std::string& text, Value& out) { return Parser(text).parse(out); }

@@ -67,6 +67,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref) {
 }
 
 Tracker::Tracker(int w, int h, const TrackerConfig& cfg) : cfg_(cfg) {
+    cfg_.clutter_cell = std::max(1, cfg_.clutter_cell);   // из C API/Python может прийти 0
     gw_ = w / cfg_.clutter_cell + 1;
     gh_ = h / cfg_.clutter_cell + 1;
     heat_.assign((size_t)gw_ * gh_, 0.f);
@@ -161,6 +162,8 @@ bool Tracker::loadStatic(const std::string& path) {
                     hdr[3] == gh_ && hdr[4] == cfg_.clutter_cell && fread(v.data(), sizeof(float), v.size(), f) == v.size();
     fclose(f);
     if (!ok) return false;
+    for (float& x : v)   // испорченный файл: nan/inf/минус не должны попадать в память помех
+        if (!(x > 0 && x < 1e30f)) x = 0;
     stat_ = std::move(v);
     std::fill(statT_.begin(), statT_.end(), frame_);
     return true;
