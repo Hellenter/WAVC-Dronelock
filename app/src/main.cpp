@@ -131,15 +131,19 @@ struct App {
     Annotation ann;
     int annCur = 0;        // выбранный объект (AnnObject::id)
     std::string annMsg;
-    // разметка по треку: после щелчка по цели точки ставятся сами, пока трек виден
+    // разметка по цели: после щелчка по дрону точки ставятся сами, пока он виден — по треку
+    // алгоритма, а где трека нет (трекер сбросил треки, дрон принят за помеху) — по картинке
     bool annAuto = true;
     int annStep = 10;          // точка раз в столько кадров
-    int annFollowId = 0;       // трек (Track::id), за которым идёт разметка; 0 — нет
+    bool annFollow = false;    // разметка идёт за целью
+    int annFollowId = 0;       // трек (Track::id), по которому она сейчас идёт; 0 — по картинке
     int annFollowObj = 0;      // объект разметки
     int annFollowSeq = 0;      // последний просмотренный результат (Result::seq)
     int64_t annFollowKey = 0;  // кадр последней поставленной точки
-    int64_t annSeenFrame = -1; // последний кадр, где трек был найден
-    float annSeenX = 0, annSeenY = 0;
+    int64_t annSeenFrame = -1; // последний кадр, где цель была найдена
+    float annSeenX = 0, annSeenY = 0;   // где, в пикселях видео
+    std::vector<float> annTpl; // как цель выглядит: окрестность, яркость без среднего и нормированная
+    int annByTrack = 0, annByImage = 0;   // кадров, где цель нашлась по треку и по картинке
     bool annDirty = false;     // точки добавлены, файл ещё не записан
     double annSavedAt = 0;
     // шкала видео
@@ -261,6 +265,7 @@ void open_video(App& a, const std::string& path) {
     a.ann.load(a.pipe.gtPath(), vi.w, vi.h, vi.fps);
     a.annCur = a.ann.objs.empty() ? 0 : a.ann.objs[0].id;
     a.annMsg.clear();
+    a.annFollow = false;
     a.annFollowId = 0;
     a.annDirty = false;
 }
@@ -288,34 +293,162 @@ static void track_to_video(const App& a, const Result& r, const Track& t, float&
     y = (t.y + (float)r.fy) * (H > 0 ? (float)vi.h / H : 1.f);
 }
 
-void ann_follow_start(App& a, const Result& r, const Track& t) {
-    a.annFollowId = t.id;
+// ---- поиск цели по картинке: окрестность (2R+1)^2 кадра обработки, нормированная корреляция
+const int TPL_R = 7;
+
+static bool tpl_grab(const Frame& f, float x, float y, std::vector<float>& out) {
+    const int cx = (int)std::lround(x), cy = (int)std::lround(y), R = TPL_R;
+    if (cx - R < 0 || cy - R < 0 || cx + R >= f.w || cy + R >= f.h || f.px.size() < (size_t)f.w * f.h) return false;
+    out.resize((2 * R + 1) * (2 * R + 1));
+    double m = 0;
+    for (int j = -R, k = 0; j <= R; ++j)
+        for (int i = -R; i <= R; ++i, ++k) m += out[k] = f.px[(size_t)(cy + j) * f.w + cx + i];
+    m /= out.size();
+    double n = 0;
+    for (float& v : out) {
+        v -= (float)m;
+        n += v * v;
+    }
+    if (n < out.size() * 4.0) return false;   // ровное место (СКО < 2): искать нечего
+    const float inv = (float)(1 / std::sqrt(n));
+    for (float& v : out) v *= inv;
+    return true;
+}
+
+// лучшее совпадение с шаблоном в пределах ±S пикс. от (x, y); score — корреляция -1..1
+static bool tpl_match(const Frame& f, const std::vector<float>& tpl, float& x, float& y, int S, float& score) {
+    const int R = TPL_R, cx0 = (int)std::lround(x), cy0 = (int)std::lround(y);
+    if (tpl.empty() || f.px.size() < (size_t)f.w * f.h) return false;
+    std::vector<float> p;
+    float best = -2;
+    int bx = 0, by = 0;
+    for (int dy = -S; dy <= S; ++dy)
+        for (int dx = -S; dx <= S; ++dx) {
+            if (!tpl_grab(f, (float)(cx0 + dx), (float)(cy0 + dy), p)) continue;
+            float c = 0;
+            for (size_t k = 0; k < p.size(); ++k) c += p[k] * tpl[k];
+            c -= 0.002f * (float)(dx * dx + dy * dy) / (float)(S * S + 1);   // при равенстве — ближе
+            if (c > best) {
+                best = c;
+                bx = cx0 + dx;
+                by = cy0 + dy;
+            }
+        }
+    if (best < -1) return false;
+    x = (float)bx;
+    y = (float)by;
+    score = best;
+    return true;
+}
+
+// пиксели кадра обработки <-> пиксели видео (у кадра из поворотки — свои координаты, там только по треку)
+static bool frame_scale(const App& a, const Result& r, float& kx, float& ky) {
+    const VideoInfo vi = a.pipe.info();
+    if (r.follow || vi.w <= 0 || vi.h <= 0) return false;
+    kx = (float)r.frame->w / vi.w;
+    ky = (float)r.frame->h / vi.h;
+    return true;
+}
+
+// щелчок мимо цели алгоритма: прилипнуть к самой заметной точке рядом (дрон — пятно темнее
+// или светлее фона), чтобы промах мышью на пару пикселей экрана не сдвинул всю разметку
+static void snap_to_spot(const Frame& f, float& x, float& y, int R) {
+    const int cx = (int)std::lround(x), cy = (int)std::lround(y);
+    if (cx - R - 1 < 0 || cy - R - 1 < 0 || cx + R + 1 >= f.w || cy + R + 1 >= f.h || f.px.size() < (size_t)f.w * f.h)
+        return;
+    auto P = [&](int i, int j) { return (float)f.px[(size_t)j * f.w + i]; };
+    double m = 0;
+    for (int j = cy - R; j <= cy + R; ++j)
+        for (int i = cx - R; i <= cx + R; ++i) m += P(i, j);
+    m /= (2 * R + 1) * (2 * R + 1);
+    float best = 0;
+    for (int j = cy - R; j <= cy + R; ++j)
+        for (int i = cx - R; i <= cx + R; ++i) {
+            float v = 0;   // 3x3 — чтобы не прилипать к одиночному шумному пикселю
+            for (int b = -1; b <= 1; ++b)
+                for (int c = -1; c <= 1; ++c) v += P(i + c, j + b);
+            v = std::fabs(v / 9 - (float)m);
+            if (v > best + 1e-3f) {
+                best = v;
+                x = (float)i;
+                y = (float)j;
+            }
+        }
+}
+
+static void ann_grab(App& a, const Result& r) {
+    float kx, ky;
+    std::vector<float> t;
+    if (frame_scale(a, r, kx, ky) && tpl_grab(*r.frame, a.annSeenX * kx, a.annSeenY * ky, t)) a.annTpl = t;
+}
+
+// начать с точки (x, y) в пикселях видео на кадре r; t — цель алгоритма под ней, если есть
+void ann_follow_start(App& a, const Result& r, const Track* t, float x, float y) {
+    a.annFollow = true;
+    a.annFollowId = t ? t->id : 0;
     a.annFollowObj = a.annCur;
     a.annFollowSeq = r.seq;
     a.annFollowKey = r.frame->index;
     a.annSeenFrame = r.frame->index;
-    track_to_video(a, r, t, a.annSeenX, a.annSeenY);
-    a.annMsg = "разметка идёт за целью #" + std::to_string(t.id) + ": пустите видео (пробел)";
+    a.annSeenX = x;
+    a.annSeenY = y;
+    a.annByTrack = a.annByImage = 0;
+    a.annTpl.clear();
+    ann_grab(a, r);
+    if (!t && a.annTpl.empty()) {
+        a.annFollow = false;
+        a.annMsg = "точка поставлена; вести нечего: рядом нет цели алгоритма, а на картинке ровное место";
+        return;
+    }
+    a.annMsg = "разметка идёт за целью: пустите видео (пробел), где ошибётся — пауза и щелчок по дрону";
 }
 
 void ann_follow_stop(App& a, const char* why) {
-    if (!a.annFollowId) return;
+    if (!a.annFollow) return;
     // последняя точка — где цель видели в последний раз, чтобы объект не тянулся по прямой дальше
     if (AnnObject* ob = a.ann.find(a.annFollowObj))
         if (a.annSeenFrame > a.annFollowKey) {
+            ob->keys.erase(ob->keys.upper_bound(a.annFollowKey), ob->keys.lower_bound(a.annSeenFrame));
             ob->keys[a.annSeenFrame] = {a.annSeenX, a.annSeenY};
             a.annDirty = true;
         }
+    a.annFollow = false;
     a.annFollowId = 0;
     if (a.annDirty) ann_changed(a);
     a.annDirty = false;
     if (why) a.annMsg = why;
 }
 
-// Каждый кадр интерфейса: пройти по новым результатам и поставить точки, пока трек виден.
-// Трек пропал — остановиться на паузе там, где его потеряли: найти дрон и щёлкнуть снова
+// Трек алгоритма рядом с местом, где цель видели: трекер сбросил треки (маска неба выучена
+// заново, сцена поменялась) или захват перешёл на новый трек того же дрона — у цели новый
+// номер. Захват — первый кандидат
+static const Track* ann_follow_reacquire(const App& a, const Result& r) {
+    const VideoInfo vi = a.pipe.info();
+    const int64_t gap = std::max<int64_t>(1, r.frame->index - a.annSeenFrame);
+    // около 0.8% ширины кадра (20 пикс. на 2560) плюс запас на полёт за пропущенные кадры;
+    // шире нельзя — рядом с дроном полно помех, и разметка уползла бы на них
+    const float lim = 0.008f * (float)std::max(vi.w, 640) + 2.f * (float)std::min<int64_t>(gap, 60);
+    const Track* best = nullptr;
+    float bd = lim;
+    for (const auto& t : r.tracks) {
+        if (t.miss > 0) continue;
+        float x, y;
+        track_to_video(a, r, t, x, y);
+        float d = std::hypot(x - a.annSeenX, y - a.annSeenY);
+        if (t.id == r.lockId) d *= 0.5f;
+        if (d < bd) {
+            bd = d;
+            best = &t;
+        }
+    }
+    return best;
+}
+
+// Каждый кадр интерфейса: пройти по новым результатам и поставить точки, пока цель видна.
+// Сначала — трек алгоритма (тот же или новый номер рядом), нет его — поиск по картинке около
+// прошлого места. Не нашлась около секунды — пауза там, где её потеряли: щёлкнуть по дрону снова
 void ann_follow_update(App& a) {
-    if (!a.annFollowId) return;
+    if (!a.annFollow) return;
     if (!a.annotate || !a.ann.find(a.annFollowObj)) {
         ann_follow_stop(a, nullptr);
         return;
@@ -323,6 +456,8 @@ void ann_follow_update(App& a) {
     int first, last;
     if (!a.pipe.historyRange(first, last)) return;
     AnnObject* ob = a.ann.find(a.annFollowObj);
+    const double fps = a.pipe.info().fps;
+    const int64_t grace = std::max<int64_t>(5, (int64_t)(fps > 0 ? fps : 30));
     for (int seq = std::max(first, a.annFollowSeq + 1); seq <= last; ++seq) {
         auto r = a.pipe.at(seq);
         if (!r) continue;
@@ -332,10 +467,50 @@ void ann_follow_update(App& a) {
             ann_follow_stop(a, "разметка за целью остановлена: видео перемотали");
             return;
         }
+        if (r->dup) continue;   // повтор прошлого кадра записи экрана
         const Track* t = nullptr;
-        for (const auto& x : r->tracks)
-            if (x.id == a.annFollowId) t = &x;
-        if (!t) {
+        if (a.annFollowId)
+            for (const auto& x : r->tracks)
+                if (x.id == a.annFollowId && x.miss == 0) t = &x;
+        if (t) {   // тот же трек не должен уйти далеко от прошлого места (перескок на помеху)
+            float x, y;
+            track_to_video(a, *r, *t, x, y);
+            const VideoInfo vi = a.pipe.info();
+            const float lim = 0.02f * (float)std::max(vi.w, 640) + 2.f * (float)std::min<int64_t>(idx - a.annSeenFrame, 60);
+            if (std::hypot(x - a.annSeenX, y - a.annSeenY) > lim) t = nullptr;
+        }
+        if (!t) t = ann_follow_reacquire(a, *r);
+        bool found = false;
+        if (t) {
+            track_to_video(a, *r, *t, a.annSeenX, a.annSeenY);
+            a.annFollowId = t->id;
+            ann_grab(a, *r);   // как цель выглядит сейчас — на случай, если трек дальше пропадёт
+            ++a.annByTrack;
+            found = true;
+        } else {
+            a.annFollowId = 0;
+            float kx, ky;
+            if (!a.annTpl.empty() && frame_scale(a, *r, kx, ky)) {
+                const int64_t gap = std::min<int64_t>(idx - a.annSeenFrame, 10);
+                float x = a.annSeenX * kx, y = a.annSeenY * ky, sc = 0;
+                const int S = std::min(24, 4 + 2 * (int)gap);
+                if (tpl_match(*r->frame, a.annTpl, x, y, S, sc) && sc > 0.6f) {
+                    a.annSeenX = x / kx;
+                    a.annSeenY = y / ky;
+                    std::vector<float> nt;   // шаблон понемногу следует за видом цели
+                    if (tpl_grab(*r->frame, x, y, nt)) {
+                        double n = 0;
+                        for (size_t k = 0; k < nt.size(); ++k) n += (a.annTpl[k] = 0.9f * a.annTpl[k] + 0.1f * nt[k]) * a.annTpl[k];
+                        if (n > 0)
+                            for (float& v : a.annTpl) v /= (float)std::sqrt(n);
+                    }
+                    ++a.annByImage;
+                    found = true;
+                }
+            }
+        }
+        if (!found) {
+            if (idx - a.annSeenFrame <= grace) continue;   // дрон мог мигнуть: ждём до секунды
             char b[160];
             snprintf(b, sizeof(b), "цель потеряна после кадра %lld: найдите дрон и щёлкните по нему снова",
                      (long long)a.annSeenFrame);
@@ -343,10 +518,10 @@ void ann_follow_update(App& a) {
             a.pipe.setPaused(true);
             return;
         }
-        if (t->miss > 0) continue;   // на прогнозе: точку не ставим, ждём, найдётся ли
-        track_to_video(a, *r, *t, a.annSeenX, a.annSeenY);
         a.annSeenFrame = idx;
         if (idx - a.annFollowKey >= a.annStep) {
+            // пройденный участок — заново: старые точки на нём (прошлый проход, ошибка) убрать
+            ob->keys.erase(ob->keys.upper_bound(a.annFollowKey), ob->keys.lower_bound(idx));
             ob->keys[idx] = {a.annSeenX, a.annSeenY};
             a.annFollowKey = idx;
             a.annDirty = true;
@@ -355,7 +530,7 @@ void ann_follow_update(App& a) {
     // файл — не чаще раза в секунду: на нём пересчитывается качество
     if (a.annDirty && now_ms() - a.annSavedAt > 1000) {
         ann_changed(a);
-        a.annMsg = "разметка идёт за целью #" + std::to_string(a.annFollowId) + ": " + a.annMsg;
+        a.annMsg = "разметка идёт за целью: " + a.annMsg;
         a.annDirty = false;
         a.annSavedAt = now_ms();
     }
@@ -673,8 +848,8 @@ void panel_annotate(App& a) {
                 "по прямой, поэтому точку достаточно ставить раз в 10-30 кадров и на поворотах; объект есть "
                 "от первой до последней точки. Правый щелчок — убрать точку на этом кадре. Сохраняется сразу "
                 "в <видео>.gt.json, рядом с видео.");
-    ImGui::TextWrapped("Пауза, щелчок по дрону — опорная точка, правый щелчок — убрать. Щелчок по цели алгоритма — "
-                       "дальше точки ставятся сами, пока цель видна.");
+    ImGui::TextWrapped("Пауза, щелчок по дрону — опорная точка, дальше точки ставятся сами, пока дрон виден. "
+                       "Ошиблись — пауза и щелчок по дрону: поправит и поведёт дальше. Правый щелчок — убрать точку.");
     if (!a.annotate) {
         ann_follow_stop(a, nullptr);
         if (a.ann.noDrones) ImGui::TextDisabled("ролик отмечен: дронов нет");
@@ -693,18 +868,46 @@ void panel_annotate(App& a) {
         return;
     }
     ImGui::Checkbox("Вести точки по цели", &a.annAuto);
-    help_marker("Щелчок по цели алгоритма (рамке) — и дальше, пока видео идёт, точки ставятся сами по её треку раз "
-                "в N кадров. Цель потерялась — видео встаёт на паузу: найдите дрон и щёлкните снова. Если трек "
-                "ушёл на другой объект — пауза, отмотайте назад и «стереть точки дальше».");
+    help_marker("Щелчок по дрону (или кнопка «вести точки по захвату») — и дальше, пока видео идёт, точки ставятся "
+                "сами раз в N кадров: по треку алгоритма, а где трека нет (трекер сбросил треки, дрон принят за "
+                "помеху, захват перешёл на новый номер) — по картинке, по виду дрона около прошлого места. Дрон не "
+                "нашёлся больше секунды — видео встаёт на паузу: щёлкните по нему снова. Ушло на другой объект — "
+                "пауза, стрелкой влево назад к ошибке и щелчок по дрону: точки пойдут заново от этого кадра, "
+                "старые на пройденном участке заменятся.");
     if (a.annAuto) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderInt("##annstep", &a.annStep, 2, 60, "раз в %d кадр.");
     }
-    if (a.annFollowId) {
-        ImGui::TextColored(TXT_OK, "идёт за целью #%d, кадр %lld", a.annFollowId, (long long)a.annSeenFrame);
+    if (a.annFollow) {
+        if (a.annFollowId)
+            ImGui::TextColored(TXT_OK, "идёт за целью #%d, кадр %lld", a.annFollowId, (long long)a.annSeenFrame);
+        else
+            ImGui::TextColored(TXT_OK, "идёт по картинке, кадр %lld", (long long)a.annSeenFrame);
         ImGui::SameLine();
         if (ImGui::SmallButton("стоп")) ann_follow_stop(a, "разметка за целью остановлена");
+        if (a.annByImage > 0)
+            ImGui::TextDisabled("кадров по треку %d, по картинке %d", a.annByTrack, a.annByImage);
+    } else if (a.annAuto) {
+        // без щелчка: начать с захваченной цели на показанном кадре
+        const std::shared_ptr<const Result> sh = a.shown;
+        const Track* lk = nullptr;
+        if (sh && !sh->follow)
+            for (const auto& t : sh->tracks)
+                if (t.id == sh->lockId) lk = &t;
+        ImGui::BeginDisabled(!lk);
+        if (ImGui::Button(lk ? "вести точки по захвату" : "вести точки по захвату (захвата нет)", ImVec2(-FLT_MIN, 0)) &&
+            lk) {
+            if (!a.ann.find(a.annCur)) a.annCur = a.ann.add(false);
+            float x, y;
+            track_to_video(a, *sh, *lk, x, y);
+            a.ann.find(a.annCur)->keys[sh->frame->index] = {x, y};
+            ann_changed(a);
+            ann_follow_start(a, *sh, lk, x, y);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Точка на этом кадре ставится в захват, дальше — сами по нему. Захват ушёл на "
+                              "другой объект — пауза, щелчок по дрону поправит точку и поведёт дальше от неё");
     }
     const float bw = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3;
     if (ImGui::Button("+ дрон", ImVec2(bw, 0))) a.annCur = a.ann.add(false);
@@ -894,6 +1097,17 @@ void tab_video(App& a, bool& changed) {
     }
     heading("Проигрывание");
     changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
+    if (ImGui::Checkbox("Чистый старт (без накопленного опыта)", &a.s.fresh)) {
+        a.pipe.setSettings(a.s);
+        if (a.s.fresh) {   // забыть уже накопленное и пройти видео с начала
+            a.pipe.forget();
+            seek_to(a, 0, false);
+        }
+    }
+    help_marker("Видео проверяется так, будто открыто впервые: память статичных помех (.static.bin) и маска неба "
+                "(.mask.bin), накопленные прошлыми запусками рядом с видео, не загружаются и не перезаписываются, "
+                "а на каждом новом проходе зацикленного видео маска неба учится заново. Включение забывает уже "
+                "накопленное и начинает видео сначала. Для честной оценки настроек; мультитест всегда идёт так.");
     changed |= ImGui::Checkbox("Пропускать повторы кадра", &a.s.skipDuplicates);
     help_marker("Запись экрана 60 к/с с ролика 25-30 к/с повторяет каждый кадр 2-3 раза. Включено — повтор не "
                 "обрабатывается, трекер видит ролик с его настоящей частотой, как с камеры 25-30 к/с. Выключено — "
@@ -1533,6 +1747,9 @@ void mt_setup(App& a) {
     ImGui::Checkbox("с имитацией устройства", &a.mtEmulate);
     help_marker("Оставить замедление выбранного устройства (Raspberry Pi). Имеет смысл вместе с «как камера» — тогда "
                 "видно, сколько захвата теряется из-за пропущенных кадров. Иначе только дольше.");
+    ImGui::TextDisabled("каждый прогон — чистый старт, без накопленного опыта");
+    ImGui::SetItemTooltip("Память помех и маска неба, накопленные прошлыми запусками рядом с видео (.static.bin, "
+                          ".mask.bin), не загружаются и не перезаписываются: варианты сравниваются честно");
     ImGui::EndDisabled();
     ImGui::Spacing();
     {
@@ -2166,20 +2383,23 @@ void draw_view(App& a, const Result* r) {
             float fx = (io.MousePos.x - o.x) / sc, fy = (io.MousePos.y - o.y) / sc;
             float best = 14.f / sc;
             const Track* snap = nullptr;
+            // и к «статичной помехе»: зависший или медленный дрон трекер тоже считает помехой
             for (const auto& t : r->tracks)
-                if (!t.clutter && std::hypot(t.x - fx, t.y - fy) < best) {
+                if (std::hypot(t.x - fx, t.y - fy) < best) {
                     best = std::hypot(t.x - fx, t.y - fy);
                     fx = t.x;
                     fy = t.y;
                     snap = &t;
                 }
+            if (!snap && !r->follow) snap_to_spot(f, fx, fy, std::min(12, std::max(2, (int)std::lround(3 / sc))));
             if (fx >= 0 && fy >= 0 && fx < f.w && fy < f.h) {
                 ann_follow_stop(a, nullptr);
                 if (!a.ann.find(a.annCur)) a.annCur = a.ann.add(false);
                 a.ann.find(a.annCur)->keys[f.index] = {fx / kx, fy / ky};
                 ann_changed(a);
-                // по последнему кадру — его результаты дальше и пойдут; кадр из истории — нет
-                if (snap && a.annAuto && a.viewSeq < 0 && !r->follow) ann_follow_start(a, *r, *snap);
+                // и с кадра из истории: следующие кадры истории уже посчитаны, по ним точки встанут сразу.
+                // Нет цели алгоритма под щелчком — дальше по картинке
+                if (a.annAuto && !r->follow) ann_follow_start(a, *r, snap, fx / kx, fy / ky);
             }
         }
         if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
