@@ -94,6 +94,14 @@ DL_API int dl_tracker_focus(dl_tracker* t, float* xyr, int cap);
 DL_API void dl_detector_set_focus(dl_detector* d, const float* xyr, int n);
 DL_API int dl_tracker_clutter(dl_tracker* t, dl_candidate* out, int cap);
 DL_API void dl_tracker_reset(dl_tracker* t);
+/* Очередь целей (несколько дронов в кадре): id подтверждённых треков по весомости для захвата,
+   самый весомый первым; возвращает длину очереди. Захваченная цель — dl_tracker_locked.
+   dl_tracker_select — захват на трек id (ручной выбор держится, пока цель жива; 1 — выбран),
+   dl_tracker_next — на следующий в очереди после захваченного (по кругу), возвращает его id. */
+DL_API int dl_tracker_queue(dl_tracker* t, int* ids, int cap);
+DL_API int dl_tracker_locked(dl_tracker* t);
+DL_API int dl_tracker_select(dl_tracker* t, int id);
+DL_API int dl_tracker_next(dl_tracker* t);
 /* Долгая память статичных помех (неподвижная камера): frames = 0 выключает,
    hits — сколько неподвижных откликов делают место помехой. Файл привязан к размеру кадра. */
 DL_API void dl_tracker_set_static(dl_tracker* t, int frames, float hits);

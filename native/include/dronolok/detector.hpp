@@ -342,6 +342,13 @@ struct TrackerConfig {
     // самолёты и вертолёты 53% -> 45%, ложный захват 26% кадров, как и было.
     float lock_cmax = 0.f;
     float lock_slow = 1.f;
+    // Камера ведёт цель (игра, поворотка, оператор): пока камера поворачивается
+    // (setMovingCamera), цель в середине кадра, прошедшая по кадру меньше follow_frac пути камеры
+    // (последние до 48 попаданий), — та, за которой камера следит. Её вес для захвата — score x follow_k, без
+    // поправок lock_slow (её скорость по сцене — это скорость камеры). Фон, едущий вместе с
+    // камерой, по сцене стоит. War Thunder wt15, wt18, wt19 (камера игры ведёт дрон). 0 — выкл.
+    float follow_k = 3.f;
+    float follow_frac = 0.3f;
     float hard_switch = 2.f;
     int clutter_cell = 8;       // ячейка карты статичного клаттера
     float clutter_decay = 0.97f;
@@ -490,6 +497,8 @@ struct Track {
     float straight = 1.f;    // прямота пути за последние попадания (см. edge_straight)
     bool flock = false;      // летит в стае с машущей птицей
     bool overlay = false;    // наложение на кадр: стоит в кадре, пока камера движется
+    bool followed = false;   // камера поворачивается за ним: по кадру почти стоит, по сцене летит
+    bool everFollowed = false;   // камера его вела: зависнув потом, помехой не становится
     bool anchored = false;   // на мачте или столбе (см. Silhouette::attached): не дрон
     // ожидание размера (захват): логарифм видимого размера и его изменение за кадр
     float ls = 0, dls = 0;
@@ -535,6 +544,18 @@ public:
     // не превзошёл другой в lock_switch раз. 0 — захвата нет.
     int lockedId() const { return lockId_; }
     LockState lockState() const { return !lockId_ ? LockState::None : hard_ ? LockState::Hard : LockState::Tracking; }
+    // Очередь целей: подтверждённые треки в кадре (не помехи) по весомости для захвата
+    // (Track::lockW — уверенность, что это дрон, с приоритетом летящих), самая весомая первой.
+    // Захваченная — тоже в очереди, на своём месте
+    void lockQueue(std::vector<int>& ids) const;
+    // Ручной выбор цели (оператор, поворотка): захват переходит на трек id из очереди и держится
+    // на нём, пока цель жива, — более весомые его не перебивают. Проверка (жёсткий захват)
+    // начинается заново. false — такого трека в очереди нет
+    bool selectLock(int id);
+    // Следующая цель очереди после захваченной (по кругу); возвращает её id, 0 — очередь пуста
+    int nextLock();
+    // захват выбран вручную (selectLock/nextLock) и держится, пока цель жива
+    bool manualLock() const { return lockId_ && manual_; }
     // сколько кадров подряд захваченная цель — дрон (до verify_frames — проверка)
     int verifyFrames() const { return verify_; }
     // Жёсткий захват: детектору смотреть весь кадр раз в столько кадров (иначе 1)
@@ -546,6 +567,11 @@ public:
     void setLockSilhouette(const Silhouette& s) { lockSilh_ = s; }
     // При движущейся камере долгая память учится только наложениям на кадр (см. overlay_hits)
     void setMovingCamera(bool m) { movingCam_ = m; }
+    // Сдвиг камеры, которому для прогноза не доверяем (оценка по облакам и веткам на крупном
+    // кадре), только для координат сцены: пробег, скорость и класс цели считаются по сцене.
+    // Цель, которую камера ведёт, тогда «летит», а фон, едущий навстречу, стоит и становится
+    // помехой. Действует на следующий update()
+    void setSceneShift(float dx, float dy) { sceneDx_ = dx; sceneDy_ = dy; }
     // Камера на поворотном устройстве ведёт захваченную цель: цель стоит почти на месте
     // кадра, а фон едет навстречу её движению (сдвиг камеры — в update как camDx/camDy, от
     // датчиков поворотки или GlobalMotion). Захваченная цель тогда не считается наложением
@@ -560,6 +586,10 @@ public:
     // кандидаты, не попавшие ни в клаттер, ни в подтверждённый трек
     const std::vector<Candidate>& noiseDets() const { return noiseDets_; }
     void resetTracks();
+    // то же, но цель, которую вела камера, остаётся (с захватом, если он на ней)
+    void resetTracksKeepFollowed();
+    // маска неба выучена заново: убрать треки, оказавшиеся на земле (тайл маски 0), кроме захваченного
+    void dropMasked(const std::vector<uint8_t>& mask, int tw, int th, int tilePx);
     // Память статичных помех: сохранить/загрузить (файл привязан к размеру кадра), забыть,
     // и центры запомненных ячеек — для отображения
     bool saveStatic(const std::string& path) const;
@@ -579,6 +609,8 @@ private:
     void staticAdd(size_t i);
     bool staticHot(float x, float y) const;
     bool silhouetteFor(const Track& t) const;
+    bool followedNow(const Track& t) const;   // камера ведёт эту цель (см. follow_k)
+    bool midFrame(float x, float y) const;    // середина кадра: там нет надписей, там ведомая цель
     void classify(Track& t) const;
     void shiftHeat(float dx, float dy);
     float measVar(int level) const;
@@ -596,6 +628,8 @@ private:
     std::vector<int> lastDet_;  // кадр последнего отклика в ячейке (не от трека спокойного неба)
     int quietEpoch_ = 0;        // кадр, когда камера последний раз двигалась
     float gx_ = 0, gy_ = 0;   // накопленный сдвиг камеры
+    float sceneDx_ = 0, sceneDy_ = 0;
+    int frameW_ = 0, frameH_ = 0;
     std::vector<Track> tracks_, out_;
     std::vector<Candidate> clutterDets_, noiseDets_;
     int nextId_ = 1;
@@ -604,6 +638,7 @@ private:
     std::vector<std::pair<int, int>> beat_;   // претенденты на захват: id и сколько кадров подряд весомее
     int verify_ = 0;
     bool hard_ = false;
+    bool manual_ = false;   // захват выбран вручную
     Silhouette lockSilh_;
     bool movingCam_ = false;
     bool following_ = false;
