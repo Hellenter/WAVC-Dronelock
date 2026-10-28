@@ -72,6 +72,11 @@ struct Settings {
     // маска неба из файла рядом с видео (<видео>.mask.bin) вместо обучения на каждом старте;
     // первые learnMaskFrames кадров она сверяется с видимым, при расхождении учится заново
     bool maskFile = true;
+    // чистый старт: накопленное с прошлых запусков (память помех, маска неба из файлов рядом
+    // с видео) не читается и не пишется — видео проверяется так, будто открыто впервые
+    bool fresh = false;
+    bool useStaticFile() const { return staticFile && !fresh; }
+    bool useMaskFile() const { return maskFile && !fresh; }
     // трекер считает в секундах: скорости, ворота и выдержки пересчитываются под частоту
     // кадров (dronolok::tracker_for_fps; повторы кадров записи экрана не считаются)
     bool trkSeconds = true;
@@ -232,6 +237,11 @@ public:
     // Ручной выбор держится, пока цель жива (Tracker::selectLock)
     void nextTarget() { lockCmd_ = -1; }
     void selectTarget(int id) { lockCmd_ = id; }
+    // забыть накопленное в этом запуске (память помех, маску неба), файлы не трогать
+    void forget() {
+        staticCmd_ = 3;
+        relearnMask();
+    }
     void resetStats();
     // Разметка <видео>.gt.json: заменить на ходу (после правки в приложении); пустая — убрать
     std::string gtPath() const { return path_ + ".gt.json"; }

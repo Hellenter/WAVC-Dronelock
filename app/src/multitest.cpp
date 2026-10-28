@@ -480,6 +480,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     s.loop = false;
     s.staticFile = false;   // память помех от прошлых прогонов исказила бы сравнение
     s.maskFile = c.maskFile;
+    s.fresh = !c.maskFile;   // чистый старт: накопленное рядом с видео не читается и не пишется
     s.trackLog.clear();
     if (!c.emulate) {
         s.slowdown = 1;
