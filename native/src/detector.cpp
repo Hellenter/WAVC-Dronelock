@@ -159,9 +159,15 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
         std::vector<int> edge(tw_, th_);
         for (int x = 0; x < tw_; ++x) {
             int below = 0;   // текстурных тайлов от y до низа кадра
+            int gap = 0;     // гладких тайлов подряд над землёй
             for (int y = th_ - 1; y >= 0; --y) {
-                below += bad[(size_t)y * tw_ + x] != 0;
-                if (bad[(size_t)y * tw_ + x] && 2 * below > th_ - y) edge[x] = y;
+                const bool b = bad[(size_t)y * tw_ + x] != 0;
+                below += b;
+                gap = b ? 0 : gap + 1;
+                // кромка не выше просвета в 3 тайла: облако над лесом (тёмное небо, яркие
+                // облака — wt7) — не продолжение крон, и столбец под ним не земля
+                if (below && gap > 2) break;
+                if (b && 2 * below > th_ - y) edge[x] = y;
             }
         }
         // столбец, где кромки не нашлось или она много ниже, чем у обоих соседей (гладкая
