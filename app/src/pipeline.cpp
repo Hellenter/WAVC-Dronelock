@@ -475,7 +475,7 @@ void Pipeline::processLoop() {
     int fix = -1, fiy = -1, fcw = 0, fch = 0, noAim = 0;
     bool trkFollow = false;   // трекер считает в окне поворотки: память помех не того размера
     auto saveStatic = [&] {
-        if (!trk || trkFollow || trk->config().static_frames <= 0 || !s.staticFile) return;
+        if (!trk || trkFollow || trk->config().static_frames <= 0 || !s.useStaticFile()) return;
         trk->staticCells(statCells);
         if (!statCells.empty()) trk->saveStatic(staticPath());
     };
@@ -596,7 +596,7 @@ void Pipeline::processLoop() {
             trkH = f.h;
             trkCell = s.trk.clutter_cell;
             trkFollow = s.follow;
-            if (s.staticFile && !trkFollow && trk->loadStatic(staticPath())) {
+            if (s.useStaticFile() && !trkFollow && trk->loadStatic(staticPath())) {
                 trk->staticCells(statCells);
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = "память помех загружена: " + std::to_string(statCells.size()) + " ячеек";
@@ -607,21 +607,25 @@ void Pipeline::processLoop() {
         // на кадр (надписи, логотипы), см. TrackerConfig::overlay_hits
         trk->config().static_frames = s.trk.static_frames;
         if (const int cmd = staticCmd_.exchange(0)) {
-            if (cmd == 2) {
-                trk->clearStatic();
-                remove_file(staticPath());
-            }
+            if (cmd >= 2) trk->clearStatic();
+            if (cmd == 2) remove_file(staticPath());
             trk->staticCells(statCells);
             trk->getStatic(statSnap);
-            const bool ok = cmd == 2 || trk->saveStatic(staticPath());
+            const bool ok = cmd >= 2 || trk->saveStatic(staticPath());
             std::lock_guard<std::mutex> lr(rm_);
-            staticMsg_ = cmd == 2 ? "память помех очищена"
+            staticMsg_ = cmd == 3   ? "чистый старт: накопленная память забыта, маска неба учится заново"
+                         : cmd == 2 ? "память помех очищена"
                          : ok     ? "сохранено " + std::to_string(statCells.size()) + " ячеек: " + staticPath()
                                   : "не удалось сохранить " + staticPath();
         }
         if (p.loopStart || p.seekStart) {   // склейка зацикленного видео или перемотка — треки не должны "прыгать"
             trk->resetTracks();
             trk->setStatic(statSnap);
+            // чистый старт: каждый проход как первый — и маска неба учится заново
+            if (s.fresh && p.loopStart) {
+                maskForce_ = true;
+                relearn_ = true;
+            }
             gm.reset();
             camHist.clear();
         }
@@ -648,7 +652,7 @@ void Pipeline::processLoop() {
         } else if (relearn_.exchange(false)) {
             const bool force = maskForce_.exchange(false);
             // маска из файла сразу закрывает лес, а первые кадры сверяется с видимым
-            if (s.learnMaskFrames > 0 && s.maskFile && !force && det.loadMask(maskPath(), s.learnMaskFrames)) {
+            if (s.learnMaskFrames > 0 && s.useMaskFile() && !force && det.loadMask(maskPath(), s.learnMaskFrames)) {
                 learnLeft = 0;
                 maskOn = true;
                 maskChecking = true;
@@ -766,14 +770,14 @@ void Pipeline::processLoop() {
             const bool learning = det.learningMask();
             if (maskChecking && !det.verifyingMask()) {   // сверка маски из файла закончилась
                 maskChecking = false;
-                if (det.maskReplaced() && s.maskFile) det.saveMask(maskPath());
+                if (det.maskReplaced() && s.useMaskFile()) det.saveMask(maskPath());
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = det.maskReplaced() ? "сцена изменилась: маска неба выучена заново и сохранена"
                                                 : "маска неба из файла подтверждена";
             }
             if (learnLeft > 0 && --learnLeft == 0) {
                 det.endMaskLearning();
-                if (s.maskFile) det.saveMask(maskPath());
+                if (s.useMaskFile()) det.saveMask(maskPath());
                 // треки, начатые до маски, могли родиться на том, что маска теперь закрыла
                 // (надписи поверх записи экрана, кромка крыш): начинаем заново
                 if (trk->lockState() != dronolok::LockState::Hard) trk->resetTracks();
