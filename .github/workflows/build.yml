@@ -62,7 +62,7 @@ jobs:
       - name: Мультитест (без окна, синтетика с разметкой)
         run: |
           ./build-app/dronolok_app --multitest sample --vary auto_thr --vary thr=8,14 --vary lock_slow --frames 40 --parallel 2 --out mt-linux
-          python -c "import json; d=json.load(open('mt-linux/results.json')); r=d['runs']; assert len(r)==4 and all(x['done'] for x in r) and r[0]['recall_drone'] is not None, r; print('прогонов', len(r), 'оценка базы', r[0]['score'])"
+          python -c "import json; d=json.load(open('mt-linux/results.json')); r=d['runs']; assert len(r)==5 and all(x['done'] for x in r) and r[0]['recall_drone'] is not None, r; print('прогонов', len(r), 'оценка базы', r[0]['score'])"
       - uses: actions/upload-artifact@v4
         with:
           name: multitest-linux
