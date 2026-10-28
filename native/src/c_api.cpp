@@ -126,6 +126,16 @@ dl_tracker* dl_tracker_create(int w, int h) {
 void dl_tracker_destroy(dl_tracker* t) { delete t; }
 void dl_tracker_reset(dl_tracker* t) { t->trk.resetTracks(); }
 
+int dl_tracker_queue(dl_tracker* t, int* ids, int cap) {
+    std::vector<int> q;
+    t->trk.lockQueue(q);
+    for (int i = 0; ids && i < std::min((int)q.size(), cap); ++i) ids[i] = q[i];
+    return (int)q.size();
+}
+int dl_tracker_locked(dl_tracker* t) { return t->trk.lockedId(); }
+int dl_tracker_select(dl_tracker* t, int id) { return t->trk.selectLock(id) ? 1 : 0; }
+int dl_tracker_next(dl_tracker* t) { return t->trk.nextLock(); }
+
 int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* out, int cap) {
     if (!dets || n < 0) n = 0;   // resize(-1) — это 4 миллиарда элементов
     t->dets.resize((size_t)n);

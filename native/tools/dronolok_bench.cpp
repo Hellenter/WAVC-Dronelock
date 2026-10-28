@@ -180,6 +180,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-fine-mask") cfg.fine_mask = false;
         else if (a == "--lock-slow") tcfg.lock_slow = (float)std::atof(val().c_str());
         else if (a == "--lock-dwell") tcfg.lock_dwell = std::atoi(val().c_str());
+        else if (a == "--follow-k") tcfg.follow_k = (float)std::atof(val().c_str());
         else if (a == "--hard-switch") tcfg.hard_switch = (float)std::atof(val().c_str());
         else if (a == "--edge-mover-k") tcfg.edge_mover_k = (float)std::atof(val().c_str());
         else if (a == "--bg-k") cfg.bg_k = (float)std::atof(val().c_str());

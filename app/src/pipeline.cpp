@@ -447,6 +447,7 @@ void Pipeline::processLoop() {
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
     bool maskOn = false, motionWas = false, maskChecking = false;
+    bool relearnMoved = false;   // маска учится заново после плавного поворота камеры (панорамы)
     // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
     float uniqShare = 1.f, trkFps = 0.f;
     auto trkCfg = [&](const Settings& st) {
@@ -462,6 +463,11 @@ void Pipeline::processLoop() {
     // "авто" при крупном кадре: движение камеры оценивается всегда (~2 мс на 4 Мп), и если
     // камера ведёт съёмку с рук или панораму — учёт движения включается
     std::deque<float> camHist;
+    // панорама в авто на крупном кадре: камера плавно поворачивается (игра или поворотка ведёт
+    // цель). Маска неба, привязанная к кадру, тогда неверна — как при съёмке с рук
+    std::deque<std::pair<float, float>> panHist;
+    float panX = 0, panY = 0;
+    bool panning = false;
     DupCheck dupCheck;
     int dupRun = 0;
     std::shared_ptr<Result> lastR;
@@ -549,7 +555,7 @@ void Pipeline::processLoop() {
         const Frame& f = *view;
         DetectorConfig want = s.det;
         want.scales = ef.scales;
-        want.zones = ef.zones;
+        want.zones = ef.zones || (panning && s.zones < 0);   // панорама: маски нет, землю убирают зоны
         if (s.governor) LoadGovernor::apply(gov.level(), want);
         else gov.reset();
         // жёсткий захват: весь кадр — реже, между ними детектор смотрит только вокруг цели
@@ -559,14 +565,14 @@ void Pipeline::processLoop() {
         if (p.loopStart || p.seekStart) scene.reset();
         if (s.adapt) {
             const double base = s.targetFps > 0 ? s.targetFps : info_.fps;
-            if (scene.update(f.px.data(), f.w, f.h, f.w, (float)base, ef.motion || s.follow)) {
+            if (scene.update(f.px.data(), f.w, f.h, f.w, (float)base, ef.motion || s.follow || panning)) {
                 sceneMoved = scene.state().moved;
                 sceneLight = scene.state().lightJump;
             }
             DetectorConfig sd;
             TrackerConfig st;
             scene_profile(scene.state(), want, trkCfg(s), sd, st, &sceneWhy);
-            if (!dirty && scene_mask_stale(dc, sd) && maskOn && !ef.motion && !s.follow) {
+            if (!dirty && scene_mask_stale(dc, sd) && maskOn && !ef.motion && !s.follow && !panning) {
                 maskForce_ = true;   // маска выучена с другим порогом или полярностью — учить заново
                 relearn_ = true;
             }
@@ -624,18 +630,24 @@ void Pipeline::processLoop() {
             trk->setStatic(statSnap);
             gm.reset();
             camHist.clear();
+            panHist.clear();
+            panX = panY = 0;
+            panning = false;
         }
         // Маска неба привязана к кадру и годится только для неподвижной камеры: при съёмке с рук
         // земля через секунду окажется там, где было небо, и наоборот (дрон пропадёт в "маске").
         // камера, ведущая цель, тоже поворачивается: маска неба не годится
-        const bool camMoves = ef.motion || s.follow;
+        const bool camMoves = ef.motion || s.follow || panning;
         if (sceneLight) det.resetBackground();   // облако закрыло солнце: старый фон ячеек только мешает
         if (sceneMoved && !camMoves && maskOn) {   // камеру повернули: маска неба — заново, не из файла
             maskForce_ = true;
             relearn_ = true;
+            // камера плывёт медленнее порога панорамы (ведёт цель) — треки живут; скачок вида
+            // (смена камеры в игре, монтаж) — треки заново
+            relearnMoved = std::hypot(panX, panY) * 2560.f / std::max(1, f.w) >= 8.f;
         }
         if (camMoves != motionWas) {
-            if (!camMoves) relearn_ = true;
+            if (!camMoves) relearn_ = true, relearnMoved = true;
             motionWas = camMoves;
         }
         if (camMoves) {
@@ -714,11 +726,33 @@ void Pipeline::processLoop() {
                 while (camHist.size() > 60) camHist.pop_front();
                 float recent = 0;
                 for (float d : camHist) recent += d;
-                trk->setMovingCamera(ef.motion || recent > 4.f);
+                trk->setMovingCamera(ef.motion || recent > 4.f || panning);
+                // панорама: смещение за последнюю секунду (со знаком: дрожь оценки по облакам
+                // гасится, плавный поворот копится; скачки при смене вида камеры не в счёт).
+                // Вход — от 20 пикс./с на 2560 пикс. ширины, выход — ниже 8
+                if (autoMotion && !ef.motion && s.panDetect) {
+                    const float jump = 120.f * src.w / 2560.f;
+                    const bool ok = me.valid && std::hypot(me.dx, me.dy) < jump;
+                    panHist.emplace_back(ok ? me.dx : 0.f, ok ? me.dy : 0.f);
+                    panX += panHist.back().first;
+                    panY += panHist.back().second;
+                    const size_t win = (size_t)std::max(10L, std::lround(trkFps > 0 ? trkFps : info_.fps > 0 ? info_.fps : 30.0));
+                    while (panHist.size() > win) {
+                        panX -= panHist.front().first;
+                        panY -= panHist.front().second;
+                        panHist.pop_front();
+                    }
+                    const float net = std::hypot(panX, panY) * 2560.f / src.w;
+                    panning = panning ? net >= 8.f : net > 20.f;
+                }
             } else {
                 trk->setMovingCamera(ef.motion);
             }
-            if (!ef.motion) me.dx = me.dy = 0;   // камера стоит: трекеру сдвиг не нужен
+            // крупный кадр, авто, панорама: сдвиг — только для координат сцены (кого камера ведёт;
+            // у неподвижной камеры оценка по плывущим облакам дала бы сцене ложный дрейф)
+            if (!ef.motion && autoMotion && panning && s.sceneShift && me.valid) trk->setSceneShift(me.dx, me.dy);
+            if (!ef.motion && !(panning && s.panMotion)) me.dx = me.dy = 0;   // камера стоит: трекеру сдвиг не нужен
+            if (panning && s.panMotion) trk->setSceneShift(0, 0);
             // поворот окна известен точно: картинка в нём сдвинулась навстречу
             me.dx -= cropDx;
             me.dy -= cropDy;
@@ -743,6 +777,10 @@ void Pipeline::processLoop() {
             }
             const double t1 = now_ms();
             const auto& tracks = trk->update(cands, me.dx, me.dy);
+            if (const int lc = lockCmd_.exchange(0)) {   // оператор выбрал цель из очереди
+                if (lc < 0) trk->nextLock();
+                else trk->selectLock(lc);
+            }
             // поворотка на следующий кадр: со скоростью цели плюс доля ошибки до центра окна
             if (s.follow) {
                 float ax, ay, avx, avy, sx = 0, sy = 0;
@@ -775,8 +813,14 @@ void Pipeline::processLoop() {
                 det.endMaskLearning();
                 if (s.maskFile) det.saveMask(maskPath());
                 // треки, начатые до маски, могли родиться на том, что маска теперь закрыла
-                // (надписи поверх записи экрана, кромка крыш): начинаем заново
-                if (trk->lockState() != dronolok::LockState::Hard) trk->resetTracks();
+                // (надписи поверх записи экрана, кромка крыш): начинаем заново. После панорамы
+                // убираем только оказавшиеся на земле — камера, ведущая цель, остановилась, и
+                // цель не должна теряться
+                if (trk->lockState() != dronolok::LockState::Hard) {
+                    if (relearnMoved) trk->dropMasked(det.tileMask(), det.tilesX(), det.tilesY(), det.tileSizePx());
+                    else trk->resetTracksKeepFollowed();
+                }
+                relearnMoved = false;
             }
             // эмуляция устройства: ядро медленнее в slowdown раз, плюс нижняя граница времени кадра
             if (s.slowdown > 1) wait_until(t0 + (t2 - t0) * std::min(100.0, s.slowdown), stop_);
@@ -806,6 +850,8 @@ void Pipeline::processLoop() {
             r->learning = learning;
             r->seq = ++seq;
             r->lockId = trk->lockedId();
+            trk->lockQueue(r->lockQueue);
+            r->manualLock = trk->manualLock();
             r->camDx = me.dx;
             r->camDy = me.dy;
             r->camQ = me.quality;
@@ -911,18 +957,18 @@ void Pipeline::processLoop() {
         if (!s.trackLog.empty()) {
             if (!tlog) {
                 tlog.reset(open_file(s.trackLog, "w"));
-                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y\n");
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w\n");
             }
             if (tlog) {
                 if (tracks.empty())
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d\n", p.loop, (long long)f.index, r->lockId,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,\n", p.loop, (long long)f.index, r->lockId,
                             (int)r->lockState, statCells.size(), r->fx, r->fy);
                 // координаты — исходного кадра (и при виртуальной поворотке)
                 for (const auto& t : tracks)
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d\n", p.loop,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f\n", p.loop,
                             (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x + (float)r->fx, t.y + (float)r->fy,
                             t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits, t.travel, t.score, statCells.size(), t.bw,
-                            t.bh, t.expectedSize(), r->fx, r->fy);
+                            t.bh, t.expectedSize(), r->fx, r->fy, (int)t.followed, t.lockW);
             }
         }
         if (observer_) observer_(*r);

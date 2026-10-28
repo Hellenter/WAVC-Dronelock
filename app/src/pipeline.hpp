@@ -60,6 +60,9 @@ struct Settings {
     // алгоритм поверх det/trk; "авто" решается по размеру кадра (см. effective())
     int scales = 0;            // 0 = авто, иначе 1..4 (DetectorConfig::scales)
     int motion = -1;           // компенсация движения камеры: -1 авто, 0 выкл., 1 вкл.
+    bool sceneShift = true;    // авто на крупном кадре: сдвиг камеры — для координат сцены трекера
+    bool panDetect = true;     // авто на крупном кадре: плавный поворот камеры — без маски неба
+    bool panMotion = false;    // ...и с учётом сдвига в прогнозе трекера
     bool focus = false;        // пониженный порог возле прогноза треков (эксперимент)
     int zones = -1;            // зоны кадра небо/смешанные/земля: -1 авто, 0 выкл., 1 вкл.
     // память помех из файла рядом с видео: загружать при открытии и сохранять при закрытии.
@@ -126,6 +129,8 @@ struct Result {
     int seq = 0;
     // захват и прогноз
     int lockId = 0;                              // захваченная цель (Track::id), 0 — нет
+    std::vector<int> lockQueue;                  // очередь целей по весомости (Tracker::lockQueue)
+    bool manualLock = false;                     // захват выбран вручную
     float camDx = 0, camDy = 0, camQ = 0;        // сдвиг картинки за кадр и уверенность оценки
     bool camValid = false, motionOn = false;
     double motionMs = 0;
@@ -223,6 +228,10 @@ public:
     std::string maskPath() const { return path_ + ".mask.bin"; }
     void staticSave() { staticCmd_ = 1; }
     void staticClear() { staticCmd_ = 2; }
+    // Очередь целей: захват на следующую по весомости (по кругу) или на выбранный трек.
+    // Ручной выбор держится, пока цель жива (Tracker::selectLock)
+    void nextTarget() { lockCmd_ = -1; }
+    void selectTarget(int id) { lockCmd_ = id; }
     void resetStats();
     // Разметка <видео>.gt.json: заменить на ходу (после правки в приложении); пустая — убрать
     std::string gtPath() const { return path_ + ".gt.json"; }
@@ -277,6 +286,7 @@ private:
     std::atomic<bool> relearn_{true};
     std::atomic<bool> maskForce_{false};   // "заново": учить, даже если есть файл
     std::atomic<int> staticCmd_{0};
+    std::atomic<int> lockCmd_{0};   // -1 — следующая цель очереди, > 0 — id выбранного трека
     std::atomic<int64_t> seekReq_{-1};
     std::atomic<int64_t> preN_{0};       // кадров в предзагрузке (0 — читаем файл)
     std::string staticMsg_;

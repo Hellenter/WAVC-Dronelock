@@ -297,6 +297,31 @@ static void test_static_map() {
     std::printf("static map: ok\n");
 }
 
+// Очередь целей: две летящие цели — обе в очереди, весомая первой; "следующая" переводит
+// захват на другую, и ручной выбор держится, хоть первая и весомее
+static void test_lock_queue() {
+    Tracker t(640, 480);
+    auto cand = [](float x, float y, float c) {
+        Candidate d{};
+        d.x = x; d.y = y; d.contrast = c; d.snr = 5; d.polarity = -1; d.margin = c / 10.f;
+        return d;
+    };
+    auto step = [&](int i) { t.update({cand(100 + 3.f * i, 150, 60), cand(100 + 3.f * i, 350, 25)}); };
+    for (int i = 0; i < 40; ++i) step(i);
+    std::vector<int> q;
+    t.lockQueue(q);
+    CHECK(q.size() == 2, "очередь целей: %zu вместо 2", q.size());
+    CHECK(!q.empty() && t.lockedId() == q[0], "захват не на самой весомой цели");
+    const int first = t.lockedId();
+    const int second = t.nextLock();
+    CHECK(second && second != first && t.lockedId() == second && t.manualLock(), "следующая цель не выбрана");
+    for (int i = 40; i < 100; ++i) step(i);
+    CHECK(t.lockedId() == second, "ручной выбор перебит более весомой целью");
+    CHECK(t.nextLock() == first, "очередь не по кругу");
+    CHECK(!t.selectLock(12345), "выбран несуществующий трек");
+    std::printf("lock queue: ok\n");
+}
+
 // Силуэт крупного БПЛА: от кончика крыла к центру всей цели; на чистом небе — ничего
 static void test_silhouette() {
     const int W = 800, H = 600;
@@ -383,14 +408,16 @@ static void test_size_expect() {
 }
 
 // Камера на поворотке ведёт захваченную цель (setFollowing, aim): цель стоит в центре
-// кадра, неподвижные точки сцены едут навстречу. Без setFollowing такую цель трекер счёл
-// бы наложением на кадр (стоит в кадре, пока камера поворачивается) и снял захват
+// кадра, неподвижные точки сцены едут навстречу. Без setFollowing и без признака "камера
+// ведёт цель" (follow_k = 0) такую цель трекер счёл бы наложением на кадр (стоит в кадре,
+// пока камера поворачивается) и снял захват; с follow_k (по умолчанию) — держит и так
 static void test_follow() {
-    for (int follow = 0; follow <= 1; ++follow) {
+    for (int follow = 0; follow <= 2; ++follow) {
         TrackerConfig tc;
         tc.verify_frames = 10;
+        if (follow == 0) tc.follow_k = 0;
         Tracker t(1280, 720, tc);
-        t.setFollowing(follow != 0);
+        t.setFollowing(follow == 1);
         auto cand = [](float x, float y, float c) {
             Candidate d{};
             d.x = x; d.y = y; d.contrast = c; d.snr = 5; d.polarity = -1; d.margin = c / 10.f;
@@ -417,8 +444,8 @@ static void test_follow() {
             ox += step;
         }
         if (follow) {
-            CHECK(kept && lock && t.lockState() == LockState::Hard, "камера ведёт цель: захват %d, состояние %d", lock,
-                  (int)t.lockState());
+            CHECK(kept && lock && t.lockState() == LockState::Hard, "камера ведёт цель (%s): захват %d, состояние %d",
+                  follow == 1 ? "setFollowing" : "follow_k", lock, (int)t.lockState());
             CHECK(err < 30, "камера ведёт цель: цель ушла от центра на %.0f пикс.", err);
         } else {
             CHECK(!(kept && lock && t.lockState() == LockState::Hard), "без setFollowing цель не сочтена наложением");
@@ -741,6 +768,7 @@ int main() {
     test_scales_focus();
     test_compact_tex();
     test_static_map();
+    test_lock_queue();
     test_silhouette();
     test_hard_lock();
     test_size_expect();

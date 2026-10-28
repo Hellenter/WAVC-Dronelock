@@ -76,6 +76,10 @@ def _load():
     lib.dl_tracker_update.argtypes = [C.c_void_p, C.POINTER(_Cand), C.c_int, C.POINTER(_Track), C.c_int]
     lib.dl_tracker_clutter.argtypes = [C.c_void_p, C.POINTER(_Cand), C.c_int]
     lib.dl_tracker_reset.argtypes = [C.c_void_p]
+    lib.dl_tracker_queue.argtypes = [C.c_void_p, C.POINTER(C.c_int), C.c_int]
+    lib.dl_tracker_locked.argtypes = [C.c_void_p]
+    lib.dl_tracker_select.argtypes = [C.c_void_p, C.c_int]
+    lib.dl_tracker_next.argtypes = [C.c_void_p]
     lib.dl_tracker_set_static.argtypes = [C.c_void_p, C.c_int, C.c_float]
     lib.dl_tracker_static_save.argtypes = [C.c_void_p, C.c_char_p]
     lib.dl_tracker_static_load.argtypes = [C.c_void_p, C.c_char_p]
@@ -194,6 +198,23 @@ class NativeTracker:
 
     def clear_static(self):
         lib().dl_tracker_static_clear(self._h)
+
+    def queue(self):
+        """очередь целей: id по весомости для захвата, самая весомая первой"""
+        buf = (C.c_int * 64)()
+        n = lib().dl_tracker_queue(self._h, buf, 64)
+        return [buf[i] for i in range(min(n, 64))]
+
+    def locked(self):
+        return lib().dl_tracker_locked(self._h)
+
+    def select(self, track_id):
+        """ручной выбор цели: захват держится на ней, пока она жива"""
+        return bool(lib().dl_tracker_select(self._h, track_id))
+
+    def next_target(self):
+        """захват на следующую цель очереди; её id или 0"""
+        return lib().dl_tracker_next(self._h)
 
     def set_motion(self, dx, dy):
         """сдвиг картинки к следующему кадру (камера движется)"""

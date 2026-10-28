@@ -1910,6 +1910,30 @@ void metrics_quality(App& a, const Metrics& m) {
     if (!a.note.empty()) ImGui::TextWrapped("%s", a.note.c_str());
 }
 
+// очередь целей: несколько в кадре — по весомости (уверенности, что это дрон); оператор
+// переключает захват на следующую (Tab) или выбирает щелчком по цели на кадре
+void lock_queue(App& a, const Result* r) {
+    if (!r || r->lockQueue.empty()) return;
+    if (ImGui::SmallButton("Следующая цель [Tab]")) a.pipe.nextTarget();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Захват — на следующую цель очереди (по кругу). Выбранная вручную держится,\n"
+                          "пока жива: более весомые её не перебивают. Выбрать цель — щелчок по ней на кадре.");
+    ImGui::SameLine();
+    if (r->manualLock) ImGui::TextColored(TXT_WARN, "выбрана вручную");
+    else ImGui::TextDisabled("выбор автоматический");
+    std::string line = "очередь:";
+    for (size_t i = 0; i < r->lockQueue.size() && i < 6; ++i)
+        for (const auto& t : r->tracks)
+            if (t.id == r->lockQueue[i]) {
+                char b[64];
+                snprintf(b, sizeof(b), "%s %zu. #%d %s %.0f%s", i ? " ·" : "", i + 1, t.id, class_ru(t), t.lockW,
+                         t.id == r->lockId ? " ◄" : "");
+                line += b;
+            }
+    if (r->lockQueue.size() > 6) line += " …";
+    ImGui::TextWrapped("%s", line.c_str());
+}
+
 void panel_metrics(App& a, const Metrics& m, const Result* r) {
     const Settings s = a.pipe.settings();
     const double fpsSrc = s.targetFps > 0 ? s.targetFps : m.sourceFps;
@@ -1937,6 +1961,7 @@ void panel_metrics(App& a, const Metrics& m, const Result* r) {
              plat::process_memory_mb());
     kpi("CPU", v, a.cpuPct > 90 ? TXT_WARN : ImVec4(0.85f, 0.88f, 0.95f, 1), sub, tw);
     lock_banner(r, m);
+    lock_queue(a, r);
     if (!m.status.empty()) ImGui::TextColored(TXT_WARN, "%s", m.status.c_str());
     ImGui::Spacing();
 
@@ -2137,8 +2162,20 @@ void draw_view(App& a, const Result* r) {
                 snprintf(b, sizeof(b), "#%d %s", t.id, class_ru(t));
                 dl->AddText(ImVec2(q.x + h + 3, q.y - h - 2), col, b);
             }
+            if (r->lockQueue.size() > 1 && t.id != r->lockId) {   // место в очереди целей
+                const auto it = std::find(r->lockQueue.begin(), r->lockQueue.end(), t.id);
+                if (it != r->lockQueue.end()) {
+                    char b[16];
+                    snprintf(b, sizeof(b), "%d", (int)(it - r->lockQueue.begin()) + 1);
+                    dl->AddText(ImVec2(q.x - h - 4 - ImGui::CalcTextSize(b).x, q.y - h - 2), COL_LOCK, b);
+                }
+            }
             if (hovered && std::fabs(io.MousePos.x - q.x) < h + 2 && std::fabs(io.MousePos.y - q.y) < h + 2) hover = &t;
         }
+    // щелчок по цели (не в разметке) — захват на неё
+    if (hover && !(a.annotate && a.ann.editable) && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+        io.MouseDragMaxDistanceSqr[0] < 16 && !hover->clutter)
+        a.pipe.selectTarget(hover->id);
     if (a.annotate && a.ann.editable) {
         // разметка: опорные точки и положение объектов на этом кадре (в пикселях видео)
         const VideoInfo vi = a.pipe.info();
@@ -2226,7 +2263,8 @@ void draw_view(App& a, const Result* r) {
         ImGui::Text("отклонение от плавной траектории %.2f пикс.", hover->resid);
         ImGui::Text("мигание контраста %.2f, попаданий %d", hover->contrastCv, hover->hits);
         ImGui::Text("скорость по сцене %.1f, %.1f; прошёл %.0f пикс.", hover->vsx, hover->vsy, hover->travel);
-        ImGui::Text("ошибка прогноза %.1f пикс., вес для захвата %.1f", hover->sigma, hover->score);
+        ImGui::Text("ошибка прогноза %.1f пикс., весомость %.1f, вес для захвата %.1f", hover->sigma, hover->score,
+                    hover->lockW);
         if (hover->miss) ImGui::Text("на прогнозе %d кадр.", hover->miss);
         ImGui::EndTooltip();
     }
@@ -2408,6 +2446,9 @@ int run_bench(int argc, char** argv) {
         else if (a == "--learn-mask") s.learnMaskFrames = atoi(val().c_str());
         else if (a == "--scales") s.scales = atoi(val().c_str());
         else if (a == "--motion") s.motion = atoi(val().c_str());
+        else if (a == "--no-scene-shift") s.sceneShift = false;
+        else if (a == "--no-pan") s.panDetect = false;
+        else if (a == "--pan-motion") s.panMotion = true;
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--static-file") s.staticFile = true;
@@ -2440,6 +2481,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
         else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());
         else if (a == "--lock-dwell") s.trk.lock_dwell = atoi(val().c_str());
+        else if (a == "--follow-k") s.trk.follow_k = (float)atof(val().c_str());
         else if (a == "--hard-switch") s.trk.hard_switch = (float)atof(val().c_str());
         else if (a == "--follow") s.follow = true;
         else if (a == "--follow-frac") s.followFrac = (float)atof(val().c_str());
@@ -2824,6 +2866,7 @@ int main(int argc, char** argv) {
             else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) step_back(a);
             else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step_forward(a);
             if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) seek_to(a, 0, false);
+            if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) a.pipe.nextTarget();
             if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
                 set_speed(a, a.s.speed * 2);
             if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
