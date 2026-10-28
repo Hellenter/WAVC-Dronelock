@@ -199,6 +199,7 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
 
 namespace {
 const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
+const int32_t kMaxSide = 1 << 16;   // сторона кадра в файле маски, пикс.
 }
 
 bool Detector::saveMask(const std::string& path) const {
@@ -219,7 +220,9 @@ bool Detector::loadMask(const std::string& path, int verify) {
     int32_t hdr[6];
     bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, kMaskMagic, 8) == 0 &&
               std::fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 &&
-              hdr[5] > 0 && hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile;
+              hdr[5] > 0 && hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
+              // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
+              hdr[0] <= kMaxSide && hdr[1] <= kMaxSide;
     std::vector<uint8_t> m;
     if (ok) {
         m.resize((size_t)hdr[4] * hdr[5]);
@@ -305,6 +308,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     }
     if (m) stats_->comp.assign(m, m + (size_t)tw_ * th_);
     else stats_->comp.clear();
+    // полный кадр по маске неба: закрытые тайлы не читаются (кроме кромки, она в compMask_)
+    p.trim = m && !timing_.partial;
     backend_->compute(FrameView{gray, w, h, stride}, p, m, stats_->dark, stats_->bright,
                       timing_.jobs, timing_.jobs_skipped);
     if (cfg_.auto_thr && !timing_.partial) {
@@ -356,6 +361,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         q.tile = L.tile;
         q.dark = true;
         q.bright = false;
+        q.cells = false;   // ячейки грубых масштабов никто не читает (selectTiles берёт их только с основного)
+        q.trim = false;
         int jobs = 0, skipped = 0;
         const uint8_t* cm = nullptr;
         if (timing_.coarsePartial) {
@@ -375,7 +382,18 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
-    if (p.cells && (cfg_.bg_map || cfg_.tbd)) {
+    // фон ячеек читают кромка маски неба и накопление (tbd). Без маски и без накопления (камера
+    // движется, поворотка) его не учим — это заметная доля последовательной части кадра; когда
+    // маска появится, фон учится заново: выученный на движущейся картинке ей всё равно чужой
+    const bool bgUsed = cfg_.tbd || learning_ || verifyLeft_ || !mask_.empty();
+    if (p.cells && cfg_.bg_map && !bgUsed) {
+        bgIdle_ = true;
+    } else if (p.cells && (cfg_.bg_map || cfg_.tbd)) {
+        if (bgIdle_) {
+            stats_->cb[0].reset(0);
+            stats_->cb[1].reset(0);
+            bgIdle_ = false;
+        }
         markExcl();
         for (int pol = 0; pol < 2; ++pol) {
             if (!(pol ? cfg_.bright : cfg_.dark)) continue;
@@ -909,22 +927,25 @@ void Detector::updateFine() {
     const bool exOn = ex.size() == n;
     const float hot = hotLevel();
     const float rate = 1.f / (float)std::max(10, cfg_.fine_frames);
-    for (int cy = 0; cy < cth; ++cy) {
-        const int ty = cy / cpt;
-        for (int cx = 0; cx < ctw; ++cx) {
-            const int tx = cx / cpt;
-            const size_t ti = (size_t)ty * tw_ + tx, ci = (size_t)cy * ctw + cx;
+    // тайлы земли у кромки — малая часть кадра: обходим только их ячейки (на 16 Мп
+    // проход по всем 62 тыс. ячеек стоил больше, чем сами ячейки кромки)
+    for (int ty = 0; ty < th_; ++ty)
+        for (int tx = 0; tx < tw_; ++tx) {
+            const size_t ti = (size_t)ty * tw_ + tx;
             if (!edgeG_[ti] || (!comp.empty() && !comp[ti])) continue;
-            if (exOn && ex[ci]) continue;   // вокруг треков: цель — не текстура
-            float v = cfg_.dark ? stats_->dark.cmax[ci] : 0.f;
-            if (cfg_.bright && stats_->bright.cmax.size() == n) v = std::max(v, (float)stats_->bright.cmax[ci]);
-            const float t = v > hot ? 1.f : 0.f;
-            if (fineN_[ci] < 65535) ++fineN_[ci];
-            // первые кадры — среднее, дальше — забывание за fine_frames кадров
-            const float a = std::max(rate, 1.f / (float)fineN_[ci]);
-            fineTex_[ci] += a * (t - fineTex_[ci]);
+            for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
+                for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx) {
+                    const size_t ci = (size_t)cy * ctw + cx;
+                    if (exOn && ex[ci]) continue;   // вокруг треков: цель — не текстура
+                    float v = cfg_.dark ? stats_->dark.cmax[ci] : 0.f;
+                    if (cfg_.bright && stats_->bright.cmax.size() == n) v = std::max(v, (float)stats_->bright.cmax[ci]);
+                    const float t = v > hot ? 1.f : 0.f;
+                    if (fineN_[ci] < 65535) ++fineN_[ci];
+                    // первые кадры — среднее, дальше — забывание за fine_frames кадров
+                    const float a = std::max(rate, 1.f / (float)fineN_[ci]);
+                    fineTex_[ci] += a * (t - fineTex_[ci]);
+                }
         }
-    }
     // сверху вниз: небо, если тихо давно и рядом сверху (или сбоку в той же строке) небо —
     // так небо обтекает облачко или ветку, но в одинокий просвет внутри кроны не попадает
     const int need = std::max(10, cfg_.fine_frames / 2);
@@ -934,19 +955,33 @@ void Detector::updateFine() {
         const size_t ti = (size_t)(cy / cpt) * tw_ + cx / cpt;
         return mask_[ti] != 0 || (edgeG_[ti] && fineSky_[(size_t)cy * ctw + cx] != 0);
     };
-    for (int cy = 0; cy < cth; ++cy) {
-        const int ty = cy / cpt;
-        auto quiet = [&](int cx) {
-            const size_t ti = (size_t)ty * tw_ + cx / cpt, ci = (size_t)cy * ctw + cx;
-            return edgeG_[ti] && fineN_[ci] >= need && fineTex_[ci] < cfg_.fine_tex;
-        };
-        for (int cx = 0; cx < ctw; ++cx)
-            fineSky_[(size_t)cy * ctw + cx] = quiet(cx) && (sky(cx - 1, cy - 1) || sky(cx, cy - 1) || sky(cx + 1, cy - 1));
-        // в строке — от найденного неба вбок по тихим ячейкам
-        for (int cx = 1; cx < ctw; ++cx)
-            if (!fineSky_[(size_t)cy * ctw + cx] && quiet(cx) && sky(cx - 1, cy)) fineSky_[(size_t)cy * ctw + cx] = 1;
-        for (int cx = ctw - 2; cx >= 0; --cx)
-            if (!fineSky_[(size_t)cy * ctw + cx] && quiet(cx) && sky(cx + 1, cy)) fineSky_[(size_t)cy * ctw + cx] = 1;
+    // вне тайлов кромки ячейка не тихая и небом не станет: строки тайлов без кромки — нули,
+    // в остальных проходы идут по прежнему порядку, но только по ячейкам тайлов кромки
+    for (int ty = 0; ty < th_; ++ty) {
+        const uint8_t* eg = &edgeG_[(size_t)ty * tw_];
+        const bool any = std::find(eg, eg + tw_, 1) != eg + tw_;
+        for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy) {
+            uint8_t* fs = &fineSky_[(size_t)cy * ctw];
+            std::fill(fs, fs + ctw, 0);
+            if (!any) continue;
+            auto quiet = [&](int cx) {
+                const size_t ci = (size_t)cy * ctw + cx;
+                return fineN_[ci] >= need && fineTex_[ci] < cfg_.fine_tex;
+            };
+            for (int tx = 0; tx < tw_; ++tx)
+                if (eg[tx])
+                    for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx)
+                        fs[cx] = quiet(cx) && (sky(cx - 1, cy - 1) || sky(cx, cy - 1) || sky(cx + 1, cy - 1));
+            // в строке — от найденного неба вбок по тихим ячейкам
+            for (int tx = 0; tx < tw_; ++tx)
+                if (eg[tx])
+                    for (int cx = std::max(1, tx * cpt); cx < (tx + 1) * cpt; ++cx)
+                        if (!fs[cx] && quiet(cx) && sky(cx - 1, cy)) fs[cx] = 1;
+            for (int tx = tw_ - 1; tx >= 0; --tx)
+                if (eg[tx])
+                    for (int cx = std::min(ctw - 2, (tx + 1) * cpt - 1); cx >= tx * cpt; --cx)
+                        if (!fs[cx] && quiet(cx) && sky(cx + 1, cy)) fs[cx] = 1;
+        }
     }
 }
 

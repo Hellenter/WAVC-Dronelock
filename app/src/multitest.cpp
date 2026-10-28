@@ -140,7 +140,8 @@ bool parse_values(const Param& p, const std::string& text, std::vector<double>& 
                 if (c == ',') c = '.';
             char* e = nullptr;
             v = strtod(t.c_str(), &e);
-            if (!e || *e) return false;
+            // nan/inf и огромные числа дальше приводятся к int настройки — неопределённое поведение
+            if (!e || *e || !(std::fabs(v) <= 1e9)) return false;
             if (p.flag) v = v > 0 ? 1 : 0;
         }
         if (std::find(out.begin(), out.end(), v) == out.end()) out.push_back(v);

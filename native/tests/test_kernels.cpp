@@ -11,7 +11,10 @@
 #include "dronolok/detector.hpp"
 #include "dronolok/scene.hpp"
 #include "dronolok/tuning.hpp"
+#include "gt_eval.hpp"
 #include "kernels.hpp"
+#include "mini_json.hpp"
+#include "y4m_reader.hpp"
 
 using namespace dronolok;
 
@@ -86,6 +89,34 @@ static void test_kernels(const Kernels* ref, const Kernels* K) {
         CHECK(s0 == s1 && m0 == m1 && h0 == h1 && a0 == a1, "%s tile_stats T=%d", K->name, T);
         CHECK(a0[0] == 3 * T + 5, "%s argmax first T=%d", K->name, T);
     }
+}
+
+// SAD с маской против прямого счёта: маска 0 / 0xFF, nullptr, разные длины и смещения
+static void test_sad(const Kernels* K) {
+    std::mt19937 g(7);
+    for (int n : {0, 1, 7, 15, 16, 17, 31, 32, 33, 64, 100, 236, 316, 1000}) {
+        for (int off : {0, 1, 5}) {
+            auto a = rnd(n + off, g), b = rnd(n + off, g), m = rnd(n + off, g);
+            for (auto& x : m) x = (x & 3) == 0 ? 0xFF : 0;
+            uint32_t es = 0, ek = 0, ea = 0;
+            for (int x = off; x < n + off; ++x) {
+                const uint32_t d = (uint32_t)std::abs(a[x] - b[x]);
+                ea += d;
+                if (m[x]) ++ek;
+                else es += d;
+            }
+            uint32_t s = 1, k = 1;
+            K->sad_masked(a.data() + off, b.data() + off, m.data() + off, n, &s, &k);
+            CHECK(s == es && k == ek, "%s sad_masked n=%d off=%d: %u/%u против %u/%u", K->name, n, off, s, k, es, ek);
+            K->sad_masked(a.data() + off, b.data() + off, nullptr, n, &s, &k);
+            CHECK(s == ea && k == 0, "%s sad n=%d off=%d: %u против %u", K->name, n, off, s, ea);
+        }
+    }
+    // худший случай: все разности 255
+    std::vector<uint8_t> z(4096, 0), f(4096, 255), m0(4096, 0);
+    uint32_t s = 0, k = 0;
+    K->sad_masked(z.data(), f.data(), m0.data(), 4096, &s, &k);
+    CHECK(s == 255u * 4096 && k == 0, "%s sad_masked max: %u", K->name, s);
 }
 
 static std::vector<uint8_t> synth_frame(int w, int h, unsigned seed) {
@@ -453,6 +484,32 @@ static void test_stationary() {
     m.loadMask(path, 10);
     for (int i = 0; i < 10; ++i) m.detect(ground_frame(w, h, 0.3f, 200 + i).data(), w, h, w, c);
     CHECK(m.maskReplaced() && m.tileMask() != a.tileMask(), "mask verify, moved camera");
+    // с маской неба задание сужается до своих тайлов маски: кандидаты при любом размере
+    // заданий те же (на полном кадре и между полными просмотрами, full_every 2)
+    for (int fe : {1, 2}) {
+        std::vector<Candidate> ref;
+        int run = 0;
+        for (auto jj : {std::pair<int, int>{1000, 1000}, std::pair<int, int>{1, 1}, std::pair<int, int>{4, 0},
+                        std::pair<int, int>{3, 5}}) {
+            DetectorConfig k = cfg;
+            k.job_rows = jj.first;
+            k.job_cols = jj.second;
+            k.full_every = fe;
+            Detector d(k);
+            d.loadMask(path, 0);
+            std::vector<Candidate> all;
+            for (int i = 0; i < 6; ++i) {
+                auto f = ground_frame(w, h, 0.6f, 300 + i);
+                for (int y = 0; y < 3; ++y)   // точка в небе, по кадру сдвигается
+                    for (int x = 0; x < 3; ++x) f[(size_t)(60 + y) * w + 100 + 9 * i + x] = 40;
+                d.detect(f.data(), w, h, w, c);
+                all.insert(all.end(), c.begin(), c.end());
+            }
+            if (run++ == 0) ref = all;
+            CHECK(!all.empty() && same(ref, all), "mask + jobs %dx%d full_every %d: %zu vs %zu candidates", jj.first,
+                  jj.second, fe, all.size(), ref.size());
+        }
+    }
     std::remove(path.c_str());
 
     // две тёмные точки в одном тайле 64x64: при per_tile 2 обе
@@ -475,6 +532,106 @@ static void test_stationary() {
     CHECK(t25.gate == t.gate && t25.max_miss == t.max_miss, "tracker_for_fps 25");
     CHECK(t10.gate > t.gate && t10.max_miss < t.max_miss && t10.confirm == t.confirm, "tracker_for_fps 10");
     std::printf("stationary camera (mask file, per_tile, fps): ok\n");
+}
+
+// Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
+// поверх кадра (неподвижные точки исключаются из оценки) и с повтором кадра
+static void test_motion() {
+    const int w = 1280, h = 720, B = 24;
+    std::mt19937 g(7);
+    const int bw = w / B + 8, bh = h / B + 8;
+    std::vector<uint8_t> blocks((size_t)bw * bh);
+    for (auto& b : blocks) b = (uint8_t)(60 + g() % 140);
+    auto frame = [&](int ox, int oy, bool osd) {
+        std::vector<uint8_t> f((size_t)w * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) f[(size_t)y * w + x] = blocks[(size_t)((y + oy + 4 * B) / B) * bw + (x + ox + 4 * B) / B];
+        if (osd)   // надпись в углу не двигается вместе с картинкой
+            for (int y = 20; y < 120; ++y)
+                for (int x = 20; x < 400; ++x) f[(size_t)y * w + x] = ((x / 6 + y / 6) & 1) ? 250 : 10;
+        return f;
+    };
+    for (bool osd : {false, true}) {
+        GlobalMotion gm;
+        auto f0 = frame(0, 0, osd), f1 = frame(-13, 7, osd);   // картинка ушла вправо на 13 и вверх на 7
+        gm.estimate(f0.data(), w, h, w);
+        const MotionEstimate e = gm.estimate(f1.data(), w, h, w);
+        CHECK(e.valid && std::fabs(e.dx - 13) <= 1.5f && std::fabs(e.dy + 7) <= 1.5f, "motion%s: %.2f %.2f (13, -7)",
+              osd ? " with overlay" : "", e.dx, e.dy);
+        const MotionEstimate z = gm.estimate(f1.data(), w, h, w);   // повтор кадра
+        CHECK(z.valid && z.dx == 0 && z.dy == 0, "motion: repeated frame %.2f %.2f", z.dx, z.dy);
+    }
+    std::printf("motion: ok\n");
+}
+
+// Испорченные файлы (маска, разметка, y4m, память помех): отказ, без падения и без гигабайтных выделений
+static void put_file(const std::string& path, const std::string& data) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fwrite(data.data(), 1, data.size(), f);
+    std::fclose(f);
+}
+
+static void test_bad_files() {
+    const std::string path = "test_bad.bin";
+    {   // маска: заголовок согласован, но кадр 2e9 x 2e9 — было выделение ~1e15 байт
+        const char magic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
+        const int32_t hdr[6] = {2000000000, 2000000000, 2, 32, 2000000000 / 64, 2000000000 / 64};
+        std::string s(magic, 8);
+        s.append((const char*)hdr, sizeof(hdr));
+        put_file(path, s);
+        Detector d;
+        CHECK(!d.loadMask(path), "loadMask: huge header accepted");
+    }
+    {   // JSON: глубокая вложенность (было переполнение стека), nan/inf, обычный файл
+        minijson::Value v;
+        CHECK(!minijson::parse("{\"frames\": " + std::string(200000, '[') + "}", v), "json: deep nesting accepted");
+        CHECK(!minijson::parse("{\"x\": nan}", v) && !minijson::parse("[inf]", v), "json: nan/inf accepted");
+        CHECK(minijson::parse("{\"a\": [1, 2.5, {\"b\": \"c\"}], \"d\": true}", v) && v["a"].a.size() == 3 &&
+                  v["a"].a[1].num() == 2.5 && v["a"].a[2]["b"].s == "c" && v["d"].num() == 1,
+              "json: valid file");
+        put_file(path, "{\"w\": 1e300, \"h\": -1e300, \"frames\": [[{\"x\": 1e300, \"y\": 5, \"id\": 1e300}]]}");
+        GroundTruth g;
+        CHECK(g.load(path) && g.frames.size() == 1 && g.frames[0].size() == 1 && g.frames[0][0].id == 1000000000,
+              "gt: huge numbers");
+    }
+    {   // y4m: огромный кадр в заголовке, заголовок без конца строки
+        put_file(path, "YUV4MPEG2 W1000000 H1000000 F25:1 Cmono\nFRAME\n");
+        FrameReader r;
+        CHECK(!r.open(path), "y4m: huge frame accepted");
+        put_file(path, "YUV4MPEG2 W64 H48 F25:1 Cmono\nFRAME\n" + std::string(64 * 48, '\x80'));
+        FrameReader ok;
+        std::vector<uint8_t> y;
+        CHECK(ok.open(path) && ok.width() == 64 && ok.next(y) && y.size() == 64u * 48 && !ok.next(y), "y4m: valid file");
+    }
+    {   // трекер: ячейка 0 из C API/Python (было деление на ноль), память помех с nan
+        TrackerConfig tc;
+        tc.clutter_cell = 0;
+        Tracker t(320, 240, tc);
+        std::vector<Candidate> dets(1);
+        dets[0].x = 100;
+        dets[0].y = 100;
+        dets[0].contrast = 20;
+        for (int i = 0; i < 3; ++i) t.update(dets);
+        CHECK(t.staticCellPx() >= 1, "tracker: clutter_cell 0");
+        TrackerConfig sc;
+        sc.static_frames = 1000;
+        Tracker a(320, 240, sc);
+        CHECK(a.saveStatic(path), "saveStatic");
+        FILE* f = std::fopen(path.c_str(), "r+b");
+        const float bad[2] = {NAN, -INFINITY};
+        if (f) {
+            std::fseek(f, 5 * 4, SEEK_SET);
+            std::fwrite(bad, sizeof(bad), 1, f);
+            std::fclose(f);
+        }
+        std::vector<float> v;
+        CHECK(a.loadStatic(path), "loadStatic");
+        a.getStatic(v);
+        CHECK(!v.empty() && v[0] == 0.f && v[1] == 0.f, "loadStatic: nan/inf kept");
+    }
+    std::remove(path.c_str());
+    std::printf("bad files (mask, json, y4m, tracker): ok\n");
 }
 
 // Оценка сцены: небо сверху, рваная кромка леса, ночь, резкая смена света, сдвиг камеры
@@ -531,10 +688,12 @@ static void test_scene() {
 
 int main() {
     const Kernels* ref = kernels_scalar();
+    test_sad(ref);
     for (Isa isa : available_isas()) {
         if (isa == Isa::Scalar) continue;
         const Kernels* K = select_kernels(isa);
         test_kernels(ref, K);
+        test_sad(K);
         std::printf("kernels %s: ok\n", K->name);
     }
     test_detector();
@@ -547,6 +706,8 @@ int main() {
     test_governor();
     test_stationary();
     test_scene();
+    test_motion();
+    test_bad_files();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

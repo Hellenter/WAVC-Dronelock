@@ -13,6 +13,7 @@
 #include <cstdlib>
 
 #include "dronolok/detector.hpp"
+#include "kernels.hpp"
 
 namespace dronolok {
 namespace {
@@ -43,9 +44,11 @@ void gradient(const std::vector<uint8_t>& in, int w, int h, std::vector<uint8_t>
 }
 
 // средняя разность при сдвиге (u, v): cur(x) против prev(x - u); край margin не считаем.
-// skip — точки, которые не учитываются (неподвижные наложения на кадр), может быть пустым
-double sad(const std::vector<uint8_t>& cur, const std::vector<uint8_t>& prev, int w, int h, int u, int v,
-           int margin, const std::vector<uint8_t>& skip) {
+// skip — точки, которые не учитываются (неподвижные наложения на кадр), может быть пустым.
+// Строка — векторное ядро (psadbw / vpadal): с ветвлением на каждой точке оценка стоила
+// 7 мс на кадр 16 Мп, автовекторизованным циклом 1.5 мс.
+double sad(const Kernels* K, const std::vector<uint8_t>& cur, const std::vector<uint8_t>& prev, int w, int h,
+           int u, int v, int margin, const std::vector<uint8_t>& skip) {
     const int x0 = std::max(margin, margin + u), x1 = std::min(w - margin, w - margin + u);
     const int y0 = std::max(margin, margin + v), y1 = std::min(h - margin, h - margin + v);
     if (x1 - x0 < 8 || y1 - y0 < 8) return 1e9;
@@ -53,14 +56,11 @@ double sad(const std::vector<uint8_t>& cur, const std::vector<uint8_t>& prev, in
     for (int y = y0; y < y1; ++y) {
         const uint8_t* c = &cur[(size_t)y * w];
         const uint8_t* p = prev.data() + (std::ptrdiff_t)(y - v) * w - u;
-        if (skip.empty()) {
-            for (int x = x0; x < x1; ++x) s += std::abs(c[x] - p[x]);
-            n += x1 - x0;
-        } else {
-            const uint8_t* k = &skip[(size_t)y * w];
-            for (int x = x0; x < x1; ++x)
-                if (!k[x]) { s += std::abs(c[x] - p[x]); ++n; }
-        }
+        const uint8_t* k = skip.empty() ? nullptr : &skip[(size_t)y * w + x0];
+        uint32_t rs = 0, rk = 0;
+        K->sad_masked(c + x0, p + x0, k, x1 - x0, &rs, &rk);
+        s += rs;
+        n += (x1 - x0) - (long long)rk;
     }
     return n < 64 ? 1e9 : (double)s / (double)n;
 }
@@ -68,14 +68,15 @@ double sad(const std::vector<uint8_t>& cur, const std::vector<uint8_t>& prev, in
 // Неподвижные наложения на кадр (надписи, логотипы, OSD при записи экрана) и повтор
 // кадра: текстура, которая не изменилась ни на уровень. Такие точки тянут оценку к нулю,
 // когда камера на самом деле поворачивается, — их не учитываем. Возвращает долю таких
-// точек среди текстурных; 1 — кадр повторился или камера стоит.
+// точек среди текстурных; 1 — кадр повторился или камера стоит. В маске 0xFF — пропустить.
 double static_mask(const std::vector<uint8_t>& cur, const std::vector<uint8_t>& prev, std::vector<uint8_t>& skip) {
-    skip.assign(cur.size(), 0);
+    skip.resize(cur.size());
     size_t tex = 0, st = 0;
-    for (size_t i = 0; i < cur.size(); ++i) {
-        if (cur[i] < 4) continue;
-        ++tex;
-        if (std::abs(cur[i] - prev[i]) <= 1) { skip[i] = 1; ++st; }
+    for (size_t i = 0; i < cur.size(); ++i) {   // без ветвлений — векторизуется
+        const unsigned t = cur[i] >= 4, still = t & (std::abs(cur[i] - prev[i]) <= 1);
+        skip[i] = (uint8_t)(0u - still);
+        tex += t;
+        st += still;
     }
     return tex ? (double)st / (double)tex : 1.0;
 }
@@ -142,6 +143,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
         return res;
     }
     for (size_t L = 1; L < pyr.size(); ++L) static_mask(pyr[L].px, prev_[L].px, skip[L]);
+    static const Kernels* const K = select_kernels(Isa::Auto);
     int u = 0, v = 0;
     double best = 0;
     double sum = 0;
@@ -159,7 +161,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
         best = 1e18;
         for (int dv = -range; dv <= range; ++dv)
             for (int du = -range; du <= range; ++du) {
-                const double e = sad(c.px, p.px, c.w, c.h, u + du, v + dv, margin, skip[L]);
+                const double e = sad(K, c.px, p.px, c.w, c.h, u + du, v + dv, margin, skip[L]);
                 if (L == 0) { sum += e; ++cnt; }
                 if (e < best) { best = e; bu = u + du; bv = v + dv; }
             }
@@ -175,12 +177,13 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     };
     const double e0 = best;
     const auto& k0 = skip[0];
-    const double fx = sub(sad(c.px, p.px, c.w, c.h, u - 1, v, 2, k0), e0, sad(c.px, p.px, c.w, c.h, u + 1, v, 2, k0));
-    const double fy = sub(sad(c.px, p.px, c.w, c.h, u, v - 1, 2, k0), e0, sad(c.px, p.px, c.w, c.h, u, v + 1, 2, k0));
+    auto at = [&](int du, int dv) { return sad(K, c.px, p.px, c.w, c.h, u + du, v + dv, 2, k0); };
+    const double fx = sub(at(-1, 0), e0, at(1, 0));
+    const double fy = sub(at(0, -1), e0, at(0, 1));
     // уверенность: насколько лучший сдвиг выделяется среди соседних и есть ли вообще текстура
-    double texture = 0;
-    for (uint8_t g : c.px) texture += g;
-    texture /= (double)c.px.size();
+    uint64_t tsum = 0;
+    for (uint8_t g : c.px) tsum += g;
+    const double texture = (double)tsum / (double)c.px.size();
     const double mean = cnt ? sum / cnt : best;
     res.quality = (float)std::max(0.0, std::min(1.0, mean > 1e-9 ? 1.0 - best / mean : 0.0));
     res.valid = texture > 1.0 && res.quality > 0.05;

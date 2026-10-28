@@ -70,7 +70,11 @@ bool VideoSource::open(const std::string& path, int threads, std::string& err) {
     }
     AVStream* st = fmt_->streams[stream_];
     ctx_ = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(ctx_, st->codecpar);
+    if (!ctx_ || avcodec_parameters_to_context(ctx_, st->codecpar) < 0) {
+        err = "не удалось подготовить декодер (испорченные параметры потока или нет памяти)";
+        close();
+        return false;
+    }
     ctx_->thread_count = threads;   // 0 = FFmpeg выберет сам
     ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     if ((r = avcodec_open2(ctx_, codec, nullptr)) < 0) {
@@ -81,6 +85,16 @@ bool VideoSource::open(const std::string& path, int threads, std::string& err) {
     }
     frame_ = av_frame_alloc();
     pkt_ = av_packet_alloc();
+    if (!frame_ || !pkt_) {
+        err = "не хватило памяти под кадр";
+        close();
+        return false;
+    }
+    if (ctx_->width <= 0 || ctx_->height <= 0) {
+        err = "в потоке не указан размер кадра";
+        close();
+        return false;
+    }
     info_.w = ctx_->width;
     info_.h = ctx_->height;
     AVRational fr = av_guess_frame_rate(fmt_, st, nullptr);

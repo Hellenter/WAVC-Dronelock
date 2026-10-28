@@ -3,6 +3,7 @@
 // есть не-клаттерный подтверждённый трек; остальные треки — ложные.
 // Дополнительно — матрица "что на самом деле" x "каким классом назвал трекер".
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -37,15 +38,18 @@ struct GroundTruth {
         std::fclose(f);
         minijson::Value v;
         if (!minijson::parse(text, v)) return false;
-        w = (int)v["w"].num();
-        h = (int)v["h"].num();
+        // числа из файла — в разумных пределах до приведения к int/float (иначе неопределённое поведение)
+        auto clamp = [](double x, double lim) { return std::min(std::max(x, -lim), lim); };
+        w = (int)clamp(v["w"].num(), 1 << 20);
+        h = (int)clamp(v["h"].num(), 1 << 20);
         fps = v["fps"].num();
         frames.clear();
         for (const auto& fr : v["frames"].a) {
             std::vector<GtObj> objs;
             for (const auto& o : fr.a) {
-                GtObj g{o["kind"].s == "bird", o["bright"].num() != 0, (float)o["x"].num(), (float)o["y"].num()};
-                if (o["id"].type == minijson::Value::Num) g.id = (int)o["id"].num();
+                GtObj g{o["kind"].s == "bird", o["bright"].num() != 0, (float)clamp(o["x"].num(), 1e7),
+                        (float)clamp(o["y"].num(), 1e7)};
+                if (o["id"].type == minijson::Value::Num) g.id = (int)clamp(o["id"].num(), 1e9);
                 g.group = o["group"].s;
                 objs.push_back(g);
             }

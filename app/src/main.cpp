@@ -2134,7 +2134,7 @@ void draw_view(App& a, const Result* r) {
             const bool key = o.keys.count(f.index) > 0;
             dl->AddCircle(q, 16, c, 0, cur ? 2.5f : 1.5f);
             if (key) dl->AddCircleFilled(q, 4, c);
-            char b[32];
+            char b[64];   // кириллица — 2 байта на букву: в 32 "#1 птица (по прямой)" обрезалась
             snprintf(b, sizeof(b), "#%d %s%s", o.id, o.bird ? "птица" : "дрон", key ? "" : " (по прямой)");
             dl->AddText(ImVec2(q.x + 18, q.y + 4), c, b);
         }
@@ -2165,7 +2165,7 @@ void draw_view(App& a, const Result* r) {
     }
     dl->PopClipRect();
     // строка состояния и легенда поверх видео
-    char st[320];
+    char st[512];   // с запасом: при обрезке len += snprintf ушёл бы за конец буфера
     int len = r->dup ? snprintf(st, sizeof(st), "%dx%d  кадр %lld  проход %d  повтор прошлого кадра", f.w, f.h,
                                 (long long)f.index, r->loop + 1)
                      : snprintf(st, sizeof(st), "%dx%d  кадр %lld  проход %d  детекция %.2f мс  обработка %.2f мс",

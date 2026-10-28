@@ -1,12 +1,17 @@
 #include "annotate.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 #include "dronolok/fileutil.hpp"
 #include "mini_json.hpp"
 
 using namespace dronolok;
+
+// номер кадра в разметке не больше этого (~4 суток при 25 к/с): число из файла иначе уходит в
+// (int64_t) с переполнением, а toGroundTruth выделял бы память под все кадры до него
+static const int64_t MAX_FRAMES = 10000000;
 
 void Annotation::load(const std::string& path, int vw, int vh, double vfps) {
     w = vw;
@@ -33,10 +38,14 @@ void Annotation::load(const std::string& path, int vw, int vh, double vfps) {
     const double sx = v["w"].num() > 0 ? vw / v["w"].num() : 1, sy = v["h"].num() > 0 ? vh / v["h"].num() : 1;
     for (const auto& o : ob.a) {
         AnnObject a;
-        a.id = (int)o["id"].num();
+        a.id = (int)std::min(std::max(o["id"].num(), -1e9), 1e9);
         a.bird = o["kind"].s == "bird";
-        for (const auto& k : o["keys"].a)
-            if (k.a.size() >= 3) a.keys[(int64_t)k.a[0].num()] = {(float)(k.a[1].num() * sx), (float)(k.a[2].num() * sy)};
+        for (const auto& k : o["keys"].a) {
+            if (k.a.size() < 3) continue;
+            const double fi = k.a[0].num(), x = k.a[1].num() * sx, y = k.a[2].num() * sy;
+            if (!(fi >= 0 && fi < (double)MAX_FRAMES) || !(std::fabs(x) < 1e7 && std::fabs(y) < 1e7)) continue;
+            a.keys[(int64_t)fi] = {(float)x, (float)y};
+        }
         if (!a.keys.empty()) objs.push_back(a);
     }
 }
@@ -72,7 +81,7 @@ GroundTruth Annotation::toGroundTruth(int64_t frames) const {
     int64_t last = 0;
     for (const auto& o : objs)
         if (!o.keys.empty()) last = std::max(last, o.keys.rbegin()->first);
-    frames = std::max(frames, last + 1);
+    frames = std::min(std::max(frames, last + 1), MAX_FRAMES);
     if (objs.empty() && !noDrones) return g;
     g.frames.resize((size_t)frames);
     for (int64_t f = 0; f < frames; ++f) frameObjects(f, g.frames[(size_t)f]);
