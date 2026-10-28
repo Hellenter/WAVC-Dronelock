@@ -50,6 +50,7 @@ struct Scratch {
     Ring P[2];
     Ring D[2];
     std::vector<uint8_t> band[2];
+    std::vector<uint8_t> colmax;
     int bandStride = 0;
     int cap = 0, cwp = 0, tile = 0;
 
@@ -80,6 +81,10 @@ public:
         const size_t nt = (size_t)tw * th;
         if (p.dark) dk.resize(nt);
         if (p.bright) br.resize(nt);
+        const bool cells = p.cells && T % CELL == 0;
+        const size_t nc = cells ? (size_t)(tw * T / CELL) * (th * T / CELL) : 0;
+        if (p.dark) cells ? dk.resizeCells(nc) : dk.resizeCells(0);
+        if (p.bright) cells ? br.resizeCells(nc) : br.resizeCells(0);
         jobs = skipped = 0;
         if (!tw || !th || (!p.dark && !p.bright)) return;
         const int jr = std::max(1, p.job_rows);
@@ -176,7 +181,40 @@ private:
                     const int nrows = rr % BAND + 1;
                     K_->tile_stats(S.band[pol].data(), S.bandStride, T, nrows, rr + 1 - nrows, ntiles, p.hot_thr,
                                    &ts.sum[i0], &ts.maxv[i0], &ts.hot[i0], &ts.argmax[i0]);
+                    if (!ts.cmax.empty() && nrows == CELL) {
+                        const int ctw = tw * T / CELL;
+                        cell_stats(S.band[pol].data(), S.bandStride, cw, p.cell_thr, S.colmax,
+                                   &ts.cmax[(size_t)(yr / CELL) * ctw + cx0 / CELL],
+                                   &ts.carg[(size_t)(yr / CELL) * ctw + cx0 / CELL]);
+                    }
                 }
+            }
+        }
+    }
+
+    // Ячейки по полосе из CELL строк отклика: максимум по столбцам (векторизуется
+    // компилятором), потом по группам из CELL столбцов. Место максимума ищется только у
+    // ячеек выше thr — на чистом небе таких единицы.
+    static void cell_stats(const uint8_t* band, int stride, int cw, uint8_t thr, std::vector<uint8_t>& colmax,
+                           uint8_t* cmax, uint8_t* carg) {
+        colmax.resize(cw);
+        uint8_t* cm = colmax.data();
+        std::memcpy(cm, band, cw);
+        for (int r = 1; r < CELL; ++r) {
+            const uint8_t* row = band + (size_t)r * stride;
+            for (int x = 0; x < cw; ++x) cm[x] = cm[x] > row[x] ? cm[x] : row[x];
+        }
+        const int ncell = cw / CELL;
+        for (int c = 0; c < ncell; ++c) {
+            const uint8_t* g = cm + c * CELL;
+            uint8_t m = g[0];
+            for (int x = 1; x < CELL; ++x) m = g[x] > m ? g[x] : m;
+            cmax[c] = m;
+            if (m <= thr) continue;
+            for (int r = 0, found = 0; r < CELL && !found; ++r) {
+                const uint8_t* row = band + (size_t)r * stride + c * CELL;
+                for (int x = 0; x < CELL; ++x)
+                    if (row[x] == m) { carg[c] = (uint8_t)(r * CELL + x); found = 1; break; }
             }
         }
     }

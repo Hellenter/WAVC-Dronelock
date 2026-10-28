@@ -908,6 +908,10 @@ void tab_algorithm(App& a, bool& changed) {
     help_marker("Каждая полярность — отдельный проход морфологии. Дрон на фоне неба почти всегда темнее неба, "
                 "поэтому на слабом железе можно оставить только тёмные: вдвое быстрее.");
 
+    blk |= ImGui::Checkbox("Трекер в секундах", &a.s.trkSeconds);
+    help_marker("Скорости, ворота и выдержки трекера настроены на 25 новых кадров в секунду. Включено — они "
+                "пересчитываются под частоту камеры (повторы кадров в записи экрана не считаются). Камера 16 Мп "
+                "на 10 к/с: птиц находится 77% вместо 51%, дронов, принятых за птиц, нет.");
     heading("Камера ведёт цель");
     changed |= ImGui::Checkbox("виртуальная поворотка", &a.s.follow);
     help_marker("Проверка захвата для камеры на поворотном устройстве, которая следует за целью. Алгоритм видит "
@@ -938,6 +942,36 @@ void tab_algorithm(App& a, bool& changed) {
     blk |= ImGui::SliderInt("##mask", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
     ImGui::SameLine();
     if (ImGui::Button("заново", ImVec2(-FLT_MIN, 0))) a.pipe.relearnMask();
+    blk |= ImGui::Checkbox("Маска из файла", &a.s.maskFile);
+    help_marker("Маска неба лежит рядом с видео (.mask.bin): на старте она закрывает лес сразу, а не через 25 "
+                "кадров обучения (ложных треков в первые 3 с — в 6 раз меньше). Пока идут эти кадры, маска "
+                "сверяется с видимым; если камеру сдвинули и больше 10% тайлов не совпало — учится заново и "
+                "перезаписывается. «Заново» учит, не глядя в файл.");
+    bool pt2 = d.per_tile > 1;
+    if (ImGui::Checkbox("Два кандидата в тайле", &pt2)) {
+        d.per_tile = pt2 ? 2 : 1;
+        blk = true;
+    }
+    help_marker("Кроме самого сильного отклика тайла 64x64 берётся ещё один, из ячейки 16x16 подальше от первого: "
+                "дрон рядом с бликом, птицей или вторым дроном. Пара дронов в 20 пикс.: 65% -> 99%. Цена ~0.5 мс на "
+                "16 Мп.");
+    blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
+    help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
+                "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
+                "лесом: 16% -> 52%, ложных не больше.");
+    blk |= ImGui::Checkbox("Накопление слабых целей (опыт)", &d.tbd);
+    help_marker("Track-before-detect: ячейка, где отклик чуть выше её фона кадр за кадром, даёт кандидата и ниже "
+                "порога. Пока не окупается: на 16 Мп дальних 19% -> 28%, но на других сценах прироста нет, а ложных "
+                "+10..70 в минуту; +4.7 мс на 16 Мп.");
+    label("полоса у горизонта, пикс.",
+          "Полоса над кромкой земли (по маске неба) смотрится каждый кадр, небо выше — раз в N кадров и вокруг "
+          "уже найденных целей. Дальние дроны — низко над горизонтом, близкие — выше, крупнее и контрастнее. "
+          "16 Мп, полоса 512: раз в 2 — без потерь, раз в 3 — на 24% быстрее, высокие цели 97% -> 90%.");
+    blk |= ImGui::SliderInt("##band", &d.band_px, 0, 1024, d.band_px > 0 ? "%d" : "выкл.");
+    if (d.band_px > 0) {
+        label("небо выше полосы раз в, кадров");
+        blk |= ImGui::SliderInt("##upev", &d.upper_every, 1, 4, d.upper_every > 1 ? "%d" : "каждый");
+    }
     bool stOn = t.static_frames > 0;
     if (ImGui::Checkbox("Память статичных помех", &stOn)) {
         t.static_frames = stOn ? 3000 : 0;
@@ -1817,6 +1851,7 @@ int run_bench(int argc, char** argv) {
     s.pace = Pace::MaxSpeed;
     s.loop = true;
     s.staticFile = false;
+    s.maskFile = false;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -1833,6 +1868,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--static-file") s.staticFile = true;
+        else if (a == "--mask-file") s.maskFile = true;
         else if (a == "--slowdown") s.slowdown = atof(val().c_str());
         else if (a == "--governor") s.governor = true;
         else if (a == "--camera") s.pace = Pace::Realtime;   // кадры в темпе видео, лишние выбрасываются
@@ -1918,6 +1954,7 @@ int run_stress(int argc, char** argv) {
     Pipeline p;
     Settings s;
     s.staticFile = false;
+    s.maskFile = false;
     p.setSettings(s);
     std::string err;
     if (!p.open(video, err)) {

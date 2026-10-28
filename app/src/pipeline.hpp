@@ -64,6 +64,12 @@ struct Settings {
     // В замерах выключено: зацикленный ролик повторяет те же позиции целей, и память,
     // накопленная прошлыми запусками, искажала бы результат
     bool staticFile = true;
+    // маска неба из файла рядом с видео (<видео>.mask.bin) вместо обучения на каждом старте;
+    // первые learnMaskFrames кадров она сверяется с видимым, при расхождении учится заново
+    bool maskFile = true;
+    // трекер считает в секундах: скорости, ворота и выдержки пересчитываются под частоту
+    // кадров (dronolok::tracker_for_fps; повторы кадров записи экрана не считаются)
+    bool trkSeconds = true;
     // эмуляция устройства: обработка кадра растягивается в slowdown раз (ядро устройства
     // медленнее ядра ПК во столько раз, см. calibrate_ms_per_mp)
     double slowdown = 1.0;
@@ -201,6 +207,7 @@ public:
     // Память статичных помех лежит рядом с видео (<видео>.static.bin): загружается при
     // открытии и сохраняется при закрытии, если включена
     std::string staticPath() const { return path_ + ".static.bin"; }
+    std::string maskPath() const { return path_ + ".mask.bin"; }
     void staticSave() { staticCmd_ = 1; }
     void staticClear() { staticCmd_ = 2; }
     void resetStats();
@@ -243,6 +250,7 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<int> steps_{0};
     std::atomic<bool> relearn_{true};
+    std::atomic<bool> maskForce_{false};   // "заново": учить, даже если есть файл
     std::atomic<int> staticCmd_{0};
     std::atomic<int64_t> seekReq_{-1};
     std::atomic<int64_t> preN_{0};       // кадров в предзагрузке (0 — читаем файл)

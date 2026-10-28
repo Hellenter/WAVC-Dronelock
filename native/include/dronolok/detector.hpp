@@ -59,6 +59,39 @@ struct DetectorConfig {
     bool zones = false;
     float mixed_k = 1.f;        // на ваших роликах главное — правило "подтверждать, когда полетела", порог можно не поднимать
     int coarse_every = 2;       // крупная цель за кадр смещается мало, а грубые масштабы недёшевы
+    // --- Неподвижная камера: ячейки 16x16 пикс. кадра (8x8 после пулинга) ---
+    // Второй кандидат в тайле: самая сильная ячейка тайла вдали от первого — дрон рядом с
+    // бликом, птицей или другим дроном. 1 — как раньше, один на тайл. Пара дронов в 20 пикс.:
+    // полнота 65% -> 99%, ложных не прибавилось; цена ~0.5 мс на 16 Мп (4 потока).
+    int per_tile = 2;
+    // Фон по ячейкам у земли (неподвижная камера с маской неба). Маска неба не расширяется на
+    // тайл запаса, а текстурные тайлы у самой кромки леса, которые раньше выбрасывались
+    // целиком, смотрятся по ячейкам: у каждой ячейки там скользящие квантили (медиана и 90%)
+    // её максимального отклика за ~bg_frames кадров, цель — только если отклик выше
+    // медиана + bg_k * СКО. Шум неба для общего порога считается без этих тайлов.
+    // Дальние дроны в 1-12% высоты над лесом: полнота 16% -> 52%, ложных не прибавилось.
+    // В чистом небе свой порог ячейки не нужен: шум там ровный, общий порог точнее (с ним
+    // же на всё небо дальние теряются: 52% -> 6%). Ячейки вокруг треков фон не учат.
+    bool bg_map = true;
+    float bg_k = 3.f;
+    int bg_frames = 250;
+    // Накопление слабой цели по кадрам (track-before-detect на ячейках, фон ячеек тогда
+    // учится по всему небу): A = tbd_decay * max3x3(A) + max(0, z - tbd_z0), z — превышение
+    // отклика ячейки над её фоном в СКО. Ячейка, накопившая tbd_thr, даёт кандидата, даже
+    // если её отклик ниже порога (но не ниже tbd_min порога). Пока не окупается: на 16 Мп
+    // дальних 19% -> 28%, на сценах 4 Мп прироста нет, а ложных тревог +10..70 в минуту;
+    // максимум по ячейке 16x16 сам шумит, дрон с контрастом 7-12 не виден и так. +4.7 мс на 16 Мп.
+    bool tbd = false;
+    float tbd_decay = 0.7f, tbd_thr = 7.f, tbd_z0 = 1.5f, tbd_min = 0.5f;
+    // Полоса у горизонта (неподвижная камера с маской неба): band_px пикс. кадра над кромкой
+    // земли смотрятся каждый кадр и с порогом band_k * порог; небо выше — раз в upper_every
+    // кадров, между ними только вокруг треков. Дальняя цель — низко над горизонтом, близкая
+    // высоко, крупная и контрастная. band_px = 0 — выключено. 16 Мп, полоса 512 пикс.:
+    // upper_every 2 — потерь нет; 3 — на 24% быстрее, высокие цели 97% -> 90%. band_k < 1
+    // не помогает: в полосе прибавляются ложные, а не дальние.
+    int band_px = 0;
+    float band_k = 1.f;
+    int upper_every = 1;
     // ресурсы
     int threads = 0;            // 0 = все аппаратные потоки
     std::vector<int> cpus;      // привязка рабочих потоков к ядрам (пусто = как решит ОС)
@@ -80,6 +113,8 @@ struct Candidate {
     // силуэта, то есть за взмахами крыльев.
     float energy = 0;
     float margin = 0;  // во сколько раз отклик выше действующего порога (0 — неизвестно: не из Detector)
+    bool tbd = false;  // найдена накоплением по кадрам (DetectorConfig::tbd), отклик ниже порога
+    bool second = false;   // второй кандидат в тайле (DetectorConfig::per_tile)
 };
 
 // Область, где ждём цель (прогноз трека): там порог ниже, см. DetectorConfig::focus_k
@@ -93,7 +128,8 @@ struct DetectTiming {
     double response_ms = 0;  // пулинг + морфология + статистика тайлов (бэкенд)
     double select_ms = 0;    // выбор кандидатов
     int jobs = 0, jobs_skipped = 0;   // задания бэкенда, пропущенные по маске
-    bool partial = false;    // основной масштаб — только вокруг треков (full_every)
+    bool partial = false;    // основной масштаб — только вокруг треков (full_every) или полоса у горизонта
+    bool upperSkipped = false;   // небо выше полосы у горизонта в этот кадр не смотрели (upper_every)
     bool coarsePartial = false;
 };
 
@@ -116,6 +152,15 @@ public:
     void endMaskLearning(float frac = 0.3f);
     bool learningMask() const { return learning_; }
     void clearMask();
+    // Маска неба в файле: неподвижной камере не нужно учить её заново при каждом запуске
+    // (в эти кадры захват ложный). loadMask сразу включает сохранённую маску и первые verify
+    // кадров параллельно учит маску заново; если новая отличается больше чем на 10% тайлов
+    // (камеру сдвинули, повернули), берётся новая (maskReplaced). Файл привязан к размеру
+    // кадра, пулингу и тайлу — чужой не загрузится.
+    bool saveMask(const std::string& path) const;
+    bool loadMask(const std::string& path, int verify = 25);
+    bool verifyingMask() const { return verifyLeft_ > 0; }
+    bool maskReplaced() const { return maskReplaced_; }
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
@@ -142,6 +187,12 @@ public:
 private:
     void selectTiles(const TileStats& ts, int tw, int th, int tile, int factor, int pol, int lvl,
                      bool fineGrid, std::vector<Candidate>& out);
+    void selectTbd(const TileStats& ts, int pol, std::vector<Candidate>& out);
+    void updateBg(const TileStats& ts, int pol);
+    void updateBand();
+    float bgThr(int pol, size_t ci) const;
+    bool bgWarm(int pol, size_t ci) const;
+    void markExcl();
     void markFocus(int tw, int th, int tilePx);
 
     DetectorConfig cfg_;
@@ -152,6 +203,18 @@ private:
     bool learning_ = false;
     std::vector<float> texSum_;
     int texN_ = 0;
+    int verifyLeft_ = 0;
+    bool maskReplaced_ = false;
+    long maskVer_ = 0, bandVer_ = -1;
+    std::vector<uint8_t> band_, nearGround_;   // тайлы полосы у горизонта; тайлы рядом с маской
+public:
+    // тайлы полосы у горизонта (tilesY x tilesX, 1 — полоса), пусто — выключено или нет маски
+    const std::vector<uint8_t>& horizonBand() const { return band_; }
+    // ячейка в точке кадра (x, y): максимум отклика в этом кадре, фон (среднее, СКО) и
+    // накопленное A; false — ячеек нет (для отладки и вывода в приложении)
+    bool cellInfo(int pol, float x, float y, float& cmax, float& mu, float& sd, float& A) const;
+private:
+    void buildMask(float frac, std::vector<uint8_t>& out) const;
     std::vector<FocusArea> focus_, roi_;
     std::vector<uint8_t> focusTiles_, roiMask_, zones_;
     std::vector<int> fill_;
@@ -278,6 +341,14 @@ struct TrackerConfig {
     float overlay_px = 1.f;
     float overlay_cam = 24.f;
 };
+
+// Время в секундах. Числа выше подобраны для камеры 25 кадр/с: счётчики кадров — это время
+// при 25 к/с, скорости, ускорения и ворота — пикс. за кадр при 25 к/с. tracker_for_fps
+// пересчитывает их под настоящую частоту камеры так, чтобы в секундах и пикс./с всё осталось
+// как было: камера 16 Мп даёт ~10 к/с (цель смещается за кадр в 2.5 раза дальше, удержание
+// 12 кадров — уже 1.2 с вместо 0.5), запись экрана — 60. Счётчики попаданий (confirm,
+// cls_min_hits, static_hits) и расстояния (mover_px, dup_px) не меняются.
+TrackerConfig tracker_for_fps(const TrackerConfig& c, float fps, float ref_fps = 25.f);
 
 struct TrackPoint { float x, y; };
 

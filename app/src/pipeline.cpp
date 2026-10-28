@@ -215,7 +215,10 @@ void Pipeline::step() {
     qcv_.notify_all();
 }
 
-void Pipeline::relearnMask() { relearn_ = true; }
+void Pipeline::relearnMask() {
+    maskForce_ = true;
+    relearn_ = true;
+}
 
 void Pipeline::setGroundTruth(const GroundTruth& g) {
     auto p = std::make_shared<GroundTruth>(g);
@@ -441,7 +444,12 @@ void Pipeline::processLoop() {
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
-    bool maskOn = false, motionWas = false;
+    bool maskOn = false, motionWas = false, maskChecking = false;
+    // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
+    float uniqShare = 1.f, trkFps = 0.f;
+    auto trkCfg = [&](const Settings& st) {
+        return st.trkSeconds && trkFps > 0 ? tracker_for_fps(st.trk, trkFps) : st.trk;
+    };
     {
         std::lock_guard<std::mutex> lk(rm_);
         backend_ = det.backendName();
@@ -491,7 +499,7 @@ void Pipeline::processLoop() {
                 s = settings_;
                 ver = settingsVer_;
                 dirty = true;
-                if (trk) trk->config() = s.trk;
+                if (trk) trk->config() = trkCfg(s);
             }
         }
         const Frame& src = *p.frame;
@@ -555,7 +563,7 @@ void Pipeline::processLoop() {
         }
         if (!trk || trkW != f.w || trkH != f.h || trkCell != s.trk.clutter_cell || trkFollow != s.follow) {
             saveStatic();
-            trk.reset(new Tracker(f.w, f.h, s.trk));
+            trk.reset(new Tracker(f.w, f.h, trkCfg(s)));
             trkW = f.w;
             trkH = f.h;
             trkCell = s.trk.clutter_cell;
@@ -605,7 +613,15 @@ void Pipeline::processLoop() {
             }
             relearn_ = false;
         } else if (relearn_.exchange(false)) {
-            if (s.learnMaskFrames > 0) {
+            const bool force = maskForce_.exchange(false);
+            // маска из файла сразу закрывает лес, а первые кадры сверяется с видимым
+            if (s.learnMaskFrames > 0 && s.maskFile && !force && det.loadMask(maskPath(), s.learnMaskFrames)) {
+                learnLeft = 0;
+                maskOn = true;
+                maskChecking = true;
+                std::lock_guard<std::mutex> lr(rm_);
+                staticMsg_ = "маска неба из файла, сверяется с видео";
+            } else if (s.learnMaskFrames > 0) {
                 det.beginMaskLearning();
                 learnLeft = s.learnMaskFrames;
                 maskOn = true;
@@ -618,10 +634,22 @@ void Pipeline::processLoop() {
         // Повтор кадра: запись экрана 60 к/с с ролика 25-30 к/с даёт тот же кадр 2-3 раза.
         // Нового в нём нет, а трекер видел бы цель то стоящей, то прыгнувшей вдвое — берём
         // результат прошлого кадра
-        const bool dup = s.skipDuplicates && lastR && !p.loopStart && !p.seekStart && dupRun < 2 &&
-                         dupCheck.duplicate(f.px.data(), f.w, f.h, f.w);
-        if (!s.skipDuplicates || p.loopStart || p.seekStart) dupCheck.reset();
+        // повтор ищем и для трекера в секундах: у записи экрана 60 к/с новых кадров 25-30 в секунду
+        const bool checkDup = s.skipDuplicates || s.trkSeconds;
+        const bool same = checkDup && lastR && !p.loopStart && !p.seekStart && (dupRun < 2 || !s.skipDuplicates) &&
+                          dupCheck.duplicate(f.px.data(), f.w, f.h, f.w);
+        const bool dup = s.skipDuplicates && same;
+        if (!checkDup || p.loopStart || p.seekStart) dupCheck.reset();
         dupRun = dup ? dupRun + 1 : 0;
+        if (!p.loopStart && !p.seekStart) uniqShare = 0.98f * uniqShare + 0.02f * (same ? 0.f : 1.f);
+        {   // трекер в секундах: частота меняется (камера, повторы кадров) — пересчитать
+            const double base = s.targetFps > 0 ? s.targetFps : info_.fps;
+            const float fps = (float)(base * std::max(0.2f, uniqShare));
+            if (fps > 0 && std::fabs(fps - trkFps) > 0.1f * std::max(trkFps, 1.f)) {
+                trkFps = fps;
+                if (trk) trk->config() = trkCfg(s);
+            }
+        }
         std::shared_ptr<Result> r;
         double t0 = now_ms(), t3 = t0;
         if (dup) {
@@ -703,8 +731,16 @@ void Pipeline::processLoop() {
             }
             const double t2 = now_ms();
             const bool learning = det.learningMask();
+            if (maskChecking && !det.verifyingMask()) {   // сверка маски из файла закончилась
+                maskChecking = false;
+                if (det.maskReplaced() && s.maskFile) det.saveMask(maskPath());
+                std::lock_guard<std::mutex> lr(rm_);
+                staticMsg_ = det.maskReplaced() ? "сцена изменилась: маска неба выучена заново и сохранена"
+                                                : "маска неба из файла подтверждена";
+            }
             if (learnLeft > 0 && --learnLeft == 0) {
                 det.endMaskLearning();
+                if (s.maskFile) det.saveMask(maskPath());
                 // треки, начатые до маски, могли родиться на том, что маска теперь закрыла
                 // (надписи поверх записи экрана, кромка крыш): начинаем заново
                 if (trk->lockState() != dronolok::LockState::Hard) trk->resetTracks();
