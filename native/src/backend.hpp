@@ -29,6 +29,8 @@ struct ResponseParams {
     // второго кандидата в тайле. tile должен делиться на CELL.
     bool cells = false;
     uint8_t cell_thr = 255;
+    // Сглаживание 3x3 [1 2 1]x[1 2 1] кадра перед пулингом (DetectorConfig::smooth)
+    bool smooth = false;
 };
 
 constexpr int CELL = 8;

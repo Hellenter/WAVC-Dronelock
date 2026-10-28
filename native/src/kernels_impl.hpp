@@ -37,6 +37,19 @@ static void k_pool1(const uint8_t* r0, uint8_t* dk, uint8_t* br, int n) {
         [&](int x) { dk[x] = r0[x]; br[x] = (uint8_t)(255 - r0[x]); });
 }
 
+// Сглаживание 3x3 [1 2 1]x[1 2 1]/16 (с округлением) строки b по строкам a, b, c: n выходов,
+// читает столбцы -1..n. Перед пулингом оно работает как согласованный фильтр для цели в 1-4
+// пикс.: шум падает втрое, а тусклая точка — меньше чем вдвое.
+static void k_smooth3(const uint8_t* a, const uint8_t* b, const uint8_t* c, uint8_t* out, int n) {
+    for_cols(n,
+        [&](int x) { smooth3_vec(a + x, b + x, c + x, out + x); },
+        [&](int x) {
+            const unsigned s = (unsigned)a[x - 1] + 2u * a[x] + a[x + 1] + 2u * ((unsigned)b[x - 1] + 2u * b[x] + b[x + 1]) +
+                               c[x - 1] + 2u * c[x] + c[x + 1];
+            out[x] = (uint8_t)((s + 8) >> 4);
+        });
+}
+
 // Длина ядра известна при компиляции для частых k: указатели строк живут в регистрах,
 // а 4 направления считаются независимыми цепочками (без длинной зависимости по min/max).
 template <int K>
@@ -228,6 +241,6 @@ static void k_tile_stats(const uint8_t* band, int stride, int T, int rows, int r
 }
 
 static const dronolok::Kernels* make_table(const char* name) {
-    static const dronolok::Kernels k = {name, W, k_pool2, k_pool1, k_dilate4, k_erode4_sub, k_tile_stats};
+    static const dronolok::Kernels k = {name, W, k_pool2, k_pool1, k_dilate4, k_erode4_sub, k_tile_stats, k_smooth3};
     return &k;
 }

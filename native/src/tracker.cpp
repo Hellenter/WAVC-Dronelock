@@ -55,6 +55,8 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref) {
     c.clutter_decay = std::pow(c.clutter_decay, v);
     c.max_miss = frames(c.max_miss, 3);
     c.static_frames = frames(c.static_frames, 100);
+    c.quiet_frames = frames(c.quiet_frames, 10);
+    c.quiet_max = frames(c.quiet_max, 100);
     c.flap_hold = frames(c.flap_hold, 5);
     // окно взмахов: не короче 32 кадров — на 10 к/с частые взмахи приходят сложенными в
     // низкие частоты, на их период нужно несколько секунд
@@ -72,6 +74,7 @@ Tracker::Tracker(int w, int h, const TrackerConfig& cfg) : cfg_(cfg) {
     heat_.assign((size_t)gw_ * gh_, 0.f);
     stat_.assign(heat_.size(), 0.f);
     statT_.assign(heat_.size(), 0);
+    lastDet_.assign(heat_.size(), 0);
 }
 
 void Tracker::resetTracks() {
@@ -285,7 +288,9 @@ void Tracker::classify(Track& t) const {
     // (фонарь, угол дома, когда камера ведёт панораму) — помеха; наложение на кадр — тоже.
     // Цель жёсткого захвата уже признана дроном: зависшая, она помехой не становится
     const bool held = hard_ && t.id == lockId_;
-    if (t.overlay || t.anchored || (!held && (t.clutter || (n >= cfg_.cls_min_hits && t.travel < std::max(3.f, 0.25f * (float)t.age))))) {
+    const bool qh = quietHold(t);
+    if (t.overlay || t.anchored ||
+        (!held && (t.clutter || (!qh && n >= cfg_.cls_min_hits && t.travel < std::max(3.f, 0.25f * (float)t.age))))) {
         t.cls = TargetClass::Clutter;
         return;
     }
@@ -300,7 +305,7 @@ void Tracker::classify(Track& t) const {
     float e = std::max(t.resid / (cfg_.bird_resid * (float)lf), t.contrastCv / cfg_.bird_contrast_cv);
     if (cfg_.bird_speed > 0) e = std::max(e, t.speed / cfg_.bird_speed);
     const bool flapped = frame_ - t.flapT <= cfg_.flap_hold;
-    t.hovering = cfg_.hover_speed > 0 && t.everMover && t.speed < cfg_.hover_speed;
+    t.hovering = cfg_.hover_speed > 0 && (t.everMover || qh) && t.speed < cfg_.hover_speed;
     float inst = e > 1.f ? 1.f : 0.f;
     if (flapped || t.flock) inst = 1.f;
     else if (t.hovering) inst = 0.f;
@@ -314,11 +319,22 @@ void Tracker::classify(Track& t) const {
 // 1 кадр, устоявшийся и летящий по сцене — столько, сколько было попаданий, но не больше max_miss
 int Tracker::coastLimit(const Track& t) const {
     if (hard_ && t.id == lockId_) return std::max(1, cfg_.hard_miss);
-    const int lim = t.hits < cfg_.cls_min_hits || t.travel < cfg_.mover_px ? 1 : std::min(cfg_.max_miss, t.hits);
+    const int lim = t.hits < cfg_.cls_min_hits || (t.travel < cfg_.mover_px && !quietHold(t)) ? 1 : std::min(cfg_.max_miss, t.hits);
     // захваченную цель не бросаем после одного пропуска: у крупного дрона детектор
     // ловит то одну, то другую часть, и молодой трек иначе рвётся (а при 25 к/с —
     // на каждом втором захвате)
     return t.id == lockId_ ? std::max(lim, std::min(cfg_.max_miss, 4)) : lim;
+}
+
+// Родился у кромки крон и сейчас ходит туда-сюда, а не летит (см. edge_straight)
+bool Tracker::edgeJitter(const Track& t) const {
+    return t.edgeBorn && cfg_.edge_straight > 0 && t.obs.size() >= 16 && t.straight < cfg_.edge_straight &&
+           !(hard_ && t.id == lockId_);
+}
+
+// Трек спокойного неба (см. quiet_frames) ещё не простоял quiet_max кадров
+bool Tracker::quietHold(const Track& t) const {
+    return t.quiet && t.age < cfg_.quiet_max && !t.overlay && !t.anchored;
 }
 
 // вклад попадания в уверенность: ~ логарифм отношения правдоподобия "цель / шум" для
@@ -374,7 +390,7 @@ void Tracker::focus(float camDx, float camDy, std::vector<FocusArea>& out) const
     for (const Track& t0 : tracks_) {
         // только устоявшиеся летящие цели: иначе пониженный порог подкармливает шумовые треки
         if (!t0.solid || t0.cls == TargetClass::Clutter) continue;
-        if (t0.id != lockId_ && (t0.hits < cfg_.cls_min_hits || t0.travel < cfg_.mover_px)) continue;
+        if (t0.id != lockId_ && (t0.hits < cfg_.cls_min_hits || (t0.travel < cfg_.mover_px && !quietHold(t0)))) continue;
         Track t = t0;
         kf_predict(t, camDx, camDy, q);
         const float S = t.p00 + measVar(t.level);
@@ -610,11 +626,28 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // клаттер: всё, что не продолжает движущуюся цель, греет карту; в горячих ячейках —
     // помеха (её не отдаём ни трекам, ни в новые треки)
     auto mover = [&](const Track& t) {
-        return t.confirmed && t.travel >= cfg_.mover_px * (t.edgeBorn ? cfg_.edge_mover_k : 1.f) && !t.overlay && !t.anchored;
+        return t.confirmed && t.travel >= cfg_.mover_px * (t.edgeBorn ? cfg_.edge_mover_k : 1.f) && !t.overlay && !t.anchored &&
+               !edgeJitter(t);
     };
+    // спокойное небо: рядом с треком появился другой отклик (кромка облака, листва) или
+    // камера сдвинулась — это уже не одинокая точка, дальше как обычный трек
+    const bool camStill = !movingCam_ && std::fabs(camDx) < 0.5f && std::fabs(camDy) < 0.5f;
+    if (!camStill) quietEpoch_ = frame_;
+    if (cfg_.quiet_frames > 0)
+        for (size_t ti = 0; ti < tracks_.size(); ++ti) {
+            Track& t = tracks_[ti];
+            if (!t.quiet) continue;
+            if (!camStill || !quietHold(t)) { t.quiet = false; continue; }
+            const float dup = cfg_.dup_px * (float)(1 << std::min(4, t.level)), r = std::max(cfg_.quiet_r, dup);
+            for (size_t di = 0; di < dets.size() && t.quiet; ++di) {
+                if (owner[di] == (int)ti || shadow[di] || dets[di].weak) continue;
+                const float dx = std::fabs(dets[di].x - t.x), dy = std::fabs(dets[di].y - t.y);
+                if (dx < r && dy < r && (dx >= dup || dy >= dup)) t.quiet = false;
+            }
+        }
     std::vector<char> isMover(dets.size(), 0);
     for (size_t di = 0; di < dets.size(); ++di) {
-        isMover[di] = (owner[di] >= 0 && mover(tracks_[owner[di]])) || (int)di == silhDet;
+        isMover[di] = (owner[di] >= 0 && (mover(tracks_[owner[di]]) || quietHold(tracks_[owner[di]]))) || (int)di == silhDet;
         if (!isMover[di] && !shadow[di] && !dets[di].weak) heat_[cellOf(dets[di])] += 1.f - decay;
     }
     // долгая память учится только при неподвижной камере: координаты ячеек — кадра
@@ -636,10 +669,12 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         }
     }
 
+    std::vector<char> quietDet(dets.size(), 0);   // отклик трека спокойного неба
     for (size_t ti = 0; ti < tracks_.size(); ++ti) {
         Track& tr = tracks_[ti];
         const int best = match[ti];
         tr.det = best;
+        if (best >= 0 && tr.quiet) quietDet[best] = 1;
         tr.hist.push_back(best >= 0);
         while ((int)tr.hist.size() > cfg_.window) tr.hist.pop_front();
         ++tr.age;
@@ -672,7 +707,20 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         const float sx = d.x - gx_, sy = d.y - gy_;
         if (tr.hits <= 5) tr.travel = 0;
         tr.obs.push_back({frame_, sx, sy, d.contrast, d.level, d.energy, d.x, d.y});
-        while ((int)tr.obs.size() > std::max({cfg_.cls_window, cfg_.flap_window, cfg_.overlay_hits})) tr.obs.pop_front();
+        while ((int)tr.obs.size() > std::max({48, cfg_.cls_window, cfg_.flap_window, cfg_.overlay_hits})) tr.obs.pop_front();
+        // прямота пути: последние до 48 попаданий, 8 отрезков (шум замера на коротких шагах
+        // не делает медленный дрон "дрожащим")
+        if (tr.obs.size() >= 16) {
+            const int n = (int)std::min<size_t>(48, tr.obs.size()), a = (int)tr.obs.size() - n;
+            float path = 0;
+            for (int s = 0; s < 8; ++s) {
+                const auto& p = tr.obs[a + (n - 1) * s / 8];
+                const auto& q = tr.obs[a + (n - 1) * (s + 1) / 8];
+                path += std::hypot(q.x - p.x, q.y - p.y);
+            }
+            const float net = std::hypot(tr.obs.back().x - tr.obs[a].x, tr.obs.back().y - tr.obs[a].y);
+            tr.straight = path > 1e-3f ? net / path : 0.f;
+        }
         // как далеко ушёл по сцене: по медиане последних 5 попаданий — одиночный скачок
         // отклика (соседнее пятно, силуэт захватил лишнее) полётом не считается
         if (tr.hits >= 5 && tr.obs.size() >= 5) {
@@ -708,7 +756,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         if (mover(tr)) {
             tr.everMover = true;
             tr.pend.clear();
-        } else if (learn && !tr.everMover && !tr.everLocked) {
+        } else if (learn && !tr.everMover && !tr.everLocked && !quietHold(tr)) {
             tr.pend.push_back((uint32_t)cellOf(d));
             if (tr.pend.size() >= 256 && tr.id != lockId_) {
                 for (uint32_t c : tr.pend) staticAdd(c);
@@ -729,6 +777,18 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                   tracks_.end());
     // новые треки из свободных детекций; начальная скорость неизвестна — широкие ворота
     const float v0 = cfg_.gate / 3.f;
+    // родился в спокойном небе: камера стоит quiet_frames кадров, и столько же вокруг на
+    // quiet_r не было откликов (не кромка крон, не облако, не запомненная помеха)
+    auto quietBirth = [&](const Candidate& d) {
+        if (cfg_.quiet_frames <= 0 || d.edge || frame_ - quietEpoch_ < cfg_.quiet_frames || staticHot(d.x, d.y))
+            return false;
+        const int r = (int)std::ceil(cfg_.quiet_r / (float)cell);
+        const int cx = std::min(gw_ - 1, std::max(0, (int)d.x / cell)), cy = std::min(gh_ - 1, std::max(0, (int)d.y / cell));
+        for (int y = std::max(0, cy - r); y <= std::min(gh_ - 1, cy + r); ++y)
+            for (int x = std::max(0, cx - r); x <= std::min(gw_ - 1, cx + r); ++x)
+                if (frame_ - lastDet_[(size_t)y * gw_ + x] < cfg_.quiet_frames) return false;
+        return true;
+    };
     for (int di = 0; di < (int)dets.size(); ++di) {
         // слабый отклик (пониженный порог у прогноза) только продолжает трек, новый не рождает
         if (owner[di] >= 0 || clut[di] || shadow[di] || dets[di].weak || di == silhDet) continue;
@@ -756,9 +816,18 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         t.path.push_back({t.x, t.y});
         t.obs.push_back({frame_, t.bx, t.by, t.contrast, d.level, d.energy, d.x, d.y});
         t.edgeBorn = d.edge;
-        if (learn) t.pend.push_back((uint32_t)cellOf(d));
+        t.quiet = quietBirth(d);
+        if (learn && !t.quiet) t.pend.push_back((uint32_t)cellOf(d));
+        if (t.quiet) quietDet[di] = 1;
         tracks_.push_back(std::move(t));
     }
+    // время последнего отклика по ячейкам; отклики треков спокойного неба не в счёт — иначе
+    // тусклая цель, трек которой оборвался, на том же месте уже не родится "в тишине"
+    if (cfg_.quiet_frames > 0)
+        for (size_t di = 0; di < dets.size(); ++di) {
+            if (shadow[di] || dets[di].weak || part[di] || quietDet[di]) continue;
+            lastDet_[cellOf(dets[di])] = frame_;
+        }
     // стая: по взмахам соседей с прошлого кадра
     for (auto& tr : tracks_) {
         tr.flock = false;
@@ -801,7 +870,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             tr.lockW *= std::min(1.f, tr.travel / 64.f) * (tr.speed < cfg_.hover_speed ? 0.05f : 1.f) /
                         (1.f + tr.speed / cfg_.lock_slow);
         // родился у кромки неба (кроны, крыши): цель, только если полетела
-        if (!tr.solid || tr.miss > coastLimit(tr) || (tr.edgeBorn && !tr.everMover)) continue;
+        if (!tr.solid || tr.miss > coastLimit(tr) || (tr.edgeBorn && (!tr.everMover || edgeJitter(tr)))) continue;
         out_.push_back(tr);
         if (tr.det >= 0) inTrack[tr.det] = 1;
     }

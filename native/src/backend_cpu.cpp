@@ -51,12 +51,15 @@ struct Scratch {
     Ring D[2];
     std::vector<uint8_t> band[2];
     std::vector<uint8_t> colmax;
-    int bandStride = 0;
+    std::vector<uint8_t> sm;   // две сглаженные строки кадра (DetectorConfig::smooth)
+    int bandStride = 0, smStride = 0;
     int cap = 0, cwp = 0, tile = 0;
 
     void ensure(int cap_, int cwp_, int tile_) {
         if (cap_ == cap && cwp_ <= cwp && tile_ == tile) return;
         cap = cap_; cwp = cwp_; tile = tile_;
+        smStride = (2 * cwp + 64) & ~63;
+        sm.assign((size_t)2 * smStride, 0);
         for (int p = 0; p < 2; ++p) {
             P[p].init(cap, cwp, 1);
             D[p].init(cap, cwp, 4);
@@ -143,7 +146,17 @@ private:
                 uint8_t* pb = S.P[1].row(y);
                 if (p.pool == 2) {
                     const uint8_t* r0 = f.data + (size_t)(2 * yy) * f.stride + 2 * vx0;
-                    K_->pool2(r0, r0 + f.stride, pd + off, pb + off, nv);
+                    size_t r1 = f.stride;
+                    if (p.smooth) {
+                        smoothRow(f, 2 * yy, 2 * vx0, 2 * nv, S.sm.data());
+                        smoothRow(f, 2 * yy + 1, 2 * vx0, 2 * nv, S.sm.data() + S.smStride);
+                        r0 = S.sm.data();
+                        r1 = S.smStride;
+                    }
+                    K_->pool2(r0, r0 + r1, pd + off, pb + off, nv);
+                } else if (p.smooth) {
+                    smoothRow(f, yy, vx0, nv, S.sm.data());
+                    K_->pool1(S.sm.data(), pd + off, pb + off, nv);
                 } else {
                     K_->pool1(f.data + (size_t)yy * f.stride + vx0, pd + off, pb + off, nv);
                 }
@@ -190,6 +203,22 @@ private:
                 }
             }
         }
+    }
+
+    // Строка y кадра, сглаженная 3x3, столбцы x0..x0+n: у краёв кадра — повтор крайних пикселей
+    void smoothRow(const FrameView& f, int y, int x0, int n, uint8_t* out) const {
+        const uint8_t* b = f.data + (size_t)y * f.stride;
+        const uint8_t* a = y > 0 ? b - f.stride : b;
+        const uint8_t* c = y + 1 < f.h ? b + f.stride : b;
+        const int xs = std::max(x0, 1), xe = std::min(x0 + n, f.w - 1);
+        if (xe > xs) K_->smooth3(a + xs, b + xs, c + xs, out + (xs - x0), xe - xs);
+        auto px = [&](int x) {
+            const int l = std::max(x - 1, 0), r = std::min(x + 1, f.w - 1);
+            const unsigned s = (unsigned)a[l] + 2u * a[x] + a[r] + 2u * ((unsigned)b[l] + 2u * b[x] + b[r]) + c[l] + 2u * c[x] + c[r];
+            out[x - x0] = (uint8_t)((s + 8) >> 4);
+        };
+        for (int x = x0; x < std::min(xs, x0 + n); ++x) px(x);
+        for (int x = std::max(xe, x0); x < x0 + n; ++x) px(x);
     }
 
     // Ячейки по полосе из CELL строк отклика: максимум по столбцам (векторизуется

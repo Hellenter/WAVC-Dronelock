@@ -26,6 +26,9 @@ struct Kernels {
     // Накопительная: перед первой частью тайла все счётчики должны быть нулевыми.
     void (*tile_stats)(const uint8_t* band, int stride, int tile, int rows, int r0, int ntiles, uint8_t hot_thr,
                        uint32_t* sum, uint8_t* maxv, uint16_t* hot, uint16_t* argmax);
+    // Сглаживание 3x3 [1 2 1]x[1 2 1]/16 с округлением: out[x] по строкам a (выше), b, c (ниже).
+    // Читает столбцы -1..n каждой строки.
+    void (*smooth3)(const uint8_t* a, const uint8_t* b, const uint8_t* c, uint8_t* out, int n);
 };
 
 const Kernels* kernels_scalar();

@@ -28,6 +28,9 @@ struct DetectorConfig {
     float clutter_k = 3.f;      // во сколько раз отклик выше среднего в тайле
     int tile = 32;              // тайл для оценки клаттера и поиска максимумов
     float max_density = 0.012f; // доля "горячих" пикселей в тайле, выше — текстура
+    // ...если горячие ячейки 16x16 не собраны вокруг максимума тайла (иначе это одна крупная
+    // цель, а не текстура)
+    bool compact_tex = true;
     bool dark = true, bright = true;
     int max_cands = 300;        // на полярность
     // Масштабы. 1: цели примерно до 7 пикс. (при pool 2; крупнее тайл похож на текстуру
@@ -107,6 +110,20 @@ struct DetectorConfig {
     int band_px = 0;
     float band_k = 1.f;
     int upper_every = 1;
+    // Сглаживание кадра 3x3 [1 2 1]x[1 2 1] перед пулингом — согласованный фильтр для цели в 1-4
+    // пикс.: шум отклика падает втрое, тусклая точка — меньше чем вдвое. Отклик тогда в других
+    // единицах, порог (thr, порог по шуму) умножается на smooth_k.
+    bool smooth = false;
+    float smooth_k = 0.5f;
+    // ...но широкому пятну (облако, блик) сглаживание прибавляет больше, чем точке: бонус
+    // порога только компактным. Ширина — амплитуда в 2 пикс. от пика к пику: до compact_r0
+    // (FWHM ~3 пикс.) порог thr * smooth_k, от compact_r1 (FWHM ~5) — полный thr, между — плавно.
+    bool smooth_compact = true;
+    float compact_r0 = 0.45f, compact_r1 = 0.7f;
+    // Положение кандидата точнее шага пулинга: вершина пятна на сглаженном 3x3 кадре вокруг
+    // отклика, по трём точкам гаусса вдоль x и y. Без этого координата — центр клетки 2x2
+    // пулинга (ошибка до 1 пикс., СКО ~0.8 пикс.).
+    bool subpixel = false;
     // ресурсы
     int threads = 0;            // 0 = все аппаратные потоки
     std::vector<int> cpus;      // привязка рабочих потоков к ядрам (пусто = как решит ОС)
@@ -198,7 +215,10 @@ public:
     const DetectTiming& timing() const { return timing_; }
     // Оценка шума отклика (средний отклик тайла неба, медиана) и действующий порог
     float noiseLevel() const { return noise_; }
-    float threshold() const { return cfg_.auto_thr && thrEff_ > 0 ? thrEff_ : cfg_.thr; }
+    // во сколько раз отклик основного масштаба меньше "уровней яркости" (сглаживание, smooth_k)
+    float smoothK() const { return cfg_.smooth ? cfg_.smooth_k : 1.f; }
+    // порог основного масштаба в единицах его отклика (со сглаживанием — thr * smooth_k)
+    float threshold() const { return cfg_.auto_thr && thrEff_ > 0 ? thrEff_ : cfg_.thr * smoothK(); }
     std::string backendName() const;
     int threads() const;
 
@@ -241,6 +261,10 @@ public:
     // ячейка в точке кадра (x, y): максимум отклика в этом кадре, фон (среднее, СКО) и
     // накопленное A; false — ячеек нет (для отладки и вывода в приложении)
     bool cellInfo(int pol, float x, float y, float& cmax, float& mu, float& sd, float& A) const;
+    // текстурные тайлы основного масштаба в последнем кадре (tilesY x tilesX), pol 0 — тёмные, 1 — светлые
+    const std::vector<uint8_t>& texturedTiles(int pol) const;
+    // тайлы неба у самой земли (tilesY x tilesX): там текстурный тайл смотрится по ячейкам; пусто — нет
+    const std::vector<uint8_t>& nearGroundTiles() const { return nearGround_; }
 private:
     void buildMask(float frac, std::vector<uint8_t>& out) const;
     std::vector<FocusArea> focus_, roi_;
@@ -296,6 +320,10 @@ struct TrackerConfig {
     // родившемуся у кромки крон и крыш (Candidate::edge) — дальше в edge_mover_k раз: листва
     // на ветру "ходит" по кроне на десяток пикселей и иначе выдаётся целью
     float edge_mover_k = 3.f;
+    // ...и летит, а не дрожит: путь за последние до 48 попаданий (8 отрезков) прямой хотя бы
+    // на edge_straight (смещение / длина пути). Листва на кромке крон за минуты набирает
+    // пробег, но ходит туда-сюда (прямота ~0.4), дрон — по прямой (0.9+). 0 — выключено.
+    float edge_straight = 0.5f;
     float dup_px = 8.f;         // ближе к существующему треку новый трек не рождается
     float lock_switch = 1.5f;   // захват переходит на другую цель, если она весомее во столько раз
     // ...и остаётся весомее lock_dwell кадров подряд (при 25 к/с). Вес двух далёких медленных
@@ -344,6 +372,15 @@ struct TrackerConfig {
     // Зависание: цель, которая летала, а теперь стоит (скорость по сцене меньше hover_speed
     // пикс./кадр), — дрон; из птиц так умеет только пустельга. 0 — выключено.
     float hover_speed = 0.3f;
+    // Новая точка в спокойном небе: дрон висит или летит прямо на камеру и по кадру почти не
+    // движется, поэтому карта клаттера и правило "не сдвинулся — помеха" его гасят. Трек,
+    // родившийся там, где quiet_frames кадров не было ни одного отклика (камера стоит, вокруг
+    // на quiet_r пикс. пусто), карту не греет и правилом пробега не гасится; выдаётся как
+    // зависший дрон. Рядом появился другой отклик (кромка облака, листва) — флаг снимается;
+    // простоял дольше quiet_max кадров — дальше как обычная помеха. 0 — выключено.
+    int quiet_frames = 0;
+    int quiet_max = 750;
+    float quiet_r = 32.f;
     // Стая: попутчик машущей птицы (ближе flock_px, скорость отличается меньше чем на
     // flock_dv от его скорости) — тоже птица. Рой дронов крыльями не машет и так не
     // помечается. 0 — выключено.
@@ -448,6 +485,8 @@ struct Track {
     float flapPeriod = 0;    // период взмахов (видимый, с учётом наложения частот), кадров
     float flapDepth = 0;     // размах пульсации к среднему
     bool hovering = false;   // летал, а теперь висит на месте
+    bool quiet = false;      // родился в спокойном небе (см. TrackerConfig::quiet_frames)
+    float straight = 1.f;    // прямота пути за последние попадания (см. edge_straight)
     bool flock = false;      // летит в стае с машущей птицей
     bool overlay = false;    // наложение на кадр: стоит в кадре, пока камера движется
     bool anchored = false;   // на мачте или столбе (см. Silhouette::attached): не дрон
@@ -544,6 +583,8 @@ private:
     float measVar(int level) const;
     float evidenceOf(const Candidate& d) const;
     int coastLimit(const Track& t) const;
+    bool quietHold(const Track& t) const;
+    bool edgeJitter(const Track& t) const;
 
     TrackerConfig cfg_;
     int gw_, gh_;
@@ -551,6 +592,8 @@ private:
     float heatAccX_ = 0, heatAccY_ = 0;
     std::vector<float> stat_;   // память статичных помех: значение на кадр statT_
     std::vector<int> statT_;    // (затухание считается лениво, при обращении)
+    std::vector<int> lastDet_;  // кадр последнего отклика в ячейке (не от трека спокойного неба)
+    int quietEpoch_ = 0;        // кадр, когда камера последний раз двигалась
     float gx_ = 0, gy_ = 0;   // накопленный сдвиг камеры
     std::vector<Track> tracks_, out_;
     std::vector<Candidate> clutterDets_, noiseDets_;
