@@ -29,6 +29,11 @@ void set_process_priority(int level);
 bool open_video_dialog(void* owner);
 bool video_dialog_open();
 bool video_dialog_result(std::string& path);   // true — диалог закрыт; path пустой, если отменили
+// То же для папки (мультитест): свой диалог, независимый от выбора видео
+bool open_folder_dialog(void* owner);
+bool folder_dialog_open();
+bool folder_dialog_result(std::string& path);
+bool open_in_browser(const std::string& path);   // файл (отчёт) или папка — в программе по умолчанию
 std::vector<std::string> ui_fonts();   // системные шрифты с кириллицей, по убыванию предпочтения
 void attach_console();                 // Windows: вывод --bench в консоль, из которой запустили
 
