@@ -83,6 +83,33 @@ double static_mask(const std::vector<uint8_t>& cur, const std::vector<uint8_t>& 
 
 }  // namespace
 
+void GlobalMotion::setRegion(const uint8_t* tiles, int tw, int th, int tilePx) {
+    region_.clear();
+    if (!tiles || tw <= 0 || th <= 0 || tilePx <= 0) return;
+    size_t ground = 0;
+    for (size_t i = 0; i < (size_t)tw * th; ++i) ground += tiles[i] == 0;
+    if (ground * 20 < (size_t)tw * th) return;
+    region_.resize((size_t)tw * th);
+    for (size_t i = 0; i < region_.size(); ++i) region_[i] = tiles[i] == 0;
+    rtw_ = tw;
+    rth_ = th;
+    rpx_ = tilePx;
+}
+
+void GlobalMotion::setAnchored(bool on) {
+    if (on == anchored_) return;
+    anchored_ = on;
+    prev_.clear();
+    last_.clear();
+    accX_ = accY_ = 0;
+}
+
+bool GlobalMotion::inRegion(int x, int y, int scale) const {
+    if (region_.empty()) return true;
+    const int tx = std::min(rtw_ - 1, x * scale / rpx_), ty = std::min(rth_ - 1, y * scale / rpx_);
+    return region_[(size_t)ty * rtw_ + tx] != 0;
+}
+
 MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int stride) {
     const double t0 = now_ms();
     MotionEstimate res;
@@ -90,6 +117,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
         w_ = w;
         h_ = h;
         prev_.clear();
+        last_.clear();
         f_ = 1;
         while (w / f_ > MAX_SIDE || h / f_ > MAX_SIDE) f_ *= 2;
     }
@@ -128,29 +156,73 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
         gradient(lv.px, lv.w, lv.h, g);
         lv.px.swap(g);
     }
-    if (prev_.size() != pyr.size()) {
+    if (!anchored_) {
+        if (prev_.size() == pyr.size()) res = match(pyr, prev_, 0.f, 0.f, true);
         prev_ = std::move(pyr);
         ms_ = now_ms() - t0;
         return res;
     }
+    // От опорного кадра (prev_): сдвиг за кадр — разность с прошлым итогом. Прогноз для
+    // поиска и проверка — обычный сдвиг от прошлого кадра (last_): при повторе кадра или
+    // рывке камеры (запись экрана) опорный совмещается плохо — тогда он и берётся.
+    if (prev_.size() != pyr.size() || last_.size() != pyr.size()) {
+        prev_ = pyr;
+        last_ = std::move(pyr);
+        accX_ = accY_ = 0;
+        ms_ = now_ms() - t0;
+        return res;
+    }
+    const MotionEstimate step = match(pyr, last_, 0.f, 0.f, false);
+    MotionEstimate key = match(pyr, prev_, accX_ + step.dx, accY_ + step.dy, false);
+    const float ix = key.dx - accX_, iy = key.dy - accY_;
+    const float tol = std::max(4.f, 0.5f * std::hypot(step.dx, step.dy));
+    const bool keyOk = key.valid && step.valid && std::hypot(ix - step.dx, iy - step.dy) <= tol;
+    const bool far = std::max(std::fabs(key.dx), std::fabs(key.dy)) > std::min(w, h) / 6.f;
+    if (keyOk) {
+        res = key;
+        res.dx = ix;
+        res.dy = iy;
+        accX_ = key.dx;
+        accY_ = key.dy;
+    } else {
+        res = step;
+    }
+    if (!keyOk || far) {   // новый опорный кадр
+        prev_ = pyr;
+        accX_ = accY_ = 0;
+    }
+    last_ = std::move(pyr);
+    ms_ = now_ms() - t0;
+    return res;
+}
+
+// Сдвиг cur относительно ref (пирамиды градиента), поиск вокруг (px, py) пикс. кадра.
+// partCheck — проверка по частям кадра (ветки на ветру при неподвижной камере)
+MotionEstimate GlobalMotion::match(const std::vector<Img>& pyr, const std::vector<Img>& ref, float px, float py,
+                                   bool partCheck) const {
+    MotionEstimate res;
     // кадр повторился (запись 25 к/с в ролике 60 к/с) или вся текстура на месте — сдвига нет
     std::vector<std::vector<uint8_t>> skip(pyr.size());
-    if (static_mask(pyr[0].px, prev_[0].px, skip[0]) > 0.9) {
+    if (static_mask(pyr[0].px, ref[0].px, skip[0]) > 0.9) {
         res.valid = true;
         res.quality = 1.f;
-        prev_ = std::move(pyr);
-        ms_ = now_ms() - t0;
         return res;
     }
-    for (size_t L = 1; L < pyr.size(); ++L) static_mask(pyr[L].px, prev_[L].px, skip[L]);
+    for (size_t L = 1; L < pyr.size(); ++L) static_mask(pyr[L].px, ref[L].px, skip[L]);
+    if (!region_.empty())   // только земля: небо — как неподвижные точки, не учитываются
+        for (size_t L = 0; L < pyr.size(); ++L)
+            for (int y = 0; y < pyr[L].h; ++y)
+                for (int x = 0; x < pyr[L].w; ++x)
+                    if (!inRegion(x, y, f_ << L)) skip[L][(size_t)y * pyr[L].w + x] = 0xFF;
     static const Kernels* const K = select_kernels(Isa::Auto);
-    int u = 0, v = 0;
+    const int topS = f_ << (pyr.size() - 1);
+    int u = (int)std::lround(px / topS), v = (int)std::lround(py / topS);
     double best = 0;
     double sum = 0;
     int cnt = 0;
     for (int L = (int)pyr.size() - 1; L >= 0; --L) {
         const Img& c = pyr[L];
-        const Img& p = prev_[L];
+        const Img& p = ref[L];
         const int range = L == (int)pyr.size() - 1 ? TOP_RANGE : REFINE;
         const int margin = 2;
         if (L != (int)pyr.size() - 1) {
@@ -170,7 +242,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     }
     // субпиксель: парабола по трём точкам вдоль каждой оси на нижнем уровне
     const Img& c = pyr[0];
-    const Img& p = prev_[0];
+    const Img& p = ref[0];
     auto sub = [&](double em, double e0, double ep) {
         const double den = em - 2 * e0 + ep;
         return den > 1e-9 ? std::max(-0.5, std::min(0.5, 0.5 * (em - ep) / den)) : 0.0;
@@ -193,7 +265,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     // неподвижной камере: неподвижный фон мы сами исключили маской, и оценка ушла за
     // ветками. Считаем по всем точкам, с неподвижными; наложения на кадр при настоящем
     // повороте — малая часть кусков.
-    if (res.valid && (u != 0 || v != 0)) {
+    if (partCheck && res.valid && (u != 0 || v != 0)) {
         int forShift = 0, forZero = 0;
         const int G = 4, m = 2 + std::max(std::abs(u), std::abs(v));
         for (int gy = 0; gy < G; ++gy)
@@ -201,6 +273,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
                 const int x0 = std::max(m, c.w * gx / G), x1 = std::min(c.w - m, c.w * (gx + 1) / G);
                 const int y0 = std::max(m, c.h * gy / G), y1 = std::min(c.h - m, c.h * (gy + 1) / G);
                 if (x1 - x0 < 4 || y1 - y0 < 4) continue;
+                if (!inRegion((x0 + x1) / 2, (y0 + y1) / 2, f_)) continue;   // кусок неба: облака не в счёт
                 long long es = 0, ez = 0, tx = 0;
                 for (int y = y0; y < y1; ++y) {
                     const uint8_t* cr = &c.px[(size_t)y * c.w];
@@ -218,8 +291,6 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
             }
         if (forShift < 2 * forZero || forShift == 0) {
             res.quality = 1.f;
-            prev_ = std::move(pyr);
-            ms_ = now_ms() - t0;
             return res;   // valid, сдвиг 0
         }
     }
@@ -227,8 +298,6 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
         res.dx = (float)((u + fx) * f_);
         res.dy = (float)((v + fy) * f_);
     }
-    prev_ = std::move(pyr);
-    ms_ = now_ms() - t0;
     return res;
 }
 

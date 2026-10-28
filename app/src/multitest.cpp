@@ -55,6 +55,7 @@ const std::vector<Param>& params() {
         {"trk_seconds", "Трекер в секундах", "Алгоритм", true, "1, 0", S(trkSeconds)},
         {"follow", "Виртуальная поворотка", "Алгоритм", true, "0, 1", S(follow)},
         {"mask", "Кадров на маску неба (0 выкл.)", "Алгоритм", false, "0, 25, 50", S(learnMaskFrames)},
+        {"pan_mask", "Маска едет за камерой", "Алгоритм", true, "1, 0", S(panMask)},
         {"per_tile", "Кандидатов в тайле", "Алгоритм", false, "1, 2", D(per_tile)},
         {"skyline", "Всё ниже горизонта — земля", "Алгоритм", true, "1, 0", D(skyline)},
         {"adapt", "Подстраиваться под сцену и погоду", "Алгоритм", true, "1, 0", S(adapt)},

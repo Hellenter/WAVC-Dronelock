@@ -30,6 +30,10 @@ extern "C" {
 
 dl_motion* dl_motion_create(void) { return new dl_motion; }
 void dl_motion_destroy(dl_motion* m) { delete m; }
+void dl_motion_set_anchored(dl_motion* m, int on) { m->gm.setAnchored(on != 0); }
+void dl_motion_set_region(dl_motion* m, const uint8_t* tiles, int tw, int th, int tile_px) {
+    m->gm.setRegion(tiles, tw, th, tile_px);
+}
 int dl_motion_estimate(dl_motion* m, const uint8_t* gray, int w, int h, int stride, float* dx, float* dy,
                        float* quality) {
     const MotionEstimate e = m->gm.estimate(gray, w, h, stride);
@@ -97,6 +101,11 @@ const char* dl_detector_backend(dl_detector* d) { return d->backend.c_str(); }
 int dl_detector_threads(dl_detector* d) { return d->det.threads(); }
 void dl_mask_begin(dl_detector* d) { d->det.beginMaskLearning(); }
 void dl_mask_end(dl_detector* d, float frac) { d->det.endMaskLearning(frac); }
+void dl_mask_follow(dl_detector* d, int on) {
+    if (on && !d->det.trackingMask()) d->det.beginMaskTracking();
+    else if (!on && d->det.trackingMask()) d->det.endMaskTracking();
+}
+void dl_mask_shift(dl_detector* d, float dx, float dy) { d->det.shiftMask(dx, dy); }
 
 int dl_mask_get(dl_detector* d, uint8_t* out, int cap, int* tw, int* th) {
     const auto& m = d->det.tileMask();

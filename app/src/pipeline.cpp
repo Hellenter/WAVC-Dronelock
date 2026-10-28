@@ -439,6 +439,8 @@ void Pipeline::processLoop() {
     DetectorConfig dc = s.det;   // то, что сейчас стоит в детекторе (с учётом "авто")
     bool dirty = true;
     GlobalMotion gm;
+    GlobalMotion gmMask;   // сдвиг земли для маски неба за камерой
+    gmMask.setAnchored(true);
     LoadGovernor gov;
     SceneAnalyzer scene;
     std::string sceneWhy;
@@ -637,11 +639,18 @@ void Pipeline::processLoop() {
             panHist.clear();
             panX = panY = 0;
             panning = false;
+            if (det.trackingMask()) {   // маска ехала за камерой до конца ролика — к началу не подходит
+                det.clearMask();
+                maskOn = false;
+                relearn_ = true;
+            }
         }
         // Маска неба привязана к кадру и годится только для неподвижной камеры: при съёмке с рук
         // земля через секунду окажется там, где было небо, и наоборот (дрон пропадёт в "маске").
         // камера, ведущая цель, тоже поворачивается: маска неба не годится
         const bool camMoves = ef.motion || s.follow || panning;
+        // панорама: маска неба едет за камерой (сдвиг земли за кадр) вместо выключения
+        const bool panTrack = panning && s.panMask && !ef.motion && !s.follow && s.learnMaskFrames > 0;
         if (sceneLight) det.resetBackground();   // облако закрыло солнце: старый фон ячеек только мешает
         if (sceneMoved && !camMoves && maskOn) {   // камеру повернули: маска неба — заново, не из файла
             maskForce_ = true;
@@ -651,10 +660,21 @@ void Pipeline::processLoop() {
             relearnMoved = std::hypot(panX, panY) * 2560.f / std::max(1, f.w) >= 8.f;
         }
         if (camMoves != motionWas) {
-            if (!camMoves) relearn_ = true, relearnMoved = true;
+            // маска ехала за камерой — она и есть выученная маска, учить заново не нужно
+            if (!camMoves && det.trackingMask()) det.endMaskTracking();
+            else if (!camMoves) relearn_ = true, relearnMoved = true;
             motionWas = camMoves;
         }
-        if (camMoves) {
+        if (panTrack) {
+            if (!det.trackingMask()) {   // с выученной маской или с накопленным при обучении
+                det.beginMaskTracking();
+                maskOn = true;
+                learnLeft = 0;
+                maskChecking = false;
+            }
+            relearn_ = false;
+        } else if (camMoves) {
+            if (det.trackingMask()) det.endMaskTracking();
             if (maskOn) {
                 det.clearMask();
                 maskOn = false;
@@ -719,6 +739,18 @@ void Pipeline::processLoop() {
             const bool autoMotion = s.motion < 0;
             if (ef.motion || autoMotion) me = gm.estimate(src.px.data(), src.w, src.h, src.w);
             else gm.reset();
+            // маске за камерой нужен сдвиг земли (облака плывут сами, по ним оценка отстаёт) и
+            // без накопления ошибки: своя оценка — по земле и от опорного кадра
+            MotionEstimate mm;
+            if (det.trackingMask() && !s.follow) {
+                const auto& tm = det.tileMask();
+                gmMask.setRegion(tm.size() == (size_t)det.tilesX() * det.tilesY() ? tm.data() : nullptr, det.tilesX(),
+                                 det.tilesY(), det.tileSizePx());
+                mm = gmMask.estimate(src.px.data(), src.w, src.h, src.w);
+                if (mm.valid) det.shiftMask(mm.dx, mm.dy);
+            } else {
+                gmMask.reset();
+            }
             if (autoMotion || s.follow) {
                 // крупный кадр: сдвиг трекеру не передаём (оценка по облакам и веткам на
                 // ветру неточна, а камера, ведущая цель, держит её почти на месте кадра),
@@ -754,7 +786,13 @@ void Pipeline::processLoop() {
             }
             // крупный кадр, авто, панорама: сдвиг — только для координат сцены (кого камера ведёт;
             // у неподвижной камеры оценка по плывущим облакам дала бы сцене ложный дрейф)
-            if (!ef.motion && autoMotion && panning && s.sceneShift && me.valid) trk->setSceneShift(me.dx, me.dy);
+            if (!ef.motion && autoMotion && panning && s.sceneShift && me.valid) {
+                // маска за камерой считает сдвиг земли точнее: по нему и координаты сцены (с
+                // оценкой по всему кадру, которая отстаёт от земли, маска вредит: неподвижное в
+                // сцене, сдвинутое маской, трекер считает летящим)
+                if (mm.valid) trk->setSceneShift(mm.dx, mm.dy);
+                else trk->setSceneShift(me.dx, me.dy);
+            }
             if (!ef.motion && !(panning && s.panMotion)) me.dx = me.dy = 0;   // камера стоит: трекеру сдвиг не нужен
             if (panning && s.panMotion) trk->setSceneShift(0, 0);
             // поворот окна известен точно: картинка в нём сдвинулась навстречу

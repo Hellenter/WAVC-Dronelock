@@ -605,6 +605,80 @@ static void test_motion() {
     std::printf("motion: ok\n");
 }
 
+// Маска неба за камерой: камера поворачивается вдоль горизонта. Холм над землёй едет вместе
+// с маской, надпись на кадре и ведомая камерой точка стоят на месте кадра. Сдвиг от опорного
+// кадра при медленном повороте (0.5 пикс./кадр) не теряется, как сумма сдвигов за кадр.
+static void test_mask_follow() {
+    const int w = 1280, h = 720, T = 64, horizon = 448;
+    auto hash = [](int x, int y) { return ((uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u) * 2654435761u >> 24; };
+    auto frame = [&](int ox, bool extras) {   // ox — поворот камеры: точка сцены X видна в x = X - ox
+        std::vector<uint8_t> f((size_t)w * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const int X = x + ox;
+                const bool hill = X >= 1400 && X < 1592 && y >= horizon - 2 * T;
+                // земля: пятна 24x24 (по ним видно сдвиг) и мелкая текстура (листва, трава)
+                const uint32_t blk = hash((X + 4800) / 24, y / 24 + 1000) % 100, fine = hash(X, y) % 80;
+                f[(size_t)y * w + x] = y >= horizon || hill ? (uint8_t)(40 + blk + fine) : (uint8_t)(170 + hash(X, y) % 3);
+            }
+        if (extras) {
+            for (int y = 40; y < 100; ++y)   // надпись в углу кадра
+                for (int x = 1100; x < 1250; ++x) f[(size_t)y * w + x] = hash(x / 3, y / 3) % 3 ? 20 : 250;
+            for (int y = 300; y < 304; ++y)   // ведомая цель: точка в середине кадра
+                for (int x = 640; x < 644; ++x) f[(size_t)y * w + x] = 60;
+        }
+        return f;
+    };
+    DetectorConfig c;
+    c.threads = 1;
+    Detector d(c);
+    std::vector<Candidate> out;
+    d.beginMaskLearning();
+    auto f0 = frame(0, false);
+    for (int i = 0; i < 25; ++i) d.detect(f0.data(), w, h, w, out);
+    d.endMaskLearning();
+    const int tw = d.tilesX();
+    auto at = [&](int x, int y) { return d.tileMask()[(size_t)(y / T) * tw + x / T]; };
+    CHECK(at(100, 600) == 0 && at(100, 100) == 1, "mask follow: learned mask");
+    d.beginMaskTracking();
+    GlobalMotion gm;
+    gm.setAnchored(true);
+    int ox = 0;
+    float sum = 0;
+    for (int i = 0; i < 120; ++i) {   // 4 пикс. за кадр: холм въезжает справа
+        auto f = frame(ox, true);
+        gm.setRegion(d.tileMask().data(), d.tilesX(), d.tilesY(), d.tileSizePx());
+        const MotionEstimate e = gm.estimate(f.data(), w, h, w);
+        if (e.valid) d.shiftMask(e.dx, e.dy), sum += e.dx;
+        d.detect(f.data(), w, h, w, out);
+        ox += 4;
+    }
+    ox -= 4;
+    // холм: сцена 1400..1592 видна в 1400 - ox .. 1592 - ox
+    const int hx = 1496 - ox;
+    CHECK(std::fabs(sum + (float)ox) < 24.f, "mask follow: shift sum %.1f (%d)", sum, -ox);
+    CHECK(hx > 0 && hx < w && at(hx, horizon - T) == 0, "mask follow: hill at x=%d not masked", hx);
+    CHECK(at(hx + 3 * T, horizon - T) == 1 && at(hx - 3 * T, horizon - T) == 1, "mask follow: sky beside the hill masked");
+    CHECK(at(1170, 70) == 0, "mask follow: overlay not masked");
+    CHECK(at(642, 302) == 1, "mask follow: followed point masked");
+    CHECK(at(100, 600) == 0 && at(100, 100) == 1, "mask follow: ground/sky");
+    d.endMaskTracking();
+    CHECK(!d.trackingMask() && at(hx, horizon - T) == 0, "mask follow: mask kept after the pan");
+
+    // медленный поворот: 1 пикс. через кадр
+    GlobalMotion plain, anch;
+    anch.setAnchored(true);
+    float sp = 0, sa = 0;
+    for (int i = 0; i < 120; ++i) {
+        auto f = frame(i / 2, false);
+        const MotionEstimate a = plain.estimate(f.data(), w, h, w), b = anch.estimate(f.data(), w, h, w);
+        if (a.valid) sp += a.dx;
+        if (b.valid) sa += b.dx;
+    }
+    CHECK(std::fabs(sa + 59.5f) < 6.f, "anchored motion: %.1f of -59.5 (frame to frame: %.1f)", sa, sp);
+    std::printf("mask follow: ok (slow pan: anchored %.1f, frame to frame %.1f of -59.5)\n", sa, sp);
+}
+
 // Испорченные файлы (маска, разметка, y4m, память помех): отказ, без падения и без гигабайтных выделений
 static void put_file(const std::string& path, const std::string& data) {
     FILE* f = std::fopen(path.c_str(), "wb");
@@ -777,6 +851,7 @@ int main() {
     test_stationary();
     test_scene();
     test_motion();
+    test_mask_follow();
     test_bad_files();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;

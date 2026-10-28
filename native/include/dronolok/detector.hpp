@@ -92,6 +92,8 @@ struct DetectorConfig {
     bool fine_mask = true;
     int fine_frames = 150;
     float fine_tex = 0.05f;
+    // Маска неба за камерой (beginMaskTracking): память тайла — примерно roll_frames кадров
+    int roll_frames = 30;
     int bg_frames = 250;
     // Накопление слабой цели по кадрам (track-before-detect на ячейках, фон ячеек тогда
     // учится по всему небу): A = tbd_decay * max3x3(A) + max(0, z - tbd_z0), z — превышение
@@ -196,6 +198,17 @@ public:
     bool loadMask(const std::string& path, int verify = 25);
     bool verifyingMask() const { return verifyLeft_ > 0; }
     bool maskReplaced() const { return maskReplaced_; }
+    // Маска неба за камерой: камера плавно поворачивается (игра, поворотка ведёт цель), и маска,
+    // привязанная к кадру, неверна. Вместо обучения заново маска сдвигается вместе с картинкой
+    // (shiftMask — сдвиг земли за кадр, до detect) и всё время доучивается: у тайла — доля
+    // кадров с текстурой, старое забывается за ~roll_frames кадров. Тайлы, которые камера
+    // только что открыла, решаются по первым кадрам и по линии горизонта. Начинает с выученной
+    // маски (или с накопленного при обучении), без неё — с нуля. Фон и уточнение по ячейкам
+    // привязаны к кадру: на это время выключены. endMaskTracking оставляет маску как есть.
+    void beginMaskTracking();
+    void endMaskTracking();
+    bool trackingMask() const { return rolling_; }
+    void shiftMask(float dx, float dy);
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
@@ -268,6 +281,13 @@ public:
     const std::vector<uint8_t>& nearGroundTiles() const { return nearGround_; }
 private:
     void buildMask(float frac, std::vector<uint8_t>& out) const;
+    // маска по доле кадров с текстурой у каждого тайла (tex: tilesY x tilesX)
+    void buildMaskFrom(const std::vector<float>& tex, float frac, std::vector<uint8_t>& out) const;
+    bool rolling_ = false;
+    std::vector<float> rollTex_, rollN_;   // маска за камерой: текстура и число кадров, с забыванием
+    std::vector<float> rollFix_;           // ...та же текстура, но в координатах кадра (наложения на кадр)
+    float offX_ = 0, offY_ = 0;            // сдвиг картинки, ещё не перенесённый на маску (меньше тайла)
+    void updateRolling();
     std::vector<FocusArea> focus_, roi_;
     std::vector<uint8_t> focusTiles_, roiMask_, zones_;
     std::vector<int> fill_;
@@ -659,14 +679,30 @@ struct MotionEstimate {
 class GlobalMotion {
 public:
     MotionEstimate estimate(const uint8_t* gray, int w, int h, int stride);
-    void reset() { prev_.clear(); }
+    void reset() { prev_.clear(); last_.clear(); }
     double lastMs() const { return ms_; }
+    // Сдвиг считать только по земле: тайлы кадра, где tiles[i] == 0 (маска неба: 0 — земля),
+    // тайл tilePx пикс. Облака плывут сами по себе и тянут оценку к своей скорости, а маске
+    // неба нужен сдвиг земли. Земли меньше 5% кадра — по всему кадру. tiles == nullptr — снять.
+    void setRegion(const uint8_t* tiles, int tw, int th, int tilePx);
+    // Сдвиг от опорного кадра, а не от прошлого: медленный поворот (доли пикселя за кадр)
+    // на уменьшенной копии почти не виден и суммой по кадрам теряется (за 5 с — сотни пикс.),
+    // а от опорного кадра набирается заметный. Отдаёт тот же сдвиг за кадр (разность), опорный
+    // кадр меняется, когда ушли на 1/6 кадра или потеряли совмещение. Для маски неба за камерой.
+    void setAnchored(bool on);
 
 private:
     struct Img { std::vector<uint8_t> px; int w = 0, h = 0; };
     std::vector<Img> prev_, cur_;
     int f_ = 1, w_ = 0, h_ = 0;
     double ms_ = 0;
+    bool anchored_ = false;
+    std::vector<Img> last_;         // прошлый кадр (с опорным кадром prev_ — не совпадает)
+    float accX_ = 0, accY_ = 0;     // сдвиг от опорного кадра (prev_) до прошлого кадра
+    MotionEstimate match(const std::vector<Img>& cur, const std::vector<Img>& ref, float px, float py, bool partCheck) const;
+    std::vector<uint8_t> region_;   // тайлы земли (1), пусто — весь кадр
+    int rtw_ = 0, rth_ = 0, rpx_ = 0;
+    bool inRegion(int x, int y, int scale) const;   // точка уровня с шагом scale пикс. кадра
 };
 
 }  // namespace dronolok
