@@ -60,6 +60,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref) {
     // низкие частоты, на их период нужно несколько секунд
     c.flap_window = c.flap_window > 0 ? std::min(64, std::max(32, (int)std::lround(c.flap_window * t))) : 0;
     c.verify_frames = frames(c.verify_frames, 8);
+    c.lock_dwell = frames(c.lock_dwell, 3);
     c.hard_miss = frames(c.hard_miss, 6);
     c.hard_full_every = frames(c.hard_full_every, 1);
     return c;
@@ -77,6 +78,7 @@ void Tracker::resetTracks() {
     tracks_.clear();
     out_.clear();
     lockId_ = 0;
+    beat_.clear();
     lostFor_ = 0;
     lastLsN_ = 0;
     verify_ = 0;
@@ -835,11 +837,31 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         lastX_ = cur->x; lastY_ = cur->y; lastVx_ = cur->vsx; lastVy_ = cur->vsy;
         if (cur->miss >= 2) {   // цель на прогнозе, а рядом её уже ведёт свежий трек
             if (const Track* n = nearest(cur->x, cur->y, std::max(cfg_.gate, 4 * cur->sigma))) { cur = n; same = true; }
-        } else if (best && best != cur &&
-                   (hard_ ? cfg_.hard_switch > 0 && best->lockW > cfg_.hard_switch * cur->lockW &&
-                                best->speed < 0.5f * cur->speed   // с самолёта на медленный дрон, не на яркую
-                          : best->lockW > cfg_.lock_switch * cur->lockW)) {
-            cur = best;   // при жёстком захвате — только если задан hard_switch
+        } else {
+            // претенденты: весомее текущей (при жёстком захвате — только если задан hard_switch)
+            // за lock_dwell кадров; из выдержавших — самый весомый
+            auto wins = [&](const Track& t) {
+                return hard_ ? cfg_.hard_switch > 0 && t.lockW > cfg_.hard_switch * cur->lockW &&
+                                   t.speed < 0.5f * cur->speed   // с самолёта на медленный дрон, не на яркую
+                             : t.lockW > cfg_.lock_switch * cur->lockW;
+            };
+            std::vector<std::pair<int, int>> nb;
+            const Track* sw = nullptr;
+            for (const Track& t : out_) {
+                if (&t == cur || t.score <= 0) continue;
+                int n = 0;
+                for (const auto& b : beat_)
+                    if (b.first == t.id) n = b.second;
+                // счёт с утечкой: кадр перевеса +1, кадр без него -1 — претендент, весомый
+                // большую часть времени, своё набирает, хоть вес и скачет
+                const bool w = wins(t);
+                n += w ? 1 : -1;
+                if (n <= 0) continue;
+                nb.emplace_back(t.id, n);
+                if (w && n >= cfg_.lock_dwell && (!sw || t.lockW > sw->lockW)) sw = &t;
+            }
+            beat_.swap(nb);
+            if (sw) cur = sw, beat_.clear();
         }
         lockId_ = cur->id;
     } else if (lockId_ && !lockClutter && lostFor_ < (hard_ ? cfg_.hard_miss : cfg_.max_miss)) {
@@ -876,6 +898,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     }
 
     // проверка захваченной цели: verify_frames кадров подряд дрон — жёсткий захват
+    if (lockId_ != prevLock) beat_.clear();
     if (lockId_ != prevLock && !same) {   // подхват той же цели другим треком — проверка не сбрасывается
         hard_ = false;
         verify_ = 0;

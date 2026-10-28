@@ -2271,6 +2271,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-adapt") s.adapt = false;
         else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
         else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());
+        else if (a == "--lock-dwell") s.trk.lock_dwell = atoi(val().c_str());
         else if (a == "--hard-switch") s.trk.hard_switch = (float)atof(val().c_str());
         else if (a == "--follow") s.follow = true;
         else if (a == "--follow-frac") s.followFrac = (float)atof(val().c_str());
