@@ -836,7 +836,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         if (cur->miss >= 2) {   // цель на прогнозе, а рядом её уже ведёт свежий трек
             if (const Track* n = nearest(cur->x, cur->y, std::max(cfg_.gate, 4 * cur->sigma))) { cur = n; same = true; }
         } else if (best && best != cur &&
-                   (hard_ ? cfg_.hard_switch > 0 && best->lockW > cfg_.hard_switch * cur->lockW
+                   (hard_ ? cfg_.hard_switch > 0 && best->lockW > cfg_.hard_switch * cur->lockW &&
+                                best->speed < 0.5f * cur->speed   // с самолёта на медленный дрон, не на яркую
                           : best->lockW > cfg_.lock_switch * cur->lockW)) {
             cur = best;   // при жёстком захвате — только если задан hard_switch
         }
