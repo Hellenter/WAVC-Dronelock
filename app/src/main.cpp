@@ -1128,6 +1128,16 @@ void tab_fine(App& a, bool& changed) {
                                          "быстрее и не отвлекается.");
         changed |= ImGui::SliderInt("##hardfull", &t.hard_full_every, 1, 30);
     }
+    bool slow = t.lock_slow > 0;
+    if (ImGui::Checkbox("захват: сначала мелкий медленный дрон", &slow)) {
+        t.lock_slow = slow ? 1.f : 0.f;
+        t.hard_switch = slow ? 2.f : 0.f;
+        changed = true;
+    }
+    help_marker("Из нескольких целей захват берёт ту, что медленнее и уже пролетела по сцене, а не самую "
+                "контрастную: самолёт и вертолёт крупнее и быстрее дрона. Зависшая на месте точка уступает "
+                "летящим, и жёсткий захват переходит на цель вдвое весомее. Записи War Thunder: дроны в захвате "
+                "31% -> 48%, самолёты и вертолёты 53% -> 45%. Выключено — захват на самой контрастной цели.");
 
     heading("Птица или дрон");
     label("отклонение от траектории, пикс.", "Средний разброс точек трека вокруг плавной траектории за последние "
@@ -1897,6 +1907,9 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
         else if (a == "--no-skyline") s.det.skyline = false;
+        else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
+        else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());
+        else if (a == "--hard-switch") s.trk.hard_switch = (float)atof(val().c_str());
         else if (a == "--follow") s.follow = true;
         else if (a == "--follow-frac") s.followFrac = (float)atof(val().c_str());
         else if (a == "--follow-gain") s.followGain = (float)atof(val().c_str());
