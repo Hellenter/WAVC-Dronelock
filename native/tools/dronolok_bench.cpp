@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/scene.hpp"
 #include "dronolok/tuning.hpp"
 #include "gt_eval.hpp"
 #include "y4m_reader.hpp"
@@ -64,6 +65,9 @@ static void usage() {
         "  --flap-window 48 --flap-r2 0.45 --flap-depth 0.3 --flap-hold 50   взмахи (окно 0 — выкл.)\n"
         "  --hover 0.3 --flock 150     зависание = дрон, стая с машущей = птицы (0 — выкл.)\n"
         "  --fps-scale             параметры трекера в секундах: пересчитать под частоту кадров ролика\n"
+        "  --scene                 оценивать сцену и погоду (свет, шум, облака, ветер, осадки, окружение)\n"
+        "  --adapt                 ...и подстраивать под неё параметры (включает --scene)\n"
+        "  --scene-log out.csv     оценка сцены по кадрам анализа\n"
         "  --stream                не загружать заранее (замер вместе с чтением)\n"
         "  --sweep                 таблица скоростей: наборы инструкций x потоки\n"
         "  --json out.jsonl        дописать итог строкой JSON\n"
@@ -103,7 +107,8 @@ int main(int argc, char** argv) {
     }
     std::string input, gtPath, jsonPath, dumpPath, maskPath;
     int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0, learnLive = 0;
-    bool evalAll = false;
+    bool evalAll = false, sceneOn = false, adapt = false;
+    std::string sceneLog;
     bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false, fpsScale = false;
     GlobalMotion gm;
     std::vector<FocusArea> focusAreas, roiAreas;
@@ -183,6 +188,9 @@ int main(int argc, char** argv) {
         else if (a == "--static-hits") tcfg.static_hits = (float)std::atof(val().c_str());
         else if (a == "--gt") gtPath = val();
         else if (a == "--stream") stream = true;
+        else if (a == "--scene") sceneOn = true;
+        else if (a == "--adapt") sceneOn = adapt = true;
+        else if (a == "--scene-log") { sceneLog = val(); sceneOn = true; }
         else if (a == "--fps-scale") fpsScale = true;
         else if (a == "--sweep") sweep = true;
         else if (a == "--json") jsonPath = val();
@@ -244,6 +252,14 @@ int main(int argc, char** argv) {
 
     Detector det(cfg);
     Tracker trk(W, H, tcfg);
+    SceneAnalyzer scene;
+    const DetectorConfig baseCfg = cfg;
+    const TrackerConfig baseT = tcfg;
+    std::string why, lastWhy;
+    long adaptChanges = 0;
+    std::vector<double> sceneMs;
+    std::FILE* slog = sceneLog.empty() ? nullptr : std::fopen(sceneLog.c_str(), "w");
+    if (slog) std::fprintf(slog, "frame,sky_lum,ground_lum,noise,clouds,wind,precip,haze,glare,sky_frac,hv,flat,line_sd,light,terrain,event,thr,profile\n");
     std::FILE* dump = dumpPath.empty() ? nullptr : std::fopen(dumpPath.c_str(), "w");
     if (dump) std::fprintf(dump, "loop,frame,id,x,y,hits,speed,resid,contrast,contrast_cv,flap_r2,flap_period,flap_depth,hover,flock,energy,level,cls,gt\n");
     bool maskLoaded = false;
@@ -299,6 +315,38 @@ int main(int argc, char** argv) {
             trk.roi(me.dx, me.dy, roiAreas);
             det.setRoi(roiAreas);
         }
+        const double ts0 = now_ms();
+        const bool analyzed = sceneOn && scene.update(g, W, H, W, (float)rd.fps(), motion);
+        if (analyzed) sceneMs.push_back(now_ms() - ts0);
+        if (analyzed) {
+            const SceneState& ss = scene.state();
+            if (adapt) {
+                DetectorConfig dc;
+                TrackerConfig tc;
+                scene_profile(ss, baseCfg, baseT, dc, tc, &why);
+                dc.threads = cfg.threads;
+                const bool stale = scene_mask_stale(det.config(), dc);
+                if (why != lastWhy || stale) det.reconfigure(dc);
+                trk.config() = tc;
+                if (ss.lightJump) det.resetBackground();
+                // как приложение: маска заново по следующим кадрам (если её уже выучили)
+                if ((ss.moved || stale) && (learn > 0 || learnLive > 0 || maskLoaded) && !det.learningMask()) {
+                    det.beginMaskLearning();
+                    learnLive = (int)i + 25;
+                }
+                if (why != lastWhy) {
+                    ++adaptChanges;
+                    std::printf("  кадр %ld: %s\n", i, why.empty() ? "база" : why.c_str());
+                    lastWhy = why;
+                }
+            }
+            if (ss.lightJump || ss.moved) std::printf("  кадр %ld: %s\n", i, ss.lastEvent.c_str());
+            if (slog)
+                std::fprintf(slog, "%ld,%.1f,%.1f,%.2f,%.3f,%.2f,%.2f,%.3f,%.4f,%.3f,%.3f,%.3f,%.1f,%s,%s,%s,%.1f,\"%s\"\n", i,
+                             ss.skyLum, ss.groundLum, ss.noise, ss.clouds, ss.wind, ss.precip, ss.haze, ss.glare,
+                             ss.skyFrac, ss.hv, ss.skylineFlat, ss.skylineSd, light_name(ss.light), terrain_name(ss.terrain),
+                             ss.lightJump || ss.moved ? ss.lastEvent.c_str() : "", det.threshold(), why.c_str());
+        }
         det.detect(g, W, H, W, cands);
         trk.setPartial(det.timing().partial);
         const double t1 = now_ms();
@@ -328,6 +376,16 @@ int main(int argc, char** argv) {
         }
     }
     if (dump) std::fclose(dump);
+    if (slog) std::fclose(slog);
+    if (sceneOn) {
+        const SceneState& ss = scene.state();
+        std::printf("сцена: %s, %s; небо %.0f, шум %.2f, облачность %.2f, ветер у кромки %.2f пикс., осадки %.2f, "
+                    "дымка %.2f, неба %.0f%% кадра; перемен %d\n",
+                    light_name(ss.light), terrain_name(ss.terrain), ss.skyLum, ss.noise, ss.clouds, ss.wind, ss.precip,
+                    ss.haze, 100 * ss.skyFrac, ss.events);
+        std::printf("оценка сцены: %.2f мс на анализ (%zu анализов)\n", pct(sceneMs).mean, sceneMs.size());
+        if (adapt) std::printf("подстройка: %s (смен профиля %ld)\n", lastWhy.empty() ? "база" : lastWhy.c_str(), adaptChanges);
+    }
     if (!maskPath.empty()) {
         if (maskLoaded && det.maskReplaced()) std::printf("маска из файла не совпала с кадром — выучена заново\n");
         if (!maskLoaded || det.maskReplaced()) {
