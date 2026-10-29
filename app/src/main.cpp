@@ -41,6 +41,7 @@ const ImU32 COL_UNKNOWN = IM_COL32(255, 210, 0, 255);
 const ImU32 COL_CLUTTER = IM_COL32(170, 170, 170, 220);
 const ImU32 COL_NOISE = IM_COL32(210, 210, 210, 150);
 const ImU32 COL_GT = IM_COL32(0, 255, 120, 220);
+const ImU32 COL_ISSUE = IM_COL32(255, 160, 40, 255);   // спорное место разметки
 const ImU32 COL_LOCK = IM_COL32(255, 60, 230, 255);
 const ImU32 COL_FOCUS = IM_COL32(90, 170, 255, 110);
 const ImU32 COL_STATIC = IM_COL32(190, 190, 190, 230);   // как помеха, но крестиком
@@ -170,6 +171,13 @@ struct App {
     int annByTrack = 0, annByImage = 0;   // кадров, где цель нашлась по треку и по картинке
     bool annDirty = false;     // точки добавлены, файл ещё не записан
     double annSavedAt = 0;
+    // спорные места разметки: трекер и разметка расходятся или метка прыгает
+    struct AnnIssue {
+        int64_t frame;
+        std::string why;
+    };
+    std::vector<AnnIssue> annIssues;
+    std::vector<LockMark> lockMarks;
     // шкала видео
     std::vector<uint8_t> marks;
     int64_t scrub = -1;    // куда тянут ползунок шкалы
@@ -651,6 +659,133 @@ void seek_to(App& a, int64_t frame, bool preferHistory) {
     a.pipe.seek(frame);
 }
 
+// ---- переходы по разметке
+
+// Предыдущая/следующая опорная точка выбранного объекта (нет выбранного — любого). -1 — нет такой
+int64_t ann_key_near(const App& a, int64_t cur, int dir) {
+    int64_t best = -1;
+    bool sel = false;
+    for (const auto& o : a.ann.objs) sel |= o.id == a.annCur;
+    for (const auto& o : a.ann.objs) {
+        if (sel && o.id != a.annCur) continue;
+        if (dir > 0) {
+            auto it = o.keys.upper_bound(cur);
+            if (it != o.keys.end() && (best < 0 || it->first < best)) best = it->first;
+        } else {
+            auto it = o.keys.lower_bound(cur);
+            if (it != o.keys.begin() && (best < 0 || std::prev(it)->first > best)) best = std::prev(it)->first;
+        }
+    }
+    return best;
+}
+
+// Спорные места: где захват алгоритма не на метке (или метки на кадре нет), и где метка за кадры
+// между точками прыгает намного дальше обычного — так видно, что точки уехали с дрона на другое пятно
+// или разметка кончилась раньше, чем дрон ушёл. Считается по уже обработанным кадрам.
+void ann_find_issues(App& a) {
+    a.annIssues.clear();
+    if (a.ann.noDrones || a.ann.objs.empty()) return;
+    a.pipe.lockMarks(a.lockMarks);
+    const VideoInfo vi = a.pipe.info();
+    const float R = std::max(20.f, 30.f * (vi.w > 0 ? vi.w : 2560) / 2560.f);
+    const int64_t minRun = std::max<int64_t>(5, (int64_t)(vi.fps > 0 ? vi.fps / 4 : 6));
+    std::vector<App::AnnIssue> out;
+    // 1 — захват не на метке, 2 — захват есть, а метки на кадре нет
+    int curKind = 0, gap = 0;
+    int64_t runStart = 0, runEnd = 0;
+    auto flush = [&] {
+        if (curKind && runEnd - runStart + 1 >= minRun) {
+            char b[160];
+            const double sec = (runEnd - runStart + 1) / (vi.fps > 0 ? vi.fps : 25);
+            snprintf(b, sizeof(b), curKind == 1 ? "захват не на метке %.1f с (кадры %lld-%lld)"
+                                                : "захват, а метки нет %.1f с (кадры %lld-%lld)",
+                     sec, (long long)runStart, (long long)runEnd);
+            out.push_back({runStart, b});
+        }
+        curKind = 0;
+    };
+    for (int64_t f = 0; f < (int64_t)a.lockMarks.size(); ++f) {
+        const LockMark& lm = a.lockMarks[(size_t)f];
+        int kind = 0;
+        if (lm.state) {
+            bool any = false, near = false;
+            for (const auto& o : a.ann.objs) {
+                float x, y;
+                if (!Annotation::pos(o, f, x, y)) continue;
+                any = true;
+                near |= std::hypot(x - lm.x, y - lm.y) < R;
+            }
+            kind = near ? 0 : any ? 1 : 2;
+        }
+        if (kind == curKind && kind) {
+            runEnd = f;
+            gap = 0;
+        } else if (curKind && gap < 3 && !kind) {
+            ++gap;   // короткий пропуск захвата не рвёт отрезок
+        } else {
+            flush();
+            gap = 0;
+            if (kind) {
+                curKind = kind;
+                runStart = runEnd = f;
+            }
+        }
+    }
+    flush();
+    // прыжки метки: скорость между соседними точками сильно выше обычной для этого объекта
+    for (const auto& o : a.ann.objs) {
+        if (o.keys.size() < 3) continue;
+        std::vector<float> v;
+        for (auto it = o.keys.begin(), nx = std::next(it); nx != o.keys.end(); ++it, ++nx)
+            v.push_back(std::hypot(nx->second.first - it->second.first, nx->second.second - it->second.second) /
+                        (float)std::max<int64_t>(1, nx->first - it->first));
+        std::vector<float> sv = v;
+        std::nth_element(sv.begin(), sv.begin() + sv.size() / 2, sv.end());
+        const float lim = std::max(R / 2, 5 * sv[sv.size() / 2]);
+        size_t i = 0;
+        for (auto it = o.keys.begin(), nx = std::next(it); nx != o.keys.end(); ++it, ++nx, ++i)
+            if (v[i] > lim) {
+                char b[160];
+                snprintf(b, sizeof(b), "#%d: метка прыгнула на %.0f пикс. за %lld кадр. (кадры %lld-%lld)", o.id,
+                         std::hypot(nx->second.first - it->second.first, nx->second.second - it->second.second),
+                         (long long)(nx->first - it->first), (long long)it->first, (long long)nx->first);
+                out.push_back({it->first, b});
+            }
+    }
+    std::sort(out.begin(), out.end(), [](const App::AnnIssue& x, const App::AnnIssue& y) { return x.frame < y.frame; });
+    a.annIssues = std::move(out);
+}
+
+// Перейти к соседнему спорному месту от кадра cur; false — дальше нет
+bool ann_issue_jump(App& a, int64_t cur, int dir) {
+    ann_find_issues(a);
+    const App::AnnIssue* best = nullptr;
+    for (const auto& is : a.annIssues) {
+        if (dir > 0 && is.frame > cur) {
+            best = &is;
+            break;
+        }
+        if (dir < 0 && is.frame < cur) best = &is;
+    }
+    if (!best) {
+        a.annMsg = dir > 0 ? "дальше спорных мест нет" : "раньше спорных мест нет";
+        return false;
+    }
+    a.annMsg = best->why;
+    seek_to(a, best->frame, true);
+    return true;
+}
+
+bool ann_key_jump(App& a, int64_t cur, int dir) {
+    const int64_t f = ann_key_near(a, cur, dir);
+    if (f < 0) {
+        a.annMsg = dir > 0 ? "дальше точек нет" : "раньше точек нет";
+        return false;
+    }
+    seek_to(a, f, true);
+    return true;
+}
+
 std::string fmt_time(double s) {
     char b[32];
     const int m = (int)(s / 60);
@@ -1009,6 +1144,31 @@ void panel_annotate(App& a) {
         ImGui::SetItemTooltip("Если трек ушёл с дрона на другой объект: отмотайте к месту, где он ещё на дроне, "
                               "сотрите точки дальше и щёлкните по дрону снова");
     }
+    heading("Переходы");
+    {
+        const std::shared_ptr<const Result> sh = a.shown;
+        const int64_t cur = sh ? sh->frame->index : 0;
+        const float hw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+        ImGui::BeginDisabled(a.ann.objs.empty());
+        if (ImGui::Button("< точка", ImVec2(hw, 0))) ann_key_jump(a, cur, -1);
+        ImGui::SetItemTooltip("Предыдущая опорная точка выбранного объекта (PageUp)");
+        ImGui::SameLine();
+        if (ImGui::Button("точка >", ImVec2(hw, 0))) ann_key_jump(a, cur, +1);
+        ImGui::SetItemTooltip("Следующая опорная точка выбранного объекта (PageDown)");
+        if (ImGui::Button("< спорное", ImVec2(hw, 0))) ann_issue_jump(a, cur, -1);
+        ImGui::SetItemTooltip("Предыдущее спорное место (Ctrl+PageUp)");
+        ImGui::SameLine();
+        if (ImGui::Button("спорное >", ImVec2(hw, 0))) ann_issue_jump(a, cur, +1);
+        ImGui::SetItemTooltip("Следующее спорное место (Ctrl+PageDown)");
+        ImGui::EndDisabled();
+        help_marker("Спорные места — где алгоритм и разметка расходятся: захват долго держится не на метке, "
+                    "захват есть, а метки на кадре нет (разметка кончилась раньше, чем дрон ушёл), или метка "
+                    "между точками прыгнула намного дальше обычного (точки уехали на другое пятно). Ищутся по "
+                    "уже просмотренным кадрам, поэтому сначала прогоните ролик целиком. Не всё спорное — ошибка "
+                    "разметки: часто это алгоритм захватил кромку деревьев, тогда разметку не трогайте. "
+                    "На шкале видео спорные места — оранжевые метки сверху.");
+        if (!a.annIssues.empty()) ImGui::TextDisabled("спорных мест: %d", (int)a.annIssues.size());
+    }
     heading("Объекты");
     int del = 0;
     for (const auto& o : a.ann.objs) {
@@ -1246,7 +1406,8 @@ void tab_video(App& a, bool& changed) {
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
         ImGui::TextWrapped("Клавиши: пробел — пауза, стрелки — кадр назад/вперёд, Shift+стрелки — на секунду, "
-                           "Home — в начало, +/- — скорость.");
+                           "Home — в начало, +/- — скорость. При разметке PageUp/PageDown — к точке разметки, "
+                           "Ctrl+PageUp/PageDown — к спорному месту.");
         ImGui::PopStyleColor();
     }
 }
@@ -3515,6 +3676,14 @@ void draw_timeline(App& a, const Result* r, const Metrics& m) {
                 const float kx = p0.x + (float)((k.first + 0.5) / n * w);
                 dl->AddTriangleFilled(ImVec2(kx - 4, p0.y), ImVec2(kx + 4, p0.y), ImVec2(kx, p0.y + 6), COL_GT);
             }
+    // спорные места разметки
+    if (a.annotate) {
+        ann_find_issues(a);
+        for (const auto& is : a.annIssues) {
+            const float ix = p0.x + (float)((is.frame + 0.5) / n * w);
+            dl->AddTriangleFilled(ImVec2(ix - 4, p0.y - 6), ImVec2(ix + 4, p0.y - 6), ImVec2(ix, p0.y), COL_ISSUE);
+        }
+    }
     // текущий кадр
     const float cx = p0.x + (float)((cur + 0.5) / n * w);
     dl->AddLine(ImVec2(cx, p0.y - 2), ImVec2(cx, p1.y + 2), IM_COL32(255, 255, 255, 255), 2);
@@ -4138,6 +4307,10 @@ int main(int argc, char** argv) {
             else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) step_back(a);
             else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step_forward(a);
             if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) seek_to(a, 0, false);
+            if (a.annotate && ImGui::IsKeyPressed(ImGuiKey_PageUp, false))
+                io.KeyCtrl ? ann_issue_jump(a, curIdx, -1) : ann_key_jump(a, curIdx, -1);
+            if (a.annotate && ImGui::IsKeyPressed(ImGuiKey_PageDown, false))
+                io.KeyCtrl ? ann_issue_jump(a, curIdx, +1) : ann_key_jump(a, curIdx, +1);
             if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) a.pipe.nextTarget();
             if (a.annotate && a.ann.editable && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) ann_delete(a, a.annCur);
             if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))

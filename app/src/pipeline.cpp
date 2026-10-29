@@ -174,6 +174,7 @@ void Pipeline::close() {
     hist_.clear();
     histBytes_ = 0;
     marks_.clear();
+    lockMarks_.clear();
 }
 
 VideoInfo Pipeline::info() const { return info_; }
@@ -294,6 +295,11 @@ int64_t Pipeline::length() const {
 void Pipeline::marks(std::vector<uint8_t>& out) const {
     std::lock_guard<std::mutex> lk(rm_);
     out = marks_;
+}
+
+void Pipeline::lockMarks(std::vector<LockMark>& out) const {
+    std::lock_guard<std::mutex> lk(rm_);
+    out = lockMarks_;
 }
 
 int Pipeline::findInHistory(int64_t frame) const {
@@ -1130,10 +1136,20 @@ void Pipeline::processLoop() {
                          std::fabs(t.y - g.y * r->gsy) < 10;
             if (!found) mk |= MARK_MISS;
         }
+        LockMark lm;
+        for (const auto& t : tracks)
+            if (r->lockId && t.id == r->lockId) {   // в пиксели видео, как track_to_video в приложении
+                const int W = r->follow ? r->srcW : r->frame->w, H = r->follow ? r->srcH : r->frame->h;
+                lm.x = (t.x + (float)r->fx) * (W > 0 ? (float)info_.w / W : 1.f);
+                lm.y = (t.y + (float)r->fy) * (H > 0 ? (float)info_.h / H : 1.f);
+                lm.state = r->lockState == LockState::Hard ? 2 : 1;
+            }
         std::lock_guard<std::mutex> lk(rm_);
         if (f.index >= 0 && f.index < (int64_t)4 << 20) {
             if ((size_t)f.index >= marks_.size()) marks_.resize((size_t)f.index + 1, 0);
             marks_[(size_t)f.index] = mk;
+            if ((size_t)f.index >= lockMarks_.size()) lockMarks_.resize((size_t)f.index + 1);
+            lockMarks_[(size_t)f.index] = lm;
         }
         rec.t = t3 - t0_;
         if (log_.size() < 500000) log_.push_back(rec);
