@@ -648,6 +648,8 @@ void Emulator::stepNarrow(double t, double dt) {
         return false;
     };
     // 4. что делает точная
+    if (!assigned_) st_.idleTime += dt;
+    else if (!assignedBody_) st_.falseTarget += dt;
     if (!assigned_) {
         state_ = NState::Idle;
     } else if (state_ == NState::Slew) {
@@ -961,6 +963,8 @@ int run_cli(int argc, char** argv) {
            s.acqN ? s.acqSum / s.acqN : 0);
     printf("ведёт цель %.0f%% времени, из них на назначенной %.0f%%\n", 100 * s.trackTime / T,
            s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0);
+    printf("нечего вести %.0f%% времени, назначена ложная цель широкой %.0f%%\n", 100 * s.idleTime / T,
+           100 * s.falseTarget / T);
     printf("ошибка: захват точной %.3f° (90%% %.3f°, %.1f пикс. точной), ось %.3f° (90%% %.3f°), широкая %.3f° (90%% %.3f°)\n",
            lm, l9, lm / nPd, am, a9, wm, w9);
     printf("обработка: широкая %.1f мс/кадр, точная %.2f мс/кадр; отрисовка широкой %.1f, точной %.1f мс/кадр\n",
@@ -972,11 +976,11 @@ int run_cli(int argc, char** argv) {
                     "{\"sim_s\": %.2f, \"assignments\": %d, \"acquired\": %d, \"wrong_locks\": %d, \"losses\": %d,\n"
                     " \"slew_s\": %.3f, \"acquire_s\": %.3f, \"track_pct\": %.2f, \"track_correct_pct\": %.2f,\n"
                     " \"err_lock_deg\": [%.4f, %.4f], \"err_axis_deg\": [%.4f, %.4f], \"err_wide_deg\": [%.4f, %.4f],\n"
-                    " \"wide_ms\": %.2f, \"narrow_ms\": %.3f}\n",
+                    " \"idle_pct\": %.2f, \"false_target_pct\": %.2f, \"wide_ms\": %.2f, \"narrow_ms\": %.3f}\n",
                     s.simT, s.assignments, s.acquired, s.wrongLocks, s.losses, s.slewN ? s.slewSum / s.slewN : 0,
                     s.acqN ? s.acqSum / s.acqN : 0, 100 * s.trackTime / T,
                     s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0, lm, l9, am, a9, wm, w9,
-                    s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0);
+                    100 * s.idleTime / T, 100 * s.falseTarget / T, s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0);
             fclose(f);
         }
     }

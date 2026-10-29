@@ -96,6 +96,7 @@ struct Stats {
     int wideFrames = 0, narrowFrames = 0;
     int assignments = 0, acquired = 0, wrongLocks = 0, losses = 0;
     double trackTime = 0, trackCorrect = 0;   // с: точная ведёт цель, и это назначенное тело
+    double idleTime = 0, falseTarget = 0;     // с: нечего вести; назначена цель широкой, которой нет (шум, облако)
     double slewSum = 0, acqSum = 0;           // с: до цели в кадре точной и до захвата, сумма по назначениям
     int slewN = 0, acqN = 0;
     std::vector<float> errLock, errAxis, errWide;   // град: захват точной, ось точной, сообщение широкой — от правды

@@ -2367,7 +2367,16 @@ void panel_twocam(App& a) {
     ImGui::SliderFloat("##rate", &c.maxRate, 5, 180, "%.0f °/с");
     label("Ускорение поворотки");
     ImGui::SliderFloat("##acc", &c.maxAccel, 20, 1000, "%.0f °/с²", ImGuiSliderFlags_Logarithmic);
-    label("Поле зрения");
+    label("Зум (поле зрения 20° без зума)", "Зум сужает поле точной: ошибка захвата в градусах падает во столько же "
+                                          "раз (x2 — 0.015°, x4 — 0.008° на эмуляторе), но захват дольше, и близкую "
+                                          "быструю цель легче упустить из кадра. Дальние цели, которых не видит широкая, "
+                                          "зум не вернёт: точную наводит широкая.");
+    {
+        static const char* zs[] = {"x1", "x2", "x4"};
+        int z = c.narrowFov > 15 ? 0 : c.narrowFov > 7.5f ? 1 : 2;
+        if (segmented("emuzoom", zs, 3, z)) c.narrowFov = 20.f / (1 << z);
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::SliderFloat("##nfov", &c.narrowFov, 2, 40, "%.1f°");
     label("Частота кадров");
     ImGui::SliderFloat("##nfps", &c.narrowFps, 15, 240, "%.0f к/с");
@@ -2571,6 +2580,9 @@ void panel_twocam_metrics(App& a) {
     ImGui::Text("ось: аз %.2f°, угол места %.2f°", v.axis.az, v.axis.el);
     ImGui::Text("скорость поворота: %.1f / %.1f °/с (предел %.0f)", v.rateAz, v.rateEl, a.emuCfg.maxRate);
     ImGui::Text("назначений %d, взяла %d, не ту %d, потерь %d", s.assignments, s.acquired, s.wrongLocks, s.losses);
+    if (s.simT > 0)
+        ImGui::Text("нечего вести %.0f%% времени, ложная цель широкой %.0f%%", 100 * s.idleTime / s.simT,
+                    100 * s.falseTarget / s.simT);
     ImGui::TextDisabled("время %.1f с; широкая %.1f мс/кадр, точная %.2f мс/кадр", s.simT,
                         s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0);
     if (!v.status.empty()) ImGui::TextColored(TXT_WARN, "%s", v.status.c_str());
