@@ -104,7 +104,9 @@ static bool sample_color8(const FrameReader& rd, int W, int H, Color8& c) {
 static void print_sky_color(const Detector& det) {
     size_t n = 0;
     for (auto m : det.skyColored()) n += m;
-    if (n) std::printf("облака по цвету: %zu тайлов закрыты только для светлых целей\n", n);
+    if (n)
+        std::printf("облака по цвету: %zu тайлов открыты для %s\n", n,
+                    det.config().sky_bright ? "тёмных и светлых целей" : "тёмных целей");
 }
 
 static Isa parse_isa(const std::string& s) {
