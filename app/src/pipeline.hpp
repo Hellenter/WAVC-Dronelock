@@ -21,6 +21,7 @@
 // кадр подаётся по кругу без копирования (как DMA-буферы камеры).
 struct Frame {
     std::vector<uint8_t> px;
+    ColorPlanes color;        // цвет (выборка U, V), если он есть в видео
     int w = 0, h = 0;
     int64_t index = 0;        // номер кадра в файле
     double decodeMs = 0;
@@ -46,7 +47,16 @@ struct Settings {
     dronolok::TrackerConfig trk;
     // источник кадров
     Pace pace = Pace::Realtime;
-    double targetFps = 0;      // 0 = FPS видео
+    // частота камеры, 0 = FPS видео. Ниже частоты видео — эмуляция медленной камеры: кадры файла
+    // между её снимками пропускаются (60 к/с, камера 14 — каждый 4-й-5-й по времени), и цель за
+    // кадр смещается, как у настоящей камеры. Раньше все кадры подавались реже, как замедленное
+    // видео, а трекер считал на заданной частоте — смещения за кадр вчетверо меньше ожидаемых
+    // (60 к/с при "14": захват на дроне 86 -> 63%, жёсткий 64 -> 40%). Выше частоты видео — кадры подаются чаще
+    double targetFps = 0;
+    // камера реже видео: брать каждый frameStep-й кадр файла (60 к/с, шаг 4 — камера 15 к/с).
+    // Номера кадров — файла, поэтому разметка <видео>.gt.json подходит без пересчёта;
+    // трекер и темп камеры — на частоте видео / шаг
+    int frameStep = 1;
     Source source = Source::Stream;
     int preloadFrames = 100;
     int procW = 0, procH = 0;  // 0 = исходный размер
@@ -80,6 +90,10 @@ struct Settings {
     // трекер считает в секундах: скорости, ворота и выдержки пересчитываются под частоту
     // кадров (dronolok::tracker_for_fps; повторы кадров записи экрана не считаются)
     bool trkSeconds = true;
+    // окна маски неба (обучение, уточнение у кромки, доращивание, перепроверка), оценка сдвига
+    // камеры и признак панорамы — тоже в секундах: числа кадров подобраны на 60 к/с и
+    // пересчитываются под частоту камеры (dronolok::detector_for_fps, GlobalMotion::setFps)
+    bool fpsScale = true;
     // эмуляция устройства: обработка кадра растягивается в slowdown раз (ядро устройства
     // медленнее ядра ПК во столько раз, см. calibrate_ms_per_mp)
     double slowdown = 1.0;
@@ -125,6 +139,9 @@ struct Result {
     dronolok::DetectTiming dt;
     double trackMs = 0, procMs = 0, latencyMs = 0;
     std::vector<uint8_t> mask;
+    std::vector<uint8_t> maskDark;  // закрытые маской тайлы, где ищутся тёмные цели (Detector::polarityOpen)
+    std::vector<uint8_t> maskBright;  // ...и светлые
+    std::vector<uint8_t> band;      // полоса у горизонта (Detector::horizonBand), пусто — выключена
     std::vector<uint8_t> fineSky;   // ячейки 16x16 неба в тайлах земли (уточнение маски), см. Detector::fineSky
     int cellsPerTile = 0;
     int tilesX = 0, tilesY = 0, tilePx = 0;
@@ -210,6 +227,10 @@ public:
     ~Pipeline();
 
     bool open(const std::string& path, std::string& err);
+    // Кадры не из файла, а от генератора (эмулятор камер): gen заполняет px (w x h), index и
+    // возвращает false, когда кадров больше не будет. Вызывается в потоке чтения; может ждать.
+    // name — подпись вместо пути к файлу (файлы рядом с видео не читаются и не пишутся)
+    bool openGenerator(const VideoInfo& info, std::function<bool(Frame&)> gen, const std::string& name);
     void close();
     bool isOpen() const { return open_; }
     const std::string& path() const { return path_; }
@@ -217,6 +238,12 @@ public:
 
     void setSettings(const Settings& s);
     Settings settings() const;
+    // частота кадров, которые видит алгоритм: камеры (или видео), делённая на шаг прореживания
+    double cameraFps(const Settings& s) const;
+    // кадров файла на кадр камеры (шаг frameStep и частота камеры ниже частоты видео), 1 — все
+    double fileStep(const Settings& s) const;
+    // кадр файла index пропускается: между снимками медленной камеры
+    bool skipFrame(const Settings& s, int64_t index) const;
     void setPaused(bool p);
     bool paused() const { return paused_; }
     void step();                         // один кадр на паузе
@@ -281,6 +308,7 @@ private:
 
     std::string path_;
     bool open_ = false;
+    std::function<bool(Frame&)> gen_;   // кадры от генератора вместо файла
     VideoInfo info_;
     std::shared_ptr<const dronolok::GroundTruth> gt_;   // под rm_: разметку можно заменить на ходу
     bool haveGt_ = false;

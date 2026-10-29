@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "backend.hpp"
@@ -40,6 +41,8 @@ static inline float bg_sd(const CellBg& c, size_t ci) { return (c.q90[ci] - c.q5
 
 struct Detector::Stats {
     TileStats dark, bright, unused;
+    TileStats stripD, stripB;    // ряд тайлов по низу кадра для зон (DetectorConfig::zone_strip)
+    bool strip = false;          // посчитан в этом кадре
     std::vector<Level> lv;   // lv[0] — уровень 1 (x2), lv[1] — уровень 2 (x4)
     CellBg cb[2];
     std::vector<uint8_t> comp;   // тайлы, посчитанные бэкендом в этом кадре (пусто — все)
@@ -159,6 +162,39 @@ static float spot_width(const uint8_t* g, int w, int h, int stride, const Candid
     return 0.25f * (amp(bx - 2, by) + amp(bx + 2, by) + amp(bx, by - 2) + amp(bx, by + 2)) / a0;
 }
 
+// Светлый кандидат — кайма резкости у тёмного (DetectorConfig::halo_k): в окне вокруг него
+// есть точка темнее фона (медиана рамки) больше чем на k * контраст кандидата, и это тёмное
+// протяжённое — уходит за вдвое большую рамку (столб, мачта, край кроны). Компактное тёмное
+// рядом — сама цель: у дрона в игре и на солнце светлые и тёмные части рядом
+static bool halo_spot(const uint8_t* g, int w, int h, int stride, const Candidate& c, float k) {
+    const int r = 4 << std::min(2, c.level), R = r + 6, E = 2 * R;
+    const int cx = (int)std::lround(c.x), cy = (int)std::lround(c.y);
+    if (cx - E < 0 || cy - E < 0 || cx + E >= w || cy + E >= h) return false;
+    int ring[32], n = 0;
+    for (int i = 0; i < 8; ++i) {
+        const int o = -R + i * R / 4;
+        ring[n++] = g[(size_t)(cy - R) * stride + cx + o];
+        ring[n++] = g[(size_t)(cy + R) * stride + cx - o];
+        ring[n++] = g[(size_t)(cy - o) * stride + cx - R];
+        ring[n++] = g[(size_t)(cy + o) * stride + cx + R];
+    }
+    std::nth_element(ring, ring + n / 2, ring + n);
+    const int lim = ring[n / 2] - (int)std::ceil(k * c.contrast);
+    if (lim <= 0) return false;
+    bool near = false;
+    for (int y = cy - r; y <= cy + r && !near; ++y) {
+        const uint8_t* row = g + (size_t)y * stride;
+        for (int x = cx - r; x <= cx + r && !near; ++x) near = row[x] < lim;
+    }
+    if (!near) return false;
+    // протяжённость: тёмное на рамке E (по 2 пикс. вдоль сторон, тонкий столб не проскочит)
+    for (int o = -E; o <= E; o += 2)
+        if (g[(size_t)(cy - E) * stride + cx + o] < lim || g[(size_t)(cy + E) * stride + cx + o] < lim ||
+            g[(size_t)(cy + o) * stride + cx - E] < lim || g[(size_t)(cy + o) * stride + cx + E] < lim)
+            return true;
+    return false;
+}
+
 static DetectorConfig sanitize(DetectorConfig c) {
     c.k = std::max(3, std::min(31, c.k | 1));
     c.pool = c.pool == 1 ? 1 : 2;
@@ -180,6 +216,23 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.band_k = std::max(0.3f, std::min(2.f, c.band_k));
     c.upper_every = std::max(1, std::min(16, c.upper_every));
     c.smooth_k = std::max(0.1f, std::min(1.f, c.smooth_k));
+    return c;
+}
+
+DetectorConfig detector_for_fps(const DetectorConfig& c0, float fps, float ref) {
+    DetectorConfig c = c0;
+    if (!(fps > 0) || !(ref > 0) || std::fabs(fps - ref) < 0.01f * ref) return c;
+    const float t = fps / ref;   // кадров в той же секунде
+    auto frames = [&](int n, int lo) { return n > 0 ? std::max(std::min(n, lo), (int)std::lround(n * t)) : n; };
+    c.fine_frames = frames(c.fine_frames, 20);
+    c.grow_frames = frames(c.grow_frames, 20);
+    // перепроверка: и замер реже-чаще, и окно — замеров в окне столько же
+    c.recheck_every = frames(c.recheck_every, 1);
+    c.recheck_frames = frames(c.recheck_frames, 30);
+    // фон ячеек (bg_frames) остаётся в кадрах: квантили мерцания копятся по числу замеров, и окно
+    // в секундах на 15 к/с давало больше ложных захватов без дронов (6.6% -> 8%, на дронах так же).
+    // Экономия "раз в N кадров" (full_every, coarse_every, upper_every) — не окна, а бюджет кадра
+    // на слабом железе (профили "Экономный", "Минимальный" для Pi): тоже не пересчитывается
     return c;
 }
 
@@ -208,15 +261,227 @@ void Detector::reconfigure(const DetectorConfig& c0) {
 void Detector::beginMaskLearning() {
     mask_.clear();
     learning_ = true;
+    verifyLeft_ = 0;
+    fileGrown_.clear();
     texSum_.assign((size_t)tw_ * th_, 0.f);
+    for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
+    resetGrow();
+    resetColor();
 }
 
 void Detector::endMaskLearning(float frac) {
     learning_ = false;
+    resetGrow();
+    markSoftCloud(frac);   // до маски: линия горизонта через мягкие облака не идёт
     std::vector<uint8_t> m;
     buildMask(frac, m);
     if (!m.empty()) mask_.swap(m);
+    markSkyColor(frac);
+    markTexBad(frac);
+}
+
+// тайлы, закрытые маской по своей текстуре (не линией горизонта): их маска перепроверяет
+void Detector::markTexBad(float frac) {
+    texBad_.clear();
+    recheckTex_.clear();
+    recheckN_.clear();
+    const int n = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
+    if (n == 0 || texSum_.size() != mask_.size()) return;
+    texBad_.resize(mask_.size());
+    for (size_t i = 0; i < texBad_.size(); ++i) texBad_[i] = !mask_[i] && texSum_[i] / n > frac;
+    recheckTex_.assign(mask_.size(), 0.f);
+    recheckN_.assign(mask_.size(), 0);
+    // маска по полярности: тайл закрыт своей текстурой, а этой полярности в нём почти не было
+    for (auto& v : polOpen_) v.clear();
+    if (cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright)
+        for (int p = 0; p < (cfg_.pol_mask >= 2 ? 2 : 1); ++p) {
+            const auto& tp = texSumP_[p];
+            if (tp.size() != mask_.size()) continue;
+            polOpen_[p].assign(mask_.size(), 0);
+            for (size_t i = 0; i < tp.size(); ++i) polOpen_[p][i] = texBad_[i] && tp[i] / texN_ <= cfg_.pol_tex;
+        }
+    // облако по цвету: цели там ищутся, какой бы ни была его текстура, — тёмные, с sky_bright и светлые
+    if (skyCol_.size() != mask_.size()) return;
+    for (int p = 0; p < 2; ++p) {
+        if (!(p ? cfg_.bright && cfg_.sky_bright : cfg_.dark)) continue;
+        if (polOpen_[p].size() != mask_.size()) polOpen_[p].assign(mask_.size(), 0);
+        for (size_t i = 0; i < mask_.size(); ++i) polOpen_[p][i] |= skyCol_[i] && texBad_[i];
+    }
+}
+
+void Detector::resetColor() {
+    colY_.clear();
+    colU0_.clear();
+    colV0_.clear();
+    colD1_.clear();
+    colD4_.clear();
+    colHist_.clear();
+    colN_.clear();
+    skyCol_.clear();
+    softCol_.clear();
+    skyRef_ = 0;
+}
+
+// Яркость и цвет тайлов для облаков по цвету (sky_color): 8x8 отсчётов на тайл, в центрах его
+// блоков; яркость — ещё и гистограммой по 8 уровней (доля тёмных точек считается в конце обучения,
+// когда известна яркость неба), и перепады яркости от отсчёта до точек на 1 и на 4 пикс. правее и
+// ниже (мягкость облака, sky_soft)
+void Detector::sampleColor(const uint8_t* gray, int stride) {
+    const size_t n = (size_t)tw_ * th_;
+    if (!colU_ || !colV_ || colStep_ <= 0 || colPix_ <= 0 || colW_ <= 0 || colH_ <= 0 || n == 0) return;
+    if (colN_.size() != n) {
+        colY_.assign(n, 0.f);
+        colU0_.assign(n, 0.f);
+        colV0_.assign(n, 0.f);
+        colD1_.assign(n, 0.f);
+        colD4_.assign(n, 0.f);
+        colHist_.assign(n * 32, 0);
+        colN_.assign(n, 0);
+    }
+    const int tp = cfg_.tile * cfg_.pool, st = std::max(1, tp / 8);
+    for (int ty = 0; ty < th_; ++ty)
+        for (int j = 0; j < 8; ++j) {
+            const int y = ty * tp + j * st + st / 2, cy = y / colStep_;
+            if (y >= h_ || cy >= colH_) continue;
+            const uint8_t* g = gray + (size_t)y * stride;
+            const uint8_t* g1 = gray + (size_t)std::min(y + 1, h_ - 1) * stride;
+            const uint8_t* g4 = gray + (size_t)std::min(y + 4, h_ - 1) * stride;
+            const uint8_t* u = colU_ + (size_t)cy * colStride_;
+            const uint8_t* v = colV_ + (size_t)cy * colStride_;
+            for (int tx = 0; tx < tw_; ++tx) {
+                const size_t i = (size_t)ty * tw_ + tx;
+                uint32_t* hist = &colHist_[i * 32];
+                int sy = 0, su = 0, sv = 0, d1 = 0, d4 = 0, k = 0;
+                for (int q = 0; q < 8; ++q) {
+                    const int x = tx * tp + q * st + st / 2, cx = x / colStep_;
+                    if (x >= w_ || cx >= colW_) continue;
+                    const int c = g[x], x1 = std::min(x + 1, w_ - 1), x4 = std::min(x + 4, w_ - 1);
+                    sy += c;
+                    ++hist[c >> 3];
+                    su += (int)u[(size_t)cx * colPix_] - 128;
+                    sv += (int)v[(size_t)cx * colPix_] - 128;
+                    d1 += std::abs(g[x1] - c) + std::abs(g1[x] - c);
+                    d4 += std::abs(g[x4] - c) + std::abs(g4[x] - c);
+                    ++k;
+                }
+                colY_[i] += (float)sy;
+                colU0_[i] += (float)su;
+                colV0_[i] += (float)sv;
+                colD1_[i] += (float)d1;
+                colD4_[i] += (float)d4;
+                colN_[i] += (uint32_t)k;
+            }
+        }
+}
+
+// Облака по цвету (DetectorConfig::sky_color): тайл, закрытый маской по своей текстуре (доля frac
+// кадров обучения), но не зелёный, не темнее неба и без глубоких теней, — облако, освещённое
+// солнцем, а не кроны и дома. Яркость неба сцены (skyRef_) — медиана гладких тайлов, связанных с
+// верхним краем кадра через гладкие. Сначала, до маски, — яркость неба и мягкие облака (sky_soft)
+void Detector::markSoftCloud(float frac) {
+    skyRef_ = 0;
+    softCol_.clear();
+    const size_t n = (size_t)tw_ * th_;
+    const int nt = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
+    if (!cfg_.sky_color || nt == 0 || texSum_.size() != n || colN_.size() != n) return;
+    // цвет вообще есть: у серой (ИК) камеры U и V около 128 по всему кадру
+    size_t colored = 0, all = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!colN_[i]) continue;
+        ++all;
+        colored += std::fabs(colU0_[i]) + std::fabs(colV0_[i]) > 4.f * (float)colN_[i];
+    }
+    if (colored * 20 < all) return;
+    auto smooth = [&](size_t i) { return colN_[i] > 0 && texSum_[i] / nt <= frac; };
+    std::vector<uint8_t> sky(n, 0);
+    fill_.clear();
+    for (int x = 0; x < tw_; ++x)
+        if (smooth((size_t)x)) sky[x] = 1, fill_.push_back(x);
+    for (size_t k = 0; k < fill_.size(); ++k) {
+        const int i = fill_[k], x = i % tw_, y = i / tw_;
+        const int nb[4][2] = {{x - 1, y}, {x + 1, y}, {x, y - 1}, {x, y + 1}};
+        for (const auto& q : nb) {
+            if (q[0] < 0 || q[0] >= tw_ || q[1] < 0 || q[1] >= th_) continue;
+            const size_t j = (size_t)q[1] * tw_ + q[0];
+            if (!sky[j] && smooth(j)) sky[j] = 1, fill_.push_back((int)j);
+        }
+    }
+    if (fill_.size() < 8) return;   // открытого неба почти нет — сравнивать не с чем
+    std::vector<float> ys;
+    ys.reserve(fill_.size());
+    for (int i : fill_) ys.push_back(colY_[i] / (float)colN_[i]);
+    std::nth_element(ys.begin(), ys.begin() + ys.size() / 2, ys.end());
+    const float ref = ys[ys.size() / 2];
+    if (ref < 16.f) return;
+    skyRef_ = ref;
+    // мягкое: перепад на 1 пикс. — малая доля перепада на 4 (плавные переходы облака; у листвы,
+    // веток и леса в дымке перепад есть уже между соседними пикселями), и перепады невелики
+    if (!cfg_.sky_soft || colD1_.size() != n || colD4_.size() != n) return;
+    softCol_.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (!skyColorTile(i, frac)) continue;
+        const float N = (float)colN_[i], d4 = colD4_[i];
+        softCol_[i] = d4 < cfg_.sky_d4 * std::max(colY_[i], 16.f * N) && colD1_[i] < cfg_.sky_s14 * d4;
+    }
+    // гребень дальнего холма в дымке так же мягок и голубоват, но лежит полосой в один тайл между
+    // гладким небом и текстурой, которая не мягкая (лес в дымке под ним — тоже цвета неба), — это
+    // горизонт: правило "не стоит на земле" для него остаётся. Ряды сверху вниз: тайл под этим ещё
+    // с прежней пометкой
+    for (int y = 0; y < th_; ++y)
+        for (int x = 0; x < tw_; ++x) {
+            const size_t i = (size_t)y * tw_ + x, up = i - tw_, dn = i + tw_;
+            if (!softCol_[i] || (y > 0 && !smooth(up))) continue;
+            if (y + 1 == th_ || (texSum_[dn] / nt > frac && !softCol_[dn])) softCol_[i] = 0;
+        }
+}
+
+// тайл закрыт своей текстурой, а по цвету и яркости — небо (без правила "висит в небе")
+bool Detector::skyColorTile(size_t i, float frac) const {
+    const int nt = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
+    if (skyRef_ <= 0 || nt == 0 || !colN_[i] || texSum_[i] / nt <= frac) return false;
+    // зелень (BT.709): зелёный выше и красного, и заметно выше синего — листва, трава. Голубое,
+    // серое, белое и жёлтое небо, облака и тёплый свет солнца на них — нет
+    const float N = (float)colN_[i], y = colY_[i] / N, u = colU0_[i] / N, v = colV0_[i] / N;
+    const float g = -0.1873f * u - 0.4681f * v, r = 1.5748f * v, b = 1.8556f * u;   // минус яркость
+    if (g >= r && g - b > cfg_.sky_green * std::max(y, 16.f)) return false;
+    if (y < cfg_.sky_y * skyRef_) return false;
+    return darkShare(i) < 0.1f;   // точек темнее sky_dark неба — меньше 10%
+}
+
+// Доля отсчётов тайла темнее sky_dark неба сцены (полоса гистограммы на границе — по доле)
+float Detector::darkShare(size_t i) const {
+    if (skyRef_ <= 0 || i >= colN_.size() || !colN_[i] || colHist_.size() < (i + 1) * 32) return 0.f;
+    const float darkY = cfg_.sky_dark * skyRef_;
+    const int db = std::min(32, (int)(darkY / 8.f));
+    const uint32_t* h = &colHist_[i * 32];
+    float dark = 0;
+    for (int k = 0; k < db; ++k) dark += (float)h[k];
+    if (db < 32) dark += (float)h[db] * (darkY - 8.f * (float)db) / 8.f;
+    return dark / (float)colN_[i];
+}
+
+// Нужна готовая маска (mask_): облако отделено от земли открытым небом
+void Detector::markSkyColor(float frac) {
+    skyCol_.clear();
+    const size_t n = (size_t)tw_ * th_;
+    if (skyRef_ <= 0 || mask_.size() != n || colN_.size() != n || texSum_.size() != n) return;
+    skyCol_.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) skyCol_[i] = !mask_[i] && skyColorTile(i, frac);
+    // облако висит в небе, а не стоит на земле: тайл цвета неба, под которым в столбце закрытое
+    // маской доходит до земли (закрытое не цвета неба или низ кадра), — верх крон, лес в дымке у
+    // горизонта, дом: остаётся закрытым. Мягкое облако (sky_soft) — облако и на земле
+    const bool soft = softCol_.size() == n;
+    for (int x = 0; x < tw_; ++x) {
+        bool ground = true;   // под этим тайлом закрытое до самой земли
+        for (int y = th_ - 1; y >= 0; --y) {
+            const size_t i = (size_t)y * tw_ + x;
+            if (soft && softCol_[i]) continue;   // столбец над ним — как под ним
+            if (mask_[i]) ground = false;
+            else if (!skyCol_[i]) ground = true;
+            else if (ground) skyCol_[i] = 0;
+        }
+    }
 }
 
 // Маска по накопленной текстуре тайлов (texSum_ за texN_ кадров): тайл, текстурный дольше
@@ -227,13 +492,36 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
     if (n == 0 || texSum_.size() != (size_t)tw_ * th_) return;
     std::vector<uint8_t> bad(texSum_.size());
     for (size_t i = 0; i < bad.size(); ++i) bad[i] = texSum_[i] / n > frac;
+    // кромка земли — по тайлам с тёмной текстурой: тайл только со светлой (облако, pol_mask)
+    // сам закрыт, но столбец под ним землёй не делает — иначе облачное небо до самого леса
+    // закрывалось целиком, вместе с гладкими просветами между облаками
+    std::vector<uint8_t> edgeBad(bad);
+    if (cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright && texN_ > 0 && texSumP_[0].size() == bad.size())
+        for (size_t i = 0; i < bad.size(); ++i) edgeBad[i] = bad[i] && texSumP_[0][i] / texN_ > cfg_.pol_tex;
+    // мягкое облако (sky_soft) — тоже не земля: облако, касающееся крон, кромку вверх не тянет. Кроме
+    // облака над тёмной верхушкой (sky_tree): первый немягкий текстурный тайл под ним через 1-2
+    // гладких — ближнее дерево, и просвет до него остаётся закрытым
+    if (softCol_.size() == bad.size())
+        for (int y = 0; y < th_; ++y)
+            for (int x = 0; x < tw_; ++x) {
+                const size_t i = (size_t)y * tw_ + x;
+                if (!softCol_[i]) continue;
+                bool tree = false;
+                for (int k = 1; k <= 3 && y + k < th_ && cfg_.sky_tree > 0; ++k) {
+                    const size_t j = i + (size_t)k * tw_;
+                    if (softCol_[j] || !bad[j]) continue;
+                    tree = darkShare(j) >= cfg_.sky_tree;
+                    break;
+                }
+                if (!tree) edgeBad[i] = 0;
+            }
     if (cfg_.skyline) {
         std::vector<int> edge(tw_, th_);
         for (int x = 0; x < tw_; ++x) {
             int below = 0;   // текстурных тайлов от y до низа кадра
             int gap = 0;     // гладких тайлов подряд над землёй
             for (int y = th_ - 1; y >= 0; --y) {
-                const bool b = bad[(size_t)y * tw_ + x] != 0;
+                const bool b = edgeBad[(size_t)y * tw_ + x] != 0;
                 below += b;
                 gap = b ? 0 : gap + 1;
                 // кромка не выше просвета в 3 тайла: облако над лесом (тёмное небо, яркие
@@ -270,17 +558,24 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
 }
 
 namespace {
-const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
+// вторая версия — со слоем доращивания: 1 — тайл закрыт по помехам, 2 — закрыт так только для светлых
+const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '2', 0};
+const char kMaskMagic1[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
 const int32_t kMaxSide = 1 << 16;   // сторона кадра в файле маски, пикс.
 }
 
 bool Detector::saveMask(const std::string& path) const {
-    if (mask_.empty() || mask_.size() != (size_t)tw_ * th_) return false;
+    const size_t n = (size_t)tw_ * th_;
+    if (mask_.empty() || mask_.size() != n) return false;
+    std::vector<uint8_t> grown(n, 0);
+    if (verifyLeft_ && fileGrown_.size() == n) grown = fileGrown_;   // ещё сверяется: слой из файла
+    else if (grownT_.size() == n)
+        for (size_t i = 0; i < n; ++i) grown[i] = grownT_[i] && !mask_[i] ? (polOpenAt(0, i) ? 2 : 1) : 0;
     FILE* f = open_file(path, "wb");
     if (!f) return false;
     const int32_t hdr[6] = {w_, h_, cfg_.pool, cfg_.tile, tw_, th_};
     bool ok = std::fwrite(kMaskMagic, 1, 8, f) == 8 && std::fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
-              std::fwrite(mask_.data(), 1, mask_.size(), f) == mask_.size();
+              std::fwrite(mask_.data(), 1, n, f) == n && std::fwrite(grown.data(), 1, n, f) == n;
     ok = std::fclose(f) == 0 && ok;
     return ok;
 }
@@ -290,15 +585,21 @@ bool Detector::loadMask(const std::string& path, int verify) {
     if (!f) return false;
     char magic[8];
     int32_t hdr[6];
-    bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, kMaskMagic, 8) == 0 &&
-              std::fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 &&
-              hdr[5] > 0 && hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
-              // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
-              hdr[0] <= kMaxSide && hdr[1] <= kMaxSide;
-    std::vector<uint8_t> m;
+    bool ok = std::fread(magic, 1, 8, f) == 8;
+    const bool v2 = ok && std::memcmp(magic, kMaskMagic, 8) == 0;
+    ok = ok && (v2 || std::memcmp(magic, kMaskMagic1, 8) == 0) && std::fread(hdr, sizeof(hdr), 1, f) == 1 &&
+         hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 && hdr[5] > 0 &&
+         hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
+         // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
+         hdr[0] <= kMaxSide && hdr[1] <= kMaxSide;
+    std::vector<uint8_t> m, g;
     if (ok) {
         m.resize((size_t)hdr[4] * hdr[5]);
         ok = std::fread(m.data(), 1, m.size(), f) == m.size();
+        if (ok && v2) {
+            g.resize(m.size());
+            ok = std::fread(g.data(), 1, g.size(), f) == g.size();
+        }
     }
     std::fclose(f);
     if (!ok) return false;
@@ -306,13 +607,42 @@ bool Detector::loadMask(const std::string& path, int verify) {
     h_ = hdr[1];
     tw_ = hdr[4];
     th_ = hdr[5];
+    // доращенное в файле закрыто и в маске (файлы, записанные не этой версией, — как есть)
+    for (size_t i = 0; i < g.size(); ++i)
+        if (g[i]) m[i] = 0;
     mask_.swap(m);
+    fileGrown_.swap(g);
     learning_ = false;
     maskReplaced_ = false;
     verifyLeft_ = std::max(0, verify);
     texSum_.assign((size_t)tw_ * th_, 0.f);
+    for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
+    resetGrow();
+    resetColor();
+    if (!verifyLeft_) {   // без сверки маска — как в файле; доращенное перепроверка может открыть
+        applyGrown();
+        fileGrown_.clear();
+    }
     return true;
+}
+
+// тайлы, закрытые доращиванием в прошлый раз (слой файла маски), — снова закрыты доращиванием
+void Detector::applyGrown() {
+    const size_t n = mask_.size();
+    if (fileGrown_.size() != n) return;
+    for (size_t i = 0; i < n; ++i) {
+        if (!fileGrown_[i] || skyColAt(i)) continue;   // облако по цвету доращивание не закрывает
+        mask_[i] = 0;
+        if (grownT_.size() != n) grownT_.assign(n, 0);
+        grownT_[i] = 1;
+        for (auto& o : polOpen_)
+            if (o.size() == n) o[i] = 0;
+        if (fileGrown_[i] == 2 && cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright) {
+            if (polOpen_[0].size() != n) polOpen_[0].assign(n, 0);
+            polOpen_[0][i] = 1;
+        }
+    }
 }
 
 void Detector::resetBackground() {
@@ -325,6 +655,265 @@ void Detector::clearMask() {
     mask_.clear();
     learning_ = false;
     verifyLeft_ = 0;
+    fileGrown_.clear();
+    resetGrow();
+    resetColor();
+}
+
+void Detector::resetGrow() {
+    growCell_.clear();
+    growCellD_.clear();
+    growTex_.clear();
+    growN_ = 0;
+    grown_ = 0;
+    opened_ = 0;
+    cloud_.clear();
+    texBad_.clear();
+    recheckTex_.clear();
+    recheckN_.clear();
+    for (auto& v : polOpen_) v.clear();
+    grownT_.clear();
+    growQuiet_.clear();
+    growQN_.clear();
+    reopened_ = 0;
+}
+
+// Перепроверка маски (DetectorConfig::mask_recheck): тайлы, закрытые по текстуре, раз в
+// recheck_every кадров считаются; тайл, где за ~recheck_frames кадров сильный отклик бывал реже
+// recheck_tex, открывается, если выше него в столбце нет земли — это облако
+void Detector::updateRecheck() {
+    const size_t n = mask_.size();
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt;
+    const auto& dk = stats_->dark.cmax;
+    const auto& br = stats_->bright.cmax;
+    const size_t nc = (size_t)ctw * th_ * cpt;
+    if (dk.size() != nc && br.size() != nc) return;
+    const int need = std::max(1, cfg_.recheck_frames / std::max(1, cfg_.recheck_every));
+    const float a = 1.f / (float)need, thr = threshold();
+    // закрытые доращиванием: если помехам там больше неоткуда взяться — ни одна ячейка закрытой
+    // полярности не дотягивает до порога почти во всех замерах за вдвое большее окно, — открываем
+    if (grownT_.size() == n) {
+        const int needG = 2 * need;
+        const float ag = 1.f / (float)needG;
+        if (growQuiet_.size() != n) growQuiet_.assign(n, 0.f), growQN_.assign(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+            if (!grownT_[i] || mask_[i]) {
+                grownT_[i] = 0;
+                continue;
+            }
+            const bool brightOnly = polOpenAt(0, i);   // закрыт только для светлых
+            const int ty = (int)(i / tw_), tx = (int)(i % tw_);
+            bool loud = false;
+            for (int cy = ty * cpt; cy < (ty + 1) * cpt && !loud; ++cy)
+                for (int cx = tx * cpt; cx < (tx + 1) * cpt && !loud; ++cx) {
+                    const size_t ci = (size_t)cy * ctw + cx;
+                    loud = (br.size() == nc && br[ci] >= thr) || (!brightOnly && dk.size() == nc && dk[ci] >= thr);
+                }
+            if (growQN_[i] < 65535) ++growQN_[i];
+            growQuiet_[i] += std::max(ag, 1.f / (float)growQN_[i]) * ((loud ? 0.f : 1.f) - growQuiet_[i]);
+            if (growQN_[i] < needG || growQuiet_[i] < cfg_.reopen_quiet) continue;
+            mask_[i] = 1;
+            if (fineBase_.size() == n) fineBase_[i] = 1;
+            for (auto& o : polOpen_)
+                if (o.size() == n) o[i] = 0;
+            grownT_[i] = 0;
+            growQN_[i] = 0;
+            growQuiet_[i] = 0;
+            ++reopened_;
+        }
+    }
+    if (texBad_.size() != n) return;
+    uint8_t v[64];
+    for (size_t i = 0; i < n; ++i) {
+        if (!texBad_[i] || mask_[i]) continue;
+        // медиана максимумов ячеек тайла: у кромки облака отклик слабый почти везде, у крон,
+        // домов и травы — сильный в большинстве ячеек
+        const int ty = (int)(i / tw_), tx = (int)(i % tw_);
+        int k = 0;
+        for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
+            for (int cx = tx * cpt; cx < (tx + 1) * cpt && k < 64; ++cx) {
+                const size_t ci = (size_t)cy * ctw + cx;
+                v[k++] = std::max(dk.size() == nc ? dk[ci] : (uint8_t)0, br.size() == nc ? br[ci] : (uint8_t)0);
+            }
+        std::nth_element(v, v + k / 2, v + k);
+        const bool strong = v[k / 2] >= thr;
+        if (recheckN_[i] < 65535) ++recheckN_[i];
+        recheckTex_[i] += std::max(a, 1.f / (float)recheckN_[i]) * ((strong ? 1.f : 0.f) - recheckTex_[i]);
+    }
+    // открываем только выше самой верхней "сильной" земли столбца: гладкая трава под кромкой
+    // леса тоже слаба, но она земля (её закрыла линия горизонта или своя текстура)
+    for (int x = 0; x < tw_; ++x) {
+        int top = th_;
+        for (int y = 0; y < th_ && top == th_; ++y) {
+            const size_t i = (size_t)y * tw_ + x;
+            if (!mask_[i] && (!texBad_[i] || recheckN_[i] < need || recheckTex_[i] >= cfg_.recheck_tex)) top = y;
+        }
+        for (int y = 0; y < top; ++y) {
+            const size_t i = (size_t)y * tw_ + x;
+            if (mask_[i] || !texBad_[i]) continue;
+            mask_[i] = 1;
+            if (fineBase_.size() == n) fineBase_[i] = 1;
+            texBad_[i] = 0;
+            if (cloud_.size() != n) cloud_.assign(n, 0);
+            cloud_[i] = 1;
+            ++opened_;
+        }
+    }
+}
+
+// Доращивание маски по помехам (DetectorConfig::grow_mask): помехи копятся по ячейкам с
+// забыванием за ~grow_frames кадров, раз в четверть окна тайлы неба перепроверяются
+void Detector::noteClutter(const std::vector<Candidate>& clutter, const std::vector<FocusArea>& keep) {
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt, cth = th_ * cpt;
+    if (!cfg_.grow_mask || learning_ || verifyLeft_ || cfg_.tile % CELL || mask_.size() != (size_t)tw_ * th_) {
+        if (!growCell_.empty()) growCell_.clear(), growCellD_.clear(), growTex_.clear(), growN_ = 0;
+        return;
+    }
+    const size_t nc = (size_t)ctw * cth, n = (size_t)tw_ * th_;
+    if (growCell_.size() != nc || growCellD_.size() != nc || growTex_.size() != n) {
+        growCell_.assign(nc, 0.f);
+        growCellD_.assign(nc, 0.f);
+        growTex_.assign(n, 0.f);
+        growN_ = 0;
+    }
+    const int W = std::max(10, cfg_.grow_frames);
+    const float k = 1.f - 1.f / (float)W;
+    for (float& v : growCell_) v *= k;
+    for (float& v : growCellD_) v *= k;
+    // как часто тайл текстурный: дальняя трава и поле — иногда, чистое небо — почти никогда
+    const auto& t0 = stats_->tex[0];
+    const auto& t1 = stats_->tex[1];
+    for (size_t i = 0; i < n; ++i) {
+        const bool t = (t0.size() == n && t0[i]) || (t1.size() == n && t1[i]);
+        growTex_[i] = k * growTex_[i] + (t ? 1.f / (float)W : 0.f);
+    }
+    const float cpx = (float)(CELL * cfg_.pool);
+    for (const Candidate& c : clutter) {
+        const int cx = (int)(c.x / cpx), cy = (int)(c.y / cpx);
+        if (cx >= 0 && cx < ctw && cy >= 0 && cy < cth) {
+            growCell_[(size_t)cy * ctw + cx] += 1.f;
+            if (c.polarity < 0) growCellD_[(size_t)cy * ctw + cx] += 1.f;
+        }
+    }
+    ++growN_;
+    if (growN_ >= W && growN_ % std::max(1, W / 4) == 0) growMask(keep);
+}
+
+void Detector::growMask(const std::vector<FocusArea>& keep) {
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt;
+    const size_t n = (size_t)tw_ * th_;
+    const float W = (float)std::max(10, cfg_.grow_frames);
+    std::vector<float> rate(n, 0.f), rateD(n, 0.f);   // ...и только тёмных
+    std::vector<uint8_t> cells(n, 0), cand(n, 0);
+    double sum = 0;
+    int sky = 0;
+    for (int ty = 0; ty < th_; ++ty)
+        for (int tx = 0; tx < tw_; ++tx) {
+            const size_t i = (size_t)ty * tw_ + tx;
+            if (!mask_[i] && !polOpenAt(0, i) && !polOpenAt(1, i)) continue;
+            float r = 0, rd = 0;
+            int c = 0;
+            for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
+                for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx) {
+                    const float v = growCell_[(size_t)cy * ctw + cx];
+                    r += v;
+                    rd += growCellD_[(size_t)cy * ctw + cx];
+                    c += v > 0.5f;
+                }
+            rate[i] = r / W;
+            rateD[i] = rd / W;
+            cells[i] = (uint8_t)std::min(255, c);
+            sum += rate[i];
+            ++sky;
+        }
+    if (!sky) return;
+    // помех на тайл неба в среднем по сцене: в чистом небе их почти нет, в дыре маски — десятки
+    const float lim = std::max(cfg_.grow_k * (float)(sum / sky), cfg_.grow_min);
+    const int tilePx = cfg_.tile * cfg_.pool;
+    // облако по цвету (sky_color) не закрываем: помехи в нём — клочья облака, а не кроны, их держит
+    // порог по фону ячеек
+    for (size_t i = 0; i < n; ++i)
+        cand[i] = (mask_[i] || polOpenAt(0, i) || polOpenAt(1, i)) && rate[i] >= lim && cells[i] >= cfg_.grow_cells &&
+                  !skyColAt(i);
+    for (const FocusArea& a : keep) {   // вокруг цели маска не растёт
+        const int x0 = std::max(0, (int)std::floor((a.x - a.r) / tilePx)), x1 = std::min(tw_ - 1, (int)std::floor((a.x + a.r) / tilePx));
+        const int y0 = std::max(0, (int)std::floor((a.y - a.r) / tilePx)), y1 = std::min(th_ - 1, (int)std::floor((a.y + a.r) / tilePx));
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x) cand[(size_t)y * tw_ + x] = 0;
+    }
+    // открытый для одной полярности тайл уже внутри маски: закрывается без условий
+    // (светлых кандидатов там нет, помехи в нём — тёмные)
+    for (size_t i = 0; i < n; ++i) {
+        if (mask_[i] || !cand[i]) continue;
+        for (auto& v : polOpen_)
+            if (v.size() == n) v[i] = 0;
+        cand[i] = 0;
+        ++grown_;
+        const int x = (int)(i % tw_), y = (int)(i / tw_);
+        for (int cy = y * cpt; cy < (y + 1) * cpt; ++cy) {
+            std::fill_n(&growCell_[(size_t)cy * ctw + x * cpt], cpt, 0.f);
+            std::fill_n(&growCellD_[(size_t)cy * ctw + x * cpt], cpt, 0.f);
+        }
+    }
+    // прирастает к маске: земля хотя бы у двух соседей (край кадра слева, справа и снизу —
+    // тоже), и над тайлом не чистое небо (земля или такой же тайл с помехами). Ряд тайлов над
+    // ровной кромкой крон соседа-землю имеет одного — снизу, и не закрывается
+    // земля — только связанная с низом кадра: к островку маски в небе (облако) не прирастаем
+    // облако по цвету (sky_color) — тоже не земля: иначе небо между облаками, связанными с кромкой
+    // леса, закрывалось как дыра в земле
+    auto closed = [&](size_t j) { return !mask_[j] && !skyColAt(j); };
+    std::vector<uint8_t> base(n, 0);
+    fill_.clear();
+    for (int x = 0; x < tw_; ++x) {
+        const size_t i = (size_t)(th_ - 1) * tw_ + x;
+        if (closed(i)) base[i] = 1, fill_.push_back((int)i);
+    }
+    for (size_t k = 0; k < fill_.size(); ++k) {
+        const int i = fill_[k], x = i % tw_, y = i / tw_;
+        const int nb[4][2] = {{x - 1, y}, {x + 1, y}, {x, y - 1}, {x, y + 1}};
+        for (const auto& q : nb) {
+            if (q[0] < 0 || q[0] >= tw_ || q[1] < 0 || q[1] >= th_) continue;
+            const int j = q[1] * tw_ + q[0];
+            if (closed(j) && !base[j]) base[j] = 1, fill_.push_back(j);
+        }
+    }
+    auto ground = [&](int x, int y) {
+        if (y < 0) return false;
+        if (x < 0 || x >= tw_ || y >= th_) return true;
+        return base[(size_t)y * tw_ + x] != 0;
+    };
+    // чистое небо: помех мало и текстуры почти не бывает
+    auto clean = [&](size_t j) { return mask_[j] && !cand[j] && rate[j] < lim && growTex_[j] < cfg_.grow_sky_tex; };
+    const bool polGrow = cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int y = 1; y < th_; ++y)
+            for (int x = 0; x < tw_; ++x) {
+                const size_t i = (size_t)y * tw_ + x;
+                if (!cand[i]) continue;
+                const int g = ground(x - 1, y) + ground(x + 1, y) + ground(x, y + 1) + ground(x, y - 1);
+                if (g < 2 || (g == 2 && clean(i - tw_))) continue;
+                mask_[i] = 0;
+                if (grownT_.size() != n) grownT_.assign(n, 0);
+                grownT_[i] = 1;
+                if (growQN_.size() == n) growQN_[i] = 0, growQuiet_[i] = 0;
+                // помехи светлые (клочья облака): тайл закрыт только для светлых, тёмные там ищутся
+                if (polGrow && rateD[i] < lim) {
+                    if (polOpen_[0].size() != n) polOpen_[0].assign(n, 0);
+                    polOpen_[0][i] = 1;
+                }
+                base[i] = 1;
+                if (fineBase_.size() == n) fineBase_[i] = 0;   // уточнение по ячейкам у кромки не сбрасываем
+                cand[i] = 0;
+                ++grown_;
+                changed = true;
+                for (int cy = y * cpt; cy < (y + 1) * cpt; ++cy) {
+                    std::fill_n(&growCell_[(size_t)cy * ctw + x * cpt], cpt, 0.f);
+                    std::fill_n(&growCellD_[(size_t)cy * ctw + x * cpt], cpt, 0.f);
+                }
+            }
+    }
 }
 
 void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector<Candidate>& out) {
@@ -338,7 +927,11 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         th_ = (h / s) / T;
         mask_.clear();
         verifyLeft_ = 0;
-        if (learning_) texSum_.assign((size_t)tw_ * th_, 0.f);
+        fileGrown_.clear();
+        if (learning_) {
+            texSum_.assign((size_t)tw_ * th_, 0.f);
+            for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
+        }
     }
     // как cv2.threshold(R, thr*0.6) на u8: горячий, если R > floor(thr*0.6)
     const float ht = std::floor(hotLevel());
@@ -360,9 +953,15 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     // при проверке загруженной маски текстуру считаем по всему кадру, как при обучении
     const uint8_t* m = (!learning_ && !verifyLeft_ && !mask_.empty()) ? mask_.data() : nullptr;
     updateBand();
-    if (m && !edgeG_.empty()) {   // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам
+    const bool polOn = polOpen_[0].size() == mask_.size() || polOpen_[1].size() == mask_.size();
+    const bool lockOn = cfg_.lock_through && lockOn_ && m;
+    if (m && (edgeG_.size() == mask_.size() || polOn || lockOn)) {
+        // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам; и открытые для одной
+        // полярности; и под кругом цели в захвате
         compMask_.resize(mask_.size());
-        for (size_t i = 0; i < mask_.size(); ++i) compMask_[i] = mask_[i] | edgeG_[i];
+        for (size_t i = 0; i < mask_.size(); ++i)
+            compMask_[i] = mask_[i] | (edgeG_.size() == mask_.size() && edgeG_[i]) | polOpenAt(0, i) | polOpenAt(1, i) |
+                           (lockOn && lockTile((int)(i % tw_), (int)(i / tw_)));
         m = compMask_.data();
     }
     // между полными просмотрами — только тайлы вокруг треков (маска неба тоже действует);
@@ -378,6 +977,15 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
                 if (band_[i] && (!m || m[i])) roiMask_[i] = 1;
         m = roiMask_.data();
         timing_.partial = true;
+    }
+    // перепроверка маски: в этот кадр считаются и тайлы, закрытые по текстуре
+    const bool recheck = m && !timing_.partial && cfg_.mask_recheck && cfg_.recheck_every > 0 &&
+                         (texBad_.size() == mask_.size() || grownT_.size() == mask_.size()) && fn % cfg_.recheck_every == 0;
+    if (recheck) {
+        recheckMask_.assign(m, m + mask_.size());
+        for (size_t i = 0; i < mask_.size(); ++i)
+            recheckMask_[i] |= (texBad_.size() == mask_.size() && texBad_[i]) || (grownT_.size() == mask_.size() && grownT_[i]);
+        m = recheckMask_.data();
     }
     if (m) stats_->comp.assign(m, m + (size_t)tw_ * th_);
     else stats_->comp.clear();
@@ -453,12 +1061,28 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         timing_.jobs += jobs;
         timing_.jobs_skipped += skipped;
     }
+    // полоса под сеткой тайлов: ряд тайлов, выровненный по низу кадра, — только для зон
+    stats_->strip = false;
+    if (cfg_.zones && cfg_.zone_strip && !timing_.partial && tw_ > 0 && th_ > 0 && h - th_ * T * s >= 2 * CELL * s) {
+        ResponseParams q = p;
+        q.cells = false;
+        q.trim = false;
+        q.hot_thr = (uint8_t)std::max(0.f, std::min(255.f, std::floor(hotLevel())));
+        int jobs = 0, skipped = 0;
+        backend_->compute(FrameView{gray + (size_t)(h - T * s) * stride, w, T * s, stride}, q, nullptr, stats_->stripD,
+                          stats_->stripB, jobs, skipped);
+        timing_.jobs += jobs;
+        timing_.jobs_skipped += skipped;
+        stats_->strip = stats_->stripD.hot.size() == (size_t)tw_ || stats_->stripB.hot.size() == (size_t)tw_;
+    }
     const double t1 = now_ms();
     if (cfg_.zones) computeZones();
-    else zones_.clear();
+    else zones_.clear(), zoneHist_.clear();
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
+    if (cfg_.lock_through && lockOn_ && !learning_ && !mask_.empty() && (lockPol_ > 0 ? cfg_.bright : cfg_.dark))
+        selectThrough(lockPol_ > 0 ? stats_->bright : stats_->dark, lockPol_ > 0 ? 1 : 0, out);
     // фон ячеек читают кромка маски неба и накопление (tbd). Без маски и без накопления (камера
     // движется, поворотка) его не учим — это заметная доля последовательной части кадра; когда
     // маска появится, фон учится заново: выученный на движущейся картинке ей всё равно чужой
@@ -500,15 +1124,22 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
                 // и не ищем там, где маска неба запрещает поиск, и на земле
                 const int mx = (int)c.x / (T * s), my = (int)c.y / (T * s);
                 const size_t mi = (size_t)my * tw_ + mx;
-                if (!dup && !mask_.empty() && !learning_) dup = mx >= tw_ || my >= th_ || !mask_[mi];
+                if (!dup && !mask_.empty() && !learning_)
+                    dup = mx >= tw_ || my >= th_ || !(mask_[mi] || polOpenAt(c.polarity > 0, mi));
                 if (!dup && !zones_.empty()) dup = mx >= tw_ || my >= th_ || zones_[mi] == 0;
                 if (!dup) {
                     out[keep] = c;
-                    out[keep++].edge = !zones_.empty() && zones_[mi] == 1;
+                    // в тайле, закрытом маской и открытом только для этой полярности (облако), —
+                    // подтверждается, только когда полетела, как на основном масштабе
+                    out[keep++].edge = (!zones_.empty() && zones_[mi] == 1) || (!mask_.empty() && !learning_ && !mask_[mi]);
                 }
             }
             out.resize(keep);
         }
+    }
+    if (!learning_ && cfg_.halo_k > 0 && cfg_.bright) {
+        for (Candidate& c : out)
+            if (c.polarity > 0 && !c.edge && halo_spot(gray, w, h, stride, c, cfg_.halo_k)) c.edge = true;
     }
     if (!learning_) {
         // Сглаживание выгоднее всего широким пятнам: облако или блик шириной 5+ пикс. с
@@ -535,18 +1166,28 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             if (cfg_.subpixel) refine_position(gray, w, h, stride, c);
         }
     }
+    if ((learning_ || verifyLeft_) && cfg_.sky_color) sampleColor(gray, stride);
+    colU_ = colV_ = nullptr;   // цвет — только для этого кадра
     if (learning_ || verifyLeft_) ++texN_;
+    if (recheck) updateRecheck();
     if (verifyLeft_ && --verifyLeft_ == 0) {   // сверка загруженной маски с тем, что видно сейчас
         std::vector<uint8_t> fresh;
+        markSoftCloud(0.3f);
         buildMask(0.3f, fresh);
         if (fresh.size() == mask_.size()) {
+            // дальше маска — новая: закрытое в файле по текстуре (прошлым запуском, прошлой версией
+            // программы) не держится. Из файла — только доращенное по помехам, если сцена та же:
+            // отличие от файла без доращенного не больше 10% тайлов
+            const bool layer = fileGrown_.size() == fresh.size();
             size_t diff = 0;
-            for (size_t i = 0; i < fresh.size(); ++i) diff += fresh[i] != mask_[i];
-            if (diff * 10 > fresh.size()) {
-                mask_.swap(fresh);
-                maskReplaced_ = true;
-            }
+            for (size_t i = 0; i < fresh.size(); ++i) diff += fresh[i] != (mask_[i] || (layer && fileGrown_[i]));
+            maskReplaced_ = diff * 10 > fresh.size();
+            mask_.swap(fresh);
+            markSkyColor(0.3f);
+            markTexBad(0.3f);   // перепроверка и маска по полярности
+            if (!maskReplaced_) applyGrown();
         }
+        fileGrown_.clear();
     }
     const double t2 = now_ms();
     timing_.response_ms = t1 - t0;
@@ -582,53 +1223,101 @@ void Detector::updateNoise() {
 // Зоны по тайлам основного масштаба (см. DetectorConfig::zones)
 void Detector::computeZones() {
     const size_t n = (size_t)tw_ * th_;
+    // ряд полосы под сеткой (zone_strip) — лишний ряд снизу: в нём не ищем, но он земля
+    const bool strip = stats_->strip;
+    const int Th = th_ + (strip ? 1 : 0);
+    const size_t na = (size_t)tw_ * Th;
+    // кадр между полными просмотрами: посчитаны только тайлы вокруг треков, остальные выглядели
+    // бы гладкими — небом. Зоны остаются с последнего полного кадра
+    if (timing_.partial && zones_.size() == n && zoneHist_.size() >= n) return;
     zones_.assign(n, 0);
     if (!n) return;
+    std::vector<uint8_t>& zz = zoneAll_;
+    zz.assign(na, 2);
     const uint32_t area = (uint32_t)(cfg_.tile * cfg_.tile);
     auto textured = [&](const TileStats& ts, size_t i) {
         return ts.hot.size() == n && (float)div_round_even(ts.hot[i] * 255u, area) / 255.f > cfg_.max_density;
     };
+    auto texStrip = [&](const TileStats& ts, size_t x) {
+        return ts.hot.size() == (size_t)tw_ && (float)div_round_even(ts.hot[x] * 255u, area) / 255.f > cfg_.max_density;
+    };
     const bool useMask = !learning_ && !mask_.empty();
     std::vector<uint8_t>& smooth = roiMask_;   // временный буфер
-    smooth.assign(n, 0);
+    smooth.assign(na, 0);
     for (size_t i = 0; i < n; ++i)
         smooth[i] = !(useMask && !mask_[i]) && !(cfg_.dark && textured(stats_->dark, i)) &&
                     !(cfg_.bright && textured(stats_->bright, i));
+    for (size_t x = 0; strip && x < (size_t)tw_; ++x)
+        smooth[n + x] = !(cfg_.dark && texStrip(stats_->stripD, x)) && !(cfg_.bright && texStrip(stats_->stripB, x));
     // земля: крупные связные области текстуры (кроны, дома, земля, край виньетки);
     // мелкие (сама цель, птица, фонарь) — не земля. Остальное — небо.
     const int minGround = std::max(4, (int)(n / 40));
-    std::fill(zones_.begin(), zones_.end(), 2);
     std::vector<uint8_t>& seen = focusTiles_;   // тоже временный буфер, markFocus перезапишет
-    seen.assign(n, 0);
-    for (size_t s0 = 0; s0 < n; ++s0) {
+    seen.assign(na, 0);
+    for (size_t s0 = 0; s0 < na; ++s0) {
         if (smooth[s0] || seen[s0]) continue;
         fill_.clear();
         fill_.push_back((int)s0);
         seen[s0] = 1;
         for (size_t k = 0; k < fill_.size(); ++k) {
             const int i = fill_[k], x = i % tw_, y = i / tw_;
-            for (int yy = std::max(0, y - 1); yy <= std::min(th_ - 1, y + 1); ++yy)
+            for (int yy = std::max(0, y - 1); yy <= std::min(Th - 1, y + 1); ++yy)
                 for (int xx = std::max(0, x - 1); xx <= std::min(tw_ - 1, x + 1); ++xx) {
                     const int j = yy * tw_ + xx;
                     if (!smooth[j] && !seen[j]) { seen[j] = 1; fill_.push_back(j); }
                 }
         }
-        if ((int)fill_.size() >= minGround)
-            for (int i : fill_) zones_[i] = 0;
+        // полоса — земля и малым куском: всё, что упирается в низ кадра, растёт из-за него
+        bool low = false;
+        for (int i : fill_) low |= i >= (int)n;
+        if ((int)fill_.size() >= minGround || low)
+            for (int i : fill_) zz[i] = 0;
     }
+    // земля — по большинству из трёх последних полных кадров: тайл на краю кроны или облака,
+    // который через кадр то земля, то небо, не мигает (cfg_.zone_vote). Новая сетка — с этого кадра
+    if (zoneHist_.size() != na) zoneHist_.assign(na, 0x80);
+    for (size_t i = 0; i < na; ++i) {
+        const uint8_t g = zz[i] == 0, h = zoneHist_[i];
+        if (!cfg_.zone_vote || (h & 0x80)) {   // истории ещё нет: как в этом кадре
+            zoneHist_[i] = (uint8_t)(g * 7);
+            continue;
+        }
+        const uint8_t nh = (uint8_t)(((h << 1) | g) & 7);
+        zoneHist_[i] = nh;
+        const int votes = cfg_.zone_vote == 1 ? ((nh & 1) + ((nh >> 1) & 1) + ((nh >> 2) & 1)) / 2 : (nh & 3) != 0;
+        zz[i] = votes ? 0 : 2;
+    }
+    // тонкое над землёй (столб ЛЭП, мачта, антенна, узкая верхушка ели): сверху вниз ряд земли
+    // не шире thin_tiles, над которым земли нет, остаётся землёй, но смешанных тайлов вокруг
+    // себя не даёт. Иначе столб тянет за собой полосу смешанных шириной в три тайла до самого верха
+    if (cfg_.thin_tiles > 0)
+        for (int y = 0; y < Th; ++y)
+            for (int x = 0; x < tw_;) {
+                const size_t i = (size_t)y * tw_ + x;
+                if (zz[i] != 0) {
+                    ++x;
+                    continue;
+                }
+                int e = x;
+                while (e < tw_ && zz[(size_t)y * tw_ + e] == 0) ++e;
+                bool open = e - x <= cfg_.thin_tiles;
+                for (int xx = x; xx < e && open && y > 0; ++xx) open = zz[(size_t)(y - 1) * tw_ + xx] != 0;
+                if (open)
+                    for (int xx = x; xx < e; ++xx) zz[(size_t)y * tw_ + xx] = 4;   // земля без кольца
+                x = e;
+            }
     // смешанные: небо, у которого в 8-окрестности есть земля
     for (int y = 0; y < th_; ++y)
         for (int x = 0; x < tw_; ++x) {
             const size_t i = (size_t)y * tw_ + x;
-            if (zones_[i] != 2) continue;
+            if (zz[i] != 2) continue;
             bool g = false;
-            for (int yy = std::max(0, y - 1); yy <= std::min(th_ - 1, y + 1) && !g; ++yy)
+            for (int yy = std::max(0, y - 1); yy <= std::min(Th - 1, y + 1) && !g; ++yy)
                 for (int xx = std::max(0, x - 1); xx <= std::min(tw_ - 1, x + 1) && !g; ++xx)
-                    g = zones_[(size_t)yy * tw_ + xx] == 0;
-            if (g) zones_[i] = 3;   // пометка, чтобы не размножать смешанные внутри прохода
+                    g = zz[(size_t)yy * tw_ + xx] == 0;
+            if (g) zz[i] = 3;   // пометка, чтобы не размножать смешанные внутри прохода
         }
-    for (auto& z : zones_)
-        if (z == 3) z = 1;
+    for (size_t i = 0; i < n; ++i) zones_[i] = zz[i] == 3 ? 1 : zz[i] == 4 ? 0 : zz[i];
 }
 
 // маска тайлов вокруг треков (и внутри маски неба base, если она есть)
@@ -694,7 +1383,11 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const float level = (float)std::min<uint32_t>(255, div_round_even(ts.sum[i], area));
             const float dens = (float)div_round_even(ts.hot[i] * 255u, area) / 255.f;
             const bool texRaw = dens > maxDens;
-            if (fineGrid && (learning_ || verifyLeft_)) texSum_[i] += texRaw;
+            if (fineGrid && (learning_ || verifyLeft_)) {
+                texSum_[i] += texRaw;
+                auto& tp = texSumP_[pol ? 1 : 0];
+                if (tp.size() == texSum_.size()) tp[i] += texRaw;
+            }
             if (texOut) texOut[i] = texRaw;
             bool textured = texRaw;
             // Крупная контрастная цель (FWHM 5+ пикс.) сама набирает "горячих" пикселей больше
@@ -713,7 +1406,13 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             }
             // тайл земли у кромки, где уточнение нашло ячейки неба: только эти ячейки, по их фону
             bool fineTile = false;
-            if (useMask && !mask_[i]) {
+            // закрытый только текстурой другой полярности (облако для тёмных целей)
+            const bool polTile = useMask && !mask_[i] && polOpenAt(pol, i);
+            // облако по цвету (и открытое перепроверкой совсем) смотрится по ячейкам, как кромка. Застывший
+            // край облака мерцает на уровень-два, а разброс фона его ячейки по квантилям схлопывается
+            // почти в ноль — порог ячейки там не ниже фона + bg_k уровней
+            const bool cloudTile = useMask && bgOn && skyColAt(i) && (polTile || mask_[i]);
+            if (useMask && !mask_[i] && !polTile) {
                 if (!(cells && bgOn && fineSky_.size() == (size_t)ctw * th * cpt && edgeG_.size() == mask_.size() && edgeG_[i]))
                     continue;
                 for (int cy = ty * cpt; cy < (ty + 1) * cpt && !fineTile; ++cy)
@@ -724,7 +1423,9 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             if (zone == 0) continue;
             // текстурный тайл у самой земли (кромка леса): с фоном по ячейкам смотрим его
             // по ячейкам, иначе выбрасываем целиком, как раньше
-            const bool edgeTex = fineTile || (textured && nearOn && nearGround_[i]);
+            // облако, открытое для этой полярности, — тоже: застывшие просветы между клочьями
+            // ячейки поднимают себе порог сами
+            const bool edgeTex = fineTile || polTile || cloudTile || (textured && nearOn && nearGround_[i]);
             if (textured && !edgeTex) continue;
             const float zk = zone == 1 ? cfg_.mixed_k : 1.f;
             const float bk = bandOn && band_[i] ? cfg_.band_k : 1.f;
@@ -741,7 +1442,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 c.polarity = pol ? 1 : -1;
                 c.level = lvl;
                 c.weak = focusTiles_[i] && !(mx >= thrB * zk && (edgeTex || mx >= cfg_.clutter_k * level + thrB * zk * 0.5f));
-                c.edge = zone == 1 || edgeTex;
+                // открытое перепроверкой облако: цель там подтверждается, только когда полетела
+                c.edge = zone == 1 || edgeTex || polTile || (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
                 c.second = second;
                 out.push_back(c);
                 px[taken] = gx;
@@ -749,7 +1451,14 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 ++taken;
             };
             const float mx = ts.maxv[i];
-            if (!fineTile && !textured && mx >= thr && mx >= cfg_.clutter_k * level + thr * 0.5f) {
+            // небо у самой кромки (bg_near): кончики веток и верхушки крон заходят в тайл неба и
+            // мерцают в одних и тех же ячейках — порог ячейки по её фону и там (как avg + K·σ у Global
+            // Meteor Network). В ровном небе фон ячейки ниже общего порога и ничего не меняет
+            const bool nearSky = cfg_.bg_near && bgOn && nearOn && nearGround_[i] && !edgeTex;
+            auto cellQuiet = [&](size_t ci) { return !nearSky || !bgWarm(pol, ci) || ts.cmax[ci] >= bgThr(pol, ci); };
+            const size_t aci = (size_t)(ty * cpt + (ts.argmax[i] / T) / CELL) * ctw + tx * cpt + (ts.argmax[i] % T) / CELL;
+            if (nearSky && cells && !cellQuiet(aci)) continue;
+            if (!fineTile && !polTile && !cloudTile && !textured && mx >= thr && mx >= cfg_.clutter_k * level + thr * 0.5f) {
                 const int gx = tx * T + ts.argmax[i] % T, gy = ty * T + ts.argmax[i] / T;
                 push(gx, gy, mx, false);
             } else if (!edgeTex) {
@@ -771,6 +1480,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                         // у кромки леса — порог по своей ячейке (шум листвы и марева), в чистом
                         // небе хватает общего порога по шуму: там фон ячейки его только завышает
                         if (edgeTex && !(bgWarm(pol, ci) && v >= bgThr(pol, ci))) continue;
+                        if (!cellQuiet(ci)) continue;
+                        if (cloudTile && v < stats_->cb[pol].q50[ci] + cfg_.bg_k * smoothK()) continue;
                         const int gx = cx * CELL + ts.carg[ci] % CELL, gy = cy * CELL + ts.carg[ci] / CELL;
                         bool far = true;
                         for (int k = 0; k < taken && far; ++k) far = std::max(std::abs(gx - px[k]), std::abs(gy - py[k])) >= sep;
@@ -789,6 +1500,58 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                          [](const Candidate& a, const Candidate& b) { return a.contrast > b.contrast; });
         out.resize(first + cfg_.max_cands);
     }
+}
+
+bool Detector::lockTile(int tx, int ty) const {
+    const float tp = (float)(cfg_.tile * cfg_.pool);
+    const float nx = std::max((float)tx * tp, std::min(lockX_, (float)(tx + 1) * tp));
+    const float ny = std::max((float)ty * tp, std::min(lockY_, (float)(ty + 1) * tp));
+    return std::hypot(nx - lockX_, ny - lockY_) <= lockR_;
+}
+
+// Цель в захвате под маской (DetectorConfig::lock_through): одно пятно той же полярности и
+// похожего контраста в круге прогноза, в ячейках тайлов, закрытых для этой полярности
+void Detector::selectThrough(const TileStats& ts, int pol, std::vector<Candidate>& out) {
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt, cth = th_ * cpt, f = cfg_.pool;
+    const size_t nc = (size_t)ctw * cth;
+    if (cfg_.tile % CELL || ts.cmax.size() != nc || ts.carg.size() != nc || mask_.size() != (size_t)tw_ * th_) return;
+    for (const Candidate& c : out)   // цель видна и так
+        if ((c.polarity > 0) == (pol == 1) && std::hypot(c.x - lockX_, c.y - lockY_) <= lockR_) return;
+    const float cpx = (float)(CELL * f), thr = threshold() * cfg_.lock_through_k, cs = 1.f / smoothK();
+    const int x0 = std::max(0, (int)std::floor((lockX_ - lockR_) / cpx)), x1 = std::min(ctw - 1, (int)std::floor((lockX_ + lockR_) / cpx));
+    const int y0 = std::max(0, (int)std::floor((lockY_ - lockR_) / cpx)), y1 = std::min(cth - 1, (int)std::floor((lockY_ + lockR_) / cpx));
+    int best = -1, n = 0, cx[8], cy[8];
+    float bm = 0, bx = 0, by = 0;
+    for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x) {
+            const size_t ci = (size_t)y * ctw + x, ti = (size_t)(y / cpt) * tw_ + x / cpt;
+            if (mask_[ti] || polOpenAt(pol, ti)) continue;   // открытое смотрится и так
+            const float v = ts.cmax[ci];
+            if (v < thr || ts.carg[ci] == 255) continue;
+            if (lockC_ > 0 && (v * cs < 0.5f * lockC_ || v * cs > 2.f * lockC_)) continue;
+            const float px = (float)((x * CELL + ts.carg[ci] % CELL) * f) + (f - 1) * 0.5f;
+            const float py = (float)((y * CELL + ts.carg[ci] / CELL) * f) + (f - 1) * 0.5f;
+            if (std::hypot(px - lockX_, py - lockY_) > lockR_) continue;
+            if (n == 8) return;   // много пятен — листва, не цель
+            cx[n] = x, cy[n] = y, ++n;
+            if (v > bm) bm = v, best = n - 1, bx = px, by = py;
+        }
+    if (best < 0) return;
+    for (int k = 0; k < n; ++k)   // пятно одно: все сработавшие ячейки — соседи самой сильной
+        if (std::abs(cx[k] - cx[best]) > 1 || std::abs(cy[k] - cy[best]) > 1) return;
+    const size_t ti = (size_t)(cy[best] / cpt) * tw_ + cx[best] / cpt;
+    const uint32_t area = (uint32_t)(cfg_.tile * cfg_.tile);
+    const float level = (float)std::min<uint32_t>(255, ts.sum.size() > ti ? div_round_even(ts.sum[ti], area) : 0);
+    Candidate c;
+    c.x = bx;
+    c.y = by;
+    c.contrast = bm * cs;
+    c.margin = bm / threshold();
+    c.snr = bm / (level + 1.f);
+    c.polarity = pol ? 1 : -1;
+    c.weak = true;
+    c.edge = true;
+    out.push_back(c);
 }
 
 const std::vector<uint8_t>& Detector::texturedTiles(int pol) const { return stats_->tex[pol ? 1 : 0]; }
@@ -855,7 +1618,9 @@ void Detector::updateBg(const TileStats& ts, int pol) {
         for (int tx = 0; tx < tw_; ++tx) {
             const size_t ti = (size_t)ty * tw_ + tx;
             if (!comp.empty() && !comp[ti]) continue;
-            if (edgeOnly && !nearGround_[ti] && !(edgeG_.size() == nearGround_.size() && edgeG_[ti])) continue;
+            if (edgeOnly && !nearGround_[ti] && !(edgeG_.size() == nearGround_.size() && edgeG_[ti]) && !polOpenAt(pol, ti) &&
+                !skyColAt(ti))
+                continue;
             for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
                 for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx) {
                     const size_t ci = (size_t)cy * ctw + cx;
@@ -913,7 +1678,7 @@ void Detector::selectTbd(const TileStats& ts, int pol, std::vector<Candidate>& o
     for (size_t ci = 0; ci < n; ++ci) {
         const int cx = (int)(ci % ctw), cy = (int)(ci / ctw);
         const size_t ti = (size_t)(cy / cpt) * tw_ + cx / cpt;
-        if ((useMask && !mask_[ti]) || (!zones_.empty() && zones_[ti] == 0)) continue;
+        if ((useMask && !mask_[ti] && !polOpenAt(pol, ti)) || (!zones_.empty() && zones_[ti] == 0)) continue;
         if (!comp.empty() && !comp[ti]) continue;
         if (c.nupd[ci] < 8 || (tex.size() == (size_t)tw_ * th_ && tex[ti])) { E[ci] = 0; continue; }
         const float sd = std::max(1.f, bg_sd(c, ci));

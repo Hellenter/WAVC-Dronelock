@@ -50,15 +50,44 @@ const std::vector<Param>& params() {
         {"scales", "Размер цели, масштабов (0 авто)", "Алгоритм", false, "0, 1, 2, 3", S(scales)},
         {"motion", "Учитывать движение камеры (-1 авто, 0 нет, 1 да)", "Алгоритм", false, "-1, 0, 1", S(motion)},
         {"zones", "Зоны кадра (-1 авто, 0 нет, 1 да)", "Алгоритм", false, "-1, 0, 1", S(zones)},
+        {"thin_tiles", "Зоны: столб не шире, тайлов — не земля (0 выкл.)", "Алгоритм", false, "0, 1, 2", D(thin_tiles)},
+        {"zone_strip", "Зоны: полоса под сеткой у нижнего края кадра — земля, если там текстура", "Алгоритм", true, "0, 1", D(zone_strip)},
+        {"halo_k", "Светлая кайма резкости у тёмного (столб, фонарь) — не цель: во сколько раз темнее контраста (0 выкл.)", "Алгоритм", false, "0, 1.5, 2, 3", D(halo_k)},
+        {"zone_vote", "Зоны не мигают (0 нет, 1 большинство из 3 кадров, 2 земля держится кадр)", "Алгоритм", false, "0, 1, 2", D(zone_vote)},
         {"dark", "Тёмные цели", "Алгоритм", true, "1, 0", D(dark)},
         {"bright", "Яркие цели", "Алгоритм", true, "1, 0", D(bright)},
         {"trk_seconds", "Трекер в секундах", "Алгоритм", true, "1, 0", S(trkSeconds)},
+        {"fps_scale", "Маска неба и поворот камеры в секундах", "Алгоритм", true, "1, 0", S(fpsScale)},
         {"follow", "Виртуальная поворотка", "Алгоритм", true, "0, 1", S(follow)},
         {"mask", "Кадров на маску неба (0 выкл.)", "Алгоритм", false, "0, 25, 50", S(learnMaskFrames)},
         {"per_tile", "Кандидатов в тайле", "Алгоритм", false, "1, 2", D(per_tile)},
         {"skyline", "Всё ниже горизонта — земля", "Алгоритм", true, "1, 0", D(skyline)},
         {"adapt", "Подстраиваться под сцену и погоду", "Алгоритм", true, "1, 0", S(adapt)},
         {"bg_map", "Фон по ячейкам у кромки леса", "Алгоритм", true, "1, 0", D(bg_map)},
+        {"bg_near", "Фон по ячейкам и в небе у кромки (кончики веток)", "Алгоритм", true, "1, 0", D(bg_near)},
+        {"grow_mask", "Маска дорастает, где копятся помехи", "Алгоритм", true, "1, 0", D(grow_mask)},
+        {"mask_recheck", "Маска перепроверяется (облака открываются)", "Алгоритм", true, "1, 0", D(mask_recheck)},
+        {"pol_mask", "Облака закрыты только для светлых целей (0 нет, 1 тёмные ищутся, 2 и наоборот)", "Алгоритм", true, "1, 0, 2", D(pol_mask)},
+        {"pol_tex", "Маска по полярности: другой текстуры не чаще доли кадров", "Тонко", false, "0.02, 0.05, 0.1", D(pol_tex)},
+        {"sky_color", "Облака по цвету: не зелёное, не темнее неба и не стоит на земле — не закрывать как землю", "Алгоритм", true, "1, 0", D(sky_color)},
+        {"sky_green", "Облака по цвету: листва — зелёный выше синего больше доли яркости", "Тонко", false, "0.05, 0.08, 0.12", D(sky_green)},
+        {"sky_y", "Облака по цвету: не темнее доли яркости неба", "Тонко", false, "0.6, 0.7, 0.8", D(sky_y)},
+        {"sky_dark", "Облака по цвету: 10% самых тёмных точек не темнее доли неба", "Тонко", false, "0.5, 0.6, 0.7", D(sky_dark)},
+        {"sky_soft", "Мягкое облако — облако и у самой кромки леса (линия горизонта через него не идёт)", "Алгоритм", true, "1, 0", D(sky_soft)},
+        {"sky_d4", "Мягкое облако: перепад на 4 пикс. меньше доли яркости", "Тонко", false, "0.06, 0.08, 0.1", D(sky_d4)},
+        {"sky_s14", "Мягкое облако: перепад на 1 пикс. меньше доли перепада на 4", "Тонко", false, "0.28, 0.32, 0.36", D(sky_s14)},
+        {"sky_tree", "Мягкое облако над тёмной верхушкой (доля точек темнее sky_dark неба) поднимает линию горизонта", "Тонко", false, "0, 0.25, 0.35, 0.45", D(sky_tree)},
+        {"sky_bright", "Облако по цвету открыто и для светлых целей", "Алгоритм", true, "1, 0", D(sky_bright)},
+        {"lock_through", "Цель в захвате ищется и под маской (только продолжение трека)", "Алгоритм", true, "1, 0", D(lock_through)},
+        {"lock_through_k", "Под маской: порог выше общего, раз", "Тонко", false, "1.2, 1.5, 2", D(lock_through_k)},
+        {"reopen_quiet", "Доросшая маска открывается: тихих замеров не меньше доли (1.01 — никогда)", "Тонко", false, "0.8, 0.9, 1.01", D(reopen_quiet)},
+        {"recheck_tex", "Перепроверка: сильный отклик реже доли кадров — облако", "Тонко", false, "0.1, 0.2, 0.4", D(recheck_tex)},
+        {"grow_k", "Дорастание: помех выше среднего, раз", "Тонко", false, "3, 4, 6", D(grow_k)},
+        {"grow_min", "Дорастание: помех на тайл за кадр, не меньше", "Тонко", false, "0.05, 0.1, 0.2", D(grow_min)},
+        {"grow_frames", "Дорастание: окно, кадров при 60 к/с", "Тонко", false, "60, 120, 240", D(grow_frames)},
+        {"bg_frames", "Фон ячеек у кромки: окно, кадров", "Тонко", false, "125, 250, 500", D(bg_frames)},
+        {"fine_frames", "Уточнение маски у кромки: окно, кадров при 60 к/с", "Тонко", false, "75, 150, 300", D(fine_frames)},
+        {"grow_cells", "Дорастание: помехи хотя бы в стольких ячейках тайла", "Тонко", false, "1, 2, 3", D(grow_cells)},
         {"tbd", "Накопление слабых целей", "Алгоритм", true, "0, 1", D(tbd)},
         {"band", "Полоса у горизонта, пикс. (0 выкл.)", "Алгоритм", false, "0, 256, 512", D(band_px)},
         {"upper_every", "Небо выше полосы раз в, кадров", "Алгоритм", false, "1, 2, 3", D(upper_every)},
@@ -66,6 +95,8 @@ const std::vector<Param>& params() {
         {"full_every", "Весь кадр раз в, кадров", "Алгоритм", false, "1, 2, 3", D(full_every)},
         {"coarse_every", "Крупные масштабы раз в, кадров", "Алгоритм", false, "1, 2, 4", D(coarse_every)},
         {"dedup", "Пропускать повторы кадра", "Видео", true, "0, 1", S(skipDuplicates)},
+        {"step", "Камера реже видео: каждый N-й кадр", "Видео", false, "1, 4, 6", S(frameStep)},
+        {"cam_fps", "Частота камеры, к/с (0 — как в видео)", "Видео", false, "0, 15, 30", S(targetFps)},
         // Тонко: порог
         {"auto_thr", "Порог по шуму", "Тонко", true, "0, 1", D(auto_thr)},
         {"noise_k", "Порог: во сколько раз выше шума", "Тонко", false, "8, 12, 16", D(noise_k)},
@@ -81,16 +112,23 @@ const std::vector<Param>& params() {
         // Тонко: трекер и захват
         {"gate", "Макс. радиус поиска, пикс.", "Тонко", false, "20, 40, 80", T(gate)},
         {"q_accel", "Манёвренность цели", "Тонко", false, "1, 4, 8", T(q_accel)},
-        {"max_miss", "Держать на прогнозе, кадров", "Тонко", false, "6, 12, 24", T(max_miss)},
+        {"max_miss", "Держать на прогнозе, кадров", "Тонко", false, "3, 6, 12", T(max_miss)},
         {"lock_switch", "Смена захвата, раз", "Тонко", false, "1.2, 1.5, 2.5", T(lock_switch)},
         {"confirm", "Подтверждение, кадров", "Тонко", false, "2, 3, 4", T(confirm)},
         {"quiet", "Новая точка в спокойном небе, кадров (0 выкл.)", "Тонко", false, "0, 50", T(quiet_frames)},
         {"edge_straight", "У кромки — только прямой полёт", "Тонко", false, "0, 0.5", T(edge_straight)},
+        {"lock_mover", "Новый захват — только на летавший трек", "Тонко", true, "0, 1", T(lock_mover)},
+        {"hard_switch_drone", "Жёсткий захват переходит только на «дрон» или ведомую камерой цель", "Тонко", true, "1, 0", T(hard_switch_drone)},
+        {"hover_first", "Птица: зависание важнее взмахов", "Тонко", true, "1, 0", T(hover_first)},
+        {"reupdate", "Нашлась после пропуска: скорость по прямой от последней отметки, доля", "Тонко", false, "0, 0.5, 1", T(reupdate)},
+        {"lock_mover_fps", "Захват только на летавший трек при камере не быстрее, к/с", "Тонко", false, "0, 20, 30", T(lock_mover_fps)},
+        {"mover_cam_k", "Летит: по сцене дальше доли пути камеры", "Тонко", false, "0, 0.25, 0.35, 0.5", T(mover_cam_k)},
+        {"still_speed", "Помеха: по сцене медленнее, пикс./кадр при 25 к/с", "Тонко", false, "0.25, 0.6, 1", T(still_speed)},
         {"silhouette", "Крупная цель целиком (силуэт)", "Тонко", true, "1, 0", T(silhouette)},
         {"size_predict", "Ожидание размера", "Тонко", true, "1, 0", T(size_predict)},
         {"anchor_check", "На мачте или столбе — не дрон", "Тонко", true, "1, 0", T(anchor_check)},
         {"hard_lock", "Жёсткий захват дрона", "Тонко", true, "1, 0", T(hard_lock)},
-        {"verify", "Проверка: дрон подряд, кадров", "Тонко", false, "10, 25, 50", T(verify_frames)},
+        {"verify", "Проверка: дрон подряд, кадров", "Тонко", false, "5, 10, 25", T(verify_frames)},
         {"hard_miss", "Жёсткий: держать на прогнозе, кадров", "Тонко", false, "30, 60, 120", T(hard_miss)},
         {"hard_full_every", "Жёсткий: весь кадр раз в, кадров", "Тонко", false, "3, 6, 12", T(hard_full_every)},
         {"lock_slow", "Захват: сначала мелкий медленный дрон", "Тонко", true, "1, 0",
@@ -101,7 +139,8 @@ const std::vector<Param>& params() {
          }},
         // Тонко: птица или дрон
         {"bird_resid", "Птица: отклонение от траектории, пикс.", "Тонко", false, "1.6, 2.2, 3", T(bird_resid)},
-        {"bird_cv", "Птица: мигание контраста", "Тонко", false, "0.25, 0.35, 0.5", T(bird_contrast_cv)},
+        {"bird_cv", "Птица: мигание контраста", "Тонко", false, "0.35, 0.5, 0.65", T(bird_contrast_cv)},
+        {"flap_max_period", "Птица: самый медленный взмах, кадров при 25 к/с", "Тонко", false, "16, 24", T(flap_max_period)},
         {"cls_min_hits", "Птица: попаданий до решения", "Тонко", false, "6, 8, 12", T(cls_min_hits)},
         // Главное
         {"governor", "Держать темп камеры", "Главное", true, "0, 1", S(governor)},
@@ -272,8 +311,10 @@ void apply_algo(Settings& dst, const Settings& src) {
     dst.focus = src.focus;
     dst.zones = src.zones;
     dst.trkSeconds = src.trkSeconds;
+    dst.fpsScale = src.fpsScale;
     dst.governor = src.governor;
     dst.skipDuplicates = src.skipDuplicates;
+    dst.frameStep = src.frameStep;
     dst.follow = src.follow;
     dst.followFrac = src.followFrac;
     dst.followGain = src.followGain;
@@ -340,7 +381,7 @@ struct Collector {
     long fp = 0, lockEv = 0, lockOnD = 0, hardOnD = 0, falseLockF = 0;
     std::map<int, bool> life;   // трек -> хоть раз был на настоящей цели
     long firstGt = -1, firstDet = -1, firstLock = -1;
-    double skySum = 0;
+    double skySum = 0, skyDarkSum = 0;
     long skyN = 0;
 
     static bool live(const Track& t) { return !t.clutter && t.cls != TargetClass::Clutter; }
@@ -371,9 +412,15 @@ struct Collector {
 
         const int64_t idx = r.frame->index;
         if (!r.mask.empty() && idx >= warmup) {   // маска неба после обучения: сколько неба осталось в поиске
-            long on = 0;
-            for (uint8_t m : r.mask) on += m != 0;
+            long on = 0, dark = 0;
+            const bool md = r.maskDark.size() == r.mask.size(), mb = r.maskBright.size() == r.mask.size();
+            for (size_t i = 0; i < r.mask.size(); ++i) {
+                // облако, где ищутся цели обеих полярностей, — небо в поиске
+                on += r.mask[i] != 0 || (md && mb && r.maskDark[i] && r.maskBright[i]);
+                dark += r.mask[i] != 0 || (md && r.maskDark[i]);
+            }
             skySum += (double)on / r.mask.size();
+            skyDarkSum += (double)dark / r.mask.size();
             ++skyN;
         }
         if (gtN <= 0 || idx < 0 || idx >= gtN) return;
@@ -474,7 +521,8 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     RunResult rr;
     Settings s = var.setup.s;
     s.pace = c.realtime ? Pace::Realtime : Pace::MaxSpeed;
-    s.targetFps = 0;
+    // частота камеры — только медленнее видео (пропуск кадров); быстрее — темп подачи, здесь не нужен
+    if (!(s.targetFps > 0 && vm.fps > 0 && s.targetFps < 0.99 * vm.fps)) s.targetFps = 0;
     s.speed = 1;
     s.source = Source::Stream;
     s.loop = false;
@@ -497,7 +545,9 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
 
     Collector col;
     col.maxFrames = c.maxFrames;
-    col.warmup = c.warmup;
+    // номера кадров — файла, маска учится по обработанным
+    const double fstep = std::max(1, s.frameStep) * (s.targetFps > 0 ? vm.fps / s.targetFps : 1.0);
+    col.warmup = (int)std::lround(c.warmup * fstep);
     // радиус задан в пикселях исходного кадра; при уменьшенной обработке — меньше
     col.radius = c.radius * (s.procW && vm.w ? (float)s.procW / vm.w : 1.f);
     if (vm.gt) {
@@ -558,6 +608,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     rr.hardPct = 100.0 * col.hardF / F;
     rr.lockAcq = col.acq;
     rr.skyPct = col.skyN ? 100.0 * col.skySum / col.skyN : -1;
+    rr.skyDarkPct = col.skyN ? 100.0 * col.skyDarkSum / col.skyN : -1;
     rr.gt = col.gtN > 0 && col.evF > 0;
     if (rr.gt) {
         rr.evalFrames = col.evF;
@@ -621,6 +672,9 @@ const std::vector<Metric>& metrics() {
         {"sky_pct", "Небо в поиске", "%", 0, false, 1, [](const RunResult& r) { return r.skyPct; },
          "Доля кадра, где детектор ищет: не закрыта маской неба как лес, дома, земля, текстура. Меньше целей при "
          "меньшем «небе в поиске» — это не чище, а просто меньше смотрим. Прочерк — маски нет (камера движется)."},
+        {"sky_dark_pct", "Небо в поиске тёмных", "%", 0, false, 1, [](const RunResult& r) { return r.skyDarkPct; },
+         "Как «небо в поиске», но для тёмных целей: с тайлами, которые маска закрыла только из-за светлой текстуры "
+         "(облака), — там тёмный дрон ищется."},
         {"lock_pct", "Кадров с захватом", "%", 0, false, 1, [](const RunResult& r) { return r.lockPct; },
          "Доля всех кадров, где есть захват (любой цели)."},
         {"hard_pct", "Кадров с жёстким", "%", 0, false, 1, [](const RunResult& r) { return r.hardPct; },

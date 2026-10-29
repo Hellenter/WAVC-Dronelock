@@ -126,8 +126,26 @@ FramePtr Pipeline::allocFrame(int w, int h) {
     });
 }
 
+bool Pipeline::openGenerator(const VideoInfo& info, std::function<bool(Frame&)> gen, const std::string& name) {
+    close();
+    info_ = info;
+    path_ = name;
+    gen_ = std::move(gen);
+    {
+        std::lock_guard<std::mutex> lk(rm_);
+        haveGt_ = false;
+        gt_ = nullptr;
+    }
+    open_ = true;
+    relearn_ = true;
+    resetStats();
+    startThreads();
+    return true;
+}
+
 bool Pipeline::open(const std::string& path, std::string& err) {
     close();
+    gen_ = nullptr;
     VideoSource probe;
     if (!probe.open(path, 1, err)) return false;
     info_ = probe.info();
@@ -188,13 +206,31 @@ Settings Pipeline::settings() const {
     return settings_;
 }
 
+double Pipeline::cameraFps(const Settings& s) const {
+    return (s.targetFps > 0 ? s.targetFps : info_.fps) / std::max(1, s.frameStep);
+}
+
+double Pipeline::fileStep(const Settings& s) const {
+    const bool slower = s.targetFps > 0 && info_.fps > 0 && s.targetFps < 0.99 * info_.fps;
+    return std::max(1, s.frameStep) * (slower ? info_.fps / s.targetFps : 1.0);
+}
+
+// снимок камеры — первый кадр файла на её такте или после него: шаг 4 — каждый 4-й, камера
+// 14 к/с из 60 — через 4-5 кадров, в среднем 60/14
+bool Pipeline::skipFrame(const Settings& s, int64_t index) const {
+    const double r = fileStep(s);
+    if (r < 1.0001 || index <= 0) return false;
+    return std::floor((double)index / r) == std::floor((double)(index - 1) / r);
+}
+
 void Pipeline::setSettings(const Settings& s) {
     bool restart;
     {
         std::lock_guard<std::mutex> lk(sm_);
         const Settings& o = settings_;
         restart = open_ && (o.source != s.source || o.preloadFrames != s.preloadFrames || o.procW != s.procW ||
-                            o.procH != s.procH || o.decoderThreads != s.decoderThreads || o.loop != s.loop);
+                            o.procH != s.procH || o.decoderThreads != s.decoderThreads || o.loop != s.loop ||
+                            (s.source == Source::Preload && fileStep(o) != fileStep(s)));
         settings_ = s;
         ++settingsVer_;
     }
@@ -282,7 +318,7 @@ void Pipeline::decodeLoop() {
     Settings s = settings();
     VideoSource src;
     std::string err;
-    if (!src.open(path_, s.decoderThreads, err)) {
+    if (!gen_ && !src.open(path_, s.decoderThreads, err)) {
         std::lock_guard<std::mutex> lk(rm_);
         status_ = err;
         return;
@@ -295,8 +331,20 @@ void Pipeline::decodeLoop() {
         f = allocFrame(W, H);
         const double t = now_ms();
         wrapped = false;
-        if (!src.read(f->px.data(), W, H, W)) {
-            if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W)) return false;
+        if (gen_) {   // генератор: кадр нужного размера, номер ставит он сам
+            f->w = info_.w;
+            f->h = info_.h;
+            f->color = ColorPlanes();
+            if (!gen_(*f)) return false;
+            f->decodeMs = now_ms() - t;
+            std::lock_guard<std::mutex> lk(rm_);
+            ++decoded_;
+            decodeTimes_.push_back(now_ms());
+            while (decodeTimes_.size() > 200) decodeTimes_.pop_front();
+            return true;
+        }
+        if (!src.read(f->px.data(), W, H, W, &f->color)) {
+            if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W, &f->color)) return false;
             ++loop;
             wrapped = true;
         }
@@ -316,6 +364,10 @@ void Pipeline::decodeLoop() {
         for (int i = 0; i < s.preloadFrames && !stop_; ++i) {
             FramePtr f;
             if (!decodeOne(f)) break;
+            if (skipFrame(s, f->index)) {   // камера реже видео
+                --i;
+                continue;
+            }
             pre.push_back(f);
             char b[96];
             snprintf(b, sizeof(b), "Предзагрузка в память: %d / %d", i + 1, s.preloadFrames);
@@ -404,6 +456,8 @@ void Pipeline::decodeLoop() {
                 while (!stop_ && seekReq_ < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
+            // камера реже видео: лишние кадры файла пропускаем (после перемотки — первый как есть)
+            if (skipFrame(cur, f->index) && !seeked && !first && !wrapped) continue;
             p.frame = f;
             p.loop = loop;
             p.loopStart = (first || wrapped) && !seeked;
@@ -414,7 +468,7 @@ void Pipeline::decodeLoop() {
         seeked = false;
         const bool realtime = cur.pace == Pace::Realtime && !paused_;
         if (realtime) {
-            const double fps = cur.targetFps > 0 ? cur.targetFps : info_.fps;
+            const double fps = cameraFps(cur);
             // замедление: кадры "приходят с камеры" реже, обработка та же
             const double period = 1000.0 / std::max(0.1, fps) / std::min(4.0, std::max(0.01, cur.speed));
             wait_until(next, stop_);
@@ -442,16 +496,25 @@ void Pipeline::processLoop() {
     LoadGovernor gov;
     SceneAnalyzer scene;
     std::string sceneWhy;
-    std::vector<FocusArea> focus, roi;
+    std::vector<FocusArea> focus, roi, keepGrow;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
+    int grownSaved = 0;   // тайлов маски, доросших и открытых, на момент сохранения в файл
     bool maskOn = false, motionWas = false, maskChecking = false;
     bool relearnMoved = false;   // маска учится заново после плавного поворота камеры (панорамы)
     // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
     float uniqShare = 1.f, trkFps = 0.f;
+    // кадров в секунду у детектора, маски неба и трекера (повторы кадра считаются, пока их не пропускаем)
+    auto procFps = [&](const Settings& st) { return st.skipDuplicates && trkFps > 0 ? (double)trkFps : cameraFps(st); };
     auto trkCfg = [&](const Settings& st) {
-        return st.trkSeconds && trkFps > 0 ? tracker_for_fps(st.trk, trkFps) : st.trk;
+        return st.trkSeconds && trkFps > 0 ? tracker_for_fps(st.trk, trkFps, 25.f, (float)procFps(st)) : st.trk;
+    };
+    // окно в n кадров, подобранное на 60 к/с, — под частоту камеры (Settings::fpsScale), не меньше lo
+    auto perSec = [&](const Settings& st, int n, int lo) {
+        const double fps = procFps(st);
+        if (!st.fpsScale || !(fps > 0) || n <= 0) return n;
+        return std::max(std::min(n, lo), (int)std::lround(n * fps / 60.0));
     };
     {
         std::lock_guard<std::mutex> lk(rm_);
@@ -553,7 +616,8 @@ void Pipeline::processLoop() {
             fix = -1;
         }
         const Frame& f = *view;
-        DetectorConfig want = s.det;
+        // окна маски неба в кадрах — под частоту камеры
+        DetectorConfig want = s.fpsScale ? detector_for_fps(s.det, (float)procFps(s)) : s.det;
         want.scales = ef.scales;
         want.zones = ef.zones || (panning && s.zones < 0);   // панорама: маски нет, землю убирают зоны
         if (s.governor) LoadGovernor::apply(gov.level(), want);
@@ -564,7 +628,7 @@ void Pipeline::processLoop() {
         bool sceneMoved = false, sceneLight = false;
         if (p.loopStart || p.seekStart) scene.reset();
         if (s.adapt) {
-            const double base = s.targetFps > 0 ? s.targetFps : info_.fps;
+            const double base = cameraFps(s);
             if (scene.update(f.px.data(), f.w, f.h, f.w, (float)base, ef.motion || s.follow || panning)) {
                 sceneMoved = scene.state().moved;
                 sceneLight = scene.state().lightJump;
@@ -587,7 +651,9 @@ void Pipeline::processLoop() {
         }
         if (dirty || want.scales != dc.scales || want.zones != dc.zones || want.full_every != dc.full_every ||
             want.coarse_every != dc.coarse_every || want.auto_thr != dc.auto_thr || want.dark != dc.dark ||
-            want.bright != dc.bright || want.thr != dc.thr) {
+            want.bright != dc.bright || want.thr != dc.thr || want.fine_frames != dc.fine_frames ||
+            want.grow_frames != dc.grow_frames || want.recheck_every != dc.recheck_every ||
+            want.recheck_frames != dc.recheck_frames) {
             dc = want;
             det.reconfigure(dc);
             dirty = false;
@@ -663,8 +729,11 @@ void Pipeline::processLoop() {
             relearn_ = false;
         } else if (relearn_.exchange(false)) {
             const bool force = maskForce_.exchange(false);
-            // маска из файла сразу закрывает лес, а первые кадры сверяется с видимым
-            if (s.learnMaskFrames > 0 && s.useMaskFile() && !force && det.loadMask(maskPath(), s.learnMaskFrames)) {
+            // маска из файла сразу закрывает лес, а первые кадры сверяется с видимым. Кадров обучения
+            // столько, чтобы по времени как на 60 к/с, но не меньше 10: на 14 к/с 25 кадров — 1.8 с
+            // без маски (захват в это время садится на кромку крон и землю) при каждом переучивании
+            const int learnN = perSec(s, s.learnMaskFrames, 10);
+            if (s.learnMaskFrames > 0 && s.useMaskFile() && !force && det.loadMask(maskPath(), learnN)) {
                 learnLeft = 0;
                 maskOn = true;
                 maskChecking = true;
@@ -672,7 +741,7 @@ void Pipeline::processLoop() {
                 staticMsg_ = "маска неба из файла, сверяется с видео";
             } else if (s.learnMaskFrames > 0) {
                 det.beginMaskLearning();
-                learnLeft = s.learnMaskFrames;
+                learnLeft = learnN;
                 maskOn = true;
             } else {
                 det.clearMask();
@@ -692,7 +761,7 @@ void Pipeline::processLoop() {
         dupRun = dup ? dupRun + 1 : 0;
         if (!p.loopStart && !p.seekStart) uniqShare = 0.98f * uniqShare + 0.02f * (same ? 0.f : 1.f);
         {   // трекер в секундах: частота меняется (камера, повторы кадров) — пересчитать
-            const double base = s.targetFps > 0 ? s.targetFps : info_.fps;
+            const double base = cameraFps(s);
             const float fps = (float)(base * std::max(0.2f, uniqShare));
             if (fps > 0 && std::fabs(fps - trkFps) > 0.1f * std::max(trkFps, 1.f)) {
                 trkFps = fps;
@@ -717,6 +786,7 @@ void Pipeline::processLoop() {
             // сдвиг картинки от прошлого кадра: прогноз треков переносится вместе с камерой
             MotionEstimate me;
             const bool autoMotion = s.motion < 0;
+            gm.setFps(s.fpsScale ? (float)procFps(s) : 0.f);
             if (ef.motion || autoMotion) me = gm.estimate(src.px.data(), src.w, src.h, src.w);
             else gm.reset();
             if (autoMotion || s.follow) {
@@ -727,7 +797,7 @@ void Pipeline::processLoop() {
                 float mv = autoMotion && me.valid ? std::fabs(me.dx) + std::fabs(me.dy) : 0.f;
                 mv += std::fabs(cropDx) + std::fabs(cropDy);
                 camHist.push_back(mv);
-                while (camHist.size() > 60) camHist.pop_front();
+                while (camHist.size() > (size_t)perSec(s, 60, 10)) camHist.pop_front();   // секунда
                 float recent = 0;
                 for (float d : camHist) recent += d;
                 trk->setMovingCamera(ef.motion || recent > 4.f || panning);
@@ -735,12 +805,15 @@ void Pipeline::processLoop() {
                 // гасится, плавный поворот копится; скачки при смене вида камеры не в счёт).
                 // Вход — от 20 пикс./с на 2560 пикс. ширины, выход — ниже 8
                 if (autoMotion && !ef.motion && s.panDetect) {
-                    const float jump = 120.f * src.w / 2560.f;
+                    // поворот быстрее 120 пикс./кадр при 60 к/с (7200 пикс./с) — скачок вида; на
+                    // медленной камере тот же поворот даёт за кадр больше
+                    const double cf = procFps(s);
+                    const float jump = 120.f * src.w / 2560.f * (s.fpsScale && cf > 0 && cf < 60 ? (float)(60 / cf) : 1.f);
                     const bool ok = me.valid && std::hypot(me.dx, me.dy) < jump;
                     panHist.emplace_back(ok ? me.dx : 0.f, ok ? me.dy : 0.f);
                     panX += panHist.back().first;
                     panY += panHist.back().second;
-                    const size_t win = (size_t)std::max(10L, std::lround(trkFps > 0 ? trkFps : info_.fps > 0 ? info_.fps : 30.0));
+                    const size_t win = (size_t)std::max(10L, std::lround(trkFps > 0 ? trkFps : info_.fps > 0 ? cameraFps(s) : 30.0));
                     while (panHist.size() > win) {
                         panX -= panHist.front().first;
                         panY -= panHist.front().second;
@@ -769,6 +842,22 @@ void Pipeline::processLoop() {
             roi.clear();
             if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) trk->roi(me.dx, me.dy, roi);
             det.setRoi(roi);
+            {   // цель в захвате может залететь под маску (облако, кромка): там ищется её продолжение
+                float lx = 0, ly = 0, lr = 0, lc = 0;
+                int lp = -1;
+                bool on = maskOn && !det.learningMask() && trk->lockSearch(me.dx, me.dy, lx, ly, lr, lp);
+                if (on) {   // только летящая цель: зависшая точка в кроне или на земле так не держится
+                    on = false;
+                    for (const auto& t : trk->confirmed())
+                        if (t.id == trk->lockedId() && !t.clutter && !t.anchored && t.cls != TargetClass::Bird &&
+                            t.travel >= 3.f * trk->config().mover_px)
+                            on = true, lc = t.contrast;
+                }
+                det.setLockArea(on, lx, ly, lr, lp, lc);
+            }
+            // цвет кадра — для облаков по цвету при обучении маски (окно поворотки — без цвета)
+            if (view == p.frame && f.color.w > 0)
+                det.setColor(f.color.u.data(), f.color.v.data(), f.color.w, f.color.h, f.color.w, f.color.step);
             det.detect(f.px.data(), f.w, f.h, f.w, cands);
             trk->setPartial(det.timing().partial);
             // силуэт захваченной цели: прицел в центре крупного БПЛА, а не на крыле или хвосте
@@ -781,6 +870,19 @@ void Pipeline::processLoop() {
             }
             const double t1 = now_ms();
             const auto& tracks = trk->update(cands, me.dx, me.dy);
+            // маска дорастает там, где копятся помехи (неподвижная камера); у цели в захвате — нет
+            if (!camMoves && maskOn && !det.learningMask()) {
+                keepGrow.clear();
+                for (const auto& t : tracks)
+                    if (t.id == trk->lockedId() || (t.everLocked && !t.clutter)) keepGrow.push_back(FocusArea{t.x, t.y, 64.f});
+                det.noteClutter(trk->clutterDets(), keepGrow);
+                // доросшую и перепроверенную маску — в файл, раз в несколько изменённых тайлов
+                if (s.useMaskFile() && det.maskGrown() + det.maskOpened() >= grownSaved + 4) {
+                    grownSaved = det.maskGrown() + det.maskOpened();
+                    det.saveMask(maskPath());
+                }
+            }
+            if (det.maskGrown() + det.maskOpened() < grownSaved) grownSaved = 0;   // маска учится заново
             if (const int lc = lockCmd_.exchange(0)) {   // оператор выбрал цель из очереди
                 if (lc < 0) trk->nextLock();
                 else trk->selectLock(lc);
@@ -792,15 +894,20 @@ void Pipeline::processLoop() {
                 // цель окажется за краем узкого поля зрения
                 const bool verified =
                     !s.followVerified || !trk->config().hard_lock || trk->lockState() == LockState::Hard;
+                // предел поворота и возврат заданы за кадр при 60 к/с: у медленной камеры между
+                // кадрами больше времени, и поворотка за кадр проходит больше
+                const double cf = procFps(s);
+                const float perFrame = s.fpsScale && cf > 0 && cf < 60 ? (float)(60 / cf) : 1.f;
                 if (trk->aim(ax, ay, avx, avy) && verified) {
                     noAim = 0;
                     sx = avx + s.followGain * (ax - 0.5f * (float)fcw);
                     sy = avy + s.followGain * (ay - 0.5f * (float)fch);
-                } else if (++noAim > 120) {   // цели давно нет — поворотка медленно возвращается
-                    sx = 0.05f * (0.5f * (float)(src.w - fcw) - fox);
-                    sy = 0.05f * (0.5f * (float)(src.h - fch) - foy);
+                } else if (++noAim > perSec(s, 120, 10)) {   // цели давно нет (2 с) — поворотка медленно возвращается
+                    const float back = 1.f - std::pow(0.95f, perFrame);
+                    sx = back * (0.5f * (float)(src.w - fcw) - fox);
+                    sy = back * (0.5f * (float)(src.h - fch) - foy);
                 }
-                const float lim = std::max(1.f, s.followMaxPan * (float)fcw);
+                const float lim = std::max(1.f, s.followMaxPan * (float)fcw * perFrame);
                 fox += std::min(lim, std::max(-lim, sx));
                 foy += std::min(lim, std::max(-lim, sy));
             }
@@ -808,7 +915,8 @@ void Pipeline::processLoop() {
             const bool learning = det.learningMask();
             if (maskChecking && !det.verifyingMask()) {   // сверка маски из файла закончилась
                 maskChecking = false;
-                if (det.maskReplaced() && s.useMaskFile()) det.saveMask(maskPath());
+                // и подтверждённую: после сверки маска новая (из файла — только доращенное)
+                if (s.useMaskFile()) det.saveMask(maskPath());
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = det.maskReplaced() ? "сцена изменилась: маска неба выучена заново и сохранена"
                                                 : "маска неба из файла подтверждена";
@@ -831,7 +939,7 @@ void Pipeline::processLoop() {
             if (s.emulateMs > 0) wait_until(t0 + s.emulateMs, stop_);
             t3 = now_ms();
             // авто-упрощение по времени кадра против периода камеры (без замедления просмотра)
-            if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, s.targetFps > 0 ? s.targetFps : info_.fps));
+            if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, cameraFps(s)));
 
             r = std::make_shared<Result>();
             r->frame = view;
@@ -845,12 +953,15 @@ void Pipeline::processLoop() {
             r->procMs = t3 - t0;
             r->latencyMs = t3 - p.readyAt;
             r->mask = det.tileMask();
+            r->maskDark = det.polarityOpen(0);
+            r->maskBright = det.polarityOpen(1);
             r->fineSky = det.fineSky();
             r->cellsPerTile = det.cellsPerTile();
             r->tilesX = det.tilesX();
             r->tilesY = det.tilesY();
             r->tilePx = det.tileSizePx();
             r->zones = det.zones();
+            r->band = det.horizonBand();
             r->learning = learning;
             r->seq = ++seq;
             r->lockId = trk->lockedId();
@@ -956,23 +1067,25 @@ void Pipeline::processLoop() {
         if (log_.size() < 500000) log_.push_back(rec);
         // качество считаем после первого прохода (как run_demo.py) или после обучения маски
         // при съёмке с рук маска неба не учится — качество считаем сразу (своя разметка роликов)
-        const bool evalOn = camMoves || (s.loop ? p.loop >= 1 : f.index >= s.learnMaskFrames);
+        const bool evalOn =
+            camMoves || (s.loop ? p.loop >= 1 : f.index >= (int64_t)std::lround(perSec(s, s.learnMaskFrames, 10) * fileStep(s)));
         if (gtFrame && evalOn) eval_.add(r->gt, tracks, r->gsx, r->gsy);
         if (!s.trackLog.empty()) {
             if (!tlog) {
                 tlog.reset(open_file(s.trackLog, "w"));
-                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w\n");
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w,resid,contrast_cv,speed,bird_score,flap_r2\n");
             }
             if (tlog) {
                 if (tracks.empty())
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,\n", p.loop, (long long)f.index, r->lockId,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,,,,,,\n", p.loop, (long long)f.index, r->lockId,
                             (int)r->lockState, statCells.size(), r->fx, r->fy);
                 // координаты — исходного кадра (и при виртуальной поворотке)
                 for (const auto& t : tracks)
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f\n", p.loop,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", p.loop,
                             (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x + (float)r->fx, t.y + (float)r->fy,
                             t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits, t.travel, t.score, statCells.size(), t.bw,
-                            t.bh, t.expectedSize(), r->fx, r->fy, (int)t.followed, t.lockW);
+                            t.bh, t.expectedSize(), r->fx, r->fy, (int)t.followed, t.lockW, t.resid, t.contrastCv, t.speed,
+                            t.birdScore, t.flapR2);
             }
         }
         if (observer_) observer_(*r);
