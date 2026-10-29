@@ -859,6 +859,7 @@ void Pipeline::processLoop() {
             r->procMs = t3 - t0;
             r->latencyMs = t3 - p.readyAt;
             r->mask = det.tileMask();
+            r->maskDark = det.polarityOpen(0);
             r->fineSky = det.fineSky();
             r->cellsPerTile = det.cellsPerTile();
             r->tilesX = det.tilesX();

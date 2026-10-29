@@ -103,6 +103,7 @@ struct RunResult {
     double lockPct = 0, hardPct = 0;
     long lockAcq = 0;   // сколько раз захват брал новую цель
     double skyPct = -1; // доля кадра, где детектор ищет (не закрыто маской неба); -1 — маски нет
+    double skyDarkPct = -1; // ...тёмные цели (с тайлами, закрытыми только светлой текстурой)
     // по разметке
     bool gt = false;
     long evalFrames = 0, gtDroneFrames = 0;

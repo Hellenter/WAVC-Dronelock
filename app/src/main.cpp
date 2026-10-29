@@ -1404,6 +1404,17 @@ void tab_algorithm(App& a, bool& changed) {
                 "погоду до половины неба. Закрытые так тайлы раз в 10 кадров перепроверяются: у кроны и крыши "
                 "отклик сильный по всему тайлу, у облака слабый. Слабый тайл, выше которого в столбце нет земли, "
                 "за несколько секунд открывается; цель в нём подтверждается, только когда полетела.");
+    {
+        bool pm = d.pol_mask > 0;
+        if (ImGui::Checkbox("Облака закрыты только для светлых целей", &pm)) {
+            d.pol_mask = pm ? 1 : 0;
+            blk = true;
+        }
+    }
+    help_marker("Облака дают светлую текстуру (яркие клочья на небе), а кроны, дома и трава — и тёмную, и светлую. "
+                "Тайл, который маска закрыла только из-за светлой текстуры, остаётся в поиске тёмных целей: дрон "
+                "на фоне облаков тёмный. На экране такие тайлы закрашены едва заметно. Цель там подтверждается, когда "
+                "полетела; если помехи копятся, тайл закрывается совсем. Действует со следующего обучения маски.");
     blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
     help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
                 "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
@@ -2338,6 +2349,12 @@ void draw_view(App& a, const Result* r) {
         for (int ty = 0; ty < r->tilesY; ++ty)
             for (int tx = 0; tx < r->tilesX; ++tx)
                 if (!r->mask[(size_t)ty * r->tilesX + tx]) {
+                    if (r->maskDark.size() == r->mask.size() && r->maskDark[(size_t)ty * r->tilesX + tx]) {
+                        // облако: закрыто только для светлых целей, тёмные там ищутся — едва заметно
+                        dl->AddRectFilled(P((float)tx * r->tilePx, (float)ty * r->tilePx),
+                                          P((float)(tx + 1) * r->tilePx, (float)(ty + 1) * r->tilePx), IM_COL32(0, 60, 120, 28));
+                        continue;
+                    }
                     // тайл земли с уточнением: закрашиваем только ячейки, не ставшие небом
                     const int cpt = r->cellsPerTile, ctw = r->tilesX * cpt;
                     bool any = false;
@@ -2360,7 +2377,8 @@ void draw_view(App& a, const Result* r) {
         const int tw = r->tilesX, th = r->tilesY;
         const size_t n = (size_t)tw * th;
         const bool m = r->mask.size() == n, z = r->zones.size() == n, b = r->band.size() == n;
-        auto ground = [&](size_t i) { return m ? !r->mask[i] : z && r->zones[i] == 0; };
+        const bool md = m && r->maskDark.size() == n;   // облако, где ищутся тёмные цели, — небо
+        auto ground = [&](size_t i) { return m ? !r->mask[i] && !(md && r->maskDark[i]) : z && r->zones[i] == 0; };
         if (m || z)
             for (int x = 0; x < tw; ++x) {
                 int hy = th;   // верх земли, связанной с низом кадра, в этом столбце

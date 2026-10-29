@@ -63,6 +63,8 @@ const std::vector<Param>& params() {
         {"bg_map", "Фон по ячейкам у кромки леса", "Алгоритм", true, "1, 0", D(bg_map)},
         {"grow_mask", "Маска дорастает, где копятся помехи", "Алгоритм", true, "1, 0", D(grow_mask)},
         {"mask_recheck", "Маска перепроверяется (облака открываются)", "Алгоритм", true, "1, 0", D(mask_recheck)},
+        {"pol_mask", "Облака закрыты только для светлых целей (0 нет, 1 тёмные ищутся, 2 и наоборот)", "Алгоритм", true, "1, 0, 2", D(pol_mask)},
+        {"pol_tex", "Маска по полярности: другой текстуры не чаще доли кадров", "Тонко", false, "0.02, 0.05, 0.1", D(pol_tex)},
         {"recheck_tex", "Перепроверка: сильный отклик реже доли кадров — облако", "Тонко", false, "0.1, 0.2, 0.4", D(recheck_tex)},
         {"grow_k", "Дорастание: помех выше среднего, раз", "Тонко", false, "3, 4, 6", D(grow_k)},
         {"grow_min", "Дорастание: помех на тайл за кадр, не меньше", "Тонко", false, "0.05, 0.1, 0.2", D(grow_min)},
@@ -349,7 +351,7 @@ struct Collector {
     long fp = 0, lockEv = 0, lockOnD = 0, hardOnD = 0, falseLockF = 0;
     std::map<int, bool> life;   // трек -> хоть раз был на настоящей цели
     long firstGt = -1, firstDet = -1, firstLock = -1;
-    double skySum = 0;
+    double skySum = 0, skyDarkSum = 0;
     long skyN = 0;
 
     static bool live(const Track& t) { return !t.clutter && t.cls != TargetClass::Clutter; }
@@ -380,9 +382,14 @@ struct Collector {
 
         const int64_t idx = r.frame->index;
         if (!r.mask.empty() && idx >= warmup) {   // маска неба после обучения: сколько неба осталось в поиске
-            long on = 0;
-            for (uint8_t m : r.mask) on += m != 0;
+            long on = 0, dark = 0;
+            const bool md = r.maskDark.size() == r.mask.size();
+            for (size_t i = 0; i < r.mask.size(); ++i) {
+                on += r.mask[i] != 0;
+                dark += r.mask[i] != 0 || (md && r.maskDark[i]);
+            }
             skySum += (double)on / r.mask.size();
+            skyDarkSum += (double)dark / r.mask.size();
             ++skyN;
         }
         if (gtN <= 0 || idx < 0 || idx >= gtN) return;
@@ -567,6 +574,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     rr.hardPct = 100.0 * col.hardF / F;
     rr.lockAcq = col.acq;
     rr.skyPct = col.skyN ? 100.0 * col.skySum / col.skyN : -1;
+    rr.skyDarkPct = col.skyN ? 100.0 * col.skyDarkSum / col.skyN : -1;
     rr.gt = col.gtN > 0 && col.evF > 0;
     if (rr.gt) {
         rr.evalFrames = col.evF;
@@ -630,6 +638,9 @@ const std::vector<Metric>& metrics() {
         {"sky_pct", "Небо в поиске", "%", 0, false, 1, [](const RunResult& r) { return r.skyPct; },
          "Доля кадра, где детектор ищет: не закрыта маской неба как лес, дома, земля, текстура. Меньше целей при "
          "меньшем «небе в поиске» — это не чище, а просто меньше смотрим. Прочерк — маски нет (камера движется)."},
+        {"sky_dark_pct", "Небо в поиске тёмных", "%", 0, false, 1, [](const RunResult& r) { return r.skyDarkPct; },
+         "Как «небо в поиске», но для тёмных целей: с тайлами, которые маска закрыла только из-за светлой текстуры "
+         "(облака), — там тёмный дрон ищется."},
         {"lock_pct", "Кадров с захватом", "%", 0, false, 1, [](const RunResult& r) { return r.lockPct; },
          "Доля всех кадров, где есть захват (любой цели)."},
         {"hard_pct", "Кадров с жёстким", "%", 0, false, 1, [](const RunResult& r) { return r.hardPct; },

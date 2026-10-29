@@ -124,6 +124,13 @@ struct DetectorConfig {
     int recheck_every = 10;
     int recheck_frames = 150;
     float recheck_tex = 0.2f;
+    // Маска по полярности: облака дают светлую текстуру (яркие клочья на небе) почти без тёмной,
+    // а кроны, дома и трава — обе. В тайле, закрытом только светлой текстурой (тёмная бывала не
+    // чаще доли pol_tex кадров обучения), тёмные цели ищутся: дрон на фоне облаков тёмный. Цель
+    // там подтверждается, только когда полетела. 2 — и наоборот (тайл только с тёмной текстурой
+    // открыт для светлых целей), 0 — выкл. Помехи копятся — тайл закрывается (grow_mask)
+    int pol_mask = 1;
+    float pol_tex = 0.05f;
     int bg_frames = 250;
     // Накопление слабой цели по кадрам (track-before-detect на ячейках, фон ячеек тогда
     // учится по всему небу): A = tbd_decay * max3x3(A) + max(0, z - tbd_z0), z — превышение
@@ -236,6 +243,9 @@ public:
     void noteClutter(const std::vector<Candidate>& clutter, const std::vector<FocusArea>& keep);
     int maskGrown() const { return grown_; }
     int maskOpened() const { return opened_; }
+    // тайлы, закрытые маской, где ищутся цели одной полярности (DetectorConfig::pol_mask):
+    // pol 0 — тёмные, 1 — светлые (tilesY x tilesX, 1 — ищутся); пусто — нет таких
+    const std::vector<uint8_t>& polarityOpen(int pol) const { return polOpen_[pol ? 1 : 0]; }
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
@@ -279,7 +289,7 @@ private:
     int w_ = 0, h_ = 0, tw_ = 0, th_ = 0;
     std::vector<uint8_t> mask_;
     bool learning_ = false;
-    std::vector<float> texSum_;
+    std::vector<float> texSum_, texSumP_[2];   // ...и по полярностям
     int texN_ = 0;
     int verifyLeft_ = 0;
     bool maskReplaced_ = false;
@@ -302,6 +312,11 @@ private:
     std::vector<float> recheckTex_;
     std::vector<uint16_t> recheckN_;
     int opened_ = 0;
+    std::vector<uint8_t> polOpen_[2];   // закрытые тайлы, открытые для одной полярности
+    bool polOpenAt(int pol, size_t i) const {
+        const auto& v = polOpen_[pol ? 1 : 0];
+        return v.size() == mask_.size() && v[i];
+    }
     void markTexBad(float frac);
     void updateRecheck();
 public:

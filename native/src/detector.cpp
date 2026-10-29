@@ -209,6 +209,7 @@ void Detector::beginMaskLearning() {
     mask_.clear();
     learning_ = true;
     texSum_.assign((size_t)tw_ * th_, 0.f);
+    for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
     resetGrow();
 }
@@ -233,6 +234,15 @@ void Detector::markTexBad(float frac) {
     for (size_t i = 0; i < texBad_.size(); ++i) texBad_[i] = !mask_[i] && texSum_[i] / n > frac;
     recheckTex_.assign(mask_.size(), 0.f);
     recheckN_.assign(mask_.size(), 0);
+    // маска по полярности: тайл закрыт своей текстурой, а этой полярности в нём почти не было
+    for (auto& v : polOpen_) v.clear();
+    if (cfg_.pol_mask <= 0 || !cfg_.dark || !cfg_.bright) return;
+    for (int p = 0; p < (cfg_.pol_mask >= 2 ? 2 : 1); ++p) {
+        const auto& tp = texSumP_[p];
+        if (tp.size() != mask_.size()) continue;
+        polOpen_[p].assign(mask_.size(), 0);
+        for (size_t i = 0; i < tp.size(); ++i) polOpen_[p][i] = texBad_[i] && tp[i] / texN_ <= cfg_.pol_tex;
+    }
 }
 
 // Маска по накопленной текстуре тайлов (texSum_ за texN_ кадров): тайл, текстурный дольше
@@ -243,13 +253,19 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
     if (n == 0 || texSum_.size() != (size_t)tw_ * th_) return;
     std::vector<uint8_t> bad(texSum_.size());
     for (size_t i = 0; i < bad.size(); ++i) bad[i] = texSum_[i] / n > frac;
+    // кромка земли — по тайлам с тёмной текстурой: тайл только со светлой (облако, pol_mask)
+    // сам закрыт, но столбец под ним землёй не делает — иначе облачное небо до самого леса
+    // закрывалось целиком, вместе с гладкими просветами между облаками
+    std::vector<uint8_t> edgeBad(bad);
+    if (cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright && texN_ > 0 && texSumP_[0].size() == bad.size())
+        for (size_t i = 0; i < bad.size(); ++i) edgeBad[i] = bad[i] && texSumP_[0][i] / texN_ > cfg_.pol_tex;
     if (cfg_.skyline) {
         std::vector<int> edge(tw_, th_);
         for (int x = 0; x < tw_; ++x) {
             int below = 0;   // текстурных тайлов от y до низа кадра
             int gap = 0;     // гладких тайлов подряд над землёй
             for (int y = th_ - 1; y >= 0; --y) {
-                const bool b = bad[(size_t)y * tw_ + x] != 0;
+                const bool b = edgeBad[(size_t)y * tw_ + x] != 0;
                 below += b;
                 gap = b ? 0 : gap + 1;
                 // кромка не выше просвета в 3 тайла: облако над лесом (тёмное небо, яркие
@@ -327,6 +343,7 @@ bool Detector::loadMask(const std::string& path, int verify) {
     maskReplaced_ = false;
     verifyLeft_ = std::max(0, verify);
     texSum_.assign((size_t)tw_ * th_, 0.f);
+    for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
     resetGrow();
     return true;
@@ -355,6 +372,7 @@ void Detector::resetGrow() {
     texBad_.clear();
     recheckTex_.clear();
     recheckN_.clear();
+    for (auto& v : polOpen_) v.clear();
 }
 
 // Перепроверка маски (DetectorConfig::mask_recheck): тайлы, закрытые по текстуре, раз в
@@ -451,7 +469,7 @@ void Detector::growMask(const std::vector<FocusArea>& keep) {
     for (int ty = 0; ty < th_; ++ty)
         for (int tx = 0; tx < tw_; ++tx) {
             const size_t i = (size_t)ty * tw_ + tx;
-            if (!mask_[i]) continue;
+            if (!mask_[i] && !polOpenAt(0, i) && !polOpenAt(1, i)) continue;
             float r = 0;
             int c = 0;
             for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
@@ -469,12 +487,23 @@ void Detector::growMask(const std::vector<FocusArea>& keep) {
     // помех на тайл неба в среднем по сцене: в чистом небе их почти нет, в дыре маски — десятки
     const float lim = std::max(cfg_.grow_k * (float)(sum / sky), cfg_.grow_min);
     const int tilePx = cfg_.tile * cfg_.pool;
-    for (size_t i = 0; i < n; ++i) cand[i] = mask_[i] && rate[i] >= lim && cells[i] >= cfg_.grow_cells;
+    for (size_t i = 0; i < n; ++i)
+        cand[i] = (mask_[i] || polOpenAt(0, i) || polOpenAt(1, i)) && rate[i] >= lim && cells[i] >= cfg_.grow_cells;
     for (const FocusArea& a : keep) {   // вокруг цели маска не растёт
         const int x0 = std::max(0, (int)std::floor((a.x - a.r) / tilePx)), x1 = std::min(tw_ - 1, (int)std::floor((a.x + a.r) / tilePx));
         const int y0 = std::max(0, (int)std::floor((a.y - a.r) / tilePx)), y1 = std::min(th_ - 1, (int)std::floor((a.y + a.r) / tilePx));
         for (int y = y0; y <= y1; ++y)
             for (int x = x0; x <= x1; ++x) cand[(size_t)y * tw_ + x] = 0;
+    }
+    // открытый для одной полярности тайл уже внутри маски: закрывается без условий
+    for (size_t i = 0; i < n; ++i) {
+        if (mask_[i] || !cand[i]) continue;
+        for (auto& v : polOpen_)
+            if (v.size() == n) v[i] = 0;
+        cand[i] = 0;
+        ++grown_;
+        const int x = (int)(i % tw_), y = (int)(i / tw_);
+        for (int cy = y * cpt; cy < (y + 1) * cpt; ++cy) std::fill_n(&growCell_[(size_t)cy * ctw + x * cpt], cpt, 0.f);
     }
     // прирастает к маске: земля хотя бы у двух соседей (край кадра слева, справа и снизу —
     // тоже), и над тайлом не чистое небо (земля или такой же тайл с помехами). Ряд тайлов над
@@ -534,7 +563,10 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         th_ = (h / s) / T;
         mask_.clear();
         verifyLeft_ = 0;
-        if (learning_) texSum_.assign((size_t)tw_ * th_, 0.f);
+        if (learning_) {
+            texSum_.assign((size_t)tw_ * th_, 0.f);
+            for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
+        }
     }
     // как cv2.threshold(R, thr*0.6) на u8: горячий, если R > floor(thr*0.6)
     const float ht = std::floor(hotLevel());
@@ -556,9 +588,12 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     // при проверке загруженной маски текстуру считаем по всему кадру, как при обучении
     const uint8_t* m = (!learning_ && !verifyLeft_ && !mask_.empty()) ? mask_.data() : nullptr;
     updateBand();
-    if (m && !edgeG_.empty()) {   // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам
+    const bool polOn = polOpen_[0].size() == mask_.size() || polOpen_[1].size() == mask_.size();
+    if (m && (edgeG_.size() == mask_.size() || polOn)) {
+        // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам; и открытые для одной полярности
         compMask_.resize(mask_.size());
-        for (size_t i = 0; i < mask_.size(); ++i) compMask_[i] = mask_[i] | edgeG_[i];
+        for (size_t i = 0; i < mask_.size(); ++i)
+            compMask_[i] = mask_[i] | (edgeG_.size() == mask_.size() && edgeG_[i]) | polOpenAt(0, i) | polOpenAt(1, i);
         m = compMask_.data();
     }
     // между полными просмотрами — только тайлы вокруг треков (маска неба тоже действует);
@@ -704,7 +739,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
                 // и не ищем там, где маска неба запрещает поиск, и на земле
                 const int mx = (int)c.x / (T * s), my = (int)c.y / (T * s);
                 const size_t mi = (size_t)my * tw_ + mx;
-                if (!dup && !mask_.empty() && !learning_) dup = mx >= tw_ || my >= th_ || !mask_[mi];
+                if (!dup && !mask_.empty() && !learning_)
+                    dup = mx >= tw_ || my >= th_ || !(mask_[mi] || polOpenAt(c.polarity > 0, mi));
                 if (!dup && !zones_.empty()) dup = mx >= tw_ || my >= th_ || zones_[mi] == 0;
                 if (!dup) {
                     out[keep] = c;
@@ -750,8 +786,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             if (diff * 10 > fresh.size()) {
                 mask_.swap(fresh);
                 maskReplaced_ = true;
-                markTexBad(0.3f);
             }
+            markTexBad(0.3f);   // и для загруженной маски: перепроверка и маска по полярности
         }
     }
     const double t2 = now_ms();
@@ -936,7 +972,11 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const float level = (float)std::min<uint32_t>(255, div_round_even(ts.sum[i], area));
             const float dens = (float)div_round_even(ts.hot[i] * 255u, area) / 255.f;
             const bool texRaw = dens > maxDens;
-            if (fineGrid && (learning_ || verifyLeft_)) texSum_[i] += texRaw;
+            if (fineGrid && (learning_ || verifyLeft_)) {
+                texSum_[i] += texRaw;
+                auto& tp = texSumP_[pol ? 1 : 0];
+                if (tp.size() == texSum_.size()) tp[i] += texRaw;
+            }
             if (texOut) texOut[i] = texRaw;
             bool textured = texRaw;
             // Крупная контрастная цель (FWHM 5+ пикс.) сама набирает "горячих" пикселей больше
@@ -955,7 +995,9 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             }
             // тайл земли у кромки, где уточнение нашло ячейки неба: только эти ячейки, по их фону
             bool fineTile = false;
-            if (useMask && !mask_[i]) {
+            // закрытый только текстурой другой полярности (облако для тёмных целей)
+            const bool polTile = useMask && !mask_[i] && polOpenAt(pol, i);
+            if (useMask && !mask_[i] && !polTile) {
                 if (!(cells && bgOn && fineSky_.size() == (size_t)ctw * th * cpt && edgeG_.size() == mask_.size() && edgeG_[i]))
                     continue;
                 for (int cy = ty * cpt; cy < (ty + 1) * cpt && !fineTile; ++cy)
@@ -966,7 +1008,9 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             if (zone == 0) continue;
             // текстурный тайл у самой земли (кромка леса): с фоном по ячейкам смотрим его
             // по ячейкам, иначе выбрасываем целиком, как раньше
-            const bool edgeTex = fineTile || (textured && nearOn && nearGround_[i]);
+            // облако, открытое для этой полярности, — тоже: застывшие просветы между клочьями
+            // ячейки поднимают себе порог сами
+            const bool edgeTex = fineTile || polTile || (textured && nearOn && nearGround_[i]);
             if (textured && !edgeTex) continue;
             const float zk = zone == 1 ? cfg_.mixed_k : 1.f;
             const float bk = bandOn && band_[i] ? cfg_.band_k : 1.f;
@@ -984,7 +1028,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 c.level = lvl;
                 c.weak = focusTiles_[i] && !(mx >= thrB * zk && (edgeTex || mx >= cfg_.clutter_k * level + thrB * zk * 0.5f));
                 // открытое перепроверкой облако: цель там подтверждается, только когда полетела
-                c.edge = zone == 1 || edgeTex || (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
+                c.edge = zone == 1 || edgeTex || polTile || (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
                 c.second = second;
                 out.push_back(c);
                 px[taken] = gx;
@@ -992,7 +1036,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 ++taken;
             };
             const float mx = ts.maxv[i];
-            if (!fineTile && !textured && mx >= thr && mx >= cfg_.clutter_k * level + thr * 0.5f) {
+            if (!fineTile && !polTile && !textured && mx >= thr && mx >= cfg_.clutter_k * level + thr * 0.5f) {
                 const int gx = tx * T + ts.argmax[i] % T, gy = ty * T + ts.argmax[i] / T;
                 push(gx, gy, mx, false);
             } else if (!edgeTex) {
@@ -1098,7 +1142,8 @@ void Detector::updateBg(const TileStats& ts, int pol) {
         for (int tx = 0; tx < tw_; ++tx) {
             const size_t ti = (size_t)ty * tw_ + tx;
             if (!comp.empty() && !comp[ti]) continue;
-            if (edgeOnly && !nearGround_[ti] && !(edgeG_.size() == nearGround_.size() && edgeG_[ti])) continue;
+            if (edgeOnly && !nearGround_[ti] && !(edgeG_.size() == nearGround_.size() && edgeG_[ti]) && !polOpenAt(pol, ti))
+                continue;
             for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
                 for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx) {
                     const size_t ci = (size_t)cy * ctw + cx;
@@ -1156,7 +1201,7 @@ void Detector::selectTbd(const TileStats& ts, int pol, std::vector<Candidate>& o
     for (size_t ci = 0; ci < n; ++ci) {
         const int cx = (int)(ci % ctw), cy = (int)(ci / ctw);
         const size_t ti = (size_t)(cy / cpt) * tw_ + cx / cpt;
-        if ((useMask && !mask_[ti]) || (!zones_.empty() && zones_[ti] == 0)) continue;
+        if ((useMask && !mask_[ti] && !polOpenAt(pol, ti)) || (!zones_.empty() && zones_[ti] == 0)) continue;
         if (!comp.empty() && !comp[ti]) continue;
         if (c.nupd[ci] < 8 || (tex.size() == (size_t)tw_ * th_ && tex[ti])) { E[ci] = 0; continue; }
         const float sd = std::max(1.f, bg_sd(c, ci));

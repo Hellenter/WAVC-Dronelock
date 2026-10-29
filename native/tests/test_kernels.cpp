@@ -655,6 +655,35 @@ static void test_grow_mask() {
               "recheck %d: cloud open %d, opened %d", variant, (int)open, d.maskOpened());
     }
     std::printf("mask recheck opens clouds: ok\n");
+
+    // маска по полярности: "облако" из ярких клочьев (только светлая текстура) закрыто, но открыто
+    // для тёмных целей; земля (обе полярности) — нет; кромка земли по облаку вниз не тянется
+    for (int pm = 0; pm < 2; ++pm) {
+        auto puffs = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            for (int y = T; y < 2 * T; ++y)
+                for (int x = 2 * T; x < 4 * T; ++x)
+                    if ((x + seed) % 16 < 4 && y % 16 < 4) f[(size_t)y * w + x] = 230;
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.pol_mask = pm;
+        cfg.mask_recheck = false;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(puffs(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        const int tw = d.tilesX();
+        const auto& m = d.tileMask();
+        const auto& o = d.polarityOpen(0);
+        const bool open = o.size() == m.size() && o[tw + 2] && o[tw + 3] && !o[6 * tw + 2];
+        CHECK(!m[tw + 2] && !m[tw + 3] && !m[6 * tw + 2] && open == (pm != 0) && d.polarityOpen(1).empty(),
+              "pol_mask %d: cloud masked %d, open for dark %d", pm, (int)!m[tw + 2], (int)open);
+        CHECK(m[2 * tw + 2] == (pm != 0), "pol_mask %d: sky under cloud %d", pm, (int)m[2 * tw + 2]);
+    }
+    std::printf("cloud masked for bright targets only: ok\n");
 }
 
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
