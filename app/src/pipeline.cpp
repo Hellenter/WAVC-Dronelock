@@ -787,6 +787,7 @@ void Pipeline::processLoop() {
             MotionEstimate me;
             const bool autoMotion = s.motion < 0;
             gm.setFps(s.fpsScale ? (float)procFps(s) : 0.f);
+            gm.setLong(s.motionLong && autoMotion && !ef.motion);
             if (ef.motion || autoMotion) me = gm.estimate(src.px.data(), src.w, src.h, src.w);
             else gm.reset();
             if (autoMotion || s.follow) {

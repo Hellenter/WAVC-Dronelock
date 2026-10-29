@@ -916,15 +916,28 @@ struct MotionEstimate {
 class GlobalMotion {
 public:
     MotionEstimate estimate(const uint8_t* gray, int w, int h, int stride);
-    void reset() { prev_.clear(); }
+    void reset() {
+        prev_.clear();
+        hist_.clear();
+    }
     // Частота кадров камеры (0 — не задана): проверка по частям кадра (см. motion.cpp) включается
     // по скорости поворота в пикс./с, как при 60 к/с, а не по сдвигу за кадр
     void setFps(float fps) { fps_ = fps; }
+    // Длинная база: на частоте от 22.5 к/с сдвиг меряется от кадра ~1/15 с назад (за кадр — его
+    // доля). Медленный поворот на 60 к/с иначе занижен (см. motion.cpp). Оценка — среднее за 1/15 с,
+    // поэтому только там, где сдвиг не идёт в прогноз трекера каждого кадра (крупный кадр, авто)
+    void setLong(bool on) {
+        if (on != long_) hist_.clear();
+        long_ = on;
+    }
     double lastMs() const { return ms_; }
 
 private:
     struct Img { std::vector<uint8_t> px; int w = 0, h = 0; };
+    MotionEstimate match(const std::vector<Img>& cur, const std::vector<Img>& ref, int gap) const;
     std::vector<Img> prev_, cur_;
+    std::deque<std::vector<Img>> hist_;   // последние кадры для длинной базы
+    bool long_ = false;
     int f_ = 1, w_ = 0, h_ = 0;
     float fps_ = 0;
     double ms_ = 0;

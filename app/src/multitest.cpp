@@ -58,6 +58,7 @@ const std::vector<Param>& params() {
         {"bright", "Яркие цели", "Алгоритм", true, "1, 0", D(bright)},
         {"trk_seconds", "Трекер в секундах", "Алгоритм", true, "1, 0", S(trkSeconds)},
         {"fps_scale", "Маска неба и поворот камеры в секундах", "Алгоритм", true, "1, 0", S(fpsScale)},
+        {"motion_long", "Поворот камеры по кадру 1/15 с назад (крупный кадр)", "Алгоритм", true, "0, 1", S(motionLong)},
         {"follow", "Виртуальная поворотка", "Алгоритм", true, "0, 1", S(follow)},
         {"mask", "Кадров на маску неба (0 выкл.)", "Алгоритм", false, "0, 25, 50", S(learnMaskFrames)},
         {"per_tile", "Кандидатов в тайле", "Алгоритм", false, "1, 2", D(per_tile)},
@@ -329,6 +330,7 @@ void apply_algo(Settings& dst, const Settings& src) {
     dst.zones = src.zones;
     dst.trkSeconds = src.trkSeconds;
     dst.fpsScale = src.fpsScale;
+    dst.motionLong = src.motionLong;
     dst.governor = src.governor;
     dst.skipDuplicates = src.skipDuplicates;
     dst.frameStep = src.frameStep;
