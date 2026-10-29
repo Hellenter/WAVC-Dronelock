@@ -188,13 +188,18 @@ Settings Pipeline::settings() const {
     return settings_;
 }
 
+double Pipeline::cameraFps(const Settings& s) const {
+    return (s.targetFps > 0 ? s.targetFps : info_.fps) / std::max(1, s.frameStep);
+}
+
 void Pipeline::setSettings(const Settings& s) {
     bool restart;
     {
         std::lock_guard<std::mutex> lk(sm_);
         const Settings& o = settings_;
         restart = open_ && (o.source != s.source || o.preloadFrames != s.preloadFrames || o.procW != s.procW ||
-                            o.procH != s.procH || o.decoderThreads != s.decoderThreads || o.loop != s.loop);
+                            o.procH != s.procH || o.decoderThreads != s.decoderThreads || o.loop != s.loop ||
+                            (s.source == Source::Preload && o.frameStep != s.frameStep));
         settings_ = s;
         ++settingsVer_;
     }
@@ -316,6 +321,10 @@ void Pipeline::decodeLoop() {
         for (int i = 0; i < s.preloadFrames && !stop_; ++i) {
             FramePtr f;
             if (!decodeOne(f)) break;
+            if (s.frameStep > 1 && f->index % s.frameStep != 0) {   // камера реже видео
+                --i;
+                continue;
+            }
             pre.push_back(f);
             char b[96];
             snprintf(b, sizeof(b), "Предзагрузка в память: %d / %d", i + 1, s.preloadFrames);
@@ -404,6 +413,8 @@ void Pipeline::decodeLoop() {
                 while (!stop_ && seekReq_ < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
+            // камера реже видео: лишние кадры файла пропускаем (после перемотки — первый как есть)
+            if (cur.frameStep > 1 && f->index % cur.frameStep != 0 && !seeked && !first && !wrapped) continue;
             p.frame = f;
             p.loop = loop;
             p.loopStart = (first || wrapped) && !seeked;
@@ -414,7 +425,7 @@ void Pipeline::decodeLoop() {
         seeked = false;
         const bool realtime = cur.pace == Pace::Realtime && !paused_;
         if (realtime) {
-            const double fps = cur.targetFps > 0 ? cur.targetFps : info_.fps;
+            const double fps = cameraFps(cur);
             // замедление: кадры "приходят с камеры" реже, обработка та же
             const double period = 1000.0 / std::max(0.1, fps) / std::min(4.0, std::max(0.01, cur.speed));
             wait_until(next, stop_);
@@ -565,7 +576,7 @@ void Pipeline::processLoop() {
         bool sceneMoved = false, sceneLight = false;
         if (p.loopStart || p.seekStart) scene.reset();
         if (s.adapt) {
-            const double base = s.targetFps > 0 ? s.targetFps : info_.fps;
+            const double base = cameraFps(s);
             if (scene.update(f.px.data(), f.w, f.h, f.w, (float)base, ef.motion || s.follow || panning)) {
                 sceneMoved = scene.state().moved;
                 sceneLight = scene.state().lightJump;
@@ -693,7 +704,7 @@ void Pipeline::processLoop() {
         dupRun = dup ? dupRun + 1 : 0;
         if (!p.loopStart && !p.seekStart) uniqShare = 0.98f * uniqShare + 0.02f * (same ? 0.f : 1.f);
         {   // трекер в секундах: частота меняется (камера, повторы кадров) — пересчитать
-            const double base = s.targetFps > 0 ? s.targetFps : info_.fps;
+            const double base = cameraFps(s);
             const float fps = (float)(base * std::max(0.2f, uniqShare));
             if (fps > 0 && std::fabs(fps - trkFps) > 0.1f * std::max(trkFps, 1.f)) {
                 trkFps = fps;
@@ -741,7 +752,7 @@ void Pipeline::processLoop() {
                     panHist.emplace_back(ok ? me.dx : 0.f, ok ? me.dy : 0.f);
                     panX += panHist.back().first;
                     panY += panHist.back().second;
-                    const size_t win = (size_t)std::max(10L, std::lround(trkFps > 0 ? trkFps : info_.fps > 0 ? info_.fps : 30.0));
+                    const size_t win = (size_t)std::max(10L, std::lround(trkFps > 0 ? trkFps : info_.fps > 0 ? cameraFps(s) : 30.0));
                     while (panHist.size() > win) {
                         panX -= panHist.front().first;
                         panY -= panHist.front().second;
@@ -861,7 +872,7 @@ void Pipeline::processLoop() {
             if (s.emulateMs > 0) wait_until(t0 + s.emulateMs, stop_);
             t3 = now_ms();
             // авто-упрощение по времени кадра против периода камеры (без замедления просмотра)
-            if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, s.targetFps > 0 ? s.targetFps : info_.fps));
+            if (s.governor) gov.update(t3 - t0, 1000.0 / std::max(0.1, cameraFps(s)));
 
             r = std::make_shared<Result>();
             r->frame = view;
@@ -993,18 +1004,19 @@ void Pipeline::processLoop() {
         if (!s.trackLog.empty()) {
             if (!tlog) {
                 tlog.reset(open_file(s.trackLog, "w"));
-                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w\n");
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w,resid,contrast_cv,speed,bird_score,flap_r2\n");
             }
             if (tlog) {
                 if (tracks.empty())
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,\n", p.loop, (long long)f.index, r->lockId,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,,,,,,\n", p.loop, (long long)f.index, r->lockId,
                             (int)r->lockState, statCells.size(), r->fx, r->fy);
                 // координаты — исходного кадра (и при виртуальной поворотке)
                 for (const auto& t : tracks)
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f\n", p.loop,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", p.loop,
                             (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x + (float)r->fx, t.y + (float)r->fy,
                             t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits, t.travel, t.score, statCells.size(), t.bw,
-                            t.bh, t.expectedSize(), r->fx, r->fy, (int)t.followed, t.lockW);
+                            t.bh, t.expectedSize(), r->fx, r->fy, (int)t.followed, t.lockW, t.resid, t.contrastCv, t.speed,
+                            t.birdScore, t.flapR2);
             }
         }
         if (observer_) observer_(*r);

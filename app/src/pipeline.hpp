@@ -48,6 +48,11 @@ struct Settings {
     // источник кадров
     Pace pace = Pace::Realtime;
     double targetFps = 0;      // 0 = FPS видео
+    // камера реже видео: брать каждый frameStep-й кадр файла (60 к/с, шаг 4 — камера 15 к/с).
+    // Номера кадров — файла, поэтому разметка <видео>.gt.json подходит без пересчёта;
+    // трекер и темп камеры — на частоте видео / шаг. В отличие от "частоты камеры" выше,
+    // цель за кадр смещается, как у настоящей медленной камеры
+    int frameStep = 1;
     Source source = Source::Stream;
     int preloadFrames = 100;
     int procW = 0, procH = 0;  // 0 = исходный размер
@@ -220,6 +225,8 @@ public:
 
     void setSettings(const Settings& s);
     Settings settings() const;
+    // частота кадров, которые видит алгоритм: камеры (или видео), делённая на шаг прореживания
+    double cameraFps(const Settings& s) const;
     void setPaused(bool p);
     bool paused() const { return paused_; }
     void step();                         // один кадр на паузе
