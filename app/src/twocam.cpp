@@ -680,12 +680,20 @@ void Emulator::stepNarrow(double t, double dt) {
         // в окне — трек, ближайший к ожидаемому месту (летящий, не помеха, держится minHold)
         const int minHits = std::max(3, (int)std::lround(c_.minHold * c_.narrowFps));
         if (tSearch_ < 0) tSearch_ = t;
+        // где цель по широкой сейчас: сосед рядом (другой дрон в окне) не годится
+        double waz = 0, wel = 0, wsg = 0;
+        if (wt) predict(wt->rep, t, waz, wel, wsg);
         int best = 0;
         double bd = 1e18;
         for (const Track& x : tr) {
             if (x.clutter || x.miss > 0 || x.hits < minHits) continue;
             const double d = std::hypot(x.x - win_.u, x.y - win_.v);
             if (c_.windowFocus && winOn_ && d > win_.radius) continue;
+            if (wt && c_.wideCheck) {
+                double az, el;
+                azel_from_dir(unproject(narrowCam_, enc, x.x, x.y), az, el);
+                if (ang(az, el, waz, wel) > std::max(0.4, 5 * wsg)) continue;
+            }
             if (d < bd) {
                 bd = d;
                 best = x.id;
@@ -740,9 +748,16 @@ void Emulator::stepNarrow(double t, double dt) {
                 st_.errLock.push_back((float)ang(baz, bel, nrep_.az, nrep_.el));
                 st_.errAxis.push_back((float)ang(baz, bel, mount_.az, mount_.el));
             }
-            // широкая видит назначенную цель далеко от того, что ведёт точная: не та цель
-            if (wt && ang(wt->rep.az, wt->rep.el, nrep_.az, nrep_.el) > std::max(1.5, 6.0 * wt->rep.sigma) &&
-                t - tTrackStart_ > 1.0) {
+            // широкая видит назначенную цель далеко от того, что ведёт точная: не та цель.
+            // Сравниваем с прогнозом широкой на этот момент: её сообщение старше на задержку и кадр
+            bool off = false;
+            if (wt) {
+                double waz = wt->rep.az, wel = wt->rep.el, wsg = wt->rep.sigma;
+                if (c_.wideCheck) predict(wt->rep, t, waz, wel, wsg);
+                const double tol = c_.wideCheck ? std::max(0.5, 6.0 * wsg) : std::max(1.5, 6.0 * wsg);
+                off = ang(waz, wel, nrep_.az, nrep_.el) > tol && t - tTrackStart_ > (c_.wideCheck ? 0.3 : 1.0);
+            }
+            if (off) {
                 event(t, "точная ведёт не то, что широкая: ищет заново");
                 state_ = NState::Lost;
                 haveNrep_ = false;
@@ -975,6 +990,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-ff") c.feedForward = false;
         else if (a == "--no-window") c.windowFocus = false;
         else if (a == "--no-lock-focus") c.lockFocus = false;
+        else if (a == "--no-wide-check") c.wideCheck = false;
         else if (a == "--min-hold") c.minHold = (float)atof(val().c_str());
         else if (a == "--give-up") c.giveUp = (float)atof(val().c_str());
         else if (a == "--cool-down") c.coolDown = (float)atof(val().c_str());
