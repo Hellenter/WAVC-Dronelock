@@ -620,6 +620,14 @@ static void test_grow_mask() {
         size_t diff = 0;
         for (size_t i = 0; i < m.size(); ++i) diff += m[i] != m0[i];
         CHECK(diff == (variant == 0 ? 1u : 0u), "grow mask variant %d: %zu tiles changed", variant, diff);
+        if (variant != 0) continue;
+        // помехи кончились, а откликов выше порога в дыре нет: через ~2*recheck_frames она открывается
+        for (int i = 0; i < 400; ++i) {
+            d.detect(frame(300 + i).data(), w, h, w, c);
+            d.noteClutter({}, keep);
+        }
+        CHECK(d.tileMask()[6 * tw + 5] && d.maskOpened() == 1, "grow mask: quiet hole reopens (%d, opened %d)",
+              (int)d.tileMask()[6 * tw + 5], d.maskOpened());
     }
     std::printf("mask grows where clutter piles up: ok\n");
 

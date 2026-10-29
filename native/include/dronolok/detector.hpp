@@ -124,6 +124,10 @@ struct DetectorConfig {
     int recheck_every = 10;
     int recheck_frames = 150;
     float recheck_tex = 0.2f;
+    // ...закрытое доращиванием (grow_mask) тоже перепроверяется и открывается, когда ни одна его
+    // ячейка не дотягивает до порога в доле reopen_quiet замеров за ~2*recheck_frames кадров
+    // (облако ушло, помехам больше неоткуда взяться). Нужен mask_recheck; 1.01 — не открывать
+    float reopen_quiet = 0.9f;
     // Маска по полярности: облака дают светлую текстуру (яркие клочья на небе) почти без тёмной,
     // а кроны, дома и трава — обе. В тайле, закрытом только светлой текстурой (тёмная бывала не
     // чаще доли pol_tex кадров обучения), тёмные цели ищутся: дрон на фоне облаков тёмный. Цель
@@ -242,7 +246,7 @@ public:
     // любое — маску стоит сохранить заново.
     void noteClutter(const std::vector<Candidate>& clutter, const std::vector<FocusArea>& keep);
     int maskGrown() const { return grown_; }
-    int maskOpened() const { return opened_; }
+    int maskOpened() const { return opened_ + reopened_; }
     // тайлы, закрытые маской, где ищутся цели одной полярности (DetectorConfig::pol_mask):
     // pol 0 — тёмные, 1 — светлые (tilesY x tilesX, 1 — ищутся); пусто — нет таких
     const std::vector<uint8_t>& polarityOpen(int pol) const { return polOpen_[pol ? 1 : 0]; }
@@ -313,6 +317,11 @@ private:
     std::vector<uint16_t> recheckN_;
     int opened_ = 0;
     std::vector<uint8_t> polOpen_[2];   // закрытые тайлы, открытые для одной полярности
+    // закрытые доращиванием, доля "тихих" перепроверок и их число; открыто снова
+    std::vector<uint8_t> grownT_;
+    std::vector<float> growQuiet_;
+    std::vector<uint16_t> growQN_;
+    int reopened_ = 0;
     bool polOpenAt(int pol, size_t i) const {
         const auto& v = polOpen_[pol ? 1 : 0];
         return v.size() == mask_.size() && v[i];

@@ -374,6 +374,10 @@ void Detector::resetGrow() {
     recheckTex_.clear();
     recheckN_.clear();
     for (auto& v : polOpen_) v.clear();
+    grownT_.clear();
+    growQuiet_.clear();
+    growQN_.clear();
+    reopened_ = 0;
 }
 
 // Перепроверка маски (DetectorConfig::mask_recheck): тайлы, закрытые по текстуре, раз в
@@ -388,6 +392,39 @@ void Detector::updateRecheck() {
     if (dk.size() != nc && br.size() != nc) return;
     const int need = std::max(1, cfg_.recheck_frames / std::max(1, cfg_.recheck_every));
     const float a = 1.f / (float)need, thr = threshold();
+    // закрытые доращиванием: если помехам там больше неоткуда взяться — ни одна ячейка закрытой
+    // полярности не дотягивает до порога почти во всех замерах за вдвое большее окно, — открываем
+    if (grownT_.size() == n) {
+        const int needG = 2 * need;
+        const float ag = 1.f / (float)needG;
+        if (growQuiet_.size() != n) growQuiet_.assign(n, 0.f), growQN_.assign(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+            if (!grownT_[i] || mask_[i]) {
+                grownT_[i] = 0;
+                continue;
+            }
+            const bool brightOnly = polOpenAt(0, i);   // закрыт только для светлых
+            const int ty = (int)(i / tw_), tx = (int)(i % tw_);
+            bool loud = false;
+            for (int cy = ty * cpt; cy < (ty + 1) * cpt && !loud; ++cy)
+                for (int cx = tx * cpt; cx < (tx + 1) * cpt && !loud; ++cx) {
+                    const size_t ci = (size_t)cy * ctw + cx;
+                    loud = (br.size() == nc && br[ci] >= thr) || (!brightOnly && dk.size() == nc && dk[ci] >= thr);
+                }
+            if (growQN_[i] < 65535) ++growQN_[i];
+            growQuiet_[i] += std::max(ag, 1.f / (float)growQN_[i]) * ((loud ? 0.f : 1.f) - growQuiet_[i]);
+            if (growQN_[i] < needG || growQuiet_[i] < cfg_.reopen_quiet) continue;
+            mask_[i] = 1;
+            if (fineBase_.size() == n) fineBase_[i] = 1;
+            for (auto& o : polOpen_)
+                if (o.size() == n) o[i] = 0;
+            grownT_[i] = 0;
+            growQN_[i] = 0;
+            growQuiet_[i] = 0;
+            ++reopened_;
+        }
+    }
+    if (texBad_.size() != n) return;
     uint8_t v[64];
     for (size_t i = 0; i < n; ++i) {
         if (!texBad_[i] || mask_[i]) continue;
@@ -554,6 +591,9 @@ void Detector::growMask(const std::vector<FocusArea>& keep) {
                 const int g = ground(x - 1, y) + ground(x + 1, y) + ground(x, y + 1) + ground(x, y - 1);
                 if (g < 2 || (g == 2 && clean(i - tw_))) continue;
                 mask_[i] = 0;
+                if (grownT_.size() != n) grownT_.assign(n, 0);
+                grownT_[i] = 1;
+                if (growQN_.size() == n) growQN_[i] = 0, growQuiet_[i] = 0;
                 // помехи светлые (клочья облака): тайл закрыт только для светлых, тёмные там ищутся
                 if (polGrow && rateD[i] < lim) {
                     if (polOpen_[0].size() != n) polOpen_[0].assign(n, 0);
@@ -632,10 +672,11 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     }
     // перепроверка маски: в этот кадр считаются и тайлы, закрытые по текстуре
     const bool recheck = m && !timing_.partial && cfg_.mask_recheck && cfg_.recheck_every > 0 &&
-                         texBad_.size() == mask_.size() && fn % cfg_.recheck_every == 0;
+                         (texBad_.size() == mask_.size() || grownT_.size() == mask_.size()) && fn % cfg_.recheck_every == 0;
     if (recheck) {
         recheckMask_.assign(m, m + mask_.size());
-        for (size_t i = 0; i < mask_.size(); ++i) recheckMask_[i] |= texBad_[i];
+        for (size_t i = 0; i < mask_.size(); ++i)
+            recheckMask_[i] |= (texBad_.size() == mask_.size() && texBad_[i]) || (grownT_.size() == mask_.size() && grownT_[i]);
         m = recheckMask_.data();
     }
     if (m) stats_->comp.assign(m, m + (size_t)tw_ * th_);
