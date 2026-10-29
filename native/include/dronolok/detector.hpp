@@ -303,7 +303,7 @@ private:
     std::vector<uint16_t> fineN_;
     void updateFine();
     // доращивание маски по помехам: помехи по ячейкам с забыванием, кадров в окне
-    std::vector<float> growCell_, growTex_;
+    std::vector<float> growCell_, growCellD_, growTex_;   // помехи по ячейкам, из них тёмные; текстура
     int growN_ = 0, grown_ = 0;
     void growMask(const std::vector<FocusArea>& keep);
     void resetGrow();
