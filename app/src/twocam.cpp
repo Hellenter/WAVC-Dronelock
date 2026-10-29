@@ -897,6 +897,18 @@ void Emulator::loop() {
                     assignedBody_ = w.truth;
                 } else if (w.id == assigned_ && w.truth && !assignedBody_) {
                     assignedBody_ = w.truth;   // назначили по шуму рядом с целью, теперь трек на ней
+                } else if (w.id == assigned_ && !w.truth && assignedBody_) {
+                    // трек широкой ушёл с цели на пустое место (помеха, облако): цель уже не та
+                    for (const Body& b : bodies_)
+                        if (b.id == assignedBody_) {
+                            double az, el;
+                            azel_from_dir(b.at(t), az, el);
+                            if (ang(az, el, w.rep.az, w.rep.el) > 1.0) {
+                                ++st_.wideSwaps;
+                                event(t, "широкая: трек " + std::to_string(w.id) + " ушёл с цели на помеху");
+                                assignedBody_ = 0;
+                            }
+                        }
                 }
         }
         choose(t);
