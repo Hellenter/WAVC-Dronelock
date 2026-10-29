@@ -127,6 +127,7 @@ struct Result {
     double trackMs = 0, procMs = 0, latencyMs = 0;
     std::vector<uint8_t> mask;
     std::vector<uint8_t> maskDark;  // закрытые маской тайлы, где ищутся тёмные цели (Detector::polarityOpen)
+    std::vector<uint8_t> maskBright;  // ...и светлые
     std::vector<uint8_t> band;      // полоса у горизонта (Detector::horizonBand), пусто — выключена
     std::vector<uint8_t> fineSky;   // ячейки 16x16 неба в тайлах земли (уточнение маски), см. Detector::fineSky
     int cellsPerTile = 0;

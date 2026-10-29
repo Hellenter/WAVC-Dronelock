@@ -1419,9 +1419,19 @@ void tab_algorithm(App& a, bool& changed) {
     help_marker("Облака у солнца дают и светлую, и тёмную текстуру (яркие клочья и голубые просветы между ними), и "
                 "маска закрывала их целиком, как кроны. По цвету кадра такой тайл — небо: не зелёный (листва, трава), "
                 "не темнее открытого неба этой сцены, без глубоких теней (у крон и домов они есть) и не стоит на "
-                "земле. Он остаётся в поиске тёмных целей, а доращивание маски его не закрывает. wt23: неба в поиске "
-                "тёмных целей 69 -> 72%, ложных не больше. Нужно цветное видео; действует со следующего обучения "
-                "маски.");
+                "земле. Он остаётся в поиске целей (по фону своих ячеек, цель подтверждается, когда полетела), а "
+                "доращивание маски его не закрывает. Нужно цветное видео; действует со следующего обучения маски.");
+    if (d.sky_color) {
+        blk |= ImGui::Checkbox("Мягкие облака и у кромки леса", &d.sky_soft);
+        help_marker("Облако, касающееся крон, стоит на земле, и правило выше его не открывало. В облаке яркость меняется "
+                    "плавно: перепад на 1 пиксель — около четверти перепада на 4 (у листвы, веток и леса в дымке — "
+                    "половина и больше). Такой тайл цвета неба — облако и у самой кромки леса, линия горизонта через "
+                    "него не идёт. Гребень дальнего холма в дымке так же мягок, но лежит полосой в один тайл между "
+                    "гладким небом и лесом — он остаётся закрытым.");
+        blk |= ImGui::Checkbox("Облака по цвету — и для светлых целей", &d.sky_bright);
+        help_marker("Выкл.: облако по цвету открыто только для тёмных целей (дрон на фоне облака тёмный), на экране "
+                    "такие тайлы закрашены едва заметно.");
+    }
     blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
     help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
                 "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
@@ -2356,7 +2366,10 @@ void draw_view(App& a, const Result* r) {
         for (int ty = 0; ty < r->tilesY; ++ty)
             for (int tx = 0; tx < r->tilesX; ++tx)
                 if (!r->mask[(size_t)ty * r->tilesX + tx]) {
-                    if (r->maskDark.size() == r->mask.size() && r->maskDark[(size_t)ty * r->tilesX + tx]) {
+                    const size_t ti = (size_t)ty * r->tilesX + tx;
+                    const bool dk = r->maskDark.size() == r->mask.size() && r->maskDark[ti];
+                    if (dk && r->maskBright.size() == r->mask.size() && r->maskBright[ti]) continue;   // облако: ищутся все цели
+                    if (dk) {
                         // облако: закрыто только для светлых целей, тёмные там ищутся — едва заметно
                         dl->AddRectFilled(P((float)tx * r->tilePx, (float)ty * r->tilePx),
                                           P((float)(tx + 1) * r->tilePx, (float)(ty + 1) * r->tilePx), IM_COL32(0, 60, 120, 28));
@@ -2817,6 +2830,8 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-grow-mask") s.det.grow_mask = false;
         else if (a == "--no-mask-recheck") s.det.mask_recheck = false;
         else if (a == "--no-sky-color") s.det.sky_color = false;
+        else if (a == "--no-sky-soft") s.det.sky_soft = false;
+        else if (a == "--no-sky-bright") s.det.sky_bright = false;
         else if (a == "--no-adapt") s.adapt = false;
         else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
         else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());

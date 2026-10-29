@@ -838,7 +838,8 @@ void Pipeline::processLoop() {
             const bool learning = det.learningMask();
             if (maskChecking && !det.verifyingMask()) {   // сверка маски из файла закончилась
                 maskChecking = false;
-                if (det.maskReplaced() && s.useMaskFile()) det.saveMask(maskPath());
+                // и подтверждённую: после сверки маска новая (из файла — только доращенное)
+                if (s.useMaskFile()) det.saveMask(maskPath());
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = det.maskReplaced() ? "сцена изменилась: маска неба выучена заново и сохранена"
                                                 : "маска неба из файла подтверждена";
@@ -876,6 +877,7 @@ void Pipeline::processLoop() {
             r->latencyMs = t3 - p.readyAt;
             r->mask = det.tileMask();
             r->maskDark = det.polarityOpen(0);
+            r->maskBright = det.polarityOpen(1);
             r->fineSky = det.fineSky();
             r->cellsPerTile = det.cellsPerTile();
             r->tilesX = det.tilesX();

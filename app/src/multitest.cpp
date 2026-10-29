@@ -71,6 +71,10 @@ const std::vector<Param>& params() {
         {"sky_green", "Облака по цвету: листва — зелёный выше синего больше доли яркости", "Тонко", false, "0.05, 0.08, 0.12", D(sky_green)},
         {"sky_y", "Облака по цвету: не темнее доли яркости неба", "Тонко", false, "0.6, 0.7, 0.8", D(sky_y)},
         {"sky_dark", "Облака по цвету: 10% самых тёмных точек не темнее доли неба", "Тонко", false, "0.5, 0.6, 0.7", D(sky_dark)},
+        {"sky_soft", "Мягкое облако — облако и у самой кромки леса (линия горизонта через него не идёт)", "Алгоритм", true, "1, 0", D(sky_soft)},
+        {"sky_d4", "Мягкое облако: перепад на 4 пикс. меньше доли яркости", "Тонко", false, "0.06, 0.08, 0.1", D(sky_d4)},
+        {"sky_s14", "Мягкое облако: перепад на 1 пикс. меньше доли перепада на 4", "Тонко", false, "0.28, 0.32, 0.36", D(sky_s14)},
+        {"sky_bright", "Облако по цвету открыто и для светлых целей", "Алгоритм", true, "1, 0", D(sky_bright)},
         {"lock_through", "Цель в захвате ищется и под маской (только продолжение трека)", "Алгоритм", true, "1, 0", D(lock_through)},
         {"lock_through_k", "Под маской: порог выше общего, раз", "Тонко", false, "1.2, 1.5, 2", D(lock_through_k)},
         {"reopen_quiet", "Доросшая маска открывается: тихих замеров не меньше доли (1.01 — никогда)", "Тонко", false, "0.8, 0.9, 1.01", D(reopen_quiet)},
@@ -392,9 +396,10 @@ struct Collector {
         const int64_t idx = r.frame->index;
         if (!r.mask.empty() && idx >= warmup) {   // маска неба после обучения: сколько неба осталось в поиске
             long on = 0, dark = 0;
-            const bool md = r.maskDark.size() == r.mask.size();
+            const bool md = r.maskDark.size() == r.mask.size(), mb = r.maskBright.size() == r.mask.size();
             for (size_t i = 0; i < r.mask.size(); ++i) {
-                on += r.mask[i] != 0;
+                // облако, где ищутся цели обеих полярностей, — небо в поиске
+                on += r.mask[i] != 0 || (md && mb && r.maskDark[i] && r.maskBright[i]);
                 dark += r.mask[i] != 0 || (md && r.maskDark[i]);
             }
             skySum += (double)on / r.mask.size();
