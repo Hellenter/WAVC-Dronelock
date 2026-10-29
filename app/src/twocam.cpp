@@ -9,6 +9,8 @@
 
 namespace twocam {
 
+constexpr double PI = 3.14159265358979323846;
+
 using namespace dronolok;
 
 namespace {
@@ -140,7 +142,7 @@ void Emulator::spawn(Body& b, double t, bool first) {
         break;
     }
     const double sp = b.bird ? 8 + U(rng_) * 6 : c_.speedMin + U(rng_) * (c_.speedMax - c_.speedMin);
-    const double hd = U(rng_) * 2 * M_PI;
+    const double hd = U(rng_) * 2 * PI;
     b.v = {sp * std::cos(hd), sp * std::sin(hd), (U(rng_) * 2 - 1) * (b.bird ? 0.5 : 1.5)};
     b.size = b.bird ? c_.birdSize : c_.droneSize * (float)(0.8 + 0.4 * U(rng_));
     b.flapHz = b.bird ? (float)(4 + U(rng_) * 4) : 0;
@@ -159,14 +161,14 @@ void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t
         double sizePx = rad2deg(b.size / R) / pd;
         double c = (b.bird ? -55.0 : -70.0) * std::exp(-R / c_.visibility);
         if (b.bird) {   // взмахи: силуэт и контраст пульсируют
-            const double fl = std::sin(2 * M_PI * b.flapHz * t + b.phase);
+            const double fl = std::sin(2 * PI * b.flapHz * t + b.phase);
             sizePx *= 0.75 + 0.25 * fl;
             c *= 0.8 + 0.2 * fl;
         }
         const double sx = std::max(0.5, 0.42 * sizePx), sy = std::max(0.5, (b.bird ? 0.3 : 0.55) * sizePx);
         // точка меньше пикселя: та же сумма контраста, размазанная по пятну датчика
         const double area = 0.785 * sizePx * sizePx * (b.bird ? 0.6 : 1.0);
-        const double A = c * std::min(1.0, area / (2 * M_PI * sx * sy));
+        const double A = c * std::min(1.0, area / (2 * PI * sx * sy));
         const int rx = (int)std::ceil(3 * sx), ry = (int)std::ceil(3 * sy);
         const int x0 = std::max(0, (int)u - rx), x1 = std::min(w - 1, (int)u + rx);
         const int y0 = std::max(0, (int)v - ry), y1 = std::min(h - 1, (int)v + ry);
@@ -379,7 +381,7 @@ void Emulator::start(const Config& c) {
     mount_ = Mount();
     mount_.az = c.wideAz;
     mount_.el = c.wideEl;
-    cmdPose_ = {mount_.az, mount_.el, 0};
+    cmdPose_ = {(float)mount_.az, (float)mount_.el, 0};
     ffAz_ = ffEl_ = 0;
     havePrev_ = false;
     state_ = NState::Idle;
