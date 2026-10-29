@@ -446,14 +446,19 @@ bool Detector::skyColorTile(size_t i, float frac) const {
     const float g = -0.1873f * u - 0.4681f * v, r = 1.5748f * v, b = 1.8556f * u;   // минус яркость
     if (g >= r && g - b > cfg_.sky_green * std::max(y, 16.f)) return false;
     if (y < cfg_.sky_y * skyRef_) return false;
-    // точек темнее sky_dark неба — меньше 10% (полоса гистограммы на границе — по доле)
+    return darkShare(i) < 0.1f;   // точек темнее sky_dark неба — меньше 10%
+}
+
+// Доля отсчётов тайла темнее sky_dark неба сцены (полоса гистограммы на границе — по доле)
+float Detector::darkShare(size_t i) const {
+    if (skyRef_ <= 0 || i >= colN_.size() || !colN_[i] || colHist_.size() < (i + 1) * 32) return 0.f;
     const float darkY = cfg_.sky_dark * skyRef_;
     const int db = std::min(32, (int)(darkY / 8.f));
     const uint32_t* h = &colHist_[i * 32];
     float dark = 0;
     for (int k = 0; k < db; ++k) dark += (float)h[k];
     if (db < 32) dark += (float)h[db] * (darkY - 8.f * (float)db) / 8.f;
-    return dark < 0.1f * N;
+    return dark / (float)colN_[i];
 }
 
 // Нужна готовая маска (mask_): облако отделено от земли открытым небом
@@ -493,9 +498,23 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
     std::vector<uint8_t> edgeBad(bad);
     if (cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright && texN_ > 0 && texSumP_[0].size() == bad.size())
         for (size_t i = 0; i < bad.size(); ++i) edgeBad[i] = bad[i] && texSumP_[0][i] / texN_ > cfg_.pol_tex;
-    // мягкое облако (sky_soft) — тоже не земля: облако, касающееся крон, кромку вверх не тянет
+    // мягкое облако (sky_soft) — тоже не земля: облако, касающееся крон, кромку вверх не тянет. Кроме
+    // облака над тёмной верхушкой (sky_tree): первый немягкий текстурный тайл под ним через 1-2
+    // гладких — ближнее дерево, и просвет до него остаётся закрытым
     if (softCol_.size() == bad.size())
-        for (size_t i = 0; i < bad.size(); ++i) edgeBad[i] = edgeBad[i] && !softCol_[i];
+        for (int y = 0; y < th_; ++y)
+            for (int x = 0; x < tw_; ++x) {
+                const size_t i = (size_t)y * tw_ + x;
+                if (!softCol_[i]) continue;
+                bool tree = false;
+                for (int k = 1; k <= 3 && y + k < th_ && cfg_.sky_tree > 0; ++k) {
+                    const size_t j = i + (size_t)k * tw_;
+                    if (softCol_[j] || !bad[j]) continue;
+                    tree = darkShare(j) >= cfg_.sky_tree;
+                    break;
+                }
+                if (!tree) edgeBad[i] = 0;
+            }
     if (cfg_.skyline) {
         std::vector<int> edge(tw_, th_);
         for (int x = 0; x < tw_; ++x) {
