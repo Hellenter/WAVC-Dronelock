@@ -888,6 +888,16 @@ void Emulator::loop() {
         while (!inbox_.empty() && inbox_.front().first <= t + 1e-9) {
             targets_ = std::move(inbox_.front().second);
             inbox_.pop_front();
+            // трек широкой, назначенный точной, перешёл на другое тело (перескок трека у широкой):
+            // точная честно ведёт то, что ей указали, — это ошибка широкой, считаем отдельно
+            for (const auto& w : targets_)
+                if (w.id == assigned_ && w.truth && assignedBody_ && w.truth != assignedBody_) {
+                    ++st_.wideSwaps;
+                    event(t, "широкая: трек " + std::to_string(w.id) + " перескочил на другую цель");
+                    assignedBody_ = w.truth;
+                } else if (w.id == assigned_ && w.truth && !assignedBody_) {
+                    assignedBody_ = w.truth;   // назначили по шуму рядом с целью, теперь трек на ней
+                }
         }
         choose(t);
         stepNarrow(t, dtN);
@@ -1018,8 +1028,8 @@ int run_cli(int argc, char** argv) {
            s.acqN ? s.acqSum / s.acqN : 0);
     printf("ведёт цель %.0f%% времени, из них на назначенной %.0f%%\n", 100 * s.trackTime / T,
            s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0);
-    printf("нечего вести %.0f%% времени, назначена ложная цель широкой %.0f%%; точная не подтвердила целей: %d\n",
-           100 * s.idleTime / T, 100 * s.falseTarget / T, s.unconfirmed);
+    printf("нечего вести %.0f%% времени, назначена ложная цель широкой %.0f%%; точная не подтвердила целей: %d; перескоков трека у широкой: %d\n",
+           100 * s.idleTime / T, 100 * s.falseTarget / T, s.unconfirmed, s.wideSwaps);
     printf("ошибка: захват точной %.3f° (90%% %.3f°, %.1f пикс. точной), ось %.3f° (90%% %.3f°), широкая %.3f° (90%% %.3f°)\n",
            lm, l9, lm / nPd, am, a9, wm, w9);
     printf("обработка: широкая %.1f мс/кадр, точная %.2f мс/кадр; отрисовка широкой %.1f, точной %.1f мс/кадр\n",
@@ -1031,11 +1041,11 @@ int run_cli(int argc, char** argv) {
                     "{\"sim_s\": %.2f, \"assignments\": %d, \"acquired\": %d, \"wrong_locks\": %d, \"losses\": %d,\n"
                     " \"slew_s\": %.3f, \"acquire_s\": %.3f, \"track_pct\": %.2f, \"track_correct_pct\": %.2f,\n"
                     " \"err_lock_deg\": [%.4f, %.4f], \"err_axis_deg\": [%.4f, %.4f], \"err_wide_deg\": [%.4f, %.4f],\n"
-                    " \"unconfirmed\": %d, \"idle_pct\": %.2f, \"false_target_pct\": %.2f, \"wide_ms\": %.2f, \"narrow_ms\": %.3f}\n",
+                    " \"unconfirmed\": %d, \"wide_swaps\": %d, \"idle_pct\": %.2f, \"false_target_pct\": %.2f, \"wide_ms\": %.2f, \"narrow_ms\": %.3f}\n",
                     s.simT, s.assignments, s.acquired, s.wrongLocks, s.losses, s.slewN ? s.slewSum / s.slewN : 0,
                     s.acqN ? s.acqSum / s.acqN : 0, 100 * s.trackTime / T,
                     s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0, lm, l9, am, a9, wm, w9,
-                    s.unconfirmed, 100 * s.idleTime / T, 100 * s.falseTarget / T, s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0);
+                    s.unconfirmed, s.wideSwaps, 100 * s.idleTime / T, 100 * s.falseTarget / T, s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0);
             fclose(f);
         }
     }
