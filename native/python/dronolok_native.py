@@ -70,7 +70,6 @@ def _load():
     lib.dl_mask_begin.argtypes = [C.c_void_p]
     lib.dl_mask_end.argtypes = [C.c_void_p, C.c_float]
     lib.dl_mask_get.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.POINTER(C.c_int), C.POINTER(C.c_int)]
-    lib.dl_detector_set_color.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p] + [C.c_int] * 5
     lib.dl_tracker_create.restype = C.c_void_p
     lib.dl_tracker_create.argtypes = [C.c_int, C.c_int]
     lib.dl_tracker_destroy.argtypes = [C.c_void_p]
@@ -156,23 +155,10 @@ class NativePointDetector:
         a = (C.c_float * (3 * max(1, len(areas))))(*[v for xyr in areas for v in xyr])
         lib().dl_detector_set_focus(self._h, a, len(areas))
 
-    def set_color(self, u, v, step=2):
-        """Цвет следующего кадра: плоскости U и V (uint8, полный диапазон, 128 — серый), отсчёт на блок
-        step x step пикс. (yuv420p — 2). Нужен только в кадры обучения маски: облака у солнца маска не
-        закрывает, как кроны (здесь пока только перепроверка маски не открывает зелень, см. dronolok.h)"""
-        self._col = [np.ascontiguousarray(p, dtype=np.uint8) for p in (u, v)]   # живы до detect()
-        cu, cv = self._col
-        lib().dl_detector_set_color(self._h, cu.ctypes.data, cv.ctypes.data, cu.shape[1], cu.shape[0],
-                                    cu.strides[0], step, 1)
-
-    def learn_mask(self, frames, frac=0.3, colors=None):
-        """colors — [(u, v)] к кадрам frames (см. set_color) или None"""
+    def learn_mask(self, frames, frac=0.3):
         L = lib()
         L.dl_mask_begin(self._h)
-        for i, f in enumerate(frames):
-            if colors is not None:
-                u, v = colors[i]
-                self.set_color(u, v, max(1, round(f.shape[1] / u.shape[1])))
+        for f in frames:
             self.detect(f)
         L.dl_mask_end(self._h, frac)
         tw, th = C.c_int(), C.c_int()

@@ -107,13 +107,6 @@ int dl_mask_get(dl_detector* d, uint8_t* out, int cap, int* tw, int* th) {
     return (int)m.size();
 }
 
-void dl_detector_set_color(dl_detector* d, const uint8_t* u, const uint8_t* v, int cw, int ch, int stride, int step,
-                           int pix) {
-    if (!d) return;
-    if (!u || !v) u = v = nullptr;
-    d->det.setColor(u, v, cw, ch, stride, step, pix);
-}
-
 int dl_hardware_threads(void) { return hardware_threads(); }
 
 int dl_available_isas(int* out, int cap) {
