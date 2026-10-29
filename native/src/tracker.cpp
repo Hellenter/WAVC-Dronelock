@@ -74,6 +74,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     // низкие частоты, на их период нужно несколько секунд
     c.flap_window = c.flap_window > 0 ? std::min(64, std::max(32, (int)std::lround(c.flap_window * t))) : 0;
     c.verify_frames = frames(c.verify_frames, std::max(1, c.verify_min));
+    c.drift_obs = std::min(40, frames(c.drift_obs, 8));
     c.lock_dwell = frames(c.lock_dwell, 3);
     c.hard_miss = frames(c.hard_miss, 6);
     c.hard_full_every = frames(c.hard_full_every, 1);
@@ -927,14 +928,15 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // предметы), сглаженная; учитывается, пока быстрее drift_min (с запасом на выход)
     if (cfg_.drift_min > 0) {
         std::vector<float> vx, vy;
-        // скорость трека — по его последним 8 попаданиям (у фильтра Калмана она скачет от квантования
-        // положения отклика)
+        // скорость трека — по его последним drift_obs попаданиям (у фильтра Калмана она скачет от
+        // квантования положения отклика)
+        const size_t W = (size_t)std::max(2, cfg_.drift_obs);
         if (!camKnown)
             for (const Track& t : tracks_) {
                 if (t.hits < cfg_.cls_min_hits || t.miss != 0 || t.followed || t.overlay || (hard_ && t.id == lockId_) ||
-                    t.obs.size() < 8)
+                    t.obs.size() < W)
                     continue;
-                const auto& a = t.obs[t.obs.size() - 8];
+                const auto& a = t.obs[t.obs.size() - W];
                 const auto& b = t.obs.back();
                 if (b.t <= a.t) continue;
                 vx.push_back((b.x - a.x) / (float)(b.t - a.t));
