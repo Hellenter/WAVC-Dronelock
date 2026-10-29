@@ -210,10 +210,12 @@ void Detector::beginMaskLearning() {
     learning_ = true;
     texSum_.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
+    resetGrow();
 }
 
 void Detector::endMaskLearning(float frac) {
     learning_ = false;
+    resetGrow();
     std::vector<uint8_t> m;
     buildMask(frac, m);
     if (!m.empty()) mask_.swap(m);
@@ -312,6 +314,7 @@ bool Detector::loadMask(const std::string& path, int verify) {
     verifyLeft_ = std::max(0, verify);
     texSum_.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
+    resetGrow();
     return true;
 }
 
@@ -325,6 +328,113 @@ void Detector::clearMask() {
     mask_.clear();
     learning_ = false;
     verifyLeft_ = 0;
+    resetGrow();
+}
+
+void Detector::resetGrow() {
+    growCell_.clear();
+    growTex_.clear();
+    growN_ = 0;
+    grown_ = 0;
+}
+
+// Доращивание маски по помехам (DetectorConfig::grow_mask): помехи копятся по ячейкам с
+// забыванием за ~grow_frames кадров, раз в четверть окна тайлы неба перепроверяются
+void Detector::noteClutter(const std::vector<Candidate>& clutter, const std::vector<FocusArea>& keep) {
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt, cth = th_ * cpt;
+    if (!cfg_.grow_mask || learning_ || verifyLeft_ || cfg_.tile % CELL || mask_.size() != (size_t)tw_ * th_) {
+        if (!growCell_.empty()) growCell_.clear(), growTex_.clear(), growN_ = 0;
+        return;
+    }
+    const size_t nc = (size_t)ctw * cth, n = (size_t)tw_ * th_;
+    if (growCell_.size() != nc || growTex_.size() != n) {
+        growCell_.assign(nc, 0.f);
+        growTex_.assign(n, 0.f);
+        growN_ = 0;
+    }
+    const int W = std::max(10, cfg_.grow_frames);
+    const float k = 1.f - 1.f / (float)W;
+    for (float& v : growCell_) v *= k;
+    // как часто тайл текстурный: дальняя трава и поле — иногда, чистое небо — почти никогда
+    const auto& t0 = stats_->tex[0];
+    const auto& t1 = stats_->tex[1];
+    for (size_t i = 0; i < n; ++i) {
+        const bool t = (t0.size() == n && t0[i]) || (t1.size() == n && t1[i]);
+        growTex_[i] = k * growTex_[i] + (t ? 1.f / (float)W : 0.f);
+    }
+    const float cpx = (float)(CELL * cfg_.pool);
+    for (const Candidate& c : clutter) {
+        const int cx = (int)(c.x / cpx), cy = (int)(c.y / cpx);
+        if (cx >= 0 && cx < ctw && cy >= 0 && cy < cth) growCell_[(size_t)cy * ctw + cx] += 1.f;
+    }
+    ++growN_;
+    if (growN_ >= W && growN_ % std::max(1, W / 4) == 0) growMask(keep);
+}
+
+void Detector::growMask(const std::vector<FocusArea>& keep) {
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt;
+    const size_t n = (size_t)tw_ * th_;
+    const float W = (float)std::max(10, cfg_.grow_frames);
+    std::vector<float> rate(n, 0.f);
+    std::vector<uint8_t> cells(n, 0), cand(n, 0);
+    double sum = 0;
+    int sky = 0;
+    for (int ty = 0; ty < th_; ++ty)
+        for (int tx = 0; tx < tw_; ++tx) {
+            const size_t i = (size_t)ty * tw_ + tx;
+            if (!mask_[i]) continue;
+            float r = 0;
+            int c = 0;
+            for (int cy = ty * cpt; cy < (ty + 1) * cpt; ++cy)
+                for (int cx = tx * cpt; cx < (tx + 1) * cpt; ++cx) {
+                    const float v = growCell_[(size_t)cy * ctw + cx];
+                    r += v;
+                    c += v > 0.5f;
+                }
+            rate[i] = r / W;
+            cells[i] = (uint8_t)std::min(255, c);
+            sum += rate[i];
+            ++sky;
+        }
+    if (!sky) return;
+    // помех на тайл неба в среднем по сцене: в чистом небе их почти нет, в дыре маски — десятки
+    const float lim = std::max(cfg_.grow_k * (float)(sum / sky), cfg_.grow_min);
+    const int tilePx = cfg_.tile * cfg_.pool;
+    for (size_t i = 0; i < n; ++i) cand[i] = mask_[i] && rate[i] >= lim && cells[i] >= cfg_.grow_cells;
+    for (const FocusArea& a : keep) {   // вокруг цели маска не растёт
+        const int x0 = std::max(0, (int)std::floor((a.x - a.r) / tilePx)), x1 = std::min(tw_ - 1, (int)std::floor((a.x + a.r) / tilePx));
+        const int y0 = std::max(0, (int)std::floor((a.y - a.r) / tilePx)), y1 = std::min(th_ - 1, (int)std::floor((a.y + a.r) / tilePx));
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x) cand[(size_t)y * tw_ + x] = 0;
+    }
+    // прирастает к маске: земля хотя бы у двух соседей (край кадра слева, справа и снизу —
+    // тоже), и над тайлом не чистое небо (земля или такой же тайл с помехами). Ряд тайлов над
+    // ровной кромкой крон соседа-землю имеет одного — снизу, и не закрывается
+    auto ground = [&](int x, int y) {
+        if (y < 0) return false;
+        if (x < 0 || x >= tw_ || y >= th_) return true;
+        return mask_[(size_t)y * tw_ + x] == 0;
+    };
+    // чистое небо: помех мало и текстуры почти не бывает
+    auto clean = [&](size_t j) { return mask_[j] && !cand[j] && rate[j] < lim && growTex_[j] < cfg_.grow_sky_tex; };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int y = 1; y < th_; ++y)
+            for (int x = 0; x < tw_; ++x) {
+                const size_t i = (size_t)y * tw_ + x;
+                if (!cand[i]) continue;
+                const int g = ground(x - 1, y) + ground(x + 1, y) + ground(x, y + 1) + ground(x, y - 1);
+                if (g < 2 || (g == 2 && clean(i - tw_))) continue;
+                mask_[i] = 0;
+                if (fineBase_.size() == n) fineBase_[i] = 0;   // уточнение по ячейкам у кромки не сбрасываем
+                cand[i] = 0;
+                ++grown_;
+                changed = true;
+                for (int cy = y * cpt; cy < (y + 1) * cpt; ++cy)
+                    std::fill_n(&growCell_[(size_t)cy * ctw + x * cpt], cpt, 0.f);
+            }
+    }
 }
 
 void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector<Candidate>& out) {
@@ -455,7 +565,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     }
     const double t1 = now_ms();
     if (cfg_.zones) computeZones();
-    else zones_.clear();
+    else zones_.clear(), zoneHist_.clear();
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
@@ -582,6 +692,9 @@ void Detector::updateNoise() {
 // Зоны по тайлам основного масштаба (см. DetectorConfig::zones)
 void Detector::computeZones() {
     const size_t n = (size_t)tw_ * th_;
+    // кадр между полными просмотрами: посчитаны только тайлы вокруг треков, остальные выглядели
+    // бы гладкими — небом. Зоны остаются с последнего полного кадра
+    if (timing_.partial && zones_.size() == n && zoneHist_.size() == n) return;
     zones_.assign(n, 0);
     if (!n) return;
     const uint32_t area = (uint32_t)(cfg_.tile * cfg_.tile);
@@ -615,6 +728,20 @@ void Detector::computeZones() {
         }
         if ((int)fill_.size() >= minGround)
             for (int i : fill_) zones_[i] = 0;
+    }
+    // земля — по большинству из трёх последних полных кадров: тайл на краю кроны или облака,
+    // который через кадр то земля, то небо, не мигает (cfg_.zone_vote). Новая сетка — с этого кадра
+    if (zoneHist_.size() != n) zoneHist_.assign(n, 0x80);
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t g = zones_[i] == 0, h = zoneHist_[i];
+        if (!cfg_.zone_vote || (h & 0x80)) {   // истории ещё нет: как в этом кадре
+            zoneHist_[i] = (uint8_t)(g * 7);
+            continue;
+        }
+        const uint8_t nh = (uint8_t)(((h << 1) | g) & 7);
+        zoneHist_[i] = nh;
+        const int votes = cfg_.zone_vote == 1 ? ((nh & 1) + ((nh >> 1) & 1) + ((nh >> 2) & 1)) / 2 : (nh & 3) != 0;
+        zones_[i] = votes ? 0 : 2;
     }
     // смешанные: небо, у которого в 8-окрестности есть земля
     for (int y = 0; y < th_; ++y)

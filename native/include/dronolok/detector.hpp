@@ -60,6 +60,10 @@ struct DetectorConfig {
     // подтверждается, только когда сдвинулась (Tracker). Считается каждый кадр, поэтому
     // годится и для съёмки с рук; для неподвижной камеры землю и так убирает маска неба.
     bool zones = false;
+    // Земля в зонах по нескольким кадрам: 1 — большинство из трёх последних полных кадров, 2 —
+    // земля держится ещё кадр. Мигание на wt18 2.2 -> 1.4 тайла за кадр (2), ложных целей на кадр
+    // wt15/wt17 -10%, но захват на дроне wt18 87 -> 83% (1 — хуже): по умолчанию выключено
+    int zone_vote = 0;
     float mixed_k = 1.f;        // на ваших роликах главное — правило "подтверждать, когда полетела", порог можно не поднимать
     int coarse_every = 2;       // крупная цель за кадр смещается мало, а грубые масштабы недёшевы
     // --- Неподвижная камера: ячейки 16x16 пикс. кадра (8x8 после пулинга) ---
@@ -92,6 +96,20 @@ struct DetectorConfig {
     bool fine_mask = true;
     int fine_frames = 150;
     float fine_tex = 0.05f;
+    // Маска дорастает там, где копятся помехи (неподвижная камера, noteClutter): тайл неба,
+    // где за ~grow_frames кадров помех (отклики на месте, Tracker::clutterDets) в grow_k раз
+    // больше среднего по небу этой сцены, не меньше grow_min на кадр и хотя бы в grow_cells
+    // разных ячейках 16x16 (одна точка — может быть зависший дрон), закрывается — но только
+    // если прирастает к маске: земля хотя бы с трёх сторон (края кадра слева, справа, снизу —
+    // тоже земля), или с двух и над ним не чистое небо (помех мало, текстура реже grow_sky_tex
+    // кадров). Так закрываются дыры в поле и траве у горизонта, а ряд над кромкой крон и крыш,
+    // где сосед-земля один (снизу), остаётся открытым — там и появляется дрон.
+    bool grow_mask = true;
+    int grow_frames = 60;
+    float grow_k = 3.f;
+    float grow_min = 0.1f;
+    int grow_cells = 2;
+    float grow_sky_tex = 0.02f;   // чистое небо: текстурный реже такой доли кадров
     int bg_frames = 250;
     // Накопление слабой цели по кадрам (track-before-detect на ячейках, фон ячеек тогда
     // учится по всему небу): A = tbd_decay * max3x3(A) + max(0, z - tbd_z0), z — превышение
@@ -196,6 +214,12 @@ public:
     bool loadMask(const std::string& path, int verify = 25);
     bool verifyingMask() const { return verifyLeft_ > 0; }
     bool maskReplaced() const { return maskReplaced_; }
+    // Помехи этого кадра (Tracker::clutterDets, пиксели кадра) для доращивания маски
+    // (DetectorConfig::grow_mask); keep — области, где маска не растёт (цель в захвате).
+    // Вызывать после detect, только пока камера неподвижна. Число тайлов, закрытых так с
+    // начала маски, — maskGrown(); растёт — маску стоит сохранить заново.
+    void noteClutter(const std::vector<Candidate>& clutter, const std::vector<FocusArea>& keep);
+    int maskGrown() const { return grown_; }
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
@@ -252,6 +276,11 @@ private:
     std::vector<float> fineTex_;
     std::vector<uint16_t> fineN_;
     void updateFine();
+    // доращивание маски по помехам: помехи по ячейкам с забыванием, кадров в окне
+    std::vector<float> growCell_, growTex_;
+    int growN_ = 0, grown_ = 0;
+    void growMask(const std::vector<FocusArea>& keep);
+    void resetGrow();
 public:
     // тайлы полосы у горизонта (tilesY x tilesX, 1 — полоса), пусто — выключено или нет маски
     const std::vector<uint8_t>& horizonBand() const { return band_; }
@@ -269,7 +298,7 @@ public:
 private:
     void buildMask(float frac, std::vector<uint8_t>& out) const;
     std::vector<FocusArea> focus_, roi_;
-    std::vector<uint8_t> focusTiles_, roiMask_, zones_;
+    std::vector<uint8_t> focusTiles_, roiMask_, zones_, zoneHist_;
     std::vector<int> fill_;
     void computeZones();
     long frameNo_ = 0;

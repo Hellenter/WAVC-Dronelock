@@ -442,10 +442,11 @@ void Pipeline::processLoop() {
     LoadGovernor gov;
     SceneAnalyzer scene;
     std::string sceneWhy;
-    std::vector<FocusArea> focus, roi;
+    std::vector<FocusArea> focus, roi, keepGrow;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
+    int grownSaved = 0;   // тайлов маски, доросших по помехам, на момент сохранения в файл
     bool maskOn = false, motionWas = false, maskChecking = false;
     bool relearnMoved = false;   // маска учится заново после плавного поворота камеры (панорамы)
     // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
@@ -781,6 +782,19 @@ void Pipeline::processLoop() {
             }
             const double t1 = now_ms();
             const auto& tracks = trk->update(cands, me.dx, me.dy);
+            // маска дорастает там, где копятся помехи (неподвижная камера); у цели в захвате — нет
+            if (!camMoves && maskOn && !det.learningMask()) {
+                keepGrow.clear();
+                for (const auto& t : tracks)
+                    if (t.id == trk->lockedId() || (t.everLocked && !t.clutter)) keepGrow.push_back(FocusArea{t.x, t.y, 64.f});
+                det.noteClutter(trk->clutterDets(), keepGrow);
+                // доросшую маску — в файл, раз в несколько закрытых тайлов
+                if (s.useMaskFile() && det.maskGrown() >= grownSaved + 4) {
+                    grownSaved = det.maskGrown();
+                    det.saveMask(maskPath());
+                }
+            }
+            if (det.maskGrown() < grownSaved) grownSaved = 0;   // маска учится заново
             if (const int lc = lockCmd_.exchange(0)) {   // оператор выбрал цель из очереди
                 if (lc < 0) trk->nextLock();
                 else trk->selectLock(lc);

@@ -575,6 +575,55 @@ static void test_stationary() {
     std::printf("stationary camera (mask file, per_tile, fps): ok\n");
 }
 
+// Маска дорастает по помехам: дыра в земле, где копятся помехи, закрывается; ряд неба над
+// кромкой земли с теми же помехами — нет; вокруг цели в захвате — тоже нет
+static void test_grow_mask() {
+    const int w = 640, h = 480, T = 64;   // тайлы 10 x 7
+    auto frame = [&](unsigned seed) {
+        auto f = ground_frame(w, h, 0.6f, seed);
+        for (int y = 6 * T; y < 7 * T; ++y)   // гладкая "поляна" внизу кадра — дыра в маске
+            for (int x = 5 * T; x < 6 * T; ++x) f[(size_t)y * w + x] = 170;
+        return f;
+    };
+    auto points = [&](int tx, int ty) {   // помехи в трёх ячейках тайла
+        std::vector<Candidate> v;
+        for (int k = 0; k < 3; ++k) v.push_back(Candidate{tx * T + 8.f + 20 * k, ty * T + 8.f + 16 * k, 20, 3, -1});
+        return v;
+    };
+    for (int variant = 0; variant < 3; ++variant) {
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.skyline = false;   // иначе дыру внизу закрыла бы линия горизонта
+        cfg.grow_mask = variant != 2;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(frame(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        const auto m0 = d.tileMask();
+        const int tw = d.tilesX();
+        CHECK(m0[6 * tw + 5] && !m0[5 * tw + 5] && !m0[6 * tw + 4] && !m0[6 * tw + 6] && m0[3 * tw + 2] && !m0[5 * tw + 2],
+              "grow mask: learned mask (hole, edge)");
+        // помехи в дыре и в ряду неба над кромкой земли (над ним чистое небо)
+        std::vector<Candidate> cl = points(5, 6), top = points(2, 3);
+        cl.insert(cl.end(), top.begin(), top.end());
+        const std::vector<FocusArea> keep = variant == 1 ? std::vector<FocusArea>{FocusArea{5.5f * T, 6.5f * T, 10}}
+                                                         : std::vector<FocusArea>{};
+        for (int i = 0; i < 90; ++i) {
+            d.detect(frame(100 + i).data(), w, h, w, c);
+            d.noteClutter(cl, keep);
+        }
+        const auto& m = d.tileMask();
+        const bool hole = !m[6 * tw + 5], edge = !m[3 * tw + 2];
+        CHECK(hole == (variant == 0) && !edge && d.maskGrown() == (variant == 0 ? 1 : 0),
+              "grow mask variant %d: hole %d, edge %d, grown %d", variant, (int)hole, (int)edge, d.maskGrown());
+        size_t diff = 0;
+        for (size_t i = 0; i < m.size(); ++i) diff += m[i] != m0[i];
+        CHECK(diff == (variant == 0 ? 1u : 0u), "grow mask variant %d: %zu tiles changed", variant, diff);
+    }
+    std::printf("mask grows where clutter piles up: ok\n");
+}
+
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
 // поверх кадра (неподвижные точки исключаются из оценки) и с повтором кадра
 static void test_motion() {
@@ -775,6 +824,7 @@ int main() {
     test_follow();
     test_governor();
     test_stationary();
+    test_grow_mask();
     test_scene();
     test_motion();
     test_bad_files();
