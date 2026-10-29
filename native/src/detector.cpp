@@ -293,7 +293,6 @@ void Detector::resetColor() {
     colHist_.clear();
     colN_.clear();
     skyCol_.clear();
-    green_.clear();
 }
 
 // Яркость и цвет тайлов для облаков по цвету (sky_color): 8x8 отсчётов на тайл, в центрах его
@@ -344,7 +343,6 @@ void Detector::sampleColor(const uint8_t* gray, int stride) {
 // краем кадра через гладкие. Нужна готовая маска (mask_): облако отделено от земли открытым небом
 void Detector::markSkyColor(float frac) {
     skyCol_.clear();
-    green_.clear();
     const size_t n = (size_t)tw_ * th_;
     const int nt = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
     if (!cfg_.sky_color || nt == 0 || texSum_.size() != n || colN_.size() != n || mask_.size() != n) return;
@@ -358,13 +356,11 @@ void Detector::markSkyColor(float frac) {
     if (colored * 20 < all) return;
     // зелень (BT.709): зелёный выше и красного, и заметно выше синего — листва, трава. Голубое,
     // серое, белое и жёлтое небо, облака и тёплый свет солнца на них — нет
-    green_.assign(n, 0);
-    for (size_t i = 0; i < n; ++i) {
-        if (!colN_[i]) continue;
+    auto green = [&](size_t i) {
         const float N = (float)colN_[i], y = colY_[i] / N, u = colU0_[i] / N, v = colV0_[i] / N;
         const float g = -0.1873f * u - 0.4681f * v, r = 1.5748f * v, b = 1.8556f * u;   // минус яркость
-        green_[i] = g >= r && g - b > cfg_.sky_green * std::max(y, 16.f);
-    }
+        return g >= r && g - b > cfg_.sky_green * std::max(y, 16.f);
+    };
     auto smooth = [&](size_t i) { return colN_[i] > 0 && texSum_[i] / nt <= frac; };
     std::vector<uint8_t> sky(n, 0);
     fill_.clear();
@@ -390,7 +386,7 @@ void Detector::markSkyColor(float frac) {
     const float darkY = cfg_.sky_dark * ref;
     const int db = std::min(32, (int)(darkY / 8.f));
     for (size_t i = 0; i < n; ++i) {
-        if (mask_[i] || !colN_[i] || green_[i] || texSum_[i] / nt <= frac) continue;
+        if (mask_[i] || !colN_[i] || texSum_[i] / nt <= frac || green(i)) continue;
         const float N = (float)colN_[i];
         if (colY_[i] / N < cfg_.sky_y * ref) continue;
         // точек темнее sky_dark неба — меньше 10% (полоса гистограммы на границе — по доле)
@@ -614,15 +610,12 @@ void Detector::updateRecheck() {
         recheckTex_[i] += std::max(a, 1.f / (float)recheckN_[i]) * ((strong ? 1.f : 0.f) - recheckTex_[i]);
     }
     // открываем только выше самой верхней "сильной" земли столбца: гладкая трава под кромкой
-    // леса тоже слаба, но она земля (её закрыла линия горизонта или своя текстура). Зелёное по цвету
-    // (sky_color) — кроны и трава, а не облако, как бы слаб ни был отклик: тоже земля
+    // леса тоже слаба, но она земля (её закрыла линия горизонта или своя текстура)
     for (int x = 0; x < tw_; ++x) {
         int top = th_;
         for (int y = 0; y < th_ && top == th_; ++y) {
             const size_t i = (size_t)y * tw_ + x;
-            if (!mask_[i] && (!texBad_[i] || recheckN_[i] < need || recheckTex_[i] >= cfg_.recheck_tex ||
-                              (green_.size() == n && green_[i])))
-                top = y;
+            if (!mask_[i] && (!texBad_[i] || recheckN_[i] < need || recheckTex_[i] >= cfg_.recheck_tex)) top = y;
         }
         for (int y = 0; y < top; ++y) {
             const size_t i = (size_t)y * tw_ + x;

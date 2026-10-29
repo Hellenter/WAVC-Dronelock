@@ -149,9 +149,8 @@ struct DetectorConfig {
     // крон, лес в дымке у горизонта). Такой тайл при обучении маски — облако: закрыт только для
     // светлых целей, тёмные ищутся по фону ячеек (как pol_mask), но не ниже медианы ячейки + bg_k
     // уровней отклика (у кромки облака разброс фона почти нулевой, и без этого её блик — цель).
-    // Доращивание облако не закрывает и землёй не считает, mask_recheck может открыть целиком;
-    // зелёный тайл mask_recheck не открывает — это кроны и трава. Цвета нет (серая камера,
-    // gray-видео) — как раньше
+    // Доращивание облако не закрывает и землёй не считает, mask_recheck может открыть целиком.
+    // Цвета нет (серая камера, gray-видео) — как раньше. Нужен фон по ячейкам (bg_map)
     bool sky_color = true;
     float sky_green = 0.08f, sky_y = 0.7f, sky_dark = 0.6f;
     // Цель в захвате, залетевшая под маску (облако, кромка): в круге прогноза её трека
@@ -381,7 +380,7 @@ private:
     int colW_ = 0, colH_ = 0, colStride_ = 0, colStep_ = 0, colPix_ = 1;
     std::vector<float> colY_, colU0_, colV0_;
     std::vector<uint32_t> colHist_, colN_;
-    std::vector<uint8_t> skyCol_, green_;   // ...и зелёные по цвету тайлы (листва, трава)
+    std::vector<uint8_t> skyCol_;
     void sampleColor(const uint8_t* gray, int stride);
     void markSkyColor(float frac);
     void resetColor();
