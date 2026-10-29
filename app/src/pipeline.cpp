@@ -446,7 +446,7 @@ void Pipeline::processLoop() {
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
-    int grownSaved = 0;   // тайлов маски, доросших по помехам, на момент сохранения в файл
+    int grownSaved = 0;   // тайлов маски, доросших и открытых, на момент сохранения в файл
     bool maskOn = false, motionWas = false, maskChecking = false;
     bool relearnMoved = false;   // маска учится заново после плавного поворота камеры (панорамы)
     // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
@@ -788,13 +788,13 @@ void Pipeline::processLoop() {
                 for (const auto& t : tracks)
                     if (t.id == trk->lockedId() || (t.everLocked && !t.clutter)) keepGrow.push_back(FocusArea{t.x, t.y, 64.f});
                 det.noteClutter(trk->clutterDets(), keepGrow);
-                // доросшую маску — в файл, раз в несколько закрытых тайлов
-                if (s.useMaskFile() && det.maskGrown() >= grownSaved + 4) {
-                    grownSaved = det.maskGrown();
+                // доросшую и перепроверенную маску — в файл, раз в несколько изменённых тайлов
+                if (s.useMaskFile() && det.maskGrown() + det.maskOpened() >= grownSaved + 4) {
+                    grownSaved = det.maskGrown() + det.maskOpened();
                     det.saveMask(maskPath());
                 }
             }
-            if (det.maskGrown() < grownSaved) grownSaved = 0;   // маска учится заново
+            if (det.maskGrown() + det.maskOpened() < grownSaved) grownSaved = 0;   // маска учится заново
             if (const int lc = lockCmd_.exchange(0)) {   // оператор выбрал цель из очереди
                 if (lc < 0) trk->nextLock();
                 else trk->selectLock(lc);
@@ -865,6 +865,7 @@ void Pipeline::processLoop() {
             r->tilesY = det.tilesY();
             r->tilePx = det.tileSizePx();
             r->zones = det.zones();
+            r->band = det.horizonBand();
             r->learning = learning;
             r->seq = ++seq;
             r->lockId = trk->lockedId();

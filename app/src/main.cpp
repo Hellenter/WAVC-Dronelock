@@ -124,7 +124,7 @@ struct App {
     int cpuCap = 100, priority = 0, resIdx = 0;
     // отображение
     bool showNoise = true, showClutter = true, showTracks = true, showPaths = true, showIds = true;
-    bool showMask = false, showGt = true, showCrops = true, showPred = true, showFocus = false;
+    bool showMask = false, showUpper = false, showGt = true, showCrops = true, showPred = true, showFocus = false;
     int viewSeq = -1;      // кадр из истории на паузе (Result::seq), -1 — последний обработанный
     // разметка целей
     bool annotate = false;
@@ -1399,6 +1399,11 @@ void tab_algorithm(App& a, bool& changed) {
                 "закрывается, если прирастает к маске: земля хотя бы с двух сторон и над ним не чистое небо. "
                 "Ряд тайлов над кромкой крон и крыш так не закрывается, вокруг захваченной цели тоже. Только "
                 "для неподвижной камеры.");
+    blk |= ImGui::Checkbox("Маска открывает облака", &d.mask_recheck);
+    help_marker("Облака с рваной кромкой при обучении текстурны, как кроны, и маска закрывала их — в облачную "
+                "погоду до половины неба. Закрытые так тайлы раз в 10 кадров перепроверяются: у кроны и крыши "
+                "отклик сильный по всему тайлу, у облака слабый. Слабый тайл, выше которого в столбце нет земли, "
+                "за несколько секунд открывается; цель в нём подтверждается, только когда полетела.");
     blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
     help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
                 "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
@@ -1635,6 +1640,11 @@ void tab_view(App& a) {
         item("шум", &a.showNoise);
         item("помехи", &a.showClutter);
         item("маска неба и зоны", &a.showMask);
+        item("менее важное небо", &a.showUpper,
+             "Фиолетовым — небо, где дрон бывает реже: дальний дрон держится низко над горизонтом, а верх неба "
+             "нужен только близкой, крупной цели. С полосой у горизонта (вкладка «Алгоритм») это небо выше полосы, "
+             "его детектор смотрит раз в несколько кадров; без полосы — верхняя половина неба над землёй в каждом "
+             "столбце, она смотрится каждый кадр, подсветка только показывает, где это.");
         item("пониженный порог", &a.showFocus);
         item("разметка (.gt.json)", &a.showGt);
         item("вырезки целей", &a.showCrops);
@@ -2346,6 +2356,23 @@ void draw_view(App& a, const Result* r) {
                                 dl->AddRectFilled(P(cx * c, cy * c), P((cx + 1) * c, (cy + 1) * c), IM_COL32(0, 60, 120, 90));
                 }
     }
+    if (a.showUpper && r->tilesX > 0 && r->tilesY > 0) {   // менее важное небо — фиолетовым
+        const int tw = r->tilesX, th = r->tilesY;
+        const size_t n = (size_t)tw * th;
+        const bool m = r->mask.size() == n, z = r->zones.size() == n, b = r->band.size() == n;
+        auto ground = [&](size_t i) { return m ? !r->mask[i] : z && r->zones[i] == 0; };
+        if (m || z)
+            for (int x = 0; x < tw; ++x) {
+                int hy = th;   // верх земли, связанной с низом кадра, в этом столбце
+                while (hy > 0 && ground((size_t)(hy - 1) * tw + x)) --hy;
+                for (int y = 0; y < hy; ++y) {
+                    const size_t i = (size_t)y * tw + x;
+                    if (ground(i) || (b ? r->band[i] != 0 : 2 * y >= hy)) continue;
+                    dl->AddRectFilled(P((float)x * r->tilePx, (float)y * r->tilePx),
+                                      P((float)(x + 1) * r->tilePx, (float)(y + 1) * r->tilePx), IM_COL32(150, 60, 220, 60));
+                }
+            }
+    }
     if (a.showNoise)
         for (const auto& c : r->noise) dl->AddCircleFilled(P(c.x, c.y), 2.f, COL_NOISE);
     if (a.showClutter)
@@ -2761,6 +2788,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-skyline") s.det.skyline = false;
         else if (a == "--no-fine-mask") s.det.fine_mask = false;
         else if (a == "--no-grow-mask") s.det.grow_mask = false;
+        else if (a == "--no-mask-recheck") s.det.mask_recheck = false;
         else if (a == "--no-adapt") s.adapt = false;
         else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
         else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());

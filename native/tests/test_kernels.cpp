@@ -622,6 +622,39 @@ static void test_grow_mask() {
         CHECK(diff == (variant == 0 ? 1u : 0u), "grow mask variant %d: %zu tiles changed", variant, diff);
     }
     std::printf("mask grows where clutter piles up: ok\n");
+
+    // перепроверка маски: облако (крупная рябь: горячих пикселей много — тайл закрыт при обучении,
+    // но отклик ниже порога) потом открывается; контрастная "крона" (отклик выше порога) и земля
+    // под ними остаются закрытыми
+    for (int variant = 0; variant < 3; ++variant) {
+        const int A = variant == 2 ? 30 : 8;   // размах ряби; порог 10, горячий пиксель 6
+        auto cloudy = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            std::mt19937 g(seed + 7);
+            for (int y = T; y < 2 * T; ++y)
+                for (int x = 2 * T; x < 4 * T; ++x)
+                    f[(size_t)y * w + x] = (uint8_t)(160 + (((x + seed) / 8 + y / 8) % 2) * A + g() % 3);
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.mask_recheck = variant != 0;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(cloudy(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        const int tw = d.tilesX();
+        const auto m0 = d.tileMask();
+        CHECK(!m0[tw + 2] && !m0[tw + 3] && !m0[6 * tw + 2], "recheck %d: cloud and ground masked after learning",
+              variant);
+        for (int i = 0; i < 200; ++i) d.detect(cloudy(500 + i).data(), w, h, w, c);
+        const auto& m = d.tileMask();
+        const bool open = m[tw + 2] && m[tw + 3], want = variant == 1;
+        CHECK(open == want && !m[6 * tw + 2] && !m[5 * tw + 2] && d.maskOpened() == (want ? 2 : 0),
+              "recheck %d: cloud open %d, opened %d", variant, (int)open, d.maskOpened());
+    }
+    std::printf("mask recheck opens clouds: ok\n");
 }
 
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью

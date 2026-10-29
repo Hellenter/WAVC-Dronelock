@@ -64,6 +64,9 @@ struct DetectorConfig {
     // земля держится ещё кадр. Мигание на wt18 2.2 -> 1.4 тайла за кадр (2), ложных целей на кадр
     // wt15/wt17 -10%, но захват на дроне wt18 87 -> 83% (1 — хуже): по умолчанию выключено
     int zone_vote = 0;
+    // Тонкое над землёй (столб, мачта, антенна) не шире thin_tiles тайлов — земля, но без кольца
+    // смешанных тайлов: вокруг столба небо не становится смешанным полосой в три тайла. 0 — как раньше
+    int thin_tiles = 1;
     float mixed_k = 1.f;        // на ваших роликах главное — правило "подтверждать, когда полетела", порог можно не поднимать
     int coarse_every = 2;       // крупная цель за кадр смещается мало, а грубые масштабы недёшевы
     // --- Неподвижная камера: ячейки 16x16 пикс. кадра (8x8 после пулинга) ---
@@ -110,6 +113,17 @@ struct DetectorConfig {
     float grow_min = 0.1f;
     int grow_cells = 2;
     float grow_sky_tex = 0.02f;   // чистое небо: текстурный реже такой доли кадров
+    // Перепроверка маски: облака. Тайлы, закрытые при обучении по своей текстуре (кромка тучи,
+    // облака у солнца, кроны), раз в recheck_every кадров считаются заново. Текстурны и облака,
+    // и кроны, но у облака отклик слабый: медиана максимумов его ячеек 16x16 ниже порога, у крон,
+    // домов и травы — выше. Тайл, где за ~recheck_frames кадров сильный отклик бывал реже доли
+    // recheck_tex и выше которого в столбце нет такой земли, открывается. Закрытое линией
+    // горизонта и доращиванием не открывается. Цель в открытом так тайле подтверждается, только
+    // когда полетела (как у кромки): кромка облака сама даёт отклики.
+    bool mask_recheck = true;
+    int recheck_every = 10;
+    int recheck_frames = 150;
+    float recheck_tex = 0.2f;
     int bg_frames = 250;
     // Накопление слабой цели по кадрам (track-before-detect на ячейках, фон ячеек тогда
     // учится по всему небу): A = tbd_decay * max3x3(A) + max(0, z - tbd_z0), z — превышение
@@ -217,9 +231,11 @@ public:
     // Помехи этого кадра (Tracker::clutterDets, пиксели кадра) для доращивания маски
     // (DetectorConfig::grow_mask); keep — области, где маска не растёт (цель в захвате).
     // Вызывать после detect, только пока камера неподвижна. Число тайлов, закрытых так с
-    // начала маски, — maskGrown(); растёт — маску стоит сохранить заново.
+    // начала маски, — maskGrown(), открытых перепроверкой (mask_recheck) — maskOpened(); растёт
+    // любое — маску стоит сохранить заново.
     void noteClutter(const std::vector<Candidate>& clutter, const std::vector<FocusArea>& keep);
     int maskGrown() const { return grown_; }
+    int maskOpened() const { return opened_; }
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
@@ -281,6 +297,13 @@ private:
     int growN_ = 0, grown_ = 0;
     void growMask(const std::vector<FocusArea>& keep);
     void resetGrow();
+    // перепроверка маски: тайлы, закрытые по текстуре, их текстура при перепроверках
+    std::vector<uint8_t> texBad_, recheckMask_, cloud_;   // ...и открытые как облако
+    std::vector<float> recheckTex_;
+    std::vector<uint16_t> recheckN_;
+    int opened_ = 0;
+    void markTexBad(float frac);
+    void updateRecheck();
 public:
     // тайлы полосы у горизонта (tilesY x tilesX, 1 — полоса), пусто — выключено или нет маски
     const std::vector<uint8_t>& horizonBand() const { return band_; }
