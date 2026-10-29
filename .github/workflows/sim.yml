@@ -1,0 +1,92 @@
+name: sim
+
+# Виртуальная сцена (Godot 4.3): рендер роликов с разметкой и прогон конвейера по ним.
+# Рендер программный (xvfb + llvmpipe), видеокарта не нужна.
+on:
+  push:
+    paths: ['sim/**', '.github/workflows/sim.yml']
+  workflow_dispatch:
+    inputs:
+      scenes:
+        description: 'Сцены из sim/scenes через пробел'
+        default: 'forest_village pan_sweep overcast_birds'
+      seconds:
+        description: 'Длина роликов, с (пусто — как в сцене)'
+        default: ''
+
+permissions:
+  contents: read
+
+# Godot: сумма архива снята при первой загрузке 2026-10-29 (подпись не проверялась).
+env:
+  GODOT_VERSION: '4.3-stable'
+  GODOT_SHA256: '7de56444b130b10af84d19c7e0cf63cf9e9937ee4ba94364c3b7dd114253ca21'
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      - name: Пакеты
+        timeout-minutes: 35
+        run: |
+          .github/scripts/apt.sh xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl1 libxcursor1 libxinerama1 libxrandr2 libxi6 \
+            ffmpeg cmake ninja-build pkg-config libsdl2-dev libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
+      - name: Python-пакеты
+        timeout-minutes: 10
+        run: pip install --quiet --timeout 60 --retries 3 numpy==2.5.4 opencv-python-headless==5.0.0.93
+      - name: Godot
+        run: |
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          echo "${GODOT_SHA256}  godot.zip" | sha256sum -c -
+          unzip -q godot.zip -d godot-bin
+          echo "GODOT=$PWD/godot-bin/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Проверка скрипта
+        run: |
+          timeout 300 "$GODOT" --headless --path sim/godot --import || true
+          timeout 120 "$GODOT" --headless --path sim/godot --check-only --script res://sim.gd
+      - name: Рендер
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          SCENES: ${{ github.event.inputs.scenes }}
+          SECS: ${{ github.event.inputs.seconds }}
+        run: |
+          scenes="$SCENES"; [ -z "$scenes" ] && scenes="quick forest_village"
+          secs="$SECS"
+          mkdir -p vids
+          for s in $scenes; do
+            extra=(); [ -n "$secs" ] && extra=(--seconds "$secs")
+            time xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene "sim/scenes/$s.json" --out "out/$s" --keep-png "${extra[@]}"
+            n=$(ls "out/$s/wide" | wc -l)
+            python sim/preview.py "out/$s" 0
+            python sim/preview.py "out/$s" $((n / 2))
+            cp out/$s/*.mp4 out/$s/*.gt.json vids/
+          done
+          ls -la vids
+      - name: Разметка и кадры в журнал
+        run: python sim/ci_report.py out
+      - name: Приложение
+        run: |
+          cmake -S app -B build-app -G Ninja
+          cmake --build build-app
+      - name: Мультитест по роликам сцены
+        run: |
+          ./build-app/dronolok_app --multitest vids --parallel 2 --out mt-sim
+          python sim/ci_report.py --multitest mt-sim/results.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sim-videos
+          path: |
+            vids/
+            out/*/meta.json
+            out/*/*.jpg
+            out/*/*.png
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sim-multitest
+          path: mt-sim/
+          retention-days: 14
