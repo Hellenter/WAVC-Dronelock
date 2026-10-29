@@ -70,7 +70,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     // окно взмахов: не короче 32 кадров — на 10 к/с частые взмахи приходят сложенными в
     // низкие частоты, на их период нужно несколько секунд
     c.flap_window = c.flap_window > 0 ? std::min(64, std::max(32, (int)std::lround(c.flap_window * t))) : 0;
-    c.verify_frames = frames(c.verify_frames, 8);
+    c.verify_frames = frames(c.verify_frames, std::max(1, c.verify_min));
     c.lock_dwell = frames(c.lock_dwell, 3);
     c.hard_miss = frames(c.hard_miss, 6);
     c.hard_full_every = frames(c.hard_full_every, 1);

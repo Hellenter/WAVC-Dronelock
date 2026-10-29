@@ -114,6 +114,17 @@ const std::vector<Param>& params() {
         {"q_accel", "Манёвренность цели", "Тонко", false, "1, 4, 8", T(q_accel)},
         {"max_miss", "Держать на прогнозе, кадров", "Тонко", false, "3, 6, 12", T(max_miss)},
         {"lock_switch", "Смена захвата, раз", "Тонко", false, "1.2, 1.5, 2.5", T(lock_switch)},
+        {"lock_dwell", "Смена захвата: перевес держится, кадров при 25 к/с", "Тонко", false, "0, 6, 12, 24", T(lock_dwell)},
+        {"hard_switch", "Жёсткий захват переходит на цель весомее, раз (0 — никогда)", "Тонко", false, "0, 2, 4", T(hard_switch)},
+        {"follow_k", "Ведомая камерой цель весомее, раз (0 выкл.)", "Тонко", false, "0, 3, 6", T(follow_k)},
+        {"ev_confirm", "Подтверждение по уверенности (0 выкл.)", "Тонко", false, "0, 3, 6", T(ev_confirm)},
+        {"mover_px", "Летит: ушёл по сцене дальше, пикс.", "Тонко", false, "8, 16, 32", T(mover_px)},
+        {"edge_mover_k", "У кромки: летит дальше, раз", "Тонко", false, "1, 3, 5", T(edge_mover_k)},
+        {"lost_grow", "Пропавший захват: круг поиска растёт, пикс. за кадр при 25 к/с", "Тонко", false, "4, 9.6, 20", T(lost_grow)},
+        {"tentative_miss", "Неподтверждённый трек держится, кадров", "Тонко", false, "1, 2, 3", T(tentative_miss)},
+        {"clutter_level", "Карта помех: порог ячейки", "Тонко", false, "0.25, 0.35, 0.5", T(clutter_level)},
+        {"hover_speed", "Зависла: медленнее, пикс./кадр при 25 к/с", "Тонко", false, "0.15, 0.3, 0.6", T(hover_speed)},
+        {"flap_r2", "Птица: взмахи объясняют долю дисперсии", "Тонко", false, "0.35, 0.45, 0.6", T(flap_r2)},
         {"confirm", "Подтверждение, кадров", "Тонко", false, "2, 3, 4", T(confirm)},
         {"quiet", "Новая точка в спокойном небе, кадров (0 выкл.)", "Тонко", false, "0, 50", T(quiet_frames)},
         {"edge_straight", "У кромки — только прямой полёт", "Тонко", false, "0, 0.5", T(edge_straight)},
@@ -129,6 +140,7 @@ const std::vector<Param>& params() {
         {"anchor_check", "На мачте или столбе — не дрон", "Тонко", true, "1, 0", T(anchor_check)},
         {"hard_lock", "Жёсткий захват дрона", "Тонко", true, "1, 0", T(hard_lock)},
         {"verify", "Проверка: дрон подряд, кадров", "Тонко", false, "5, 10, 25", T(verify_frames)},
+        {"verify_min", "Проверка: не меньше кадров на любой частоте", "Тонко", false, "4, 6, 8", T(verify_min)},
         {"hard_miss", "Жёсткий: держать на прогнозе, кадров", "Тонко", false, "30, 60, 120", T(hard_miss)},
         {"hard_full_every", "Жёсткий: весь кадр раз в, кадров", "Тонко", false, "3, 6, 12", T(hard_full_every)},
         {"lock_slow", "Захват: сначала мелкий медленный дрон", "Тонко", true, "1, 0",
@@ -516,7 +528,7 @@ static VideoMeta probe(const std::string& path) {
     return m;
 }
 
-static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& c, int threads,
+static RunResult run_one(const VideoMeta& vm, const Variant& var, int varIdx, const Config& c, int threads,
                          const std::atomic<bool>& stop, std::atomic<long>& live) {
     RunResult rr;
     Settings s = var.setup.s;
@@ -530,6 +542,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     s.maskFile = c.maskFile;
     s.fresh = !c.maskFile;   // чистый старт: накопленное рядом с видео не читается и не пишется
     s.trackLog.clear();
+    if (!c.tracksDir.empty()) s.trackLog = ustr(upath(c.tracksDir) / (vm.file + "." + std::to_string(varIdx) + ".csv"));
     if (!c.emulate) {
         s.slowdown = 1;
         s.emulateMs = 0;
@@ -779,7 +792,7 @@ bool Runner::start(const Config& c, std::string& err) {
                     liveJob_[i] = j;
                 }
                 *live_[i] = 0;
-                RunResult r = run_one(videos_[r0.video], variants_[r0.variant], cfg_, threads, stop_, *live_[i]);
+                RunResult r = run_one(videos_[r0.video], variants_[r0.variant], r0.variant, cfg_, threads, stop_, *live_[i]);
                 r.video = r0.video;
                 r.variant = r0.variant;
                 {
@@ -869,9 +882,11 @@ static void usage() {
     printf("dronolok_app --multitest папка|видео... [--vary ключ[=знач,знач]]... [--mode one|grid]\n"
            "            [--frames N] [--warmup N] [--radius пикс] [--parallel N] [--out папка]\n"
            "            [--profile 0..3] [--set ключ=знач]... [--realtime] [--emulate] [--mask-file]\n"
+           "            [--tracks папка]\n"
            "  --vary  что перебирать (без значений — значения по умолчанию); --set — изменить базу\n"
            "  --mode  one: база + каждая настройка по отдельности (по умолч.), grid: все сочетания\n"
-           "  --list  список настроек\n");
+           "  --list  список настроек\n"
+           "  --tracks журнал треков каждого прогона: папка/<видео>.<номер варианта>.csv\n");
 }
 
 static bool parse_kv(const std::string& a, std::string& key, std::string& vals) {
@@ -928,6 +943,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--realtime") c.realtime = true;
         else if (a == "--emulate") c.emulate = true;
         else if (a == "--mask-file") c.maskFile = true;
+        else if (a == "--tracks") c.tracksDir = val();
         else if (!a.empty() && a[0] == '-') {
             printf("неизвестный ключ %s\n", a.c_str());
             usage();
