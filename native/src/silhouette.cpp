@@ -28,7 +28,8 @@ static bool stem(const uint8_t* gray, int w, int h, int stride, int x, int y, in
     for (int k = 0; k < len; ++k) {
         x += dx;
         y += dy;
-        if (x < 12 || y < 12 || x >= w - 12 || y >= h - 12) return false;
+        // линия ушла за край кадра (столб снизу, из-за кадра): своё продолжение она уже показала
+        if (x < 12 || y < 12 || x >= w - 12 || y >= h - 12) return k >= 12 && run >= k * 3 / 4;
         float best = -1e9f;
         int bo = 0;
         for (int o = -1; o <= 1; ++o) {
@@ -188,7 +189,9 @@ Silhouette measure_silhouette(const uint8_t* gray, int w, int h, int stride, flo
                 }
                 return stem(gray, w, h, stride, bxs, bys, dx, dy, len, pol, lthr);
             };
-            out.attached = from(cx, by1, 0, 1) || from(cx, by0, 0, -1);
+            // силуэт обрезан низом кадра: стоит на том, что ниже кадра (верхушка столба или
+            // кроны над самым краем), — летящий дрон в нижнюю кромку кадра не упирается
+            out.attached = oy + (y1 + 2) * s > h || from(cx, by1, 0, 1) || from(cx, by0, 0, -1);
             // контрастная мачта попала в сам силуэт: по строкам габарита ширина тёмного
             // (светлого) — длинный участок узкий, как мачта, а над ним голова прожектора
             if (!out.attached && by1 - by0 >= 30) {

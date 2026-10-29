@@ -350,6 +350,11 @@ static void test_silhouette() {
     }
     const Silhouette m = measure_silhouette(img.data(), W, H, W, 600, 107, 6, -1);
     CHECK(m.valid && m.attached, "прожектор на мачте не распознан: valid %d attached %d", m.valid, m.attached);
+    // верхушка столба над нижним краем кадра: столб уходит за край — на опоре
+    rect(200, 540, 208, 548);
+    rect(202, 548, 206, H);
+    const Silhouette p = measure_silhouette(img.data(), W, H, W, 204, 544, 4, -1);
+    CHECK(p.valid && p.attached, "столб у нижнего края кадра: valid %d attached %d", p.valid, p.attached);
     std::printf("silhouette: ok\n");
 }
 
@@ -504,6 +509,33 @@ static std::vector<uint8_t> ground_frame(int w, int h, float horizon, unsigned s
         for (int x = 0; x < w; ++x)
             f[(size_t)y * w + x] = (uint8_t)(y < horizon * h ? 170 + (int)(g() % 3) : 40 + (int)(g() % 120));
     return f;
+}
+
+// Полоса под сеткой тайлов (zone_strip): кроны в нижних 40 строках кадра делают тайлы над
+// ними смешанными; без полосы над кронами "чистое небо"
+static void test_zone_strip() {
+    const int w = 640, h = 680, T = 64;   // 10 тайлов по высоте (640 строк) и полоса 40 строк
+    for (int on = 0; on <= 1; ++on) {
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.zones = true;
+        cfg.zone_strip = on != 0;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        std::mt19937 g(3);
+        std::vector<uint8_t> f((size_t)w * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                f[(size_t)y * w + x] = (uint8_t)(y >= 645 && x < 5 * T ? 40 + (int)(g() % 120) : 170 + (int)(g() % 3));
+        for (int i = 0; i < 3; ++i) d.detect(f.data(), w, h, w, c);
+        const auto& z = d.zones();
+        const int tw = d.tilesX();
+        CHECK(d.tilesY() == 10 && z.size() == (size_t)tw * 10, "zone strip: grid %dx%d", tw, d.tilesY());
+        const bool mixed = z[9 * tw + 2] == 1 && z[9 * tw + 4] == 1 && z[9 * tw + 5] == 1, sky = z[9 * tw + 7] == 2;
+        CHECK(sky && (on ? mixed : z[9 * tw + 2] == 2), "zone strip %d: row above crowns %d %d %d, far %d", on,
+              z[9 * tw + 2], z[9 * tw + 4], z[9 * tw + 5], z[9 * tw + 7]);
+    }
+    std::printf("zone strip: ok\n");
 }
 
 static void test_stationary() {
@@ -931,6 +963,7 @@ int main() {
     test_follow();
     test_governor();
     test_stationary();
+    test_zone_strip();
     test_grow_mask();
     test_scene();
     test_motion();

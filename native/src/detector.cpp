@@ -40,6 +40,8 @@ static inline float bg_sd(const CellBg& c, size_t ci) { return (c.q90[ci] - c.q5
 
 struct Detector::Stats {
     TileStats dark, bright, unused;
+    TileStats stripD, stripB;    // ряд тайлов по низу кадра для зон (DetectorConfig::zone_strip)
+    bool strip = false;          // посчитан в этом кадре
     std::vector<Level> lv;   // lv[0] — уровень 1 (x2), lv[1] — уровень 2 (x4)
     CellBg cb[2];
     std::vector<uint8_t> comp;   // тайлы, посчитанные бэкендом в этом кадре (пусто — все)
@@ -756,6 +758,20 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         timing_.jobs += jobs;
         timing_.jobs_skipped += skipped;
     }
+    // полоса под сеткой тайлов: ряд тайлов, выровненный по низу кадра, — только для зон
+    stats_->strip = false;
+    if (cfg_.zones && cfg_.zone_strip && !timing_.partial && tw_ > 0 && th_ > 0 && h - th_ * T * s >= 2 * CELL * s) {
+        ResponseParams q = p;
+        q.cells = false;
+        q.trim = false;
+        q.hot_thr = (uint8_t)std::max(0.f, std::min(255.f, std::floor(hotLevel())));
+        int jobs = 0, skipped = 0;
+        backend_->compute(FrameView{gray + (size_t)(h - T * s) * stride, w, T * s, stride}, q, nullptr, stats_->stripD,
+                          stats_->stripB, jobs, skipped);
+        timing_.jobs += jobs;
+        timing_.jobs_skipped += skipped;
+        stats_->strip = stats_->stripD.hot.size() == (size_t)tw_ || stats_->stripB.hot.size() == (size_t)tw_;
+    }
     const double t1 = now_ms();
     if (cfg_.zones) computeZones();
     else zones_.clear(), zoneHist_.clear();
@@ -890,48 +906,61 @@ void Detector::updateNoise() {
 // Зоны по тайлам основного масштаба (см. DetectorConfig::zones)
 void Detector::computeZones() {
     const size_t n = (size_t)tw_ * th_;
+    // ряд полосы под сеткой (zone_strip) — лишний ряд снизу: в нём не ищем, но он земля
+    const bool strip = stats_->strip;
+    const int Th = th_ + (strip ? 1 : 0);
+    const size_t na = (size_t)tw_ * Th;
     // кадр между полными просмотрами: посчитаны только тайлы вокруг треков, остальные выглядели
     // бы гладкими — небом. Зоны остаются с последнего полного кадра
-    if (timing_.partial && zones_.size() == n && zoneHist_.size() == n) return;
+    if (timing_.partial && zones_.size() == n && zoneHist_.size() >= n) return;
     zones_.assign(n, 0);
     if (!n) return;
+    std::vector<uint8_t>& zz = zoneAll_;
+    zz.assign(na, 2);
     const uint32_t area = (uint32_t)(cfg_.tile * cfg_.tile);
     auto textured = [&](const TileStats& ts, size_t i) {
         return ts.hot.size() == n && (float)div_round_even(ts.hot[i] * 255u, area) / 255.f > cfg_.max_density;
     };
+    auto texStrip = [&](const TileStats& ts, size_t x) {
+        return ts.hot.size() == (size_t)tw_ && (float)div_round_even(ts.hot[x] * 255u, area) / 255.f > cfg_.max_density;
+    };
     const bool useMask = !learning_ && !mask_.empty();
     std::vector<uint8_t>& smooth = roiMask_;   // временный буфер
-    smooth.assign(n, 0);
+    smooth.assign(na, 0);
     for (size_t i = 0; i < n; ++i)
         smooth[i] = !(useMask && !mask_[i]) && !(cfg_.dark && textured(stats_->dark, i)) &&
                     !(cfg_.bright && textured(stats_->bright, i));
+    for (size_t x = 0; strip && x < (size_t)tw_; ++x)
+        smooth[n + x] = !(cfg_.dark && texStrip(stats_->stripD, x)) && !(cfg_.bright && texStrip(stats_->stripB, x));
     // земля: крупные связные области текстуры (кроны, дома, земля, край виньетки);
     // мелкие (сама цель, птица, фонарь) — не земля. Остальное — небо.
     const int minGround = std::max(4, (int)(n / 40));
-    std::fill(zones_.begin(), zones_.end(), 2);
     std::vector<uint8_t>& seen = focusTiles_;   // тоже временный буфер, markFocus перезапишет
-    seen.assign(n, 0);
-    for (size_t s0 = 0; s0 < n; ++s0) {
+    seen.assign(na, 0);
+    for (size_t s0 = 0; s0 < na; ++s0) {
         if (smooth[s0] || seen[s0]) continue;
         fill_.clear();
         fill_.push_back((int)s0);
         seen[s0] = 1;
         for (size_t k = 0; k < fill_.size(); ++k) {
             const int i = fill_[k], x = i % tw_, y = i / tw_;
-            for (int yy = std::max(0, y - 1); yy <= std::min(th_ - 1, y + 1); ++yy)
+            for (int yy = std::max(0, y - 1); yy <= std::min(Th - 1, y + 1); ++yy)
                 for (int xx = std::max(0, x - 1); xx <= std::min(tw_ - 1, x + 1); ++xx) {
                     const int j = yy * tw_ + xx;
                     if (!smooth[j] && !seen[j]) { seen[j] = 1; fill_.push_back(j); }
                 }
         }
-        if ((int)fill_.size() >= minGround)
-            for (int i : fill_) zones_[i] = 0;
+        // полоса — земля и малым куском: всё, что упирается в низ кадра, растёт из-за него
+        bool low = false;
+        for (int i : fill_) low |= i >= (int)n;
+        if ((int)fill_.size() >= minGround || low)
+            for (int i : fill_) zz[i] = 0;
     }
     // земля — по большинству из трёх последних полных кадров: тайл на краю кроны или облака,
     // который через кадр то земля, то небо, не мигает (cfg_.zone_vote). Новая сетка — с этого кадра
-    if (zoneHist_.size() != n) zoneHist_.assign(n, 0x80);
-    for (size_t i = 0; i < n; ++i) {
-        const uint8_t g = zones_[i] == 0, h = zoneHist_[i];
+    if (zoneHist_.size() != na) zoneHist_.assign(na, 0x80);
+    for (size_t i = 0; i < na; ++i) {
+        const uint8_t g = zz[i] == 0, h = zoneHist_[i];
         if (!cfg_.zone_vote || (h & 0x80)) {   // истории ещё нет: как в этом кадре
             zoneHist_[i] = (uint8_t)(g * 7);
             continue;
@@ -939,40 +968,39 @@ void Detector::computeZones() {
         const uint8_t nh = (uint8_t)(((h << 1) | g) & 7);
         zoneHist_[i] = nh;
         const int votes = cfg_.zone_vote == 1 ? ((nh & 1) + ((nh >> 1) & 1) + ((nh >> 2) & 1)) / 2 : (nh & 3) != 0;
-        zones_[i] = votes ? 0 : 2;
+        zz[i] = votes ? 0 : 2;
     }
     // тонкое над землёй (столб ЛЭП, мачта, антенна, узкая верхушка ели): сверху вниз ряд земли
     // не шире thin_tiles, над которым земли нет, остаётся землёй, но смешанных тайлов вокруг
     // себя не даёт. Иначе столб тянет за собой полосу смешанных шириной в три тайла до самого верха
     if (cfg_.thin_tiles > 0)
-        for (int y = 0; y < th_; ++y)
+        for (int y = 0; y < Th; ++y)
             for (int x = 0; x < tw_;) {
                 const size_t i = (size_t)y * tw_ + x;
-                if (zones_[i] != 0) {
+                if (zz[i] != 0) {
                     ++x;
                     continue;
                 }
                 int e = x;
-                while (e < tw_ && zones_[(size_t)y * tw_ + e] == 0) ++e;
+                while (e < tw_ && zz[(size_t)y * tw_ + e] == 0) ++e;
                 bool open = e - x <= cfg_.thin_tiles;
-                for (int xx = x; xx < e && open && y > 0; ++xx) open = zones_[(size_t)(y - 1) * tw_ + xx] != 0;
+                for (int xx = x; xx < e && open && y > 0; ++xx) open = zz[(size_t)(y - 1) * tw_ + xx] != 0;
                 if (open)
-                    for (int xx = x; xx < e; ++xx) zones_[(size_t)y * tw_ + xx] = 4;   // земля без кольца
+                    for (int xx = x; xx < e; ++xx) zz[(size_t)y * tw_ + xx] = 4;   // земля без кольца
                 x = e;
             }
     // смешанные: небо, у которого в 8-окрестности есть земля
     for (int y = 0; y < th_; ++y)
         for (int x = 0; x < tw_; ++x) {
             const size_t i = (size_t)y * tw_ + x;
-            if (zones_[i] != 2) continue;
+            if (zz[i] != 2) continue;
             bool g = false;
-            for (int yy = std::max(0, y - 1); yy <= std::min(th_ - 1, y + 1) && !g; ++yy)
+            for (int yy = std::max(0, y - 1); yy <= std::min(Th - 1, y + 1) && !g; ++yy)
                 for (int xx = std::max(0, x - 1); xx <= std::min(tw_ - 1, x + 1) && !g; ++xx)
-                    g = zones_[(size_t)yy * tw_ + xx] == 0;
-            if (g) zones_[i] = 3;   // пометка, чтобы не размножать смешанные внутри прохода
+                    g = zz[(size_t)yy * tw_ + xx] == 0;
+            if (g) zz[i] = 3;   // пометка, чтобы не размножать смешанные внутри прохода
         }
-    for (auto& z : zones_)
-        z = z == 3 ? 1 : z == 4 ? 0 : z;
+    for (size_t i = 0; i < n; ++i) zones_[i] = zz[i] == 3 ? 1 : zz[i] == 4 ? 0 : zz[i];
 }
 
 // маска тайлов вокруг треков (и внутри маски неба base, если она есть)
