@@ -603,7 +603,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     if (sil.valid && lockIdx >= 0 && cfg_.size_predict && tracks_[lockIdx].lsN >= 3)
         silOk = std::max(sil.w, sil.h) < cfg_.size_tol * tracks_[lockIdx].expectedSize() + 16.f;
     // захваченное на мачте или столбе: большинство замеров с линией от силуэта
-    if (cfg_.anchor_check && lockIdx >= 0 && sil.valid) {
+    if (cfg_.anchor_check && lockIdx >= 0 && (sil.valid || sil.attached)) {
         Track& L = tracks_[lockIdx];
         if (L.silN >= 30) { L.silN /= 2; L.attN /= 2; }
         ++L.silN;

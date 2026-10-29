@@ -350,6 +350,16 @@ static void test_silhouette() {
     }
     const Silhouette m = measure_silhouette(img.data(), W, H, W, 600, 107, 6, -1);
     CHECK(m.valid && m.attached, "прожектор на мачте не распознан: valid %d attached %d", m.valid, m.attached);
+    // верхушка столба над нижним краем кадра: столб уходит за край — на опоре
+    rect(200, 540, 208, 548);
+    rect(202, 548, 206, H);
+    const Silhouette p = measure_silhouette(img.data(), W, H, W, 204, 544, 4, -1);
+    CHECK(p.valid && p.attached, "столб у нижнего края кадра: valid %d attached %d", p.valid, p.attached);
+    // столб с проводом: силуэт крупнее предела, но доходит до низа кадра — на опоре
+    rect(738, 420, 742, H);
+    rect(100, 450, W, 452);
+    const Silhouette q = measure_silhouette(img.data(), W, H, W, 740, 424, 4, -1, 8.f, 200.f);
+    CHECK(!q.valid && q.attached, "столб с проводом у низа кадра: valid %d attached %d", q.valid, q.attached);
     std::printf("silhouette: ok\n");
 }
 
@@ -506,6 +516,69 @@ static std::vector<uint8_t> ground_frame(int w, int h, float horizon, unsigned s
     return f;
 }
 
+// Полоса под сеткой тайлов (zone_strip): кроны в нижних 40 строках кадра делают тайлы над
+// ними смешанными; без полосы над кронами "чистое небо"
+static void test_zone_strip() {
+    const int w = 640, h = 680, T = 64;   // 10 тайлов по высоте (640 строк) и полоса 40 строк
+    for (int on = 0; on <= 1; ++on) {
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.zones = true;
+        cfg.zone_strip = on != 0;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        std::mt19937 g(3);
+        std::vector<uint8_t> f((size_t)w * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                f[(size_t)y * w + x] = (uint8_t)(y >= 645 && x < 5 * T ? 40 + (int)(g() % 120) : 170 + (int)(g() % 3));
+        for (int i = 0; i < 3; ++i) d.detect(f.data(), w, h, w, c);
+        const auto& z = d.zones();
+        const int tw = d.tilesX();
+        CHECK(d.tilesY() == 10 && z.size() == (size_t)tw * 10, "zone strip: grid %dx%d", tw, d.tilesY());
+        const bool mixed = z[9 * tw + 2] == 1 && z[9 * tw + 4] == 1 && z[9 * tw + 5] == 1, sky = z[9 * tw + 7] == 2;
+        CHECK(sky && (on ? mixed : z[9 * tw + 2] == 2), "zone strip %d: row above crowns %d %d %d, far %d", on,
+              z[9 * tw + 2], z[9 * tw + 4], z[9 * tw + 5], z[9 * tw + 7]);
+    }
+    std::printf("zone strip: ok\n");
+}
+
+// Светлая кайма резкости у тёмного столба (halo_k): кандидат на ней — "у кромки"
+// (подтверждается, только когда полетит), одиночная светлая точка в небе — нет
+static void test_halo() {
+    const int w = 640, h = 480;
+    for (int on = 0; on <= 1; ++on) {
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.bright = true;
+        cfg.halo_k = on ? 2.f : 0.f;
+        Detector d(cfg);
+        std::mt19937 g(5);
+        std::vector<uint8_t> f((size_t)w * h);
+        for (auto& v : f) v = (uint8_t)(150 + (int)(g() % 3));
+        for (int y = 200; y < 290; ++y) {   // столб 4 пикс. и светлая кайма по бокам
+            for (int x = 300; x < 304; ++x) f[(size_t)y * w + x] = 60;
+            f[(size_t)y * w + 299] = f[(size_t)y * w + 304] = 175;
+        }
+        for (int x = 299; x < 305; ++x) f[(size_t)199 * w + x] = 175;
+        for (int y = 100; y < 102; ++y)
+            for (int x = 100; x < 102; ++x) f[(size_t)y * w + x] = 185;   // светлая точка
+        std::vector<Candidate> c;
+        bool haloSeen = false, haloEdge = true, dot = false, dotEdge = false;
+        for (int i = 0; i < 3; ++i) {
+            d.detect(f.data(), w, h, w, c);
+            for (const Candidate& k : c) {
+                if (k.polarity < 0) continue;
+                if (std::fabs(k.x - 302) < 12 && k.y > 190 && k.y < 295) haloSeen = true, haloEdge &= k.edge;
+                if (std::fabs(k.x - 100.5f) < 4 && std::fabs(k.y - 100.5f) < 4) dot = true, dotEdge |= k.edge;
+            }
+        }
+        CHECK(dot && !dotEdge, "halo %d: светлая точка dot %d edge %d", on, dot, dotEdge);
+        CHECK(haloSeen && haloEdge == (on != 0), "halo %d: кайма seen %d edge %d", on, haloSeen, haloEdge);
+    }
+    std::printf("sharpening halo: ok\n");
+}
+
 static void test_stationary() {
     const int w = 640, h = 480;
     const std::string path = "test_mask.bin";
@@ -573,6 +646,162 @@ static void test_stationary() {
     CHECK(t25.gate == t.gate && t25.max_miss == t.max_miss, "tracker_for_fps 25");
     CHECK(t10.gate > t.gate && t10.max_miss < t.max_miss && t10.confirm == t.confirm, "tracker_for_fps 10");
     std::printf("stationary camera (mask file, per_tile, fps): ok\n");
+}
+
+// Маска дорастает по помехам: дыра в земле, где копятся помехи, закрывается; ряд неба над
+// кромкой земли с теми же помехами — нет; вокруг цели в захвате — тоже нет
+static void test_grow_mask() {
+    const int w = 640, h = 480, T = 64;   // тайлы 10 x 7
+    auto frame = [&](unsigned seed) {
+        auto f = ground_frame(w, h, 0.6f, seed);
+        for (int y = 6 * T; y < 7 * T; ++y)   // гладкая "поляна" внизу кадра — дыра в маске
+            for (int x = 5 * T; x < 6 * T; ++x) f[(size_t)y * w + x] = 170;
+        return f;
+    };
+    auto points = [&](int tx, int ty) {   // помехи в трёх ячейках тайла
+        std::vector<Candidate> v;
+        for (int k = 0; k < 3; ++k) v.push_back(Candidate{tx * T + 8.f + 20 * k, ty * T + 8.f + 16 * k, 20, 3, -1});
+        return v;
+    };
+    for (int variant = 0; variant < 3; ++variant) {
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.skyline = false;   // иначе дыру внизу закрыла бы линия горизонта
+        cfg.grow_mask = variant != 2;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(frame(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        const auto m0 = d.tileMask();
+        const int tw = d.tilesX();
+        CHECK(m0[6 * tw + 5] && !m0[5 * tw + 5] && !m0[6 * tw + 4] && !m0[6 * tw + 6] && m0[3 * tw + 2] && !m0[5 * tw + 2],
+              "grow mask: learned mask (hole, edge)");
+        // помехи в дыре и в ряду неба над кромкой земли (над ним чистое небо)
+        std::vector<Candidate> cl = points(5, 6), top = points(2, 3);
+        cl.insert(cl.end(), top.begin(), top.end());
+        const std::vector<FocusArea> keep = variant == 1 ? std::vector<FocusArea>{FocusArea{5.5f * T, 6.5f * T, 10}}
+                                                         : std::vector<FocusArea>{};
+        for (int i = 0; i < 90; ++i) {
+            d.detect(frame(100 + i).data(), w, h, w, c);
+            d.noteClutter(cl, keep);
+        }
+        const auto& m = d.tileMask();
+        const bool hole = !m[6 * tw + 5], edge = !m[3 * tw + 2];
+        CHECK(hole == (variant == 0) && !edge && d.maskGrown() == (variant == 0 ? 1 : 0),
+              "grow mask variant %d: hole %d, edge %d, grown %d", variant, (int)hole, (int)edge, d.maskGrown());
+        size_t diff = 0;
+        for (size_t i = 0; i < m.size(); ++i) diff += m[i] != m0[i];
+        CHECK(diff == (variant == 0 ? 1u : 0u), "grow mask variant %d: %zu tiles changed", variant, diff);
+        if (variant != 0) continue;
+        // помехи кончились, а откликов выше порога в дыре нет: через ~2*recheck_frames она открывается
+        for (int i = 0; i < 400; ++i) {
+            d.detect(frame(300 + i).data(), w, h, w, c);
+            d.noteClutter({}, keep);
+        }
+        CHECK(d.tileMask()[6 * tw + 5] && d.maskOpened() == 1, "grow mask: quiet hole reopens (%d, opened %d)",
+              (int)d.tileMask()[6 * tw + 5], d.maskOpened());
+    }
+    std::printf("mask grows where clutter piles up: ok\n");
+
+    // перепроверка маски: облако (крупная рябь: горячих пикселей много — тайл закрыт при обучении,
+    // но отклик ниже порога) потом открывается; контрастная "крона" (отклик выше порога) и земля
+    // под ними остаются закрытыми
+    for (int variant = 0; variant < 3; ++variant) {
+        const int A = variant == 2 ? 30 : 8;   // размах ряби; порог 10, горячий пиксель 6
+        auto cloudy = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            std::mt19937 g(seed + 7);
+            for (int y = T; y < 2 * T; ++y)
+                for (int x = 2 * T; x < 4 * T; ++x)
+                    f[(size_t)y * w + x] = (uint8_t)(160 + (((x + seed) / 8 + y / 8) % 2) * A + g() % 3);
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.mask_recheck = variant != 0;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(cloudy(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        const int tw = d.tilesX();
+        const auto m0 = d.tileMask();
+        CHECK(!m0[tw + 2] && !m0[tw + 3] && !m0[6 * tw + 2], "recheck %d: cloud and ground masked after learning",
+              variant);
+        for (int i = 0; i < 200; ++i) d.detect(cloudy(500 + i).data(), w, h, w, c);
+        const auto& m = d.tileMask();
+        const bool open = m[tw + 2] && m[tw + 3], want = variant == 1;
+        CHECK(open == want && !m[6 * tw + 2] && !m[5 * tw + 2] && d.maskOpened() == (want ? 2 : 0),
+              "recheck %d: cloud open %d, opened %d", variant, (int)open, d.maskOpened());
+    }
+    std::printf("mask recheck opens clouds: ok\n");
+
+    // маска по полярности: "облако" из ярких клочьев (только светлая текстура) закрыто, но открыто
+    // для тёмных целей; земля (обе полярности) — нет; кромка земли по облаку вниз не тянется
+    for (int pm = 0; pm < 2; ++pm) {
+        auto puffs = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            for (int y = T; y < 2 * T; ++y)
+                for (int x = 2 * T; x < 4 * T; ++x)
+                    if ((x + seed) % 16 < 4 && y % 16 < 4) f[(size_t)y * w + x] = 230;
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.pol_mask = pm;
+        cfg.mask_recheck = false;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(puffs(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        const int tw = d.tilesX();
+        const auto& m = d.tileMask();
+        const auto& o = d.polarityOpen(0);
+        const bool open = o.size() == m.size() && o[tw + 2] && o[tw + 3] && !o[6 * tw + 2];
+        CHECK(!m[tw + 2] && !m[tw + 3] && !m[6 * tw + 2] && open == (pm != 0) && d.polarityOpen(1).empty(),
+              "pol_mask %d: cloud masked %d, open for dark %d", pm, (int)!m[tw + 2], (int)open);
+        CHECK(m[2 * tw + 2] == (pm != 0), "pol_mask %d: sky under cloud %d", pm, (int)m[2 * tw + 2]);
+    }
+    std::printf("cloud masked for bright targets only: ok\n");
+
+    // цель в захвате под маской: в круге прогноза одно тёмное пятно — слабый кандидат; без
+    // захвата или с двумя пятнами (неоднозначно) — ничего
+    {
+        auto ripple = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            for (int y = T; y < 2 * T; ++y)
+                for (int x = 2 * T; x < 4 * T; ++x) f[(size_t)y * w + x] = (uint8_t)(160 + (((x + seed) / 8 + y / 8) % 2) * 8);
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.pol_mask = 0;
+        cfg.mask_recheck = false;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(ripple(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        CHECK(!d.tileMask()[d.tilesX() + 2], "lock through: ripple tile masked");
+        const float bx = 2.5f * T, by = 1.5f * T;
+        for (int variant = 0; variant < 3; ++variant) {
+            auto f = ripple(100);
+            for (int y = 0; y < 4; ++y)
+                for (int x = 0; x < 4; ++x) {
+                    f[(size_t)(by + y) * w + (size_t)bx + x] = 100;
+                    if (variant == 2) f[(size_t)(by + y) * w + (size_t)bx + 40 + x] = 100;   // второе пятно
+                }
+            d.setLockArea(variant != 1, bx + 2, by + 2, 60.f, -1, 40.f);
+            d.detect(f.data(), w, h, w, c);
+            int n = 0;
+            for (const auto& q : c) n += q.weak && std::hypot(q.x - bx - 2, q.y - by - 2) < 8;
+            CHECK(n == (variant == 0 ? 1 : 0), "lock through %d: %d candidates", variant, n);
+        }
+        d.setLockArea(false);
+    }
+    std::printf("locked target found under the mask: ok\n");
 }
 
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
@@ -775,6 +1004,9 @@ int main() {
     test_follow();
     test_governor();
     test_stationary();
+    test_zone_strip();
+    test_halo();
+    test_grow_mask();
     test_scene();
     test_motion();
     test_bad_files();

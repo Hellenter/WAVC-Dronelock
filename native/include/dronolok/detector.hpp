@@ -60,6 +60,18 @@ struct DetectorConfig {
     // подтверждается, только когда сдвинулась (Tracker). Считается каждый кадр, поэтому
     // годится и для съёмки с рук; для неподвижной камеры землю и так убирает маска неба.
     bool zones = false;
+    // Земля в зонах по нескольким кадрам: 1 — большинство из трёх последних полных кадров, 2 —
+    // земля держится ещё кадр. Мигание на wt18 2.2 -> 1.4 тайла за кадр (2), ложных целей на кадр
+    // wt15/wt17 -10%, но захват на дроне wt18 87 -> 83% (1 — хуже): по умолчанию выключено
+    int zone_vote = 0;
+    // Тонкое над землёй (столб, мачта, антенна) не шире thin_tiles тайлов — земля, но без кольца
+    // смешанных тайлов: вокруг столба небо не становится смешанным полосой в три тайла. 0 — как раньше
+    int thin_tiles = 1;
+    // Полоса у нижнего края кадра, не вошедшая в сетку тайлов (1080 строк — это 16 тайлов по
+    // 64 и ещё 56 строк): по ней считается ещё ряд тайлов, выровненный по низу кадра, и он
+    // участвует в зонах как земля, если там текстура. Иначе кроны и столбы у самого края в
+    // зоны не попадают, их верхушки над краем — "чистое небо". Искать там не ищем
+    bool zone_strip = true;
     float mixed_k = 1.f;        // на ваших роликах главное — правило "подтверждать, когда полетела", порог можно не поднимать
     int coarse_every = 2;       // крупная цель за кадр смещается мало, а грубые масштабы недёшевы
     // --- Неподвижная камера: ячейки 16x16 пикс. кадра (8x8 после пулинга) ---
@@ -92,6 +104,49 @@ struct DetectorConfig {
     bool fine_mask = true;
     int fine_frames = 150;
     float fine_tex = 0.05f;
+    // Маска дорастает там, где копятся помехи (неподвижная камера, noteClutter): тайл неба,
+    // где за ~grow_frames кадров помех (отклики на месте, Tracker::clutterDets) в grow_k раз
+    // больше среднего по небу этой сцены, не меньше grow_min на кадр и хотя бы в grow_cells
+    // разных ячейках 16x16 (одна точка — может быть зависший дрон), закрывается — но только
+    // если прирастает к маске: земля хотя бы с трёх сторон (края кадра слева, справа, снизу —
+    // тоже земля), или с двух и над ним не чистое небо (помех мало, текстура реже grow_sky_tex
+    // кадров). Так закрываются дыры в поле и траве у горизонта, а ряд над кромкой крон и крыш,
+    // где сосед-земля один (снизу), остаётся открытым — там и появляется дрон.
+    bool grow_mask = true;
+    int grow_frames = 60;
+    float grow_k = 3.f;
+    float grow_min = 0.1f;
+    int grow_cells = 2;
+    float grow_sky_tex = 0.02f;   // чистое небо: текстурный реже такой доли кадров
+    // Перепроверка маски: облака. Тайлы, закрытые при обучении по своей текстуре (кромка тучи,
+    // облака у солнца, кроны), раз в recheck_every кадров считаются заново. Текстурны и облака,
+    // и кроны, но у облака отклик слабый: медиана максимумов его ячеек 16x16 ниже порога, у крон,
+    // домов и травы — выше. Тайл, где за ~recheck_frames кадров сильный отклик бывал реже доли
+    // recheck_tex и выше которого в столбце нет такой земли, открывается. Закрытое линией
+    // горизонта и доращиванием не открывается. Цель в открытом так тайле подтверждается, только
+    // когда полетела (как у кромки): кромка облака сама даёт отклики.
+    bool mask_recheck = true;
+    int recheck_every = 10;
+    int recheck_frames = 150;
+    float recheck_tex = 0.2f;
+    // ...закрытое доращиванием (grow_mask) тоже перепроверяется и открывается, когда ни одна его
+    // ячейка не дотягивает до порога в доле reopen_quiet замеров за ~2*recheck_frames кадров
+    // (облако ушло, помехам больше неоткуда взяться). Нужен mask_recheck; 1.01 — не открывать
+    float reopen_quiet = 0.9f;
+    // Маска по полярности: облака дают светлую текстуру (яркие клочья на небе) почти без тёмной,
+    // а кроны, дома и трава — обе. В тайле, закрытом только светлой текстурой (тёмная бывала не
+    // чаще доли pol_tex кадров обучения), тёмные цели ищутся: дрон на фоне облаков тёмный. Цель
+    // там подтверждается, только когда полетела. 2 — и наоборот (тайл только с тёмной текстурой
+    // открыт для светлых целей), 0 — выкл. Помехи копятся — тайл закрывается (grow_mask)
+    int pol_mask = 1;
+    float pol_tex = 0.05f;
+    // Цель в захвате, залетевшая под маску (облако, кромка): в круге прогноза её трека
+    // (setLockArea) ячейки под маской смотрятся с порогом x lock_through_k. Кандидат — той же
+    // полярности, контраст в пределах x2 от контраста трека, слабый (только продолжает трек,
+    // новых не рождает) и только если пятно там одно: два разных — неоднозначно, трек держится
+    // на прогнозе. Если цель видна и без маски, ничего не добавляется
+    bool lock_through = true;
+    float lock_through_k = 1.5f;
     int bg_frames = 250;
     // Накопление слабой цели по кадрам (track-before-detect на ячейках, фон ячеек тогда
     // учится по всему небу): A = tbd_decay * max3x3(A) + max(0, z - tbd_z0), z — превышение
@@ -120,6 +175,12 @@ struct DetectorConfig {
     // (FWHM ~3 пикс.) порог thr * smooth_k, от compact_r1 (FWHM ~5) — полный thr, между — плавно.
     bool smooth_compact = true;
     float compact_r0 = 0.45f, compact_r1 = 0.7f;
+    // Ореол резкости: камера телефона повышает резкость, и вдоль тёмного столба, мачты, края
+    // фонаря идёт светлая кайма — светлый кандидат прямо у тёмного. Светлый кандидат, рядом с
+    // которым (до 4 пикс., на грубых масштабах шире) темнее фона больше чем в halo_k раз его
+    // контраста и это тёмное протяжённое, — кайма: как у кромки (Candidate::edge), цель, только
+    // когда полетела. Выбрасывать нельзя: wt19 захват на дроне 84 -> 56%. 0 — выкл.
+    float halo_k = 2.f;
     // Положение кандидата точнее шага пулинга: вершина пятна на сглаженном 3x3 кадре вокруг
     // отклика, по трём точкам гаусса вдоль x и y. Без этого координата — центр клетки 2x2
     // пулинга (ошибка до 1 пикс., СКО ~0.8 пикс.).
@@ -196,9 +257,26 @@ public:
     bool loadMask(const std::string& path, int verify = 25);
     bool verifyingMask() const { return verifyLeft_ > 0; }
     bool maskReplaced() const { return maskReplaced_; }
+    // Помехи этого кадра (Tracker::clutterDets, пиксели кадра) для доращивания маски
+    // (DetectorConfig::grow_mask); keep — области, где маска не растёт (цель в захвате).
+    // Вызывать после detect, только пока камера неподвижна. Число тайлов, закрытых так с
+    // начала маски, — maskGrown(), открытых перепроверкой (mask_recheck) — maskOpened(); растёт
+    // любое — маску стоит сохранить заново.
+    void noteClutter(const std::vector<Candidate>& clutter, const std::vector<FocusArea>& keep);
+    int maskGrown() const { return grown_; }
+    int maskOpened() const { return opened_ + reopened_; }
+    // тайлы, закрытые маской, где ищутся цели одной полярности (DetectorConfig::pol_mask):
+    // pol 0 — тёмные, 1 — светлые (tilesY x tilesX, 1 — ищутся); пусто — нет таких
+    const std::vector<uint8_t>& polarityOpen(int pol) const { return polOpen_[pol ? 1 : 0]; }
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
+    // Цель в захвате на этот кадр: прогноз (x, y), радиус поиска, полярность и контраст трека
+    // (DetectorConfig::lock_through); on = false — захвата нет. Действует до следующего вызова
+    void setLockArea(bool on, float x = 0, float y = 0, float r = 0, int polarity = -1, float contrast = 0) {
+        lockOn_ = on;
+        lockX_ = x, lockY_ = y, lockR_ = r, lockPol_ = polarity, lockC_ = contrast;
+    }
     // Где искать в кадры между полными просмотрами (Tracker::roi)
     void setRoi(const std::vector<FocusArea>& areas) { roi_ = areas; }
     const std::vector<uint8_t>& tileMask() const { return mask_; }   // tilesY x tilesX, 1 = искать
@@ -239,7 +317,7 @@ private:
     int w_ = 0, h_ = 0, tw_ = 0, th_ = 0;
     std::vector<uint8_t> mask_;
     bool learning_ = false;
-    std::vector<float> texSum_;
+    std::vector<float> texSum_, texSumP_[2];   // ...и по полярностям
     int texN_ = 0;
     int verifyLeft_ = 0;
     bool maskReplaced_ = false;
@@ -252,6 +330,33 @@ private:
     std::vector<float> fineTex_;
     std::vector<uint16_t> fineN_;
     void updateFine();
+    // доращивание маски по помехам: помехи по ячейкам с забыванием, кадров в окне
+    std::vector<float> growCell_, growCellD_, growTex_;   // помехи по ячейкам, из них тёмные; текстура
+    int growN_ = 0, grown_ = 0;
+    void growMask(const std::vector<FocusArea>& keep);
+    void resetGrow();
+    // перепроверка маски: тайлы, закрытые по текстуре, их текстура при перепроверках
+    std::vector<uint8_t> texBad_, recheckMask_, cloud_;   // ...и открытые как облако
+    std::vector<float> recheckTex_;
+    std::vector<uint16_t> recheckN_;
+    int opened_ = 0;
+    std::vector<uint8_t> polOpen_[2];   // закрытые тайлы, открытые для одной полярности
+    // закрытые доращиванием, доля "тихих" перепроверок и их число; открыто снова
+    std::vector<uint8_t> grownT_;
+    std::vector<float> growQuiet_;
+    std::vector<uint16_t> growQN_;
+    int reopened_ = 0;
+    bool polOpenAt(int pol, size_t i) const {
+        const auto& v = polOpen_[pol ? 1 : 0];
+        return v.size() == mask_.size() && v[i];
+    }
+    void markTexBad(float frac);
+    void updateRecheck();
+    bool lockOn_ = false;
+    float lockX_ = 0, lockY_ = 0, lockR_ = 0, lockC_ = 0;
+    int lockPol_ = -1;
+    bool lockTile(int tx, int ty) const;   // тайл задет кругом захвата (lock_through)
+    void selectThrough(const TileStats& ts, int pol, std::vector<Candidate>& out);
 public:
     // тайлы полосы у горизонта (tilesY x tilesX, 1 — полоса), пусто — выключено или нет маски
     const std::vector<uint8_t>& horizonBand() const { return band_; }
@@ -269,7 +374,7 @@ public:
 private:
     void buildMask(float frac, std::vector<uint8_t>& out) const;
     std::vector<FocusArea> focus_, roi_;
-    std::vector<uint8_t> focusTiles_, roiMask_, zones_;
+    std::vector<uint8_t> focusTiles_, roiMask_, zones_, zoneHist_, zoneAll_;
     std::vector<int> fill_;
     void computeZones();
     long frameNo_ = 0;
@@ -307,7 +412,8 @@ struct TrackerConfig {
     float r_meas = 1.5f;        // ошибка измерения позиции, пикс. (на грубых масштабах больше)
     int confirm = 3;            // подтверждение: confirm попаданий из window кадров
     int window = 5;
-    int max_miss = 12;          // подтверждённый трек держится на прогнозе до стольких кадров (не дольше, чем было попаданий)
+    int max_miss = 6;           // подтверждённый трек держится на прогнозе до стольких кадров (не дольше, чем было попаданий);
+                                // ночной тест 29.10: 12 -> 6, на wt15 захват раньше (0.72 -> 0.45 с), ложных не больше
     int tentative_miss = 2;     // неподтверждённый — столько
     // Подтверждение по накопленной "уверенности" (последовательный тест отношения
     // правдоподобия, как в track-before-detect): попадание добавляет margin^2 - 1 + ev_hit
@@ -364,7 +470,8 @@ struct TrackerConfig {
     int cls_window = 16;        // сколько последних попаданий смотреть
     int cls_min_hits = 8;       // меньше — класс Unknown
     float bird_resid = 2.2f;    // СКО отклонения от плавной траектории, пикс., выше — птица
-    float bird_contrast_cv = 0.35f;  // вариация контраста (взмахи крыльев)
+    float bird_contrast_cv = 0.5f;   // вариация контраста (взмахи крыльев); 0.35 -> 0.5: дрон с дёрганой камерой
+                                     // реже «птица», жёсткий захват на дроне wt2 86 -> 92%
     float bird_speed = 0.f;     // >0: быстрее (пикс./кадр) — тоже признак птицы
     // Взмахи крыльев: суммарный контраст (Candidate::energy) за последние flap_window
     // кадров приближается синусоидой с периодом 2..16 кадров (при 25 кадр/с это 1.5-12.5 Гц;
@@ -417,7 +524,8 @@ struct TrackerConfig {
     // hard_full_every кадров, см. hardFullEvery). Снимается, если цель пропала дольше
     // hard_miss кадров или оказалась птицей. false — захват как обычно.
     bool hard_lock = true;
-    int verify_frames = 25;
+    int verify_frames = 10;     // 25 -> 10 (ночной тест 29.10): вместе с bird_contrast_cv 0.5 жёсткий на дроне
+                                // wt2 86 -> 96%, wt15 75 -> 90%, захват на дроне не хуже, ложного на wt2 нет
     int hard_miss = 60;
     int hard_full_every = 6;
     // Наложения на кадр (надписи, логотипы, OSD, грязь на объективе): отклик стоит в одной
@@ -453,6 +561,7 @@ struct Silhouette {
     int area = 0;          // площадь, пикс.
     // от силуэта вверх или вниз тянется длинная тонкая линия (мачта, столб, ствол) —
     // это светильник на мачте или что-то на конструкции, а не летящий дрон
+    // (и при valid = false: силуэт крупнее maxR дошёл до низа кадра — точка на земле)
     bool attached = false;
 };
 // Силуэт объекта, который ждём в точке (x, y) кадра gray: r — ожидаемый радиус (0 —
