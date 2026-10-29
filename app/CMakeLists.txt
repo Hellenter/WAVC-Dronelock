@@ -62,6 +62,7 @@ add_executable(dronolok_app
   src/multitest_report.cpp
   src/pipeline.cpp
   src/platform.cpp
+  src/twocam.cpp
   src/video_source.cpp)
 target_include_directories(dronolok_app PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../native/tools ${FFMPEG_INCLUDE_DIRS})
 target_link_libraries(dronolok_app PRIVATE dronolok_static imgui)

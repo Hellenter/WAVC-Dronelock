@@ -219,6 +219,10 @@ public:
     ~Pipeline();
 
     bool open(const std::string& path, std::string& err);
+    // Кадры не из файла, а от генератора (эмулятор камер): gen заполняет px (w x h), index и
+    // возвращает false, когда кадров больше не будет. Вызывается в потоке чтения; может ждать.
+    // name — подпись вместо пути к файлу (файлы рядом с видео не читаются и не пишутся)
+    bool openGenerator(const VideoInfo& info, std::function<bool(Frame&)> gen, const std::string& name);
     void close();
     bool isOpen() const { return open_; }
     const std::string& path() const { return path_; }
@@ -292,6 +296,7 @@ private:
 
     std::string path_;
     bool open_ = false;
+    std::function<bool(Frame&)> gen_;   // кадры от генератора вместо файла
     VideoInfo info_;
     std::shared_ptr<const dronolok::GroundTruth> gt_;   // под rm_: разметку можно заменить на ходу
     bool haveGt_ = false;
