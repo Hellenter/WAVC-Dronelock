@@ -516,7 +516,9 @@ func glb_mesh(path: String) -> Array:
 
 
 func list_glb(sub: String) -> Array:
-	var dir = str(cfg.get("world", {}).get("assets", ProjectSettings.globalize_path("res://assets")))
+	var dir = str(cfg.get("world", {}).get("assets", "res://assets"))
+	if dir.begins_with("res://"):
+		dir = ProjectSettings.globalize_path(dir)
 	var d = DirAccess.open(dir + "/" + sub)
 	var res = []
 	if d == null:

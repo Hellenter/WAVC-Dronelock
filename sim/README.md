@@ -49,7 +49,8 @@
   `radius`, `dir`, `phase`), `hover` (`pos`, `jitter`), `wander` (`center`, `radius`). Птицы: `flap_hz`,
   `flap_deg`, `flap_period` и `flap_on` (взмахи пачками, между ними планирование).
 
-Готовые сцены: `forest_village` (4 дрона, 2 птицы), `pan_sweep` (камера качается ±25° на 10°/с),
+Готовые сцены: `forest_village` (4 дрона, 2 птицы), `forest_polyhaven` (то же с деревьями Poly Haven из
+`assets/polyhaven`), `pan_sweep` (камера качается ±25° на 10°/с),
 `overcast_birds` (пасмурно, только птицы — проверка ложных тревог), `quick` (3 с, полразрешения).
 
 ## CI
@@ -57,3 +58,8 @@
 `.github/workflows/sim.yml` рендерит `quick` и `forest_village` при каждом изменении `sim/` (программный
 рендер, видеокарта не нужна), прогоняет по роликам мультитест и выкладывает ролики с разметкой в артефакт
 `sim-videos`. Другие сцены и длина — через «Run workflow».
+
+Модели Poly Haven приходят как `.blend`; в `.glb` для сцены их перегоняет `sim/blend2glb.py` (Blender 4,
+прореживание до `--tris`, текстуры до `--tex`, простые материалы с прозрачностью листвы):
+
+    blender -b pine_sapling_small_1k.blend --python sim/blend2glb.py -- sim/godot/assets/polyhaven/trees --tris 8000 --tex 256

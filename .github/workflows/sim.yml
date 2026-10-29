@@ -9,7 +9,7 @@ on:
     inputs:
       scenes:
         description: 'Сцены из sim/scenes через пробел'
-        default: 'forest_village pan_sweep overcast_birds'
+        default: 'forest_village forest_polyhaven pan_sweep overcast_birds'
       seconds:
         description: 'Длина роликов, с (пусто — как в сцене)'
         default: ''
@@ -54,7 +54,7 @@ jobs:
           SCENES: ${{ github.event.inputs.scenes }}
           SECS: ${{ github.event.inputs.seconds }}
         run: |
-          scenes="$SCENES"; [ -z "$scenes" ] && scenes="quick forest_village"
+          scenes="$SCENES"; [ -z "$scenes" ] && scenes="quick forest_village forest_polyhaven"
           secs="$SECS"
           mkdir -p vids
           for s in $scenes; do
