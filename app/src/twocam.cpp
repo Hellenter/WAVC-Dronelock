@@ -265,8 +265,9 @@ void Emulator::renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out) 
     });
     const uint32_t seed = noiseSeed_ += 0x7f4a7c15u;
     parallel_rows(H, [&](int ya, int yb) {
-    uint32_t r = seed ^ (uint32_t)(ya * 2654435761u) ^ 0x51ed27u;
     for (int y = ya; y < yb; ++y) {
+        // свой генератор на строку: шум не зависит от числа потоков (ядер ПК)
+        uint32_t r = (seed ^ (uint32_t)(y * 2654435761u) ^ 0x51ed27u) | 1u;
         const float gy = (float)y / NARROW_STEP;
         const int j0 = std::min(gh - 2, (int)gy);
         const float ty = gy - j0;
@@ -793,6 +794,7 @@ void Emulator::loop() {
     float lastSpeed = speed_;
     int64_t idx = 0;
     while (!stop_) {
+        if (c_.stopAt > 0 && t >= c_.stopAt - 1e-9) break;   // замер: ровно столько модельного времени
         if (paused_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             wallBase = now_s();
@@ -888,6 +890,7 @@ static void pct(std::vector<float> v, float& med, float& p90) {
 Stats Emulator::runBlocking(const Config& c, double seconds, bool verbose) {
     Config cc = c;
     cc.simSpeed = 0;
+    cc.stopAt = seconds;
     start(cc);
     double last = -1;
     while (running_) {
@@ -899,8 +902,9 @@ Stats Emulator::runBlocking(const Config& c, double seconds, bool verbose) {
                    v.st.acquired, v.st.simT > 0 ? 100 * v.st.trackTime / v.st.simT : 0);
             fflush(stdout);
         }
-        if (v.st.simT >= seconds) break;
+        if (v.st.simT >= seconds - 1e-6 || (!v.running && v.st.simT > 0)) break;
     }
+    if (th_.joinable()) th_.join();   // цикл остановился сам на stopAt: итог — ровно на этот момент
     const View v = view();
     if (verbose)
         for (const auto& e : v.events) printf("  [%6.2f] %s\n", e.t, e.text.c_str());
