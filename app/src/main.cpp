@@ -130,6 +130,8 @@ struct App {
     bool annotate = false;
     Annotation ann;
     int annCur = 0;        // выбранный объект (AnnObject::id)
+    AnnObject annUndo;     // последний удалённый целиком — «вернуть»
+    bool annHasUndo = false;
     std::string annMsg;
     // разметка по цели: после щелчка по дрону точки ставятся сами, пока он виден — по треку
     // алгоритма, а где трека нет (трекер сбросил треки, дрон принят за помеху) — по картинке
@@ -268,6 +270,7 @@ void open_video(App& a, const std::string& path) {
     a.annFollow = false;
     a.annFollowId = 0;
     a.annDirty = false;
+    a.annHasUndo = false;
 }
 
 // разметку поменяли: сохранить в <видео>.gt.json и сразу считать по ней качество
@@ -281,6 +284,34 @@ void ann_changed(App& a) {
     int keys = 0;
     for (const auto& o : a.ann.objs) keys += (int)o.keys.size();
     a.annMsg = "сохранено: объектов " + std::to_string(a.ann.objs.size()) + ", точек " + std::to_string(keys);
+}
+
+// удалить путь объекта целиком (все его точки на всех кадрах); «вернуть» восстанавливает
+void ann_delete(App& a, int id) {
+    auto it = std::find_if(a.ann.objs.begin(), a.ann.objs.end(), [&](const AnnObject& o) { return o.id == id; });
+    if (it == a.ann.objs.end()) return;
+    if (a.annFollow && a.annFollowObj == id) {
+        a.annFollow = false;   // разметка шла за ним — остановить, не дописывая последнюю точку
+        a.annFollowId = 0;
+        a.annDirty = false;
+    }
+    a.annUndo = *it;
+    a.annHasUndo = true;
+    a.ann.objs.erase(it);
+    if (a.annCur == id) a.annCur = a.ann.objs.empty() ? 0 : a.ann.objs.back().id;
+    ann_changed(a);
+    a.annMsg = "путь #" + std::to_string(id) + " удалён целиком (точек " + std::to_string(a.annUndo.keys.size()) +
+               ") — «вернуть» отменит";
+}
+
+void ann_undo(App& a) {
+    if (!a.annHasUndo) return;
+    if (a.ann.find(a.annUndo.id)) a.annUndo.id = a.ann.add(a.annUndo.bird);   // номер успели занять
+    else a.ann.objs.push_back(a.annUndo);
+    if (AnnObject* o = a.ann.find(a.annUndo.id)) o->keys = a.annUndo.keys;
+    a.annCur = a.annUndo.id;
+    a.annHasUndo = false;
+    ann_changed(a);
 }
 
 // ------------------------------------------------------------ разметка по треку
@@ -849,7 +880,8 @@ void panel_annotate(App& a) {
                 "от первой до последней точки. Правый щелчок — убрать точку на этом кадре. Сохраняется сразу "
                 "в <видео>.gt.json, рядом с видео.");
     ImGui::TextWrapped("Пауза, щелчок по дрону — опорная точка, дальше точки ставятся сами, пока дрон виден. "
-                       "Ошиблись — пауза и щелчок по дрону: поправит и поведёт дальше. Правый щелчок — убрать точку.");
+                       "Ошиблись — пауза и щелчок по дрону: поправит и поведёт дальше. Правый щелчок — убрать точку, "
+                       "Delete или «x» у объекта — весь путь.");
     if (!a.annotate) {
         ann_follow_stop(a, nullptr);
         if (a.ann.noDrones) ImGui::TextDisabled("ролик отмечен: дронов нет");
@@ -915,14 +947,10 @@ void panel_annotate(App& a) {
     if (ImGui::Button("+ птица", ImVec2(bw, 0))) a.annCur = a.ann.add(true);
     ImGui::SameLine();
     ImGui::BeginDisabled(!a.ann.find(a.annCur));
-    if (ImGui::Button("удалить", ImVec2(bw, 0))) {
-        a.ann.objs.erase(std::remove_if(a.ann.objs.begin(), a.ann.objs.end(),
-                                        [&](const AnnObject& o) { return o.id == a.annCur; }),
-                         a.ann.objs.end());
-        a.annCur = a.ann.objs.empty() ? 0 : a.ann.objs.back().id;
-        ann_changed(a);
-    }
+    if (ImGui::Button("удалить путь", ImVec2(bw, 0))) ann_delete(a, a.annCur);
     ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Удалить выбранный объект со всеми точками на всех кадрах (клавиша Delete; на видео — "
+                          "Shift + правый щелчок по кружку объекта). «Вернуть» под списком отменит");
     {
         const std::shared_ptr<const Result> sh = a.shown;
         AnnObject* ob = a.ann.find(a.annCur);
@@ -937,15 +965,27 @@ void panel_annotate(App& a) {
                               "сотрите точки дальше и щёлкните по дрону снова");
     }
     heading("Объекты");
+    int del = 0;
     for (const auto& o : a.ann.objs) {
         char b[128];
+        ImGui::PushID(o.id);
+        if (ImGui::SmallButton("x")) del = o.id;
+        ImGui::SetItemTooltip("удалить путь #%d целиком", o.id);
+        ImGui::PopID();
+        ImGui::SameLine();
         if (o.keys.empty()) snprintf(b, sizeof(b), "#%d %s: точек нет##o%d", o.id, o.bird ? "птица" : "дрон", o.id);
         else
             snprintf(b, sizeof(b), "#%d %s: точек %d, кадры %lld-%lld##o%d", o.id, o.bird ? "птица" : "дрон",
                      (int)o.keys.size(), (long long)o.keys.begin()->first, (long long)o.keys.rbegin()->first, o.id);
         if (ImGui::Selectable(b, a.annCur == o.id)) a.annCur = o.id;
     }
+    if (del) ann_delete(a, del);
     if (a.ann.objs.empty()) ImGui::TextDisabled("щёлкните по дрону на кадре — появится объект #1");
+    if (a.annHasUndo) {
+        char b[96];
+        snprintf(b, sizeof(b), "вернуть удалённый путь #%d (точек %d)", a.annUndo.id, (int)a.annUndo.keys.size());
+        if (ImGui::Button(b, ImVec2(-FLT_MIN, 0))) ann_undo(a);
+    }
     if (!a.annMsg.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
         ImGui::TextWrapped("%s", a.annMsg.c_str());
@@ -2439,9 +2479,26 @@ void draw_view(App& a, const Result* r) {
                 if (a.annAuto && !r->follow) ann_follow_start(a, *r, snap, fx / kx, fy / ky);
             }
         }
-        if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
-            if (AnnObject* ob = a.ann.find(a.annCur))
+        if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+            if (io.KeyShift) {   // Shift + правый щелчок по кружку — удалить путь этого объекта целиком
+                int id = 0;
+                float bd = 20.f;
+                for (const auto& ob : a.ann.objs) {
+                    float x, y;
+                    if (!Annotation::pos(ob, f.index, x, y)) continue;
+                    const ImVec2 q = P(x * kx, y * ky);
+                    const float d = std::hypot(q.x - io.MousePos.x, q.y - io.MousePos.y);
+                    if (d < bd) {
+                        bd = d;
+                        id = ob.id;
+                    }
+                }
+                if (id) ann_delete(a, id);
+                else a.annMsg = "Shift + правый щелчок — по кружку объекта: так удаляется весь его путь";
+            } else if (AnnObject* ob = a.ann.find(a.annCur)) {
                 if (ob->keys.erase(f.index)) ann_changed(a);
+            }
+        }
     }
     dl->PopClipRect();
     // строка состояния и легенда поверх видео
@@ -3087,6 +3144,7 @@ int main(int argc, char** argv) {
             else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step_forward(a);
             if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) seek_to(a, 0, false);
             if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) a.pipe.nextTarget();
+            if (a.annotate && a.ann.editable && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) ann_delete(a, a.annCur);
             if (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))
                 set_speed(a, a.s.speed * 2);
             if (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))
