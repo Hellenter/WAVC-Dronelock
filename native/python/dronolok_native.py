@@ -38,6 +38,25 @@ class _Track(C.Structure):
                 ("flap_r2", C.c_float), ("flap_period", C.c_float)]
 
 
+class _Camera(C.Structure):
+    _fields_ = [("w", C.c_int), ("h", C.c_int), ("hfov_deg", C.c_float), ("lens", C.c_int), ("cx", C.c_float),
+                ("cy", C.c_float), ("k1", C.c_float)]
+
+
+class _Pose(C.Structure):
+    _fields_ = [("az", C.c_float), ("el", C.c_float), ("roll", C.c_float)]
+
+
+class _Target(C.Structure):
+    _fields_ = [("id", C.c_int), ("t", C.c_double), ("az", C.c_float), ("el", C.c_float), ("vaz", C.c_float),
+                ("vel", C.c_float), ("sigma", C.c_float), ("sigma_v", C.c_float), ("cls", C.c_int),
+                ("confidence", C.c_float), ("hard", C.c_int), ("size_deg", C.c_float)]
+
+
+class _Window(C.Structure):
+    _fields_ = [("u", C.c_float), ("v", C.c_float), ("radius", C.c_float), ("visible", C.c_int)]
+
+
 class _Timing(C.Structure):
     _fields_ = [("total_ms", C.c_double), ("response_ms", C.c_double), ("select_ms", C.c_double),
                 ("jobs", C.c_int), ("jobs_skipped", C.c_int)]
@@ -94,6 +113,19 @@ def _load():
     lib.dl_tracker_set_motion.argtypes = [C.c_void_p, C.c_float, C.c_float]
     lib.dl_tracker_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
     lib.dl_detector_set_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
+    lib.dl_tracker_hard.argtypes = [C.c_void_p]
+    P, PC, PP, PF = C.POINTER, C.POINTER(_Camera), C.POINTER(_Pose), C.POINTER(C.c_float)
+    lib.dl_project.argtypes = [PC, PP, C.c_float, C.c_float, PF, PF]
+    lib.dl_unproject.argtypes = [PC, PP, C.c_float, C.c_float, PF, PF]
+    lib.dl_pixel_deg.restype = C.c_float
+    lib.dl_pixel_deg.argtypes = [PC, PP, C.c_float, C.c_float]
+    lib.dl_target_from_track.argtypes = [PC, PP, C.c_double, C.c_float, P(_Track), C.c_int, P(_Target)]
+    lib.dl_target_predict.argtypes = [P(_Target), C.c_double, PF, PF, PF]
+    lib.dl_target_window.restype = _Window
+    lib.dl_target_window.argtypes = [P(_Target), C.c_double, PC, PP, C.c_float]
+    lib.dl_target_aim.restype = _Pose
+    lib.dl_target_aim.argtypes = [P(_Target), C.c_double, C.c_double]
+    lib.dl_pose_shift.argtypes = [PC, PP, PP, C.c_float, C.c_float, PF, PF]
     return lib
 
 
@@ -216,6 +248,10 @@ class NativeTracker:
     def locked(self):
         return lib().dl_tracker_locked(self._h)
 
+    def hard(self):
+        """состояние захвата: 0 нет, 1 захват, 2 жёсткий (подтверждён дрон)"""
+        return lib().dl_tracker_hard(self._h)
+
     def select(self, track_id):
         """ручной выбор цели: захват держится на ней, пока она жива"""
         return bool(lib().dl_tracker_select(self._h, track_id))
@@ -278,3 +314,67 @@ class NativeMotion:
         ok = lib().dl_motion_estimate(self._h, g.ctypes.data, g.shape[1], g.shape[0], g.strides[0],
                                       C.byref(dx), C.byref(dy), C.byref(q))
         return dx.value, dy.value, q.value, bool(ok)
+
+
+# ---------------------------------------------------------------- геометрия и передача цели
+LENS = {"pinhole": 0, "fisheye": 1}
+
+
+class Camera:
+    """Модель камеры (dl_camera): кадр w x h, поле по ширине hfov, объектив pinhole | fisheye."""
+
+    def __init__(self, w, h, hfov, lens="pinhole", cx=-1.0, cy=-1.0, k1=0.0):
+        self.w, self.h, self.hfov, self.lens = w, h, hfov, lens
+        self.c = _Camera(w, h, hfov, LENS[lens], cx, cy, k1)
+
+    def project(self, pose, az, el):
+        u, v = C.c_float(), C.c_float()
+        ok = lib().dl_project(C.byref(self.c), C.byref(_Pose(*pose)), az, el, C.byref(u), C.byref(v))
+        return u.value, v.value, bool(ok)
+
+    def unproject(self, pose, u, v):
+        a, e = C.c_float(), C.c_float()
+        lib().dl_unproject(C.byref(self.c), C.byref(_Pose(*pose)), u, v, C.byref(a), C.byref(e))
+        return a.value, e.value
+
+    def pixel_deg(self, pose, u, v):
+        return lib().dl_pixel_deg(C.byref(self.c), C.byref(_Pose(*pose)), u, v)
+
+    def pose_shift(self, pose_from, pose_to, u=None, v=None):
+        """сдвиг картинки при повороте from -> to (для NativeTracker.set_motion по энкодерам)"""
+        dx, dy = C.c_float(), C.c_float()
+        lib().dl_pose_shift(C.byref(self.c), C.byref(_Pose(*pose_from)), C.byref(_Pose(*pose_to)),
+                            self.w / 2 if u is None else u, self.h / 2 if v is None else v, C.byref(dx), C.byref(dy))
+        return dx.value, dy.value
+
+
+class Target:
+    """Сообщение о цели (dl_target): направление, угловая скорость, время кадра, неопределённость."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __getattr__(self, k):
+        return getattr(self.raw, k)
+
+    @staticmethod
+    def from_track(cam, pose, t, fps, track, hard):
+        tr = _Track()
+        tr.id, tr.x, tr.y, tr.vx, tr.vy = track["id"], track["x"], track["y"], track["vx"], track["vy"]
+        tr.sigma, tr.cls = track.get("sigma", 1.0), CLASSES.index(track.get("cls", "unknown"))
+        out = _Target()
+        lib().dl_target_from_track(C.byref(cam.c), C.byref(_Pose(*pose)), t, fps, C.byref(tr), hard, C.byref(out))
+        return Target(out)
+
+    def predict(self, t):
+        a, e, s = C.c_float(), C.c_float(), C.c_float()
+        lib().dl_target_predict(C.byref(self.raw), t, C.byref(a), C.byref(e), C.byref(s))
+        return a.value, e.value, s.value
+
+    def window(self, t, cam, pose, k_sigma=3.0):
+        w = lib().dl_target_window(C.byref(self.raw), t, C.byref(cam.c), C.byref(_Pose(*pose)), k_sigma)
+        return w.u, w.v, w.radius, bool(w.visible)
+
+    def aim(self, t, lead):
+        p = lib().dl_target_aim(C.byref(self.raw), t, lead)
+        return (p.az, p.el, p.roll)

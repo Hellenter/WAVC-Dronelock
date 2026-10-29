@@ -126,8 +126,26 @@ FramePtr Pipeline::allocFrame(int w, int h) {
     });
 }
 
+bool Pipeline::openGenerator(const VideoInfo& info, std::function<bool(Frame&)> gen, const std::string& name) {
+    close();
+    info_ = info;
+    path_ = name;
+    gen_ = std::move(gen);
+    {
+        std::lock_guard<std::mutex> lk(rm_);
+        haveGt_ = false;
+        gt_ = nullptr;
+    }
+    open_ = true;
+    relearn_ = true;
+    resetStats();
+    startThreads();
+    return true;
+}
+
 bool Pipeline::open(const std::string& path, std::string& err) {
     close();
+    gen_ = nullptr;
     VideoSource probe;
     if (!probe.open(path, 1, err)) return false;
     info_ = probe.info();
@@ -300,7 +318,7 @@ void Pipeline::decodeLoop() {
     Settings s = settings();
     VideoSource src;
     std::string err;
-    if (!src.open(path_, s.decoderThreads, err)) {
+    if (!gen_ && !src.open(path_, s.decoderThreads, err)) {
         std::lock_guard<std::mutex> lk(rm_);
         status_ = err;
         return;
@@ -313,6 +331,18 @@ void Pipeline::decodeLoop() {
         f = allocFrame(W, H);
         const double t = now_ms();
         wrapped = false;
+        if (gen_) {   // генератор: кадр нужного размера, номер ставит он сам
+            f->w = info_.w;
+            f->h = info_.h;
+            f->color = ColorPlanes();
+            if (!gen_(*f)) return false;
+            f->decodeMs = now_ms() - t;
+            std::lock_guard<std::mutex> lk(rm_);
+            ++decoded_;
+            decodeTimes_.push_back(now_ms());
+            while (decodeTimes_.size() > 200) decodeTimes_.pop_front();
+            return true;
+        }
         if (!src.read(f->px.data(), W, H, W, &f->color)) {
             if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W, &f->color)) return false;
             ++loop;

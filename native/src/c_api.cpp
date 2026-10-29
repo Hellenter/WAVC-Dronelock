@@ -4,6 +4,7 @@
 #include <string>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/geometry.hpp"
 
 using namespace dronolok;
 
@@ -213,5 +214,75 @@ void dl_detector_set_focus(dl_detector* d, const float* xyr, int n) {
     for (int i = 0; i < n; ++i) a[i] = {xyr[3 * i], xyr[3 * i + 1], xyr[3 * i + 2]};
     d->det.setFocus(a);
 }
+
+static CameraModel cam(const dl_camera* c) {
+    CameraModel m;
+    if (!c) return m;
+    m.w = c->w;
+    m.h = c->h;
+    m.hfov_deg = c->hfov_deg;
+    m.lens = c->lens == 1 ? Lens::Fisheye : Lens::Pinhole;
+    m.cx = c->cx;
+    m.cy = c->cy;
+    m.k1 = c->k1;
+    return m;
+}
+static Pose pose(const dl_pose* p) { return p ? Pose{p->az, p->el, p->roll} : Pose{}; }
+static TargetReport report(const dl_target* t) {
+    TargetReport r;
+    r.id = t->id; r.t = t->t; r.az = t->az; r.el = t->el; r.vaz = t->vaz; r.vel = t->vel; r.sigma = t->sigma;
+    r.sigma_v = t->sigma_v; r.cls = t->cls; r.confidence = t->confidence; r.hard = t->hard; r.size_deg = t->size_deg;
+    return r;
+}
+
+int dl_project(const dl_camera* c, const dl_pose* p, float az, float el, float* u, float* v) {
+    double uu = 0, vv = 0;
+    const bool ok = project(cam(c), pose(p), dir_from_azel(az, el), uu, vv);
+    if (u) *u = (float)uu;
+    if (v) *v = (float)vv;
+    return ok && in_frame(cam(c), uu, vv) ? 1 : 0;
+}
+void dl_unproject(const dl_camera* c, const dl_pose* p, float u, float v, float* az, float* el) {
+    double a, e;
+    azel_from_dir(unproject(cam(c), pose(p), u, v), a, e);
+    if (az) *az = (float)a;
+    if (el) *el = (float)e;
+}
+float dl_pixel_deg(const dl_camera* c, const dl_pose* p, float u, float v) {
+    return (float)pixel_deg(cam(c), pose(p), u, v);
+}
+void dl_target_from_track(const dl_camera* c, const dl_pose* p, double t, float fps, const dl_track* tr, int hard,
+                          dl_target* out) {
+    if (!tr || !out) return;
+    const TargetReport r = make_report(cam(c), pose(p), t, fps > 0 ? fps : 25.f, tr->x, tr->y, tr->vx, tr->vy, tr->sigma);
+    *out = {tr->id, r.t, r.az, r.el, r.vaz, r.vel, r.sigma, r.sigma_v, tr->cls,
+            // уверенность по классу: подтверждённый дрон, дрон, неизвестно, птица или помеха
+            hard == 2 ? 0.9f : tr->cls == 1 ? 0.6f : tr->cls == 0 ? 0.4f : 0.15f, hard == 2 ? 1 : 0, 0.f};
+}
+void dl_target_predict(const dl_target* tg, double t, float* az, float* el, float* sigma) {
+    double a = 0, e = 0, s = 0;
+    if (tg) predict(report(tg), t, a, e, s);
+    if (az) *az = (float)a;
+    if (el) *el = (float)e;
+    if (sigma) *sigma = (float)s;
+}
+dl_window dl_target_window(const dl_target* tg, double t, const dl_camera* c, const dl_pose* p, float k_sigma) {
+    dl_window w{0, 0, 0, 0};
+    if (!tg) return w;
+    const SearchWindow s = search_window(report(tg), t, cam(c), pose(p), k_sigma > 0 ? k_sigma : 3.f);
+    return {s.u, s.v, s.radius, s.visible};
+}
+dl_pose dl_target_aim(const dl_target* tg, double t, double lead) {
+    if (!tg) return {0, 0, 0};
+    const Pose p = aim(report(tg), t, lead);
+    return {p.az, p.el, p.roll};
+}
+void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose* to, float u, float v, float* dx, float* dy) {
+    double a = 0, b = 0;
+    pose_shift(cam(c), pose(from), pose(to), u, v, a, b);
+    if (dx) *dx = (float)a;
+    if (dy) *dy = (float)b;
+}
+int dl_tracker_hard(dl_tracker* t) { return (int)t->trk.lockState(); }
 
 }  // extern "C"
