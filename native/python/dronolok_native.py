@@ -90,6 +90,7 @@ def _load():
     lib.dl_motion_destroy.argtypes = [C.c_void_p]
     lib.dl_motion_estimate.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_float),
                                        C.POINTER(C.c_float), C.POINTER(C.c_float)]
+    lib.dl_motion_set_fps.argtypes = [C.c_void_p, C.c_float]
     lib.dl_tracker_set_motion.argtypes = [C.c_void_p, C.c_float, C.c_float]
     lib.dl_tracker_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
     lib.dl_detector_set_focus.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_int]
@@ -257,13 +258,19 @@ class NativeTracker:
 class NativeMotion:
     """Сдвиг картинки между кадрами (камера движется): estimate(gray) -> (dx, dy, quality, valid)"""
 
-    def __init__(self):
+    def __init__(self, fps=None):
         self._h = lib().dl_motion_create()
+        if fps:
+            self.set_fps(fps)
 
     def __del__(self):
         if getattr(self, "_h", None):
             lib().dl_motion_destroy(self._h)
             self._h = None
+
+    def set_fps(self, fps):
+        """Частота кадров камеры, см. dl_motion_set_fps."""
+        lib().dl_motion_set_fps(self._h, float(fps))
 
     def estimate(self, gray):
         g = np.ascontiguousarray(gray, dtype=np.uint8)

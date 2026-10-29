@@ -645,6 +645,21 @@ static void test_stationary() {
     const TrackerConfig t25 = tracker_for_fps(t, 25.f), t10 = tracker_for_fps(t, 10.f);
     CHECK(t25.gate == t.gate && t25.max_miss == t.max_miss, "tracker_for_fps 25");
     CHECK(t10.gate > t.gate && t10.max_miss < t.max_miss && t10.confirm == t.confirm, "tracker_for_fps 10");
+    // правила в пикс./с: на 60 к/с — прежние числа за кадр
+    const TrackerConfig t60 = tracker_for_fps(t, 60.f);
+    CHECK(std::fabs(t60.still_speed - 0.25f) < 1e-3f && std::fabs(t60.lost_grow - 4.f) < 1e-3f &&
+              std::fabs(t60.flock_speed - 0.5f) < 1e-3f, "tracker_for_fps 60: %.3f %.3f %.3f", t60.still_speed, t60.lost_grow,
+          t60.flock_speed);
+    // окна маски неба в кадрах подобраны на 60 к/с: там и без частоты — как есть, на 15 к/с — в
+    // секундах; фон ячеек и экономия "раз в N кадров" — как есть
+    const DetectorConfig dd;
+    const DetectorConfig d60 = detector_for_fps(dd, 60.f), d0 = detector_for_fps(dd, 0.f), d15 = detector_for_fps(dd, 15.f);
+    CHECK(d60.fine_frames == dd.fine_frames && d60.grow_frames == dd.grow_frames && d60.coarse_every == dd.coarse_every &&
+              d0.bg_frames == dd.bg_frames, "detector_for_fps 60");
+    CHECK(d15.fine_frames < dd.fine_frames && d15.fine_frames >= 20 && d15.bg_frames == dd.bg_frames && d15.recheck_every >= 1 &&
+              d15.recheck_frames / d15.recheck_every >= dd.recheck_frames / dd.recheck_every * 3 / 4 &&
+              d15.coarse_every == dd.coarse_every && d15.full_every == dd.full_every,
+          "detector_for_fps 15: fine %d bg %d recheck %d/%d", d15.fine_frames, d15.bg_frames, d15.recheck_frames, d15.recheck_every);
     std::printf("stationary camera (mask file, per_tile, fps): ok\n");
 }
 
@@ -895,6 +910,23 @@ static void test_motion() {
               osd ? " with overlay" : "", e.dx, e.dy);
         const MotionEstimate z = gm.estimate(f1.data(), w, h, w);   // повтор кадра
         CHECK(z.valid && z.dx == 0 && z.dy == 0, "motion: repeated frame %.2f %.2f", z.dx, z.dy);
+    }
+    // Плавный поворот, а нижние 40% кадра стоят (своя техника в кадре, как в записях игры): на 60 к/с
+    // сдвиг 6 пикс. за кадр — 360 пикс./с, и проверка по частям кадра считает это шевелением в кадре
+    // при неподвижной камере; на 15 к/с это 90 пикс./с, поворот должен найтись
+    auto still = [&](int ox) {
+        std::vector<uint8_t> f = frame(ox, 0, false), s0 = frame(0, 0, false);
+        std::copy(s0.begin() + (size_t)(h * 6 / 10) * w, s0.end(), f.begin() + (size_t)(h * 6 / 10) * w);
+        return f;
+    };
+    for (float fps : {0.f, 15.f}) {
+        GlobalMotion gm;
+        gm.setFps(fps);
+        auto f0 = still(0), f1 = still(-6);
+        gm.estimate(f0.data(), w, h, w);
+        const MotionEstimate e = gm.estimate(f1.data(), w, h, w);
+        if (fps > 0) CHECK(e.valid && std::fabs(e.dx - 6) <= 1.5f && std::fabs(e.dy) <= 1.f, "motion 15 fps, still part: %.2f %.2f (6, 0)", e.dx, e.dy);
+        else CHECK(e.valid && e.dx == 0 && e.dy == 0, "motion 60 fps, still part: %.2f %.2f (0, 0)", e.dx, e.dy);
     }
     std::printf("motion: ok\n");
 }

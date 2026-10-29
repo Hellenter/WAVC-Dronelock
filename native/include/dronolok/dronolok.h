@@ -92,6 +92,10 @@ DL_API dl_motion* dl_motion_create(void);
 DL_API void dl_motion_destroy(dl_motion* m);
 DL_API int dl_motion_estimate(dl_motion* m, const uint8_t* gray, int w, int h, int stride, float* dx, float* dy,
                               float* quality);
+/* Частота кадров камеры (0 — не задана): проверка "сдвинулась только часть кадра — камера стоит"
+   включается по скорости поворота, как при 60 к/с. Без вызова на 10-15 к/с плавный поворот, при
+   котором часть кадра неподвижна, мог оцениваться нулём. */
+DL_API void dl_motion_set_fps(dl_motion* m, float fps);
 DL_API void dl_tracker_set_motion(dl_tracker* t, float dx, float dy);
 /* Области прогноза подтверждённых треков (x, y, r тройками) для dl_detector_set_focus. */
 DL_API int dl_tracker_focus(dl_tracker* t, float* xyr, int cap);

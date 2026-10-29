@@ -1112,6 +1112,10 @@ void tab_video(App& a, bool& changed) {
             a.s.targetFps = fps;
             changed = true;
         }
+        help_marker("Ниже частоты видео — камера реже видео: из файла берётся кадр на каждом такте камеры "
+                    "(14 к/с из 60 — через 4-5 кадров), видео идёт с обычной скоростью, и цель за кадр "
+                    "смещается дальше, как у настоящей камеры 16 Мп (10-15 к/с). Выше частоты видео — видео "
+                    "ускоряется. Замедлить видео, не пропуская кадров, — \"скорость видео\".");
         label("камера реже видео: каждый N-й кадр");
         if (ImGui::SliderInt("##fstep", &a.s.frameStep, 1, 8, a.s.frameStep <= 1 ? "все кадры" : "каждый %d-й")) {
             a.s.frameStep = std::max(1, a.s.frameStep);
@@ -1119,7 +1123,7 @@ void tab_video(App& a, bool& changed) {
         }
         help_marker("Эмуляция медленной камеры: из видео 60 к/с с шагом 4 алгоритм видит 15 к/с (камера 16 Мп — "
                     "10-15 к/с), и цель за кадр смещается вчетверо дальше. Разметка видео подходит без пересчёта. "
-                    "Не то же, что \"частота камеры\": та подаёт все кадры реже, как замедленное видео.");
+                    "Складывается с \"частотой камеры\": 30 к/с и каждый 2-й — 15 к/с.");
         float sp = (float)a.s.speed;
         label("скорость видео", "Замедление: кадры подаются реже, каждый обрабатывается. Кнопки x0.1-x1 есть и "
                                 "под видео. Клавиши + и -.");
@@ -1349,6 +1353,13 @@ void tab_algorithm(App& a, bool& changed) {
     help_marker("Скорости, ворота и выдержки трекера настроены на 25 новых кадров в секунду. Включено — они "
                 "пересчитываются под частоту камеры (повторы кадров в записи экрана не считаются). Камера 16 Мп "
                 "на 10 к/с: птиц находится 77% вместо 51%, дронов, принятых за птиц, нет.");
+    blk |= ImGui::Checkbox("Маска неба и поворот камеры в секундах", &a.s.fpsScale);
+    help_marker("Окна маски неба (обучение, уточнение у кромки леса, доращивание по помехам, перепроверка "
+                "облаков), оценка поворота камеры и признак панорамы подобраны на 60 к/с. Включено — они "
+                "пересчитываются под частоту камеры, и в секундах всё как на 60 к/с. Выключено на 15 к/с: "
+                "уточнение маски у кромки копится 10 с вместо 2.5, а медленный поворот, при котором часть кадра "
+                "стоит (своя техника, наложения записи экрана), считается \"камера стоит\" — маска не поспевает "
+                "за картинкой.");
     heading("Камера ведёт цель");
     changed |= ImGui::Checkbox("виртуальная поворотка", &a.s.follow);
     help_marker("Проверка захвата для камеры на поворотном устройстве, которая следует за целью. Алгоритм видит "
@@ -2820,6 +2831,8 @@ int run_bench(int argc, char** argv) {
         else if (a == "--tracks") s.trackLog = val();
         else if (a == "--dedup") s.skipDuplicates = true;
         else if (a == "--step") s.frameStep = std::max(1, atoi(val().c_str()));
+        else if (a == "--cam-fps") s.targetFps = atof(val().c_str());
+        else if (a == "--no-fps-scale") s.fpsScale = false;
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
         else if (a == "--no-skyline") s.det.skyline = false;
@@ -2970,7 +2983,10 @@ int run_stress(int argc, char** argv) {
                 s.slowdown = R(3) ? 1 : F(1, 20);
                 s.governor = R(2);
                 break;
-            case 17: s.learnMaskFrames = R(3) ? 25 : R(100); break;
+            case 17:
+                s.learnMaskFrames = R(3) ? 25 : R(100);
+                s.fpsScale = R(4) != 0;
+                break;
             case 18: s.det.thr = F(3, 40); break;
             case 19: s.det.k = (3 + R(13)) | 1; break;
             case 20: s.det.pool = R(2) ? 2 : 1; break;
@@ -3039,7 +3055,10 @@ int run_stress(int argc, char** argv) {
                 p.seek(R((int)std::max<int64_t>(1, std::min<int64_t>(p.length() + 20, 1 << 30))));
                 set = false;
                 break;
-            default: s.targetFps = R(2) ? 0 : F(1, 120); break;
+            default:   // частота камеры и шаг: ниже частоты видео кадры файла пропускаются
+                s.targetFps = R(2) ? 0 : F(1, 120);
+                if (R(4) == 0) s.frameStep = 1 + R(6);
+                break;
         }
         if (set) p.setSettings(s);
         ++actions;
