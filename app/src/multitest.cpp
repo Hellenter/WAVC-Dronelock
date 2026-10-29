@@ -519,7 +519,7 @@ static VideoMeta probe(const std::string& path) {
 }
 
 static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& c, int threads,
-                         const std::atomic<bool>& stop, std::atomic<long>& live, const std::string& trackLog) {
+                         const std::atomic<bool>& stop, std::atomic<long>& live) {
     RunResult rr;
     Settings s = var.setup.s;
     s.pace = c.realtime ? Pace::Realtime : Pace::MaxSpeed;
@@ -531,7 +531,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     s.staticFile = false;   // память помех от прошлых прогонов исказила бы сравнение
     s.maskFile = c.maskFile;
     s.fresh = !c.maskFile;   // чистый старт: накопленное рядом с видео не читается и не пишется
-    s.trackLog = trackLog;
+    s.trackLog.clear();
     if (!c.emulate) {
         s.slowdown = 1;
         s.emulateMs = 0;
@@ -736,7 +736,7 @@ bool Runner::start(const Config& c, std::string& err) {
         cfg_.outDir = ustr(upath(base) / b);
     }
     std::error_code ec;
-    fs::create_directories(upath(cfg_.outDir) / (cfg_.tracks ? "tracks" : ""), ec);
+    fs::create_directories(upath(cfg_.outDir), ec);
     if (ec) {
         err = "не создать папку отчёта " + cfg_.outDir + ": " + ec.message();
         return false;
@@ -781,10 +781,7 @@ bool Runner::start(const Config& c, std::string& err) {
                     liveJob_[i] = j;
                 }
                 *live_[i] = 0;
-                const std::string tl = cfg_.tracks ? ustr(upath(cfg_.outDir) / "tracks" /
-                                                          (videos_[r0.video].file + "." + std::to_string(r0.variant) + ".csv"))
-                                                   : std::string();
-                RunResult r = run_one(videos_[r0.video], variants_[r0.variant], cfg_, threads, stop_, *live_[i], tl);
+                RunResult r = run_one(videos_[r0.video], variants_[r0.variant], cfg_, threads, stop_, *live_[i]);
                 r.video = r0.video;
                 r.variant = r0.variant;
                 {
@@ -873,10 +870,9 @@ void Runner::snapshot(std::vector<VideoMeta>& v, std::vector<Variant>& var, std:
 static void usage() {
     printf("dronolok_app --multitest папка|видео... [--vary ключ[=знач,знач]]... [--mode one|grid]\n"
            "            [--frames N] [--warmup N] [--radius пикс] [--parallel N] [--out папка]\n"
-           "            [--profile 0..3] [--set ключ=знач]... [--realtime] [--emulate] [--mask-file] [--tracks]\n"
+           "            [--profile 0..3] [--set ключ=знач]... [--realtime] [--emulate] [--mask-file]\n"
            "  --vary  что перебирать (без значений — значения по умолчанию); --set — изменить базу\n"
            "  --mode  one: база + каждая настройка по отдельности (по умолч.), grid: все сочетания\n"
-           "  --tracks  журнал треков по кадрам каждого прогона (как --bench --tracks) в папку tracks отчёта\n"
            "  --list  список настроек\n");
 }
 
@@ -934,7 +930,6 @@ int run_cli(int argc, char** argv) {
         else if (a == "--realtime") c.realtime = true;
         else if (a == "--emulate") c.emulate = true;
         else if (a == "--mask-file") c.maskFile = true;
-        else if (a == "--tracks") c.tracks = true;
         else if (!a.empty() && a[0] == '-') {
             printf("неизвестный ключ %s\n", a.c_str());
             usage();
