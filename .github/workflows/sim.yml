@@ -15,7 +15,7 @@ on:
         default: ''
 
 permissions:
-  contents: read
+  contents: write   # превью кладутся в ветку sim-previews (артефакты из сессий Claude не скачать)
 
 # Godot: сумма архива снята при первой загрузке 2026-10-29 (подпись не проверялась).
 env:
@@ -66,8 +66,8 @@ jobs:
             cp out/$s/*.mp4 out/$s/*.gt.json vids/
           done
           ls -la vids
-      - name: Разметка и кадры в журнал
-        run: python sim/ci_report.py out
+      - name: Сводка разметки
+        run: python sim/ci_report.py out | tee report.txt
       - name: Приложение
         run: |
           cmake -S app -B build-app -G Ninja
@@ -75,7 +75,25 @@ jobs:
       - name: Мультитест по роликам сцены
         run: |
           ./build-app/dronolok_app --multitest vids --parallel 2 --out mt-sim
-          python sim/ci_report.py --multitest mt-sim/results.json
+          python sim/ci_report.py --multitest mt-sim/results.json | tee -a report.txt
+      - name: Превью в ветку sim-previews
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          d=previews/${GITHUB_SHA::7}
+          mkdir -p "$d"
+          cp report.txt mt-sim/results.json "$d"/
+          for m in out/*/meta.json; do s=$(basename $(dirname $m)); mkdir -p "$d/$s"
+            cp out/$s/*.jpg out/$s/*.png out/$s/*.gt.json out/$s/meta.json "$d/$s"/ 2>/dev/null || true
+            # короткий фрагмент точной камеры (640x480) — посмотреть ведение
+            ffmpeg -loglevel error -i out/$s/*_fine.mp4 -t 4 -c copy "$d/$s/fine_4s.mp4" || true
+          done
+          cd previews
+          git init -q && git checkout -q -b sim-previews
+          git -c user.name=ci -c user.email=ci@localhost add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "превью ${GITHUB_SHA::7}"
+          git fetch -q "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" sim-previews && \
+            git rebase -q FETCH_HEAD || true
+          git push -q "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" HEAD:sim-previews
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sim-videos
@@ -83,7 +101,7 @@ jobs:
             vids/
             out/*/meta.json
             out/*/*.jpg
-            out/*/*.png
+            out/*/targets_*.png
           retention-days: 14
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

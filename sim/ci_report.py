@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Сводка для журнала CI: по разметке каждой сцены (сколько кадров с целями, размеры в пикселях) и
-кадры-превью в base64 между метками ===IMG <имя>=== ... ===END===, чтобы их можно было достать из журнала.
 --multitest results.json — числа прогонов мультитеста."""
-import base64, glob, json, os, sys
+import glob, json, os, sys
 
 
 def gt_summary(out):
@@ -31,13 +30,6 @@ def gt_summary(out):
             poses = meta["fine"]["poses"]
             led = sum(1 for p in poses if p[5] is not None)
             print(f"   точная: цель назначена в {100 * led / max(len(poses), 1):.0f}% кадров")
-        for f in sorted(glob.glob(os.path.join(d, "preview_*.jpg")) + glob.glob(os.path.join(d, "targets_*.png"))):
-            data = base64.b64encode(open(f, "rb").read()).decode()
-            name = os.path.basename(d) + "/" + os.path.basename(f)
-            print(f"===IMG {name}===")
-            for i in range(0, len(data), 3000):
-                print(data[i:i + 3000])
-            print("===END===")
 
 
 def mt_summary(path):
