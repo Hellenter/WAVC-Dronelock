@@ -923,6 +923,9 @@ int run_cli(int argc, char** argv) {
         else if (a == "--range") sscanf(val().c_str(), "%f,%f", &c.rangeMin, &c.rangeMax);
         else if (a == "--speed") sscanf(val().c_str(), "%f,%f", &c.speedMin, &c.speedMax);
         else if (a == "--clouds") c.clouds = (float)atof(val().c_str());
+        else if (a == "--noise") c.noise = (float)atof(val().c_str());
+        else if (a == "--visibility") c.visibility = (float)atof(val().c_str());
+        else if (a == "--size") c.droneSize = (float)atof(val().c_str());
         else if (a == "--wide") sscanf(val().c_str(), "%dx%d", &c.wideW, &c.wideH);
         else if (a == "--wide-fps") c.wideFps = (float)atof(val().c_str());
         else if (a == "--fisheye") c.wideFisheye = true;
@@ -942,7 +945,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-window") c.windowFocus = false;
         else {
             printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 250,1200]\n"
-                   "  [--speed 6,22] [--clouds 0.35] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
+                   "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
                    "  [--fps 60] [--rate 30] [--accel 150] [--latency 0.06] [--dwell 6]\n"
                    "  [--switch queue|nearest|manual] [--json out.json] [--quiet]\n"
                    "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window]\n");
