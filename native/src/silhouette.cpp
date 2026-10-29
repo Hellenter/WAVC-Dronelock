@@ -143,7 +143,11 @@ Silhouette measure_silhouette(const uint8_t* gray, int w, int h, int stride, flo
         const bool touches = (x0 <= 1 && inside(0, (y0 + y1) / 2)) || (x1 >= n - 2 && inside(n - 1, (y0 + y1) / 2)) ||
                              (y0 <= 1 && inside((x0 + x1) / 2, 0)) || (y1 >= n - 2 && inside((x0 + x1) / 2, n - 1));
         if (touches) {
-            if (H >= maxR) return out;   // крупнее предела — это не цель, а земля, крона, облако
+            if (H >= maxR) {   // крупнее предела — это не цель, а земля, крона, облако
+                // и доходит до низа кадра: точка на столбе или мачте с проводами — на опоре
+                out.attached = oy + (y1 + 2) * s > h;
+                return out;
+            }
             H = std::min(maxR, H * 2.f);
             continue;
         }

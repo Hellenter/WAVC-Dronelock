@@ -355,6 +355,11 @@ static void test_silhouette() {
     rect(202, 548, 206, H);
     const Silhouette p = measure_silhouette(img.data(), W, H, W, 204, 544, 4, -1);
     CHECK(p.valid && p.attached, "столб у нижнего края кадра: valid %d attached %d", p.valid, p.attached);
+    // столб с проводом: силуэт крупнее предела, но доходит до низа кадра — на опоре
+    rect(738, 420, 742, H);
+    rect(100, 450, W, 452);
+    const Silhouette q = measure_silhouette(img.data(), W, H, W, 740, 424, 4, -1, 8.f, 200.f);
+    CHECK(!q.valid && q.attached, "столб с проводом у низа кадра: valid %d attached %d", q.valid, q.attached);
     std::printf("silhouette: ok\n");
 }
 
@@ -536,6 +541,42 @@ static void test_zone_strip() {
               z[9 * tw + 2], z[9 * tw + 4], z[9 * tw + 5], z[9 * tw + 7]);
     }
     std::printf("zone strip: ok\n");
+}
+
+// Светлая кайма резкости у тёмного столба (halo_k): кандидат на ней — "у кромки"
+// (подтверждается, только когда полетит), одиночная светлая точка в небе — нет
+static void test_halo() {
+    const int w = 640, h = 480;
+    for (int on = 0; on <= 1; ++on) {
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.bright = true;
+        cfg.halo_k = on ? 2.f : 0.f;
+        Detector d(cfg);
+        std::mt19937 g(5);
+        std::vector<uint8_t> f((size_t)w * h);
+        for (auto& v : f) v = (uint8_t)(150 + (int)(g() % 3));
+        for (int y = 200; y < 290; ++y) {   // столб 4 пикс. и светлая кайма по бокам
+            for (int x = 300; x < 304; ++x) f[(size_t)y * w + x] = 60;
+            f[(size_t)y * w + 299] = f[(size_t)y * w + 304] = 175;
+        }
+        for (int x = 299; x < 305; ++x) f[(size_t)199 * w + x] = 175;
+        for (int y = 100; y < 102; ++y)
+            for (int x = 100; x < 102; ++x) f[(size_t)y * w + x] = 185;   // светлая точка
+        std::vector<Candidate> c;
+        bool haloSeen = false, haloEdge = true, dot = false, dotEdge = false;
+        for (int i = 0; i < 3; ++i) {
+            d.detect(f.data(), w, h, w, c);
+            for (const Candidate& k : c) {
+                if (k.polarity < 0) continue;
+                if (std::fabs(k.x - 302) < 12 && k.y > 190 && k.y < 295) haloSeen = true, haloEdge &= k.edge;
+                if (std::fabs(k.x - 100.5f) < 4 && std::fabs(k.y - 100.5f) < 4) dot = true, dotEdge |= k.edge;
+            }
+        }
+        CHECK(dot && !dotEdge, "halo %d: светлая точка dot %d edge %d", on, dot, dotEdge);
+        CHECK(haloSeen && haloEdge == (on != 0), "halo %d: кайма seen %d edge %d", on, haloSeen, haloEdge);
+    }
+    std::printf("sharpening halo: ok\n");
 }
 
 static void test_stationary() {
@@ -964,6 +1005,7 @@ int main() {
     test_governor();
     test_stationary();
     test_zone_strip();
+    test_halo();
     test_grow_mask();
     test_scene();
     test_motion();

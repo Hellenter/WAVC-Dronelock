@@ -161,6 +161,39 @@ static float spot_width(const uint8_t* g, int w, int h, int stride, const Candid
     return 0.25f * (amp(bx - 2, by) + amp(bx + 2, by) + amp(bx, by - 2) + amp(bx, by + 2)) / a0;
 }
 
+// Светлый кандидат — кайма резкости у тёмного (DetectorConfig::halo_k): в окне вокруг него
+// есть точка темнее фона (медиана рамки) больше чем на k * контраст кандидата, и это тёмное
+// протяжённое — уходит за вдвое большую рамку (столб, мачта, край кроны). Компактное тёмное
+// рядом — сама цель: у дрона в игре и на солнце светлые и тёмные части рядом
+static bool halo_spot(const uint8_t* g, int w, int h, int stride, const Candidate& c, float k) {
+    const int r = 4 << std::min(2, c.level), R = r + 6, E = 2 * R;
+    const int cx = (int)std::lround(c.x), cy = (int)std::lround(c.y);
+    if (cx - E < 0 || cy - E < 0 || cx + E >= w || cy + E >= h) return false;
+    int ring[32], n = 0;
+    for (int i = 0; i < 8; ++i) {
+        const int o = -R + i * R / 4;
+        ring[n++] = g[(size_t)(cy - R) * stride + cx + o];
+        ring[n++] = g[(size_t)(cy + R) * stride + cx - o];
+        ring[n++] = g[(size_t)(cy - o) * stride + cx - R];
+        ring[n++] = g[(size_t)(cy + o) * stride + cx + R];
+    }
+    std::nth_element(ring, ring + n / 2, ring + n);
+    const int lim = ring[n / 2] - (int)std::ceil(k * c.contrast);
+    if (lim <= 0) return false;
+    bool near = false;
+    for (int y = cy - r; y <= cy + r && !near; ++y) {
+        const uint8_t* row = g + (size_t)y * stride;
+        for (int x = cx - r; x <= cx + r && !near; ++x) near = row[x] < lim;
+    }
+    if (!near) return false;
+    // протяжённость: тёмное на рамке E (по 2 пикс. вдоль сторон, тонкий столб не проскочит)
+    for (int o = -E; o <= E; o += 2)
+        if (g[(size_t)(cy - E) * stride + cx + o] < lim || g[(size_t)(cy + E) * stride + cx + o] < lim ||
+            g[(size_t)(cy + o) * stride + cx - E] < lim || g[(size_t)(cy + o) * stride + cx + E] < lim)
+            return true;
+    return false;
+}
+
 static DetectorConfig sanitize(DetectorConfig c) {
     c.k = std::max(3, std::min(31, c.k | 1));
     c.pool = c.pool == 1 ? 1 : 2;
@@ -831,6 +864,10 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             }
             out.resize(keep);
         }
+    }
+    if (!learning_ && cfg_.halo_k > 0 && cfg_.bright) {
+        for (Candidate& c : out)
+            if (c.polarity > 0 && !c.edge && halo_spot(gray, w, h, stride, c, cfg_.halo_k)) c.edge = true;
     }
     if (!learning_) {
         // Сглаживание выгоднее всего широким пятнам: облако или блик шириной 5+ пикс. с
