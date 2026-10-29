@@ -273,6 +273,20 @@ func build_environment() -> void:
 	sm.set_shader_parameter("seed", float(cfg.get("seed", 1)))
 	time_mats.append(sm)
 	sky.sky_material = sm
+	# настоящее небо: панорама HDRI (.hdr/.exr, например Poly Haven) вместо нарисованного
+	var hdri := str(w.get("sky_hdri", ""))
+	if hdri != "":
+		if hdri.is_relative_path():
+			hdri = ProjectSettings.globalize_path("res://assets/sky/" + hdri)
+		var img = Image.load_from_file(hdri)
+		if img == null:
+			push_warning("не открывается небо " + hdri)
+		else:
+			var pm = PanoramaSkyMaterial.new()
+			pm.panorama = ImageTexture.create_from_image(img)
+			pm.energy_multiplier = float(w.get("sky_energy", 1.0))
+			sky.sky_material = pm
+			env.sky_rotation = Vector3(0, -float(w.get("sky_rotation", 0.0)) * DEG, 0)
 	env.sky = sky
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = hz

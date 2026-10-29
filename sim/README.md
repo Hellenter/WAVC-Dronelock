@@ -27,6 +27,8 @@
 Готовые модели `.glb` (бесплатные CC0: Kenney Nature Kit / City Kit, Quaternius) кладутся в
 `sim/godot/assets/trees/` и `sim/godot/assets/houses/` — тогда вместо простых деревьев и домов берутся они
 (высота приводится к 8–22 м и 6–10 м). Другая папка: `"world": {"assets": "C:/путь"}`.
+Небо из панорамы HDRI (`.hdr`/`.exr`, Poly Haven): файл в `sim/godot/assets/sky/` и `"world": {"sky_hdri":
+"имя.hdr", "sky_rotation": 0, "sky_energy": 1.0}`; облака тогда не двигаются (панорама неподвижна).
 
 ## Сцена (.json)
 
