@@ -643,14 +643,14 @@ void ann_find_issues(App& a) {
         const LockMark& lm = a.lockMarks[(size_t)f];
         int kind = 0;
         if (lm.state) {
-            bool any = false, near = false;
+            bool any = false, onMark = false;   // не near: в windows.h это макрос
             for (const auto& o : a.ann.objs) {
                 float x, y;
                 if (!Annotation::pos(o, f, x, y)) continue;
                 any = true;
-                near |= std::hypot(x - lm.x, y - lm.y) < R;
+                onMark |= std::hypot(x - lm.x, y - lm.y) < R;
             }
-            kind = near ? 0 : any ? 1 : 2;
+            kind = onMark ? 0 : any ? 1 : 2;
         }
         if (kind == curKind && kind) {
             runEnd = f;
