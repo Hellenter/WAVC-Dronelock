@@ -82,6 +82,7 @@ private:
     std::vector<uint8_t> sky_;                 // 1 — блок неба
     std::vector<float> ref_;                   // земля на опорном кадре (сдвиг сцены)
     std::vector<int16_t> refLine_;
+    std::vector<int16_t> lastLine_;           // кромка на прошлом анализе (дрожь кромки)
     float lumFast_ = 0, lumSlow_ = 0;
     int movedRun_ = 0;
     bool havePrev_ = false;

@@ -1432,6 +1432,21 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const float thrB = thr0 * bk;   // порог тайла без фокуса
             const float thr = (focusTiles_[i] ? thrF : thr0) * zk * bk;
             int taken = 0, px[4], py[4];
+            // тайл неба у самой земли (near_edge): цель отсюда подтверждается, только когда полетела
+            const bool nearEdge = cfg_.near_edge && nearOn && nearGround_[i];
+            // ...и не дальше near_edge_px от закрытого тайла (0 — весь тайл)
+            auto nearClosed = [&](float x, float y) {
+                if (cfg_.near_edge_px <= 0) return true;
+                const float tp = (float)(T * f);
+                for (int yy = std::max(0, ty - 1); yy <= std::min(th - 1, ty + 1); ++yy)
+                    for (int xx = std::max(0, tx - 1); xx <= std::min(tw - 1, tx + 1); ++xx) {
+                        if (mask_[(size_t)yy * tw + xx]) continue;
+                        const float dx = std::max({(float)xx * tp - x, 0.f, x - (float)(xx + 1) * tp});
+                        const float dy = std::max({(float)yy * tp - y, 0.f, y - (float)(yy + 1) * tp});
+                        if (dx * dx + dy * dy <= cfg_.near_edge_px * cfg_.near_edge_px) return true;
+                    }
+                return false;
+            };
             auto push = [&](int gx, int gy, float mx, bool second) {   // gx, gy — пикс. после пулинга
                 Candidate c;
                 c.x = (float)(gx * f) + (f - 1) * 0.5f;
@@ -1443,7 +1458,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 c.level = lvl;
                 c.weak = focusTiles_[i] && !(mx >= thrB * zk && (edgeTex || mx >= cfg_.clutter_k * level + thrB * zk * 0.5f));
                 // открытое перепроверкой облако: цель там подтверждается, только когда полетела
-                c.edge = zone == 1 || edgeTex || polTile || (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
+                c.edge = zone == 1 || edgeTex || polTile || (nearEdge && nearClosed(c.x, c.y)) ||
+                         (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
                 c.second = second;
                 out.push_back(c);
                 px[taken] = gx;
