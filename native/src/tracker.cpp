@@ -37,11 +37,17 @@ const char* class_name(TargetClass c) {
     return "?";
 }
 
-TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref) {
+TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, float ufps) {
     TrackerConfig c = c0;
     // медленная камера: новый захват — только на летавший трек (см. lock_mover_fps)
     if (fps > 0 && fps <= c.lock_mover_fps) c.lock_mover = true;
-    if (!(fps > 0) || !(ref > 0) || std::fabs(fps - ref) < 0.01f * ref) return c;
+    if (!(fps > 0) || !(ref > 0)) return c;
+    // правила на кадр жизни трека — по частоте вызовов update
+    const float vu = ref / (ufps > 0 ? ufps : fps);
+    c.still_speed *= vu;
+    c.flock_speed *= vu;
+    c.lost_grow *= vu;
+    if (std::fabs(fps - ref) < 0.01f * ref) return c;
     const float t = fps / ref, v = ref / fps;   // t — кадров в той же секунде, v — пикс. за кадр
     auto frames = [&](int n, int lo) { return n > 0 ? std::max(lo, (int)std::lround(n * t)) : n; };
     // по физике ворота растут как v, а СКО ускорения в пикс./кадр^2 как v^2. Замер на 10 к/с
@@ -389,7 +395,7 @@ void Tracker::classify(Track& t) const {
     const bool held = (hard_ && t.id == lockId_) || t.everFollowed;
     const bool qh = quietHold(t);
     if (t.overlay || t.anchored ||
-        (!held && (t.clutter || (!qh && n >= cfg_.cls_min_hits && t.travel < std::max(3.f, 0.25f * (float)t.age))))) {
+        (!held && (t.clutter || (!qh && n >= cfg_.cls_min_hits && t.travel < std::max(3.f, cfg_.still_speed * (float)t.age))))) {
         t.cls = TargetClass::Clutter;
         return;
     }
@@ -953,7 +959,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     for (auto& tr : tracks_) {
         tr.flock = false;
         const float v = std::hypot(tr.vsx, tr.vsy);
-        if (cfg_.flock_px <= 0 || !tr.confirmed || v < 0.5f) continue;
+        if (cfg_.flock_px <= 0 || !tr.confirmed || v < cfg_.flock_speed) continue;
         for (const auto& o : tracks_)
             if (&o != &tr && o.confirmed && frame_ - o.flapT <= cfg_.flap_hold &&
                 std::fabs(o.x - tr.x) < cfg_.flock_px && std::fabs(o.y - tr.y) < cfg_.flock_px &&
@@ -1082,7 +1088,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         ++lostFor_;
         lastX_ += camDx;
         lastY_ += camDy;
-        const float r = cfg_.gate + 4.f * lostFor_;
+        const float r = cfg_.gate + cfg_.lost_grow * lostFor_;
         const Track* n = nearest(lastX_ + lastVx_ * lostFor_, lastY_ + lastVy_ * lostFor_, r);
         if (!n) n = nearest(lastX_, lastY_, r);
         if (n) { lockId_ = n->id; lostFor_ = 0; same = true; }

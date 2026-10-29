@@ -57,6 +57,7 @@ const std::vector<Param>& params() {
         {"dark", "Тёмные цели", "Алгоритм", true, "1, 0", D(dark)},
         {"bright", "Яркие цели", "Алгоритм", true, "1, 0", D(bright)},
         {"trk_seconds", "Трекер в секундах", "Алгоритм", true, "1, 0", S(trkSeconds)},
+        {"fps_scale", "Маска неба и поворот камеры в секундах", "Алгоритм", true, "1, 0", S(fpsScale)},
         {"follow", "Виртуальная поворотка", "Алгоритм", true, "0, 1", S(follow)},
         {"mask", "Кадров на маску неба (0 выкл.)", "Алгоритм", false, "0, 25, 50", S(learnMaskFrames)},
         {"per_tile", "Кандидатов в тайле", "Алгоритм", false, "1, 2", D(per_tile)},
@@ -83,7 +84,9 @@ const std::vector<Param>& params() {
         {"recheck_tex", "Перепроверка: сильный отклик реже доли кадров — облако", "Тонко", false, "0.1, 0.2, 0.4", D(recheck_tex)},
         {"grow_k", "Дорастание: помех выше среднего, раз", "Тонко", false, "3, 4, 6", D(grow_k)},
         {"grow_min", "Дорастание: помех на тайл за кадр, не меньше", "Тонко", false, "0.05, 0.1, 0.2", D(grow_min)},
-        {"grow_frames", "Дорастание: окно, кадров", "Тонко", false, "60, 120, 240", D(grow_frames)},
+        {"grow_frames", "Дорастание: окно, кадров при 60 к/с", "Тонко", false, "60, 120, 240", D(grow_frames)},
+        {"bg_frames", "Фон ячеек у кромки: окно, кадров", "Тонко", false, "125, 250, 500", D(bg_frames)},
+        {"fine_frames", "Уточнение маски у кромки: окно, кадров при 60 к/с", "Тонко", false, "75, 150, 300", D(fine_frames)},
         {"grow_cells", "Дорастание: помехи хотя бы в стольких ячейках тайла", "Тонко", false, "1, 2, 3", D(grow_cells)},
         {"tbd", "Накопление слабых целей", "Алгоритм", true, "0, 1", D(tbd)},
         {"band", "Полоса у горизонта, пикс. (0 выкл.)", "Алгоритм", false, "0, 256, 512", D(band_px)},
@@ -93,6 +96,7 @@ const std::vector<Param>& params() {
         {"coarse_every", "Крупные масштабы раз в, кадров", "Алгоритм", false, "1, 2, 4", D(coarse_every)},
         {"dedup", "Пропускать повторы кадра", "Видео", true, "0, 1", S(skipDuplicates)},
         {"step", "Камера реже видео: каждый N-й кадр", "Видео", false, "1, 4, 6", S(frameStep)},
+        {"cam_fps", "Частота камеры, к/с (0 — как в видео)", "Видео", false, "0, 15, 30", S(targetFps)},
         // Тонко: порог
         {"auto_thr", "Порог по шуму", "Тонко", true, "0, 1", D(auto_thr)},
         {"noise_k", "Порог: во сколько раз выше шума", "Тонко", false, "8, 12, 16", D(noise_k)},
@@ -119,6 +123,7 @@ const std::vector<Param>& params() {
         {"reupdate", "Нашлась после пропуска: скорость по прямой от последней отметки, доля", "Тонко", false, "0, 0.5, 1", T(reupdate)},
         {"lock_mover_fps", "Захват только на летавший трек при камере не быстрее, к/с", "Тонко", false, "0, 20, 30", T(lock_mover_fps)},
         {"mover_cam_k", "Летит: по сцене дальше доли пути камеры", "Тонко", false, "0, 0.25, 0.35, 0.5", T(mover_cam_k)},
+        {"still_speed", "Помеха: по сцене медленнее, пикс./кадр при 25 к/с", "Тонко", false, "0.25, 0.6, 1", T(still_speed)},
         {"silhouette", "Крупная цель целиком (силуэт)", "Тонко", true, "1, 0", T(silhouette)},
         {"size_predict", "Ожидание размера", "Тонко", true, "1, 0", T(size_predict)},
         {"anchor_check", "На мачте или столбе — не дрон", "Тонко", true, "1, 0", T(anchor_check)},
@@ -306,6 +311,7 @@ void apply_algo(Settings& dst, const Settings& src) {
     dst.focus = src.focus;
     dst.zones = src.zones;
     dst.trkSeconds = src.trkSeconds;
+    dst.fpsScale = src.fpsScale;
     dst.governor = src.governor;
     dst.skipDuplicates = src.skipDuplicates;
     dst.frameStep = src.frameStep;
@@ -515,7 +521,8 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     RunResult rr;
     Settings s = var.setup.s;
     s.pace = c.realtime ? Pace::Realtime : Pace::MaxSpeed;
-    s.targetFps = 0;
+    // частота камеры — только медленнее видео (пропуск кадров); быстрее — темп подачи, здесь не нужен
+    if (!(s.targetFps > 0 && vm.fps > 0 && s.targetFps < 0.99 * vm.fps)) s.targetFps = 0;
     s.speed = 1;
     s.source = Source::Stream;
     s.loop = false;
@@ -538,7 +545,9 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
 
     Collector col;
     col.maxFrames = c.maxFrames;
-    col.warmup = c.warmup * std::max(1, s.frameStep);   // номера кадров — файла, маска учится по обработанным
+    // номера кадров — файла, маска учится по обработанным
+    const double fstep = std::max(1, s.frameStep) * (s.targetFps > 0 ? vm.fps / s.targetFps : 1.0);
+    col.warmup = (int)std::lround(c.warmup * fstep);
     // радиус задан в пикселях исходного кадра; при уменьшенной обработке — меньше
     col.radius = c.radius * (s.procW && vm.w ? (float)s.procW / vm.w : 1.f);
     if (vm.gt) {
