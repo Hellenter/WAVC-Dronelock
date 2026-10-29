@@ -138,6 +138,8 @@ const std::vector<Param>& params() {
         {"drift_min", "Дрейф фона: учитывать быстрее, пикс./кадр при 25 к/с (0 выкл.)", "Тонко", false, "0, 0.15, 0.25, 0.4", T(drift_min)},
         {"drift_tracks", "Дрейф фона: треков на оценку, не меньше", "Тонко", false, "3, 5, 8", T(drift_tracks)},
         {"overlay_px", "Наложение на кадр: стоит в кадре не дальше, пикс. (СКО)", "Тонко", false, "1, 2, 4", T(overlay_px)},
+        {"overlay_rel", "Наложение у края: СКО по кадру меньше доли пути по сцене (0 выкл.)", "Тонко", false, "0, 0.05, 0.1", T(overlay_rel)},
+        {"resid_frame", "Птица: отклонение от траектории — меньшее по сцене и по кадру", "Тонко", true, "0, 1", T(resid_frame)},
         {"reupdate", "Нашлась после пропуска: скорость по прямой от последней отметки, доля", "Тонко", false, "0, 0.5, 1", T(reupdate)},
         {"lock_mover_fps", "Захват только на летавший трек при камере не быстрее, к/с", "Тонко", false, "0, 20, 30", T(lock_mover_fps)},
         {"mover_cam_k", "Летит: по сцене дальше доли пути камеры", "Тонко", false, "0, 0.25, 0.35, 0.5", T(mover_cam_k)},
@@ -761,6 +763,7 @@ bool Runner::start(const Config& c, std::string& err) {
         err = "не создать папку отчёта " + cfg_.outDir + ": " + ec.message();
         return false;
     }
+    if (!cfg_.tracksDir.empty()) fs::create_directories(upath(cfg_.tracksDir), ec);
     {
         std::lock_guard<std::mutex> lk(m_);
         res_.clear();

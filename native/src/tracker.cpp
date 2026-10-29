@@ -214,14 +214,14 @@ bool Tracker::loadStatic(const std::string& path) {
 }
 
 // МНК-парабола p(t) = a + b t + c t^2; возвращает сумму квадратов остатков, b — скорость в середине окна
-static double fit_quad(const std::deque<Track::Obs>& obs, size_t from, bool useX, double& slope) {
+static double fit_quad(const std::deque<Track::Obs>& obs, size_t from, bool useX, double& slope, bool frame = false) {
     const auto o0 = obs.begin() + (std::ptrdiff_t)from;
     const int n = (int)(obs.size() - from);
     const double tm = 0.5 * (o0->t + obs.back().t);
     double S[5] = {0, 0, 0, 0, 0}, B[3] = {0, 0, 0};
     for (auto it = o0; it != obs.end(); ++it) {
         const auto& q = *it;
-        const double t = q.t - tm, v = useX ? q.x : q.y;
+        const double t = q.t - tm, v = frame ? (useX ? q.fx : q.fy) : (useX ? q.x : q.y);
         double tp = 1;
         for (int i = 0; i < 5; ++i) { S[i] += tp; if (i < 3) B[i] += tp * v; tp *= t; }
     }
@@ -245,7 +245,7 @@ static double fit_quad(const std::deque<Track::Obs>& obs, size_t from, bool useX
     double ss = 0;
     for (auto it = o0; it != obs.end(); ++it) {
         const auto& q = *it;
-        const double t = q.t - tm, v = useX ? q.x : q.y;
+        const double t = q.t - tm, v = frame ? (useX ? q.fx : q.fy) : (useX ? q.x : q.y);
         const double r = v - (coef[0] + coef[1] * t + coef[2] * t * t);
         ss += r * r;
     }
@@ -371,6 +371,11 @@ void Tracker::classify(Track& t) const {
         double sx, sy;
         const double ss = fit_quad(o, from, true, sx) + fit_quad(o, from, false, sy);
         t.resid = (float)std::sqrt(ss / n);
+        if (cfg_.resid_frame) {   // по кадру ровнее (камера ведёт цель) — шум поворота не в счёт
+            double fx, fy;
+            const double sf = fit_quad(o, from, true, fx, true) + fit_quad(o, from, false, fy, true);
+            t.resid = std::min(t.resid, (float)std::sqrt(sf / n));
+        }
         t.speed = (float)std::hypot(sx, sy);
         double mc = 0, vc = 0;
         for (size_t i = from; i < o.size(); ++i) mc += o[i].c;
@@ -898,7 +903,10 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             const float spread = std::hypot(tr.obs.back().x - tr.obs[from].x, tr.obs.back().y - tr.obs[from].y);
             // за захваченной целью камера следит сама (setFollowing): стоять в кадре — её дело
             // в середине кадра надписей и логотипов нет, а цель, которую ведёт камера, есть
-            if (std::sqrt(vv / no) < cfg_.overlay_px && spread > cfg_.overlay_cam && !(following_ && tr.id == lockId_) &&
+            const float sd = (float)std::sqrt(vv / no);
+            const bool still = sd < cfg_.overlay_px ||
+                               (cfg_.overlay_rel > 0 && sd < cfg_.overlay_rel * spread && !midFrame((float)mx, (float)my));
+            if (still && spread > cfg_.overlay_cam && !(following_ && tr.id == lockId_) &&
                 !(cfg_.follow_k > 0 && midFrame((float)mx, (float)my)))
                 tr.overlay = true;
         }
