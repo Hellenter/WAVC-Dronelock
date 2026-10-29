@@ -686,6 +686,7 @@ void Emulator::stepNarrow(double t, double dt) {
         int best = 0;
         double bd = 1e18;
         for (const Track& x : tr) {
+            if (!winOn_) break;   // ни широкая, ни своя память не говорят, где цель: любой трек в кадре — не она
             if (x.clutter || x.miss > 0 || x.hits < minHits) continue;
             const double d = std::hypot(x.x - win_.u, x.y - win_.v);
             if (c_.windowFocus && winOn_ && d > win_.radius) continue;
