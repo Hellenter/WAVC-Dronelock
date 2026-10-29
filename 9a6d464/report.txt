@@ -1,0 +1,28 @@
+forest_village wide 4608x3456 14 к/с, кадров 140, с целями 140
+   drone id=1: в кадре  65.7%  1.8–2.1 пикс.  222–260 м
+   drone id=2: в кадре   2.9%  1.1–1.1 пикс.  378–379 м
+   drone id=3: в кадре 100.0%  2.4–2.4 пикс.  165–168 м
+   drone id=4: в кадре  70.0%  4.5–5.7 пикс.  418–538 м
+   bird  id=5: в кадре 100.0%  7.4–9.1 пикс.  132–161 м
+   bird  id=6: в кадре 100.0%  4.5–6.8 пикс.  117–176 м
+forest_village fine 640x480 60 к/с, кадров 600, с целями 583
+   drone id=1: в кадре  30.2%  2.7–2.9 пикс.  222–237 м
+   drone id=2: в кадре   2.3%  1.4–1.4 пикс.  378–379 м
+   drone id=3: в кадре  92.5%  3.2–3.3 пикс.  165–168 м
+   bird  id=5: в кадре  19.0%  10.1–10.5 пикс.  155–161 м
+   точная: цель назначена в 100% кадров
+quick wide 2304x1728 14 к/с, кадров 42, с целями 42
+   drone id=1: в кадре 100.0%  0.8–0.9 пикс.  264–287 м
+   drone id=2: в кадре  31.0%  0.5–0.5 пикс.  379–379 м
+   drone id=3: в кадре 100.0%  1.2–1.2 пикс.  165–167 м
+   bird  id=5: в кадре 100.0%  3.7–3.9 пикс.  152–161 м
+   bird  id=6: в кадре 100.0%  2.3–2.6 пикс.  152–176 м
+quick fine 640x480 60 к/с, кадров 180, с целями 174
+   drone id=1: в кадре  63.9%  2.3–2.4 пикс.  264–278 м
+   drone id=3: в кадре  22.2%  3.3–3.3 пикс.  165–166 м
+   bird  id=5: в кадре  25.0%  10.1–10.2 пикс.  159–161 м
+   точная: цель назначена в 100% кадров
+{"video": 0, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 1.45, "eval_frames": 575, "gt_drone_frames": 555, "score": 24.66, "recall_drone": 34.1, "lock_on_drone": 28.11, "hard_on_drone": 23.6, "false_lock": 67.23, "false_per_frame": 1.357, "false_tracks": 99.0, "drone_as_drone": 80.08, "recall_bird": 96.04, "first_detect_s": 0.8, "first_lock_s": 7.4, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 82.5, "hard_pct": 21.83, "lock_acq": 9.0, "targets_per_frame": 1.93, "tracks": 116.0, "drone_ids": 20.0, "bird_ids": 16.0, "proc_ms": 2.259, "proc_p95_ms": 10.966, "detect_ms": 1.576, "fps": 414.52, "frames": 600.0}
+{"video": 1, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 3.08, "eval_frames": 115, "gt_drone_frames": 115, "score": 17.41, "recall_drone": 69.84, "lock_on_drone": 0.0, "hard_on_drone": 0.0, "false_lock": 100.0, "false_per_frame": 2.104, "false_tracks": 37.0, "drone_as_drone": 63.85, "recall_bird": 97.39, "first_detect_s": 0.143, "first_lock_s": null, "sky_pct": 94.7, "sky_dark_pct": 94.88, "lock_pct": 89.29, "hard_pct": 37.14, "lock_acq": 4.0, "targets_per_frame": 21.664, "tracks": 445.0, "drone_ids": 25.0, "bird_ids": 94.0, "proc_ms": 10.322, "proc_p95_ms": 19.949, "detect_ms": 9.086, "fps": 45.5, "frames": 140.0}
+{"video": 2, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.37, "eval_frames": 155, "gt_drone_frames": 149, "score": 79.58, "recall_drone": 81.88, "lock_on_drone": 79.87, "hard_on_drone": 22.82, "false_lock": 15.6, "false_per_frame": 0.4, "false_tracks": 10.0, "drone_as_drone": 87.7, "recall_bird": 100.0, "first_detect_s": 0.383, "first_lock_s": 0.433, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 90.56, "hard_pct": 18.89, "lock_acq": 5.0, "targets_per_frame": 1.311, "tracks": 15.0, "drone_ids": 5.0, "bird_ids": 5.0, "proc_ms": 1.726, "proc_p95_ms": 4.14, "detect_ms": 1.006, "fps": 490.94, "frames": 180.0}
+{"video": 3, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.6, "eval_frames": 17, "gt_drone_frames": 17, "score": 0.0, "recall_drone": 0.0, "lock_on_drone": 0.0, "hard_on_drone": 0.0, "false_lock": 100.0, "false_per_frame": 1.471, "false_tracks": 7.0, "drone_as_drone": null, "recall_bird": 100.0, "first_detect_s": null, "first_lock_s": null, "sky_pct": 89.81, "sky_dark_pct": 90.64, "lock_pct": 83.33, "hard_pct": 33.33, "lock_acq": 2.0, "targets_per_frame": 10.595, "tracks": 69.0, "drone_ids": 4.0, "bird_ids": 12.0, "proc_ms": 5.761, "proc_p95_ms": 11.255, "detect_ms": 5.056, "fps": 70.01, "frames": 42.0}
