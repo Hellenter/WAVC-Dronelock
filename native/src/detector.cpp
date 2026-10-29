@@ -1312,6 +1312,13 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 ++taken;
             };
             const float mx = ts.maxv[i];
+            // небо у самой кромки (bg_near): кончики веток и верхушки крон заходят в тайл неба и
+            // мерцают в одних и тех же ячейках — порог ячейки по её фону и там (как avg + K·σ у Global
+            // Meteor Network). В ровном небе фон ячейки ниже общего порога и ничего не меняет
+            const bool nearSky = cfg_.bg_near && bgOn && nearOn && nearGround_[i] && !edgeTex;
+            auto cellQuiet = [&](size_t ci) { return !nearSky || !bgWarm(pol, ci) || ts.cmax[ci] >= bgThr(pol, ci); };
+            const size_t aci = (size_t)(ty * cpt + (ts.argmax[i] / T) / CELL) * ctw + tx * cpt + (ts.argmax[i] % T) / CELL;
+            if (nearSky && cells && !cellQuiet(aci)) continue;
             if (!fineTile && !polTile && !cloudTile && !textured && mx >= thr && mx >= cfg_.clutter_k * level + thr * 0.5f) {
                 const int gx = tx * T + ts.argmax[i] % T, gy = ty * T + ts.argmax[i] / T;
                 push(gx, gy, mx, false);
@@ -1334,6 +1341,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                         // у кромки леса — порог по своей ячейке (шум листвы и марева), в чистом
                         // небе хватает общего порога по шуму: там фон ячейки его только завышает
                         if (edgeTex && !(bgWarm(pol, ci) && v >= bgThr(pol, ci))) continue;
+                        if (!cellQuiet(ci)) continue;
                         if (cloudTile && v < stats_->cb[pol].q50[ci] + cfg_.bg_k * smoothK()) continue;
                         const int gx = cx * CELL + ts.carg[ci] % CELL, gy = cy * CELL + ts.carg[ci] / CELL;
                         bool far = true;

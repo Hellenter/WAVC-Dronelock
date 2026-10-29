@@ -403,7 +403,9 @@ void Tracker::classify(Track& t) const {
     lf /= n;
     float e = std::max(t.resid / (cfg_.bird_resid * (float)lf), t.contrastCv / cfg_.bird_contrast_cv);
     if (cfg_.bird_speed > 0) e = std::max(e, t.speed / cfg_.bird_speed);
-    const bool flapped = frame_ - t.flapT <= cfg_.flap_hold;
+    // зависшая после полёта (hover_first): дрон, даже если контраст качнулся похоже на взмахи
+    const bool hoverNow = cfg_.hover_first && cfg_.hover_speed > 0 && t.everMover && t.speed < cfg_.hover_speed;
+    const bool flapped = frame_ - t.flapT <= cfg_.flap_hold && !hoverNow;
     t.hovering = cfg_.hover_speed > 0 && (t.everMover || qh) && t.speed < cfg_.hover_speed;
     float inst = e > 1.f ? 1.f : 0.f;
     if (flapped || t.flock) inst = 1.f;
@@ -803,6 +805,15 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         tr.p00 = p00;
         tr.p01 = p01;
         tr.p11 = p11;
+        // нашлась после пропусков (reupdate, как OC-SORT): скорость — по прямой от последней отметки
+        // до этой, а не та, что фильтр накопил на прогнозе (на 15 к/с 6 кадров прогноза — 0.4 с)
+        if (cfg_.reupdate > 0 && tr.miss >= 2 && !tr.obs.empty() && frame_ > tr.obs.back().t) {
+            const auto& o = tr.obs.back();
+            const float gap = (float)(frame_ - o.t), w = std::min(1.f, cfg_.reupdate);
+            const float vx = (d.x - gx_ - o.x) / gap, vy = (d.y - gy_ - o.y) / gap;
+            tr.vsx += w * (vx - tr.vsx);
+            tr.vsy += w * (vy - tr.vsy);
+        }
         tr.polarity = d.polarity;
         tr.contrast = d.contrast;
         tr.level = d.level;
@@ -1038,8 +1049,12 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             // претенденты: весомее текущей (при жёстком захвате — только если задан hard_switch)
             // за lock_dwell кадров; из выдержавших — самый весомый
             auto wins = [&](const Track& t) {
+                // жёсткий — только на цель, которую классификатор зовёт дроном: медленная
+                // птица рядом весомее (lock_slow), и на 15 к/с захват уходил с дрона на неё (wt16, wt18)
                 return hard_ ? cfg_.hard_switch > 0 && t.lockW > cfg_.hard_switch * cur->lockW &&
-                                   t.speed < 0.5f * cur->speed   // с самолёта на медленный дрон, не на яркую
+                                   t.speed < 0.5f * cur->speed &&   // с самолёта на медленный дрон, не на яркую
+                                   (!cfg_.hard_switch_drone || t.followed ||   // камера ведёт её — это и есть цель (wt17)
+                                    (t.cls == TargetClass::Drone && t.birdScore < 0.5f))
                              : t.lockW > cfg_.lock_switch * cur->lockW;
             };
             std::vector<std::pair<int, int>> nb;
