@@ -1028,8 +1028,9 @@ void panel_main(App& a, bool& changed) {
             FontSize f(1.1f);
             ImGui::TextWrapped("%s", name.c_str());
         }
-        ImGui::TextDisabled("%dx%d, %.2f к/с, %s%s", vi.w, vi.h, vi.fps, vi.codec.c_str(),
-                            vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "");
+        ImGui::TextDisabled("%dx%d, %.2f к/с, %s%s%s", vi.w, vi.h, vi.fps, vi.codec.c_str(),
+                            vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "",
+                            vi.rotation ? (", повёрнуто на " + std::to_string(vi.rotation) + "°").c_str() : "");
     } else {
         ImGui::TextDisabled("или перетащите файл в окно");
     }
@@ -2847,7 +2848,8 @@ int run_bench(int argc, char** argv) {
         printf("ошибка: %s\n", err.c_str());
         return 1;
     }
-    printf("видео %dx%d, %.2f к/с, %s\n", p.info().w, p.info().h, p.info().fps, p.info().codec.c_str());
+    printf("видео %dx%d, %.2f к/с, %s, поворот %d°\n", p.info().w, p.info().h, p.info().fps, p.info().codec.c_str(),
+           p.info().rotation);
     bool counting = preload == 0;
     for (;;) {
         SDL_Delay(50);

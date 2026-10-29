@@ -7,6 +7,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/display.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
@@ -32,6 +33,33 @@ void expand_tv_range(const uint8_t* src, uint8_t* dst, int n) {
     for (; i < n; ++i) dst[i] = lut[src[i]];
 }
 
+// Отображение кадра по матрице поворота — как автоповорот в ffmpeg (fftools, insert_autorotate):
+// 90/180/270° и отражения; прочие углы не поворачиваются
+static void plane_orient(const uint8_t* s, int sw, int sh, size_t ss, uint8_t* d, size_t ds, bool transpose, bool fx,
+                         bool fy) {
+    if (!transpose) {
+        for (int y = 0; y < sh; ++y) {
+            const uint8_t* r = s + (size_t)(fy ? sh - 1 - y : y) * ss;
+            uint8_t* o = d + (size_t)y * ds;
+            if (!fx) memcpy(o, r, sw);
+            else
+                for (int x = 0; x < sw; ++x) o[x] = r[sw - 1 - x];
+        }
+        return;
+    }
+    // выход sh x sw: out(x, y) = in(y, x) с отражениями; блоками 32x32 — чтение по столбцу не вымывает кэш
+    const int B = 32;
+    for (int y0 = 0; y0 < sw; y0 += B)
+        for (int x0 = 0; x0 < sh; x0 += B) {
+            const int y1 = std::min(sw, y0 + B), x1 = std::min(sh, x0 + B);
+            for (int y = y0; y < y1; ++y) {
+                const int sx = fx ? sw - 1 - y : y;
+                uint8_t* o = d + (size_t)y * ds;
+                for (int x = x0; x < x1; ++x) o[x] = s[(size_t)(fy ? sh - 1 - x : x) * ss + sx];
+            }
+        }
+}
+
 VideoSource::~VideoSource() { close(); }
 
 void VideoSource::close() {
@@ -44,6 +72,7 @@ void VideoSource::close() {
     stream_ = -1;
     eof_ = false;
     info_ = VideoInfo();
+    orient_ = Orient();
 }
 
 bool VideoSource::open(const std::string& path, int threads, std::string& err) {
@@ -97,6 +126,41 @@ bool VideoSource::open(const std::string& path, int threads, std::string& err) {
     }
     info_.w = ctx_->width;
     info_.h = ctx_->height;
+    // матрица отображения (телефоны пишут поворот в метаданные, а кадр — как лежал датчик)
+    const int32_t* dm = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+    if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                                             st->codecpar->nb_coded_side_data,
+                                                             AV_PKT_DATA_DISPLAYMATRIX))
+        if (sd->size >= 9 * sizeof(int32_t)) dm = (const int32_t*)sd->data;
+#else
+    size_t dmSize = 0;
+    if (const uint8_t* sd = av_stream_get_side_data(st, AV_PKT_DATA_DISPLAYMATRIX, &dmSize))
+        if (dmSize >= 9 * sizeof(int32_t)) dm = (const int32_t*)sd;
+#endif
+    if (dm) {
+        double theta = -std::round(av_display_rotation_get(dm));   // по часовой
+        if (std::isnan(theta)) theta = 0;
+        theta -= 360 * std::floor(theta / 360 + 0.9 / 360);
+        Orient& o = orient_;
+        if (std::fabs(theta - 90) < 1) {
+            o.transpose = true;
+            o.fy = dm[3] <= 0;   // иначе (dm[3] > 0) — с отражением, только транспонирование
+            info_.rotation = 90;
+        } else if (std::fabs(theta - 180) < 1) {
+            o.fx = dm[0] < 0;
+            o.fy = dm[4] < 0;
+            info_.rotation = 180;
+        } else if (std::fabs(theta - 270) < 1) {
+            o.transpose = true;
+            o.fx = true;
+            o.fy = dm[3] < 0;
+            info_.rotation = 270;
+        } else if (std::fabs(theta) < 1) {
+            o.fy = dm[4] < 0;
+        }
+        if (o.transpose) std::swap(info_.w, info_.h);
+    }
     AVRational fr = av_guess_frame_rate(fmt_, st, nullptr);
     info_.fps = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 25.0;
     tb_ = av_q2d(st->time_base);
@@ -228,8 +292,29 @@ bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride, ColorPla
         av_frame_unref(frame_);   // до нужного кадра после перемотки — без преобразования
     }
     skipTo_ = 0;
-    convert(dst, outW, outH, dstStride);
-    if (color) sampleColor(*color, outW, outH);
+    if (orient_.identity()) {
+        convert(dst, outW, outH, dstStride);
+        if (color) sampleColor(*color, outW, outH);
+    } else {   // декодированный кадр в размере до поворота, затем поворот в dst
+        const Orient& o = orient_;
+        const int rw = o.transpose ? outH : outW, rh = o.transpose ? outW : outH;
+        raw_.resize((size_t)rw * rh);
+        convert(raw_.data(), rw, rh, rw);
+        plane_orient(raw_.data(), rw, rh, rw, dst, dstStride, o.transpose, o.fx, o.fy);
+        if (color) {
+            sampleColor(*color, rw, rh);
+            if (color->w > 0) {
+                const int cw = color->w, ch = color->h;
+                rawU_.swap(color->u);
+                rawV_.swap(color->v);
+                color->u.resize(rawU_.size());
+                color->v.resize(rawV_.size());
+                if (o.transpose) std::swap(color->w, color->h);
+                plane_orient(rawU_.data(), cw, ch, cw, color->u.data(), color->w, o.transpose, o.fx, o.fy);
+                plane_orient(rawV_.data(), cw, ch, cw, color->v.data(), color->w, o.transpose, o.fx, o.fy);
+            }
+        }
+    }
     av_frame_unref(frame_);
     return true;
 }

@@ -24,6 +24,7 @@ struct VideoInfo {
     int64_t frames = 0;      // оценка по длительности, может быть 0
     std::string codec;
     std::string pixfmt;
+    int rotation = 0;        // поворот из метаданных (матрица отображения), градусов по часовой: 0/90/180/270
 };
 
 class VideoSource {
@@ -49,6 +50,13 @@ private:
     void convert(uint8_t* dst, int outW, int outH, int dstStride);
     void sampleColor(ColorPlanes& c, int outW, int outH);
 
+    // Как показать кадр по матрице отображения (телефон снимает «вверх ногами» или стоя):
+    // выходной (x, y) берётся из декодированного (y, x) при transpose, затем отражается по fx/fy
+    struct Orient {
+        bool transpose = false, fx = false, fy = false;
+        bool identity() const { return !transpose && !fx && !fy; }
+    };
+
     AVFormatContext* fmt_ = nullptr;
     AVCodecContext* ctx_ = nullptr;
     AVFrame* frame_ = nullptr;
@@ -60,6 +68,9 @@ private:
     int64_t start_ = 0;             // pts первого кадра
     int64_t index_ = -1, skipTo_ = 0;
     VideoInfo info_;
+    Orient orient_;
+    std::vector<uint8_t> raw_;             // кадр до поворота
+    std::vector<uint8_t> rawU_, rawV_;     // цвет до поворота
     std::vector<int> colOffU_, colOffV_;   // sampleColor: байт отсчёта цвета в строке
 };
 
