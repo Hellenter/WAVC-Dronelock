@@ -3218,6 +3218,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--tracks") s.trackLog = val();
         else if (a == "--dedup") s.skipDuplicates = true;
         else if (a == "--step") s.frameStep = std::max(1, atoi(val().c_str()));
+        else if (a == "--phase") s.framePhase = std::max(0, atoi(val().c_str()));
         else if (a == "--cam-fps") s.targetFps = atof(val().c_str());
         else if (a == "--no-fps-scale") s.fpsScale = false;
         else if (a == "--no-anchor") s.trk.anchor_check = false;
@@ -3447,6 +3448,7 @@ int run_stress(int argc, char** argv) {
             default:   // частота камеры и шаг: ниже частоты видео кадры файла пропускаются
                 s.targetFps = R(2) ? 0 : F(1, 120);
                 if (R(4) == 0) s.frameStep = 1 + R(6);
+                if (R(4) == 0) s.framePhase = R(8);
                 break;
         }
         if (set) p.setSettings(s);

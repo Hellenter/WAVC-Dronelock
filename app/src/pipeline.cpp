@@ -216,11 +216,13 @@ double Pipeline::fileStep(const Settings& s) const {
 }
 
 // снимок камеры — первый кадр файла на её такте или после него: шаг 4 — каждый 4-й, камера
-// 14 к/с из 60 — через 4-5 кадров, в среднем 60/14
+// 14 к/с из 60 — через 4-5 кадров, в среднем 60/14. Такт отсчитывается от кадра framePhase
 bool Pipeline::skipFrame(const Settings& s, int64_t index) const {
     const double r = fileStep(s);
-    if (r < 1.0001 || index <= 0) return false;
-    return std::floor((double)index / r) == std::floor((double)(index - 1) / r);
+    if (r < 1.0001) return false;
+    const int64_t i = index - std::max(0, s.framePhase);
+    if (i <= 0) return i < 0;   // до первого снимка камеры кадров нет
+    return std::floor((double)i / r) == std::floor((double)(i - 1) / r);
 }
 
 void Pipeline::setSettings(const Settings& s) {
@@ -230,7 +232,8 @@ void Pipeline::setSettings(const Settings& s) {
         const Settings& o = settings_;
         restart = open_ && (o.source != s.source || o.preloadFrames != s.preloadFrames || o.procW != s.procW ||
                             o.procH != s.procH || o.decoderThreads != s.decoderThreads || o.loop != s.loop ||
-                            (s.source == Source::Preload && fileStep(o) != fileStep(s)));
+                            (s.source == Source::Preload &&
+                             (fileStep(o) != fileStep(s) || o.framePhase != s.framePhase)));
         settings_ = s;
         ++settingsVer_;
     }
@@ -1068,7 +1071,9 @@ void Pipeline::processLoop() {
         // качество считаем после первого прохода (как run_demo.py) или после обучения маски
         // при съёмке с рук маска неба не учится — качество считаем сразу (своя разметка роликов)
         const bool evalOn =
-            camMoves || (s.loop ? p.loop >= 1 : f.index >= (int64_t)std::lround(perSec(s, s.learnMaskFrames, 10) * fileStep(s)));
+            camMoves || (s.loop ? p.loop >= 1
+                                : f.index >= (int64_t)std::lround(perSec(s, s.learnMaskFrames, 10) * fileStep(s)) +
+                                                 (fileStep(s) > 1.0001 ? std::max(0, s.framePhase) : 0));
         if (gtFrame && evalOn) eval_.add(r->gt, tracks, r->gsx, r->gsy);
         if (!s.trackLog.empty()) {
             if (!tlog) {

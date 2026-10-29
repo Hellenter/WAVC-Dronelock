@@ -96,6 +96,7 @@ const std::vector<Param>& params() {
         {"coarse_every", "Крупные масштабы раз в, кадров", "Алгоритм", false, "1, 2, 4", D(coarse_every)},
         {"dedup", "Пропускать повторы кадра", "Видео", true, "0, 1", S(skipDuplicates)},
         {"step", "Камера реже видео: каждый N-й кадр", "Видео", false, "1, 4, 6", S(frameStep)},
+        {"phase", "Камера реже видео: с какого кадра файла считать шаг (сдвиг)", "Видео", false, "0, 1, 2, 3", S(framePhase)},
         {"cam_fps", "Частота камеры, к/с (0 — как в видео)", "Видео", false, "0, 15, 30", S(targetFps)},
         // Тонко: порог
         {"auto_thr", "Порог по шуму", "Тонко", true, "0, 1", D(auto_thr)},
@@ -315,6 +316,7 @@ void apply_algo(Settings& dst, const Settings& src) {
     dst.governor = src.governor;
     dst.skipDuplicates = src.skipDuplicates;
     dst.frameStep = src.frameStep;
+    dst.framePhase = src.framePhase;
     dst.follow = src.follow;
     dst.followFrac = src.followFrac;
     dst.followGain = src.followGain;
@@ -547,7 +549,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     col.maxFrames = c.maxFrames;
     // номера кадров — файла, маска учится по обработанным
     const double fstep = std::max(1, s.frameStep) * (s.targetFps > 0 ? vm.fps / s.targetFps : 1.0);
-    col.warmup = (int)std::lround(c.warmup * fstep);
+    col.warmup = (int)std::lround(c.warmup * fstep) + (fstep > 1.0001 ? std::max(0, s.framePhase) : 0);
     // радиус задан в пикселях исходного кадра; при уменьшенной обработке — меньше
     col.radius = c.radius * (s.procW && vm.w ? (float)s.procW / vm.w : 1.f);
     if (vm.gt) {
