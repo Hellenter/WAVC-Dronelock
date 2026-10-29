@@ -88,6 +88,10 @@ DL_API int dl_available_isas(int* out, int cap);
 
 DL_API dl_tracker* dl_tracker_create(int w, int h);
 DL_API void dl_tracker_destroy(dl_tracker* t);
+/* Частота кадров камеры. Умолчания трекера подобраны для 25 к/с: на 10-15 к/с цель за кадр
+   смещается дальше, а выдержки в кадрах длятся дольше. Вызвать один раз после create
+   (как Pipeline в приложении, tracker_for_fps); без вызова — 25 к/с. */
+DL_API void dl_tracker_set_fps(dl_tracker* t, float fps);
 /* Возвращает число подтверждённых треков. */
 DL_API int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* out, int cap);
 /* Сдвиг картинки к этому кадру (камера движется): применить в следующем update. */

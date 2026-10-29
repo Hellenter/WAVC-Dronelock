@@ -74,6 +74,7 @@ def _load():
     lib.dl_tracker_create.restype = C.c_void_p
     lib.dl_tracker_create.argtypes = [C.c_int, C.c_int]
     lib.dl_tracker_destroy.argtypes = [C.c_void_p]
+    lib.dl_tracker_set_fps.argtypes = [C.c_void_p, C.c_float]
     lib.dl_tracker_update.argtypes = [C.c_void_p, C.POINTER(_Cand), C.c_int, C.POINTER(_Track), C.c_int]
     lib.dl_tracker_clutter.argtypes = [C.c_void_p, C.POINTER(_Cand), C.c_int]
     lib.dl_tracker_reset.argtypes = [C.c_void_p]
@@ -184,9 +185,11 @@ class NativePointDetector:
 
 
 class NativeTracker:
-    def __init__(self, shape):
+    def __init__(self, shape, fps=None):
         h, w = shape
         self._h = lib().dl_tracker_create(w, h)
+        if fps:
+            self.set_fps(fps)
         self._dets = (_Cand * 4096)()
         self._out = (_Track * 1024)()
         self._cl = (_Cand * 4096)()
@@ -199,6 +202,10 @@ class NativeTracker:
 
     def reset_tracks(self):
         lib().dl_tracker_reset(self._h)
+
+    def set_fps(self, fps):
+        """Частота кадров камеры (умолчания трекера — для 25 к/с), см. dl_tracker_set_fps."""
+        lib().dl_tracker_set_fps(self._h, float(fps))
 
     def set_static(self, frames=3000, hits=8.0):
         """Долгая память статичных помех (неподвижная камера); frames=0 — выключить."""
