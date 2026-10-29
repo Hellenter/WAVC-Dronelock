@@ -185,6 +185,13 @@ enum Mark : uint8_t {
     MARK_MISS = 64,     // ...и он не найден
 };
 
+// Где был захват на кадре — в пикселях видео; по нему приложение ищет места, где разметка
+// и трекер расходятся. state: 0 — захвата нет, 1 — проверка, 2 — жёсткий
+struct LockMark {
+    float x = 0, y = 0;
+    uint8_t state = 0;
+};
+
 struct Stat {
     double mean = 0, p50 = 0, p95 = 0, max = 0;
 };
@@ -225,6 +232,7 @@ public:
     void seek(int64_t frame);
     int64_t length() const;              // кадров на шкале (0 — неизвестно)
     void marks(std::vector<uint8_t>& out) const;
+    void lockMarks(std::vector<LockMark>& out) const;   // по номеру кадра, как marks
     int findInHistory(int64_t frame) const;   // seq последнего обработанного кадра frame или -1
     void relearnMask();
     // Память статичных помех лежит рядом с видео (<видео>.static.bin): загружается при
@@ -316,6 +324,7 @@ private:
     size_t histBytes_ = 0;
     std::vector<FrameRec> log_;
     std::vector<uint8_t> marks_;
+    std::vector<LockMark> lockMarks_;
     long dropped_ = 0, decoded_ = 0;
     std::deque<double> decodeTimes_;   // моменты выдачи кадров декодером
     std::string backend_, status_;
