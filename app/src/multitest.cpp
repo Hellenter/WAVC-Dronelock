@@ -108,6 +108,7 @@ const std::vector<Param>& params() {
         {"quiet", "Новая точка в спокойном небе, кадров (0 выкл.)", "Тонко", false, "0, 50", T(quiet_frames)},
         {"edge_straight", "У кромки — только прямой полёт", "Тонко", false, "0, 0.5", T(edge_straight)},
         {"lock_mover", "Новый захват — только на летавший трек", "Тонко", true, "0, 1", T(lock_mover)},
+        {"lock_mover_fps", "Захват только на летавший трек при камере не быстрее, к/с", "Тонко", false, "0, 20, 30", T(lock_mover_fps)},
         {"mover_cam_k", "Летит: по сцене дальше доли пути камеры", "Тонко", false, "0, 0.25, 0.35, 0.5", T(mover_cam_k)},
         {"silhouette", "Крупная цель целиком (силуэт)", "Тонко", true, "1, 0", T(silhouette)},
         {"size_predict", "Ожидание размера", "Тонко", true, "1, 0", T(size_predict)},

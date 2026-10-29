@@ -39,6 +39,8 @@ const char* class_name(TargetClass c) {
 
 TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref) {
     TrackerConfig c = c0;
+    // медленная камера: новый захват — только на летавший трек (см. lock_mover_fps)
+    if (fps > 0 && fps <= c.lock_mover_fps) c.lock_mover = true;
     if (!(fps > 0) || !(ref > 0) || std::fabs(fps - ref) < 0.01f * ref) return c;
     const float t = fps / ref, v = ref / fps;   // t — кадров в той же секунде, v — пикс. за кадр
     auto frames = [&](int n, int lo) { return n > 0 ? std::max(lo, (int)std::lround(n * t)) : n; };
