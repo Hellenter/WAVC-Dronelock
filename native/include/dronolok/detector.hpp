@@ -157,6 +157,17 @@ struct DetectorConfig {
     // Цвета нет (серая камера, gray-видео) — как раньше. Нужен фон по ячейкам (bg_map)
     bool sky_color = true;
     float sky_green = 0.08f, sky_y = 0.7f, sky_dark = 0.6f;
+    // ...мягкое облако — и у самой кромки леса (sky_soft): облако, касающееся крон, стоит на земле,
+    // и правило "висит в небе" его не открывало. У облака яркость меняется плавно: перепад на 1
+    // пикс. меньше sky_s14 перепада на 4 пикс. (у листвы, веток и дальнего леса — около половины), а
+    // перепад на 4 пикс. (по x и по y) меньше sky_d4 яркости тайла. Такой тайл цвета неба — облако,
+    // что бы ни было под ним, и линия горизонта через него не идёт. Кроме полосы в один тайл между
+    // гладким небом и немягкой текстурой: так лежит гребень дальнего холма в дымке, он мягок так же
+    bool sky_soft = true;
+    float sky_d4 = 0.08f, sky_s14 = 0.32f;
+    // ...облако по цвету открыто и для светлых целей — по фону ячеек и не ниже медианы + bg_k, как
+    // для тёмных; false — только для тёмных
+    bool sky_bright = true;
     // Цель в захвате, залетевшая под маску (облако, кромка): в круге прогноза её трека
     // (setLockArea) ячейки под маской смотрятся с порогом x lock_through_k. Кандидат — той же
     // полярности, контраст в пределах x2 от контраста трека, слабый (только продолжает трек,
@@ -276,9 +287,12 @@ public:
     void resetBackground();
     // Маска неба в файле: неподвижной камере не нужно учить её заново при каждом запуске
     // (в эти кадры захват ложный). loadMask сразу включает сохранённую маску и первые verify
-    // кадров параллельно учит маску заново; если новая отличается больше чем на 10% тайлов
-    // (камеру сдвинули, повернули), берётся новая (maskReplaced). Файл привязан к размеру
-    // кадра, пулингу и тайлу — чужой не загрузится.
+    // кадров параллельно учит маску заново. Дальше маска — новая, а из файла берутся только
+    // тайлы, закрытые доращиванием по помехам (их перепроверка может открыть снова): закрытое
+    // по текстуре прошлым запуском или прошлой версией программы не держится. Новая отличается
+    // от файла больше чем на 10% тайлов (камеру сдвинули, повернули) — из файла не берётся
+    // ничего (maskReplaced). Файл привязан к размеру кадра, пулингу и тайлу — чужой не загрузится;
+    // файл первой версии (без слоя доращивания) — только до конца сверки.
     bool saveMask(const std::string& path) const;
     bool loadMask(const std::string& path, int verify = 25);
     bool verifyingMask() const { return verifyLeft_ > 0; }
@@ -358,6 +372,7 @@ private:
     int texN_ = 0;
     int verifyLeft_ = 0;
     bool maskReplaced_ = false;
+    std::vector<uint8_t> fileGrown_;   // маска из файла на сверке: тайлы, закрытые доращиванием
     bool bgIdle_ = false;   // фон ячеек не учился (не было маски): при появлении маски — заново
     long maskVer_ = 0, bandVer_ = -1;
     std::vector<uint8_t> band_, nearGround_;   // тайлы полосы у горизонта; тайлы рядом с маской
@@ -391,14 +406,18 @@ private:
     // и цвета (U, V от серого), гистограмма яркости по 8 уровней, отсчётов; итог — тайлы-облака
     const uint8_t *colU_ = nullptr, *colV_ = nullptr;
     int colW_ = 0, colH_ = 0, colStride_ = 0, colStep_ = 0, colPix_ = 1;
-    std::vector<float> colY_, colU0_, colV0_;
+    std::vector<float> colY_, colU0_, colV0_, colD1_, colD4_;   // ...и перепады на 1 и 4 пикс.
     std::vector<uint32_t> colHist_, colN_;
-    std::vector<uint8_t> skyCol_;
+    std::vector<uint8_t> skyCol_, softCol_;   // ...из них мягкие (sky_soft, до маски)
+    float skyRef_ = 0;                        // яркость открытого неба сцены
     void sampleColor(const uint8_t* gray, int stride);
+    bool skyColorTile(size_t i, float frac) const;   // цвет и яркость неба (без правила "висит в небе")
+    void markSoftCloud(float frac);
     void markSkyColor(float frac);
     void resetColor();
     bool skyColAt(size_t i) const { return skyCol_.size() == mask_.size() && skyCol_[i]; }
     void markTexBad(float frac);
+    void applyGrown();
     void updateRecheck();
     bool lockOn_ = false;
     float lockX_ = 0, lockY_ = 0, lockR_ = 0, lockC_ = 0;

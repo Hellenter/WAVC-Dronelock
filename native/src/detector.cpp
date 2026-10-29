@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "backend.hpp"
@@ -260,6 +261,8 @@ void Detector::reconfigure(const DetectorConfig& c0) {
 void Detector::beginMaskLearning() {
     mask_.clear();
     learning_ = true;
+    verifyLeft_ = 0;
+    fileGrown_.clear();
     texSum_.assign((size_t)tw_ * th_, 0.f);
     for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
     texN_ = 0;
@@ -270,6 +273,7 @@ void Detector::beginMaskLearning() {
 void Detector::endMaskLearning(float frac) {
     learning_ = false;
     resetGrow();
+    markSoftCloud(frac);   // до маски: линия горизонта через мягкие облака не идёт
     std::vector<uint8_t> m;
     buildMask(frac, m);
     if (!m.empty()) mask_.swap(m);
@@ -297,24 +301,32 @@ void Detector::markTexBad(float frac) {
             polOpen_[p].assign(mask_.size(), 0);
             for (size_t i = 0; i < tp.size(); ++i) polOpen_[p][i] = texBad_[i] && tp[i] / texN_ <= cfg_.pol_tex;
         }
-    // облако по цвету: тёмные цели там ищутся, какой бы ни была его текстура
-    if (skyCol_.size() != mask_.size() || !cfg_.dark) return;
-    if (polOpen_[0].size() != mask_.size()) polOpen_[0].assign(mask_.size(), 0);
-    for (size_t i = 0; i < mask_.size(); ++i) polOpen_[0][i] |= skyCol_[i] && texBad_[i];
+    // облако по цвету: цели там ищутся, какой бы ни была его текстура, — тёмные, с sky_bright и светлые
+    if (skyCol_.size() != mask_.size()) return;
+    for (int p = 0; p < 2; ++p) {
+        if (!(p ? cfg_.bright && cfg_.sky_bright : cfg_.dark)) continue;
+        if (polOpen_[p].size() != mask_.size()) polOpen_[p].assign(mask_.size(), 0);
+        for (size_t i = 0; i < mask_.size(); ++i) polOpen_[p][i] |= skyCol_[i] && texBad_[i];
+    }
 }
 
 void Detector::resetColor() {
     colY_.clear();
     colU0_.clear();
     colV0_.clear();
+    colD1_.clear();
+    colD4_.clear();
     colHist_.clear();
     colN_.clear();
     skyCol_.clear();
+    softCol_.clear();
+    skyRef_ = 0;
 }
 
 // Яркость и цвет тайлов для облаков по цвету (sky_color): 8x8 отсчётов на тайл, в центрах его
 // блоков; яркость — ещё и гистограммой по 8 уровней (доля тёмных точек считается в конце обучения,
-// когда известна яркость неба)
+// когда известна яркость неба), и перепады яркости от отсчёта до точек на 1 и на 4 пикс. правее и
+// ниже (мягкость облака, sky_soft)
 void Detector::sampleColor(const uint8_t* gray, int stride) {
     const size_t n = (size_t)tw_ * th_;
     if (!colU_ || !colV_ || colStep_ <= 0 || colPix_ <= 0 || colW_ <= 0 || colH_ <= 0 || n == 0) return;
@@ -322,6 +334,8 @@ void Detector::sampleColor(const uint8_t* gray, int stride) {
         colY_.assign(n, 0.f);
         colU0_.assign(n, 0.f);
         colV0_.assign(n, 0.f);
+        colD1_.assign(n, 0.f);
+        colD4_.assign(n, 0.f);
         colHist_.assign(n * 32, 0);
         colN_.assign(n, 0);
     }
@@ -331,24 +345,31 @@ void Detector::sampleColor(const uint8_t* gray, int stride) {
             const int y = ty * tp + j * st + st / 2, cy = y / colStep_;
             if (y >= h_ || cy >= colH_) continue;
             const uint8_t* g = gray + (size_t)y * stride;
+            const uint8_t* g1 = gray + (size_t)std::min(y + 1, h_ - 1) * stride;
+            const uint8_t* g4 = gray + (size_t)std::min(y + 4, h_ - 1) * stride;
             const uint8_t* u = colU_ + (size_t)cy * colStride_;
             const uint8_t* v = colV_ + (size_t)cy * colStride_;
             for (int tx = 0; tx < tw_; ++tx) {
                 const size_t i = (size_t)ty * tw_ + tx;
                 uint32_t* hist = &colHist_[i * 32];
-                int sy = 0, su = 0, sv = 0, k = 0;
+                int sy = 0, su = 0, sv = 0, d1 = 0, d4 = 0, k = 0;
                 for (int q = 0; q < 8; ++q) {
                     const int x = tx * tp + q * st + st / 2, cx = x / colStep_;
                     if (x >= w_ || cx >= colW_) continue;
-                    sy += g[x];
-                    ++hist[g[x] >> 3];
+                    const int c = g[x], x1 = std::min(x + 1, w_ - 1), x4 = std::min(x + 4, w_ - 1);
+                    sy += c;
+                    ++hist[c >> 3];
                     su += (int)u[(size_t)cx * colPix_] - 128;
                     sv += (int)v[(size_t)cx * colPix_] - 128;
+                    d1 += std::abs(g[x1] - c) + std::abs(g1[x] - c);
+                    d4 += std::abs(g[x4] - c) + std::abs(g4[x] - c);
                     ++k;
                 }
                 colY_[i] += (float)sy;
                 colU0_[i] += (float)su;
                 colV0_[i] += (float)sv;
+                colD1_[i] += (float)d1;
+                colD4_[i] += (float)d4;
                 colN_[i] += (uint32_t)k;
             }
         }
@@ -356,13 +377,14 @@ void Detector::sampleColor(const uint8_t* gray, int stride) {
 
 // Облака по цвету (DetectorConfig::sky_color): тайл, закрытый маской по своей текстуре (доля frac
 // кадров обучения), но не зелёный, не темнее неба и без глубоких теней, — облако, освещённое
-// солнцем, а не кроны и дома. Яркость неба сцены — медиана гладких тайлов, связанных с верхним
-// краем кадра через гладкие. Нужна готовая маска (mask_): облако отделено от земли открытым небом
-void Detector::markSkyColor(float frac) {
-    skyCol_.clear();
+// солнцем, а не кроны и дома. Яркость неба сцены (skyRef_) — медиана гладких тайлов, связанных с
+// верхним краем кадра через гладкие. Сначала, до маски, — яркость неба и мягкие облака (sky_soft)
+void Detector::markSoftCloud(float frac) {
+    skyRef_ = 0;
+    softCol_.clear();
     const size_t n = (size_t)tw_ * th_;
     const int nt = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
-    if (!cfg_.sky_color || nt == 0 || texSum_.size() != n || colN_.size() != n || mask_.size() != n) return;
+    if (!cfg_.sky_color || nt == 0 || texSum_.size() != n || colN_.size() != n) return;
     // цвет вообще есть: у серой (ИК) камеры U и V около 128 по всему кадру
     size_t colored = 0, all = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -371,13 +393,6 @@ void Detector::markSkyColor(float frac) {
         colored += std::fabs(colU0_[i]) + std::fabs(colV0_[i]) > 4.f * (float)colN_[i];
     }
     if (colored * 20 < all) return;
-    // зелень (BT.709): зелёный выше и красного, и заметно выше синего — листва, трава. Голубое,
-    // серое, белое и жёлтое небо, облака и тёплый свет солнца на них — нет
-    auto green = [&](size_t i) {
-        const float N = (float)colN_[i], y = colY_[i] / N, u = colU0_[i] / N, v = colV0_[i] / N;
-        const float g = -0.1873f * u - 0.4681f * v, r = 1.5748f * v, b = 1.8556f * u;   // минус яркость
-        return g >= r && g - b > cfg_.sky_green * std::max(y, 16.f);
-    };
     auto smooth = [&](size_t i) { return colN_[i] > 0 && texSum_[i] / nt <= frac; };
     std::vector<uint8_t> sky(n, 0);
     fill_.clear();
@@ -399,27 +414,64 @@ void Detector::markSkyColor(float frac) {
     std::nth_element(ys.begin(), ys.begin() + ys.size() / 2, ys.end());
     const float ref = ys[ys.size() / 2];
     if (ref < 16.f) return;
-    skyCol_.assign(n, 0);
-    const float darkY = cfg_.sky_dark * ref;
-    const int db = std::min(32, (int)(darkY / 8.f));
+    skyRef_ = ref;
+    // мягкое: перепад на 1 пикс. — малая доля перепада на 4 (плавные переходы облака; у листвы,
+    // веток и леса в дымке перепад есть уже между соседними пикселями), и перепады невелики
+    if (!cfg_.sky_soft || colD1_.size() != n || colD4_.size() != n) return;
+    softCol_.assign(n, 0);
     for (size_t i = 0; i < n; ++i) {
-        if (mask_[i] || !colN_[i] || texSum_[i] / nt <= frac || green(i)) continue;
-        const float N = (float)colN_[i];
-        if (colY_[i] / N < cfg_.sky_y * ref) continue;
-        // точек темнее sky_dark неба — меньше 10% (полоса гистограммы на границе — по доле)
-        const uint32_t* h = &colHist_[i * 32];
-        float dark = 0;
-        for (int k = 0; k < db; ++k) dark += (float)h[k];
-        if (db < 32) dark += (float)h[db] * (darkY - 8.f * (float)db) / 8.f;
-        skyCol_[i] = dark < 0.1f * N;
+        if (!skyColorTile(i, frac)) continue;
+        const float N = (float)colN_[i], d4 = colD4_[i];
+        softCol_[i] = d4 < cfg_.sky_d4 * std::max(colY_[i], 16.f * N) && colD1_[i] < cfg_.sky_s14 * d4;
     }
+    // гребень дальнего холма в дымке так же мягок и голубоват, но лежит полосой в один тайл между
+    // гладким небом и текстурой, которая не мягкая (лес в дымке под ним — тоже цвета неба), — это
+    // горизонт: правило "не стоит на земле" для него остаётся. Ряды сверху вниз: тайл под этим ещё
+    // с прежней пометкой
+    for (int y = 0; y < th_; ++y)
+        for (int x = 0; x < tw_; ++x) {
+            const size_t i = (size_t)y * tw_ + x, up = i - tw_, dn = i + tw_;
+            if (!softCol_[i] || (y > 0 && !smooth(up))) continue;
+            if (y + 1 == th_ || (texSum_[dn] / nt > frac && !softCol_[dn])) softCol_[i] = 0;
+        }
+}
+
+// тайл закрыт своей текстурой, а по цвету и яркости — небо (без правила "висит в небе")
+bool Detector::skyColorTile(size_t i, float frac) const {
+    const int nt = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
+    if (skyRef_ <= 0 || nt == 0 || !colN_[i] || texSum_[i] / nt <= frac) return false;
+    // зелень (BT.709): зелёный выше и красного, и заметно выше синего — листва, трава. Голубое,
+    // серое, белое и жёлтое небо, облака и тёплый свет солнца на них — нет
+    const float N = (float)colN_[i], y = colY_[i] / N, u = colU0_[i] / N, v = colV0_[i] / N;
+    const float g = -0.1873f * u - 0.4681f * v, r = 1.5748f * v, b = 1.8556f * u;   // минус яркость
+    if (g >= r && g - b > cfg_.sky_green * std::max(y, 16.f)) return false;
+    if (y < cfg_.sky_y * skyRef_) return false;
+    // точек темнее sky_dark неба — меньше 10% (полоса гистограммы на границе — по доле)
+    const float darkY = cfg_.sky_dark * skyRef_;
+    const int db = std::min(32, (int)(darkY / 8.f));
+    const uint32_t* h = &colHist_[i * 32];
+    float dark = 0;
+    for (int k = 0; k < db; ++k) dark += (float)h[k];
+    if (db < 32) dark += (float)h[db] * (darkY - 8.f * (float)db) / 8.f;
+    return dark < 0.1f * N;
+}
+
+// Нужна готовая маска (mask_): облако отделено от земли открытым небом
+void Detector::markSkyColor(float frac) {
+    skyCol_.clear();
+    const size_t n = (size_t)tw_ * th_;
+    if (skyRef_ <= 0 || mask_.size() != n || colN_.size() != n || texSum_.size() != n) return;
+    skyCol_.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) skyCol_[i] = !mask_[i] && skyColorTile(i, frac);
     // облако висит в небе, а не стоит на земле: тайл цвета неба, под которым в столбце закрытое
     // маской доходит до земли (закрытое не цвета неба или низ кадра), — верх крон, лес в дымке у
-    // горизонта, дом: остаётся закрытым
+    // горизонта, дом: остаётся закрытым. Мягкое облако (sky_soft) — облако и на земле
+    const bool soft = softCol_.size() == n;
     for (int x = 0; x < tw_; ++x) {
         bool ground = true;   // под этим тайлом закрытое до самой земли
         for (int y = th_ - 1; y >= 0; --y) {
             const size_t i = (size_t)y * tw_ + x;
+            if (soft && softCol_[i]) continue;   // столбец над ним — как под ним
             if (mask_[i]) ground = false;
             else if (!skyCol_[i]) ground = true;
             else if (ground) skyCol_[i] = 0;
@@ -441,6 +493,9 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
     std::vector<uint8_t> edgeBad(bad);
     if (cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright && texN_ > 0 && texSumP_[0].size() == bad.size())
         for (size_t i = 0; i < bad.size(); ++i) edgeBad[i] = bad[i] && texSumP_[0][i] / texN_ > cfg_.pol_tex;
+    // мягкое облако (sky_soft) — тоже не земля: облако, касающееся крон, кромку вверх не тянет
+    if (softCol_.size() == bad.size())
+        for (size_t i = 0; i < bad.size(); ++i) edgeBad[i] = edgeBad[i] && !softCol_[i];
     if (cfg_.skyline) {
         std::vector<int> edge(tw_, th_);
         for (int x = 0; x < tw_; ++x) {
@@ -484,17 +539,24 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
 }
 
 namespace {
-const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
+// вторая версия — со слоем доращивания: 1 — тайл закрыт по помехам, 2 — закрыт так только для светлых
+const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '2', 0};
+const char kMaskMagic1[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
 const int32_t kMaxSide = 1 << 16;   // сторона кадра в файле маски, пикс.
 }
 
 bool Detector::saveMask(const std::string& path) const {
-    if (mask_.empty() || mask_.size() != (size_t)tw_ * th_) return false;
+    const size_t n = (size_t)tw_ * th_;
+    if (mask_.empty() || mask_.size() != n) return false;
+    std::vector<uint8_t> grown(n, 0);
+    if (verifyLeft_ && fileGrown_.size() == n) grown = fileGrown_;   // ещё сверяется: слой из файла
+    else if (grownT_.size() == n)
+        for (size_t i = 0; i < n; ++i) grown[i] = grownT_[i] && !mask_[i] ? (polOpenAt(0, i) ? 2 : 1) : 0;
     FILE* f = open_file(path, "wb");
     if (!f) return false;
     const int32_t hdr[6] = {w_, h_, cfg_.pool, cfg_.tile, tw_, th_};
     bool ok = std::fwrite(kMaskMagic, 1, 8, f) == 8 && std::fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
-              std::fwrite(mask_.data(), 1, mask_.size(), f) == mask_.size();
+              std::fwrite(mask_.data(), 1, n, f) == n && std::fwrite(grown.data(), 1, n, f) == n;
     ok = std::fclose(f) == 0 && ok;
     return ok;
 }
@@ -504,15 +566,21 @@ bool Detector::loadMask(const std::string& path, int verify) {
     if (!f) return false;
     char magic[8];
     int32_t hdr[6];
-    bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, kMaskMagic, 8) == 0 &&
-              std::fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 &&
-              hdr[5] > 0 && hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
-              // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
-              hdr[0] <= kMaxSide && hdr[1] <= kMaxSide;
-    std::vector<uint8_t> m;
+    bool ok = std::fread(magic, 1, 8, f) == 8;
+    const bool v2 = ok && std::memcmp(magic, kMaskMagic, 8) == 0;
+    ok = ok && (v2 || std::memcmp(magic, kMaskMagic1, 8) == 0) && std::fread(hdr, sizeof(hdr), 1, f) == 1 &&
+         hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 && hdr[5] > 0 &&
+         hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
+         // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
+         hdr[0] <= kMaxSide && hdr[1] <= kMaxSide;
+    std::vector<uint8_t> m, g;
     if (ok) {
         m.resize((size_t)hdr[4] * hdr[5]);
         ok = std::fread(m.data(), 1, m.size(), f) == m.size();
+        if (ok && v2) {
+            g.resize(m.size());
+            ok = std::fread(g.data(), 1, g.size(), f) == g.size();
+        }
     }
     std::fclose(f);
     if (!ok) return false;
@@ -520,7 +588,11 @@ bool Detector::loadMask(const std::string& path, int verify) {
     h_ = hdr[1];
     tw_ = hdr[4];
     th_ = hdr[5];
+    // доращенное в файле закрыто и в маске (файлы, записанные не этой версией, — как есть)
+    for (size_t i = 0; i < g.size(); ++i)
+        if (g[i]) m[i] = 0;
     mask_.swap(m);
+    fileGrown_.swap(g);
     learning_ = false;
     maskReplaced_ = false;
     verifyLeft_ = std::max(0, verify);
@@ -529,7 +601,29 @@ bool Detector::loadMask(const std::string& path, int verify) {
     texN_ = 0;
     resetGrow();
     resetColor();
+    if (!verifyLeft_) {   // без сверки маска — как в файле; доращенное перепроверка может открыть
+        applyGrown();
+        fileGrown_.clear();
+    }
     return true;
+}
+
+// тайлы, закрытые доращиванием в прошлый раз (слой файла маски), — снова закрыты доращиванием
+void Detector::applyGrown() {
+    const size_t n = mask_.size();
+    if (fileGrown_.size() != n) return;
+    for (size_t i = 0; i < n; ++i) {
+        if (!fileGrown_[i] || skyColAt(i)) continue;   // облако по цвету доращивание не закрывает
+        mask_[i] = 0;
+        if (grownT_.size() != n) grownT_.assign(n, 0);
+        grownT_[i] = 1;
+        for (auto& o : polOpen_)
+            if (o.size() == n) o[i] = 0;
+        if (fileGrown_[i] == 2 && cfg_.pol_mask > 0 && cfg_.dark && cfg_.bright) {
+            if (polOpen_[0].size() != n) polOpen_[0].assign(n, 0);
+            polOpen_[0][i] = 1;
+        }
+    }
 }
 
 void Detector::resetBackground() {
@@ -542,6 +636,7 @@ void Detector::clearMask() {
     mask_.clear();
     learning_ = false;
     verifyLeft_ = 0;
+    fileGrown_.clear();
     resetGrow();
     resetColor();
 }
@@ -813,6 +908,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         th_ = (h / s) / T;
         mask_.clear();
         verifyLeft_ = 0;
+        fileGrown_.clear();
         if (learning_) {
             texSum_.assign((size_t)tw_ * th_, 0.f);
             for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
@@ -1014,7 +1110,9 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
                 if (!dup && !zones_.empty()) dup = mx >= tw_ || my >= th_ || zones_[mi] == 0;
                 if (!dup) {
                     out[keep] = c;
-                    out[keep++].edge = !zones_.empty() && zones_[mi] == 1;
+                    // в тайле, закрытом маской и открытом только для этой полярности (облако), —
+                    // подтверждается, только когда полетела, как на основном масштабе
+                    out[keep++].edge = (!zones_.empty() && zones_[mi] == 1) || (!mask_.empty() && !learning_ && !mask_[mi]);
                 }
             }
             out.resize(keep);
@@ -1055,17 +1153,22 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     if (recheck) updateRecheck();
     if (verifyLeft_ && --verifyLeft_ == 0) {   // сверка загруженной маски с тем, что видно сейчас
         std::vector<uint8_t> fresh;
+        markSoftCloud(0.3f);
         buildMask(0.3f, fresh);
         if (fresh.size() == mask_.size()) {
+            // дальше маска — новая: закрытое в файле по текстуре (прошлым запуском, прошлой версией
+            // программы) не держится. Из файла — только доращенное по помехам, если сцена та же:
+            // отличие от файла без доращенного не больше 10% тайлов
+            const bool layer = fileGrown_.size() == fresh.size();
             size_t diff = 0;
-            for (size_t i = 0; i < fresh.size(); ++i) diff += fresh[i] != mask_[i];
-            if (diff * 10 > fresh.size()) {
-                mask_.swap(fresh);
-                maskReplaced_ = true;
-            }
+            for (size_t i = 0; i < fresh.size(); ++i) diff += fresh[i] != (mask_[i] || (layer && fileGrown_[i]));
+            maskReplaced_ = diff * 10 > fresh.size();
+            mask_.swap(fresh);
             markSkyColor(0.3f);
-            markTexBad(0.3f);   // и для загруженной маски: перепроверка и маска по полярности
+            markTexBad(0.3f);   // перепроверка и маска по полярности
+            if (!maskReplaced_) applyGrown();
         }
+        fileGrown_.clear();
     }
     const double t2 = now_ms();
     timing_.response_ms = t1 - t0;
