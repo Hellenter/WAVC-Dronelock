@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 data/
 *.tmp.avi
+build*/
+*.y4m

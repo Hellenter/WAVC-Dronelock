@@ -1,0 +1,267 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Выложить сборки в пре-релиз preview-<номер запуска>'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Сторонние действия закреплены по коммиту (тег можно перевесить), скачиваемые архивы —
+# по sha256, пакеты pip — по версии: при смене версии обновить и сумму. FFmpeg: сумма
+# архива ffmpeg.org, подпись проверена ключом релизов FFmpeg (FCF986EA15E6E293A5644F10B4322F04D67658D8).
+# SDL2: сумма снята при первой загрузке в CI 2026-10-28 (подпись не проверялась).
+env:
+  FFMPEG_VERSION: '7.1.1'
+  FFMPEG_SHA256: '733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1'
+  SDL2_VERSION: '2.30.11'
+  SDL2_SHA256: '0590db0a47b564aab92499ed03eaa75db9aee17c371080caa3b05df9d49d9ff9'
+
+jobs:
+  # Ядро + тесты + приложение под Linux x64, синтетическое видео для проверки
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      # установка пакетов иногда зависает на зеркалах — ограничиваем время и повторяем
+      - name: Пакеты
+        timeout-minutes: 35
+        run: |
+          .github/scripts/apt.sh cmake ninja-build pkg-config ffmpeg libsdl2-dev libavformat-dev libavcodec-dev \
+            libswscale-dev libavutil-dev
+      - name: Python-пакеты
+        timeout-minutes: 10
+        run: |
+          pip install --quiet --timeout 60 --retries 3 numpy==2.5.4 opencv-python-headless==5.0.0.93
+      - name: Ядро и тесты
+        run: |
+          cmake -S native -B build-native -G Ninja
+          cmake --build build-native
+          ./build-native/test_kernels
+      - name: Приложение
+        run: |
+          cmake -S app -B build-app -G Ninja
+          cmake --build build-app
+      - name: Синтетическое видео 16 Мп с разметкой
+        run: |
+          mkdir -p sample
+          python detector/synth_sky.py --out sample/sky16mp.mp4 --frames 60
+      - name: Совпадение с Python-прототипом
+        env: { DRONOLOK_LIB: build-native }
+        run: python native/python/compare_with_python.py sample/sky16mp.mp4 --frames 10
+      - name: Замер
+        run: |
+          ffmpeg -loglevel error -i sample/sky16mp.mp4 -frames:v 20 -pix_fmt gray -f yuv4mpegpipe - | ./build-native/dronolok_bench - --frames 20 --sweep
+          ./build-app/dronolok_app --bench sample/sky16mp.mp4 --preload 60 --frames 240 --json bench-linux.json
+      - name: Стресс-проверка приложения (случайные настройки, перемотка, пауза)
+        run: timeout 120 ./build-app/dronolok_app --stress sample/sky16mp.mp4 --seconds 30
+      - name: Мультитест (без окна, синтетика с разметкой)
+        run: |
+          ./build-app/dronolok_app --multitest sample --vary auto_thr --vary thr=8,14 --vary lock_slow --frames 40 --parallel 2 --out mt-linux
+          python -c "import json; d=json.load(open('mt-linux/results.json')); r=d['runs']; assert len(r)==5 and all(x['done'] for x in r) and r[0]['recall_drone'] is not None, r; print('прогонов', len(r), 'оценка базы', r[0]['score'])"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: multitest-linux
+          path: mt-linux/
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sample-video
+          path: sample/
+          retention-days: 14
+
+  # Windows x64: кросс-компиляция MinGW, всё статически в один .exe
+  windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Пакеты
+        timeout-minutes: 35
+        run: .github/scripts/apt.sh cmake ninja-build pkg-config nasm mingw-w64
+      - name: Кэш FFmpeg
+        id: ffcache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/ffmpeg-mingw
+          key: ffmpeg-mingw-${{ env.FFMPEG_VERSION }}-${{ env.FFMPEG_SHA256 }}-${{ hashFiles('app/scripts/build_ffmpeg_mingw.sh') }}
+      - name: FFmpeg (статический, только декодеры)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          f="$RUNNER_TEMP/ffmpeg.tar.xz"
+          curl -fsSL -o "$f" https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz
+          echo "$FFMPEG_SHA256  $f" | sha256sum -c -
+          tar xJf "$f" -C "$RUNNER_TEMP"
+          app/scripts/build_ffmpeg_mingw.sh "$RUNNER_TEMP/ffmpeg-${FFMPEG_VERSION}" ~/ffmpeg-mingw
+          rm -rf ~/ffmpeg-mingw.build
+      - name: SDL2
+        run: |
+          f="$RUNNER_TEMP/sdl2.tar.gz"
+          curl -fsSL -o "$f" https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz
+          echo "$SDL2_SHA256  $f" | sha256sum -c -
+          tar xzf "$f" -C "$RUNNER_TEMP"
+      - name: Сборка
+        run: |
+          export PKG_CONFIG_LIBDIR=$HOME/ffmpeg-mingw/lib/pkgconfig
+          cmake -S app -B build-win -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$PWD/native/cmake/mingw-w64-x86_64.cmake \
+            -DSDL2_DIR=$RUNNER_TEMP/SDL2-${SDL2_VERSION}/x86_64-w64-mingw32/lib/cmake/SDL2 \
+            -DDRONOLOK_TESTS=ON
+          cmake --build build-win
+      - name: Упаковка
+        run: |
+          d=Dronolok-win64
+          mkdir -p $d
+          cp build-win/Dronolok.exe build-win/native/dronolok_bench.exe build-win/native/dronolok.dll $d/
+          cp app/README.md $d/README.md
+          cp native/include/dronolok/dronolok.h native/python/dronolok_native.py $d/
+          x86_64-w64-mingw32-objdump -p $d/Dronolok.exe | grep -i "DLL Name" | sort -u
+          mkdir -p win-tests && cp build-win/native/test_kernels.exe win-tests/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Dronolok-win64
+          path: Dronolok-win64/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: win-tests
+          path: win-tests/
+          retention-days: 7
+
+  # Проверка .exe на настоящей Windows
+  windows-smoke:
+    needs: [linux, windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { name: Dronolok-win64, path: app }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { name: win-tests, path: tests }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { name: sample-video, path: sample }
+      - name: Тесты ядер (SSE2/AVX2 на реальном CPU)
+        run: ./tests/test_kernels.exe
+      - name: Dronolok.exe --bench
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--bench','sample/sky16mp.mp4','--preload','60','--frames','240','--json','bench-win.json' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
+          Get-Content bench-win.json
+          $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--bench','sample/sky16mp.mp4','--frames','60','--threads','2','--isa','sse2','--json','bench-win-2t.json' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
+          Get-Content bench-win-2t.json
+      - name: Dronolok.exe --multitest
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--multitest','sample','--vary','auto_thr','--vary','lock_slow','--frames','30','--out','mt-win' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
+          $d = Get-Content mt-win/results.json -Raw | ConvertFrom-Json
+          if ($d.runs.Count -ne 3) { throw "прогонов $($d.runs.Count)" }
+          if (-not (Test-Path mt-win/report.html)) { throw "нет report.html" }
+          Write-Output "прогонов $($d.runs.Count), оценка базы $($d.runs[0].score)"
+      - name: Dronolok.exe --stress
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--stress','sample/sky16mp.mp4','--seconds','30' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
+
+  # Raspberry Pi: ядро под aarch64 (Pi 3/4/5, 64-бит ОС) и armhf (32-бит ОС), тесты в qemu
+  pi:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - triple: aarch64-linux-gnu
+            qemu: qemu-aarch64-static
+          - triple: arm-linux-gnueabihf
+            qemu: qemu-arm-static
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Пакеты
+        timeout-minutes: 35
+        run: .github/scripts/apt.sh cmake ninja-build qemu-user-static g++-${{ matrix.triple }}
+      - name: Сборка и тесты NEON
+        run: |
+          cmake -S native -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/native/cmake/${{ matrix.triple }}.cmake
+          cmake --build build
+          ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_kernels
+          d=dronolok-${{ matrix.triple }}
+          mkdir -p $d && cp build/dronolok_bench build/libdronolok.so native/include/dronolok/*.h* native/python/dronolok_native.py $d/
+          tar czf $d.tar.gz $d
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dronolok-${{ matrix.triple }}
+          path: dronolok-${{ matrix.triple }}.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+    needs: [windows, windows-smoke, pi]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { path: dist }
+      - name: Архивы
+        run: |
+          cd dist
+          zip -r Dronolok-win64.zip Dronolok-win64
+          ls -la
+      # релиз через gh (есть на раннере): стороннему действию не нужен доступ на запись
+      - name: Релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('preview-{0}', github.run_number) }}
+          TITLE: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('Дронолок preview {0}', github.run_number) }}
+          PRE: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          cd dist
+          files="Dronolok-win64.zip $(ls dronolok-*/dronolok-*.tar.gz)"
+          flags=()
+          [ "$PRE" = true ] && flags+=(--prerelease)
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" $files --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" $files "${flags[@]}" --target "$GITHUB_SHA" --title "$TITLE" \
+              --generate-notes -R "$GITHUB_REPOSITORY"
+          fi
+
+  # Последняя сборка по постоянной ссылке .../releases/tag/latest-build: обновляется после
+  # каждого изменения в main и в открытом PR из этого репозитория
+  latest:
+    # только PR в основную ветку: PR в ветку другого PR (доработки соседних задач) сюда не пишут
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == github.event.repository.default_branch)
+    needs: [windows, windows-smoke, pi]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { path: dist }
+      - name: Обновить релиз latest-build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SRC: ${{ github.event.pull_request.head.ref || github.ref_name }}
+        run: |
+          cd dist
+          zip -qr Dronolok-win64.zip Dronolok-win64
+          files="Dronolok-win64.zip $(ls dronolok-*/dronolok-*.tar.gz)"
+          notes="Собрано автоматически: ветка $SRC, коммит ${SHA::7}, $(date -u '+%Y-%m-%d %H:%M') UTC.
+          Windows 10/11 x64: Dronolok-win64.zip. Raspberry Pi: dronolok-aarch64-linux-gnu.tar.gz (64-бит ОС), dronolok-arm-linux-gnueabihf.tar.gz (32-бит ОС)."
+          if gh release view latest-build -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload latest-build $files --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit latest-build --notes "$notes" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create latest-build $files --prerelease --target "$SHA" \
+              --title "Дронолок — последняя сборка" --notes "$notes" -R "$GITHUB_REPOSITORY"
+          fi
