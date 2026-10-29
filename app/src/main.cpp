@@ -1028,8 +1028,9 @@ void panel_main(App& a, bool& changed) {
             FontSize f(1.1f);
             ImGui::TextWrapped("%s", name.c_str());
         }
-        ImGui::TextDisabled("%dx%d, %.2f к/с, %s%s", vi.w, vi.h, vi.fps, vi.codec.c_str(),
-                            vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "");
+        ImGui::TextDisabled("%dx%d, %.2f к/с, %s%s%s", vi.w, vi.h, vi.fps, vi.codec.c_str(),
+                            vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "",
+                            vi.rotation ? (", повёрнуто на " + std::to_string(vi.rotation) + "°").c_str() : "");
     } else {
         ImGui::TextDisabled("или перетащите файл в окно");
     }
@@ -1435,7 +1436,9 @@ void tab_algorithm(App& a, bool& changed) {
                     "плавно: перепад на 1 пиксель — около четверти перепада на 4 (у листвы, веток и леса в дымке — "
                     "половина и больше). Такой тайл цвета неба — облако и у самой кромки леса, линия горизонта через "
                     "него не идёт. Гребень дальнего холма в дымке так же мягок, но лежит полосой в один тайл между "
-                    "гладким небом и лесом — он остаётся закрытым.");
+                    "гладким небом и лесом — он остаётся закрытым. Над тёмной верхушкой близкого дерева облако линию "
+                    "горизонта всё же поднимает: просвет между ними закрыт, иначе при малейшем сдвиге камеры туда "
+                    "заходят ветки.");
         blk |= ImGui::Checkbox("Облака по цвету — и для светлых целей", &d.sky_bright);
         help_marker("Выкл.: облако по цвету открыто только для тёмных целей (дрон на фоне облака тёмный), на экране "
                     "такие тайлы закрашены едва заметно.");
@@ -2864,7 +2867,8 @@ int run_bench(int argc, char** argv) {
         printf("ошибка: %s\n", err.c_str());
         return 1;
     }
-    printf("видео %dx%d, %.2f к/с, %s\n", p.info().w, p.info().h, p.info().fps, p.info().codec.c_str());
+    printf("видео %dx%d, %.2f к/с, %s, поворот %d°\n", p.info().w, p.info().h, p.info().fps, p.info().codec.c_str(),
+           p.info().rotation);
     bool counting = preload == 0;
     for (;;) {
         SDL_Delay(50);
