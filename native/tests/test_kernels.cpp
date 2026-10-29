@@ -692,6 +692,43 @@ static void test_grow_mask() {
         CHECK(m[2 * tw + 2] == (pm != 0), "pol_mask %d: sky under cloud %d", pm, (int)m[2 * tw + 2]);
     }
     std::printf("cloud masked for bright targets only: ok\n");
+
+    // цель в захвате под маской: в круге прогноза одно тёмное пятно — слабый кандидат; без
+    // захвата или с двумя пятнами (неоднозначно) — ничего
+    {
+        auto ripple = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            for (int y = T; y < 2 * T; ++y)
+                for (int x = 2 * T; x < 4 * T; ++x) f[(size_t)y * w + x] = (uint8_t)(160 + (((x + seed) / 8 + y / 8) % 2) * 8);
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.pol_mask = 0;
+        cfg.mask_recheck = false;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) d.detect(ripple(i).data(), w, h, w, c);
+        d.endMaskLearning();
+        CHECK(!d.tileMask()[d.tilesX() + 2], "lock through: ripple tile masked");
+        const float bx = 2.5f * T, by = 1.5f * T;
+        for (int variant = 0; variant < 3; ++variant) {
+            auto f = ripple(100);
+            for (int y = 0; y < 4; ++y)
+                for (int x = 0; x < 4; ++x) {
+                    f[(size_t)(by + y) * w + (size_t)bx + x] = 100;
+                    if (variant == 2) f[(size_t)(by + y) * w + (size_t)bx + 40 + x] = 100;   // второе пятно
+                }
+            d.setLockArea(variant != 1, bx + 2, by + 2, 60.f, -1, 40.f);
+            d.detect(f.data(), w, h, w, c);
+            int n = 0;
+            for (const auto& q : c) n += q.weak && std::hypot(q.x - bx - 2, q.y - by - 2) < 8;
+            CHECK(n == (variant == 0 ? 1 : 0), "lock through %d: %d candidates", variant, n);
+        }
+        d.setLockArea(false);
+    }
+    std::printf("locked target found under the mask: ok\n");
 }
 
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью

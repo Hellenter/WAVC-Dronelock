@@ -770,6 +770,19 @@ void Pipeline::processLoop() {
             roi.clear();
             if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) trk->roi(me.dx, me.dy, roi);
             det.setRoi(roi);
+            {   // цель в захвате может залететь под маску (облако, кромка): там ищется её продолжение
+                float lx = 0, ly = 0, lr = 0, lc = 0;
+                int lp = -1;
+                bool on = maskOn && !det.learningMask() && trk->lockSearch(me.dx, me.dy, lx, ly, lr, lp);
+                if (on) {   // только летящая цель: зависшая точка в кроне или на земле так не держится
+                    on = false;
+                    for (const auto& t : trk->confirmed())
+                        if (t.id == trk->lockedId() && !t.clutter && !t.anchored && t.cls != TargetClass::Bird &&
+                            t.travel >= 3.f * trk->config().mover_px)
+                            on = true, lc = t.contrast;
+                }
+                det.setLockArea(on, lx, ly, lr, lp, lc);
+            }
             det.detect(f.px.data(), f.w, f.h, f.w, cands);
             trk->setPartial(det.timing().partial);
             // силуэт захваченной цели: прицел в центре крупного БПЛА, а не на крыле или хвосте

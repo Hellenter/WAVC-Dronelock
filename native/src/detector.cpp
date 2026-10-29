@@ -649,11 +649,14 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     const uint8_t* m = (!learning_ && !verifyLeft_ && !mask_.empty()) ? mask_.data() : nullptr;
     updateBand();
     const bool polOn = polOpen_[0].size() == mask_.size() || polOpen_[1].size() == mask_.size();
-    if (m && (edgeG_.size() == mask_.size() || polOn)) {
-        // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам; и открытые для одной полярности
+    const bool lockOn = cfg_.lock_through && lockOn_ && m;
+    if (m && (edgeG_.size() == mask_.size() || polOn || lockOn)) {
+        // тайлы земли у кромки тоже считаем: маска уточняется по ячейкам; и открытые для одной
+        // полярности; и под кругом цели в захвате
         compMask_.resize(mask_.size());
         for (size_t i = 0; i < mask_.size(); ++i)
-            compMask_[i] = mask_[i] | (edgeG_.size() == mask_.size() && edgeG_[i]) | polOpenAt(0, i) | polOpenAt(1, i);
+            compMask_[i] = mask_[i] | (edgeG_.size() == mask_.size() && edgeG_[i]) | polOpenAt(0, i) | polOpenAt(1, i) |
+                           (lockOn && lockTile((int)(i % tw_), (int)(i / tw_)));
         m = compMask_.data();
     }
     // между полными просмотрами — только тайлы вокруг треков (маска неба тоже действует);
@@ -759,6 +762,8 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
+    if (cfg_.lock_through && lockOn_ && !learning_ && !mask_.empty() && (lockPol_ > 0 ? cfg_.bright : cfg_.dark))
+        selectThrough(lockPol_ > 0 ? stats_->bright : stats_->dark, lockPol_ > 0 ? 1 : 0, out);
     // фон ячеек читают кромка маски неба и накопление (tbd). Без маски и без накопления (камера
     // движется, поворотка) его не учим — это заметная доля последовательной части кадра; когда
     // маска появится, фон учится заново: выученный на движущейся картинке ей всё равно чужой
@@ -1137,6 +1142,58 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                          [](const Candidate& a, const Candidate& b) { return a.contrast > b.contrast; });
         out.resize(first + cfg_.max_cands);
     }
+}
+
+bool Detector::lockTile(int tx, int ty) const {
+    const float tp = (float)(cfg_.tile * cfg_.pool);
+    const float nx = std::max((float)tx * tp, std::min(lockX_, (float)(tx + 1) * tp));
+    const float ny = std::max((float)ty * tp, std::min(lockY_, (float)(ty + 1) * tp));
+    return std::hypot(nx - lockX_, ny - lockY_) <= lockR_;
+}
+
+// Цель в захвате под маской (DetectorConfig::lock_through): одно пятно той же полярности и
+// похожего контраста в круге прогноза, в ячейках тайлов, закрытых для этой полярности
+void Detector::selectThrough(const TileStats& ts, int pol, std::vector<Candidate>& out) {
+    const int cpt = cfg_.tile / CELL, ctw = tw_ * cpt, cth = th_ * cpt, f = cfg_.pool;
+    const size_t nc = (size_t)ctw * cth;
+    if (cfg_.tile % CELL || ts.cmax.size() != nc || ts.carg.size() != nc || mask_.size() != (size_t)tw_ * th_) return;
+    for (const Candidate& c : out)   // цель видна и так
+        if ((c.polarity > 0) == (pol == 1) && std::hypot(c.x - lockX_, c.y - lockY_) <= lockR_) return;
+    const float cpx = (float)(CELL * f), thr = threshold() * cfg_.lock_through_k, cs = 1.f / smoothK();
+    const int x0 = std::max(0, (int)std::floor((lockX_ - lockR_) / cpx)), x1 = std::min(ctw - 1, (int)std::floor((lockX_ + lockR_) / cpx));
+    const int y0 = std::max(0, (int)std::floor((lockY_ - lockR_) / cpx)), y1 = std::min(cth - 1, (int)std::floor((lockY_ + lockR_) / cpx));
+    int best = -1, n = 0, cx[8], cy[8];
+    float bm = 0, bx = 0, by = 0;
+    for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x) {
+            const size_t ci = (size_t)y * ctw + x, ti = (size_t)(y / cpt) * tw_ + x / cpt;
+            if (mask_[ti] || polOpenAt(pol, ti)) continue;   // открытое смотрится и так
+            const float v = ts.cmax[ci];
+            if (v < thr || ts.carg[ci] == 255) continue;
+            if (lockC_ > 0 && (v * cs < 0.5f * lockC_ || v * cs > 2.f * lockC_)) continue;
+            const float px = (float)((x * CELL + ts.carg[ci] % CELL) * f) + (f - 1) * 0.5f;
+            const float py = (float)((y * CELL + ts.carg[ci] / CELL) * f) + (f - 1) * 0.5f;
+            if (std::hypot(px - lockX_, py - lockY_) > lockR_) continue;
+            if (n == 8) return;   // много пятен — листва, не цель
+            cx[n] = x, cy[n] = y, ++n;
+            if (v > bm) bm = v, best = n - 1, bx = px, by = py;
+        }
+    if (best < 0) return;
+    for (int k = 0; k < n; ++k)   // пятно одно: все сработавшие ячейки — соседи самой сильной
+        if (std::abs(cx[k] - cx[best]) > 1 || std::abs(cy[k] - cy[best]) > 1) return;
+    const size_t ti = (size_t)(cy[best] / cpt) * tw_ + cx[best] / cpt;
+    const uint32_t area = (uint32_t)(cfg_.tile * cfg_.tile);
+    const float level = (float)std::min<uint32_t>(255, ts.sum.size() > ti ? div_round_even(ts.sum[ti], area) : 0);
+    Candidate c;
+    c.x = bx;
+    c.y = by;
+    c.contrast = bm * cs;
+    c.margin = bm / threshold();
+    c.snr = bm / (level + 1.f);
+    c.polarity = pol ? 1 : -1;
+    c.weak = true;
+    c.edge = true;
+    out.push_back(c);
 }
 
 const std::vector<uint8_t>& Detector::texturedTiles(int pol) const { return stats_->tex[pol ? 1 : 0]; }

@@ -135,6 +135,13 @@ struct DetectorConfig {
     // открыт для светлых целей), 0 — выкл. Помехи копятся — тайл закрывается (grow_mask)
     int pol_mask = 1;
     float pol_tex = 0.05f;
+    // Цель в захвате, залетевшая под маску (облако, кромка): в круге прогноза её трека
+    // (setLockArea) ячейки под маской смотрятся с порогом x lock_through_k. Кандидат — той же
+    // полярности, контраст в пределах x2 от контраста трека, слабый (только продолжает трек,
+    // новых не рождает) и только если пятно там одно: два разных — неоднозначно, трек держится
+    // на прогнозе. Если цель видна и без маски, ничего не добавляется
+    bool lock_through = true;
+    float lock_through_k = 1.5f;
     int bg_frames = 250;
     // Накопление слабой цели по кадрам (track-before-detect на ячейках, фон ячеек тогда
     // учится по всему небу): A = tbd_decay * max3x3(A) + max(0, z - tbd_z0), z — превышение
@@ -253,6 +260,12 @@ public:
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
+    // Цель в захвате на этот кадр: прогноз (x, y), радиус поиска, полярность и контраст трека
+    // (DetectorConfig::lock_through); on = false — захвата нет. Действует до следующего вызова
+    void setLockArea(bool on, float x = 0, float y = 0, float r = 0, int polarity = -1, float contrast = 0) {
+        lockOn_ = on;
+        lockX_ = x, lockY_ = y, lockR_ = r, lockPol_ = polarity, lockC_ = contrast;
+    }
     // Где искать в кадры между полными просмотрами (Tracker::roi)
     void setRoi(const std::vector<FocusArea>& areas) { roi_ = areas; }
     const std::vector<uint8_t>& tileMask() const { return mask_; }   // tilesY x tilesX, 1 = искать
@@ -328,6 +341,11 @@ private:
     }
     void markTexBad(float frac);
     void updateRecheck();
+    bool lockOn_ = false;
+    float lockX_ = 0, lockY_ = 0, lockR_ = 0, lockC_ = 0;
+    int lockPol_ = -1;
+    bool lockTile(int tx, int ty) const;   // тайл задет кругом захвата (lock_through)
+    void selectThrough(const TileStats& ts, int pol, std::vector<Candidate>& out);
 public:
     // тайлы полосы у горизонта (tilesY x tilesX, 1 — полоса), пусто — выключено или нет маски
     const std::vector<uint8_t>& horizonBand() const { return band_; }
