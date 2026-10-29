@@ -21,6 +21,7 @@
 // кадр подаётся по кругу без копирования (как DMA-буферы камеры).
 struct Frame {
     std::vector<uint8_t> px;
+    ColorPlanes color;        // цвет (выборка U, V), если он есть в видео
     int w = 0, h = 0;
     int64_t index = 0;        // номер кадра в файле
     double decodeMs = 0;

@@ -804,6 +804,71 @@ static void test_grow_mask() {
     std::printf("locked target found under the mask: ok\n");
 }
 
+// Облака по цвету: облако у солнца (яркие клочья и тёмные просветы — текстура обеих полярностей)
+// маска закрывала, как крону; по цвету оно серое, не темнее неба и отделено от земли небом — открыто
+// для тёмных целей, и тёмная цель в нём находится. Такой же серый тайл на земле (крыша), зелёный в
+// небе (верх кроны), серое видео и кадры без цвета — как раньше
+static void test_sky_color() {
+    const int w = 640, h = 640, T = 64;   // тайлы 10 x 10; небо — ряды 0..5, земля — 6..9
+    const int cloud = 1 * 10 + 2, roof = 5 * 10 + 7, crown = 1 * 10 + 6;
+    auto frame = [&](unsigned seed, bool target) {
+        auto f = ground_frame(w, h, 0.6f, seed);
+        for (int t : {cloud, cloud + 1, roof, crown})
+            for (int y = t / 10 * T; y < (t / 10 + 1) * T; ++y)
+                for (int x = t % 10 * T; x < (t % 10 + 1) * T; ++x) {
+                    if ((x + seed) % 16 < 4 && y % 16 < 4) f[(size_t)y * w + x] = 230;
+                    else if ((x + seed + 8) % 16 < 4 && (y + 8) % 16 < 4) f[(size_t)y * w + x] = 130;
+                }
+        if (target)
+            for (int y = 0; y < 4; ++y)
+                for (int x = 0; x < 4; ++x) f[(size_t)(T + 22 + y) * w + 2 * T + 22 + x] = 60;
+        return f;
+    };
+    const int cw = w / 2, ch = h / 2;   // как yuv420p: отсчёт на блок 2x2
+    std::vector<uint8_t> u((size_t)cw * ch), v(u.size()), grey(u.size(), 128);
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            const int t = 2 * y / T * 10 + 2 * x / T;
+            const bool sky = 2 * y < 0.6f * h, green = !sky || t == crown, cl = t == cloud || t == cloud + 1 || t == roof;
+            u[(size_t)y * cw + x] = cl ? 128 : green ? 118 : 138;   // голубое небо, зелёные трава и кроны
+            v[(size_t)y * cw + x] = cl ? 128 : green ? 120 : 123;
+        }
+    for (int variant = 0; variant < 4; ++variant) {   // цвет, sky_color выкл., серое видео, без цвета
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.mask_recheck = false;
+        cfg.sky_color = variant != 1;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) {
+            if (variant < 2) d.setColor(u.data(), v.data(), cw, ch, cw, 2);
+            if (variant == 2) d.setColor(grey.data(), grey.data(), cw, ch, cw, 2);
+            d.detect(frame(i, false).data(), w, h, w, c);
+        }
+        d.endMaskLearning();
+        const auto& m = d.tileMask();
+        const auto& sc = d.skyColored();
+        const auto& o = d.polarityOpen(0);
+        const bool on = variant == 0;
+        CHECK(!m[cloud] && !m[cloud + 1] && !m[roof] && !m[crown] && !m[6 * 10 + 2], "sky color %d: tiles not masked",
+              variant);
+        CHECK(sc.empty() == !on, "sky color %d: sky-colored tiles %zu", variant, sc.size());
+        if (on)
+            CHECK(sc[cloud] && sc[cloud + 1] && !sc[roof] && !sc[crown] && !sc[6 * 10 + 2],
+                  "sky color: cloud %d %d, roof %d, crown %d", sc[cloud], sc[cloud + 1], sc[roof], sc[crown]);
+        const bool open = o.size() == m.size() && o[cloud] && o[cloud + 1];
+        CHECK(open == on && (o.empty() || (!o[roof] && !o[crown])), "sky color %d: cloud open for dark %d", variant,
+              (int)open);
+        for (int i = 0; i < 20; ++i) d.detect(frame(100 + i, false).data(), w, h, w, c);   // фон ячеек облака
+        d.detect(frame(200, true).data(), w, h, w, c);
+        int n = 0;
+        for (const auto& q : c) n += q.polarity < 0 && std::hypot(q.x - 2 * T - 24, q.y - T - 24) < 6;
+        CHECK(n == (on ? 1 : 0), "sky color %d: %d dark targets in the cloud", variant, n);
+    }
+    std::printf("sunlit clouds open by colour: ok\n");
+}
+
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
 // поверх кадра (неподвижные точки исключаются из оценки) и с повтором кадра
 static void test_motion() {
@@ -1007,6 +1072,7 @@ int main() {
     test_zone_strip();
     test_halo();
     test_grow_mask();
+    test_sky_color();
     test_scene();
     test_motion();
     test_bad_files();

@@ -140,6 +140,20 @@ struct DetectorConfig {
     // открыт для светлых целей), 0 — выкл. Помехи копятся — тайл закрывается (grow_mask)
     int pol_mask = 1;
     float pol_tex = 0.05f;
+    // Облака по цвету (нужен цвет кадра, setColor). Облака, освещённые солнцем, текстурны в обеих
+    // полярностях: яркие клочья и тёмные просветы голубого неба между ними, — и маска закрывала их,
+    // как кроны. По цвету и яркости это небо: не зелёное (у листвы и травы зелёный выше красного и
+    // выше синего больше чем на sky_green яркости), не темнее sky_y яркости открытого неба этой
+    // сцены, и 10% самых тёмных точек тайла не темнее sky_dark неба (у крон и домов глубокие тени);
+    // и не стоит на земле: под ним в столбце открытое небо, а не сплошь закрытое до низа кадра (верх
+    // крон, лес в дымке у горизонта). Такой тайл при обучении маски — облако: закрыт только для
+    // светлых целей, тёмные ищутся по фону ячеек (как pol_mask), но не ниже медианы ячейки + bg_k
+    // уровней отклика (у кромки облака разброс фона почти нулевой, и без этого её блик — цель).
+    // Доращивание облако не закрывает и землёй не считает, mask_recheck может открыть целиком;
+    // зелёный тайл mask_recheck не открывает — это кроны и трава. Цвета нет (серая камера,
+    // gray-видео) — как раньше
+    bool sky_color = true;
+    float sky_green = 0.08f, sky_y = 0.7f, sky_dark = 0.6f;
     // Цель в захвате, залетевшая под маску (облако, кромка): в круге прогноза её трека
     // (setLockArea) ячейки под маской смотрятся с порогом x lock_through_k. Кандидат — той же
     // полярности, контраст в пределах x2 от контраста трека, слабый (только продолжает трек,
@@ -268,6 +282,17 @@ public:
     // тайлы, закрытые маской, где ищутся цели одной полярности (DetectorConfig::pol_mask):
     // pol 0 — тёмные, 1 — светлые (tilesY x tilesX, 1 — ищутся); пусто — нет таких
     const std::vector<uint8_t>& polarityOpen(int pol) const { return polOpen_[pol ? 1 : 0]; }
+    // Цвет кадра для DetectorConfig::sky_color (необязательно): плоскости U и V (Cb, Cr; полный
+    // диапазон, 128 — серый) cw x ch, stride байт между строками и pix между отсчётами строки,
+    // отсчёт — на блок step x step пикс. кадра (yuv420p как есть — step 2, pix 1; NV12 — u = uv,
+    // v = uv + 1, pix 2). Действует на следующий detect(); не задан — цвет этого кадра не
+    // учитывается. Читаются 8x8 отсчётов на тайл и только в кадры обучения маски
+    void setColor(const uint8_t* u, const uint8_t* v, int cw, int ch, int stride, int step, int pix = 1) {
+        colU_ = u, colV_ = v, colW_ = cw, colH_ = ch, colStride_ = stride, colStep_ = step, colPix_ = pix;
+    }
+    // тайлы, закрытые при обучении текстурой, но по цвету и яркости — небо (облака у солнца,
+    // sky_color; tilesY x tilesX); пусто — нет таких или цвета не было
+    const std::vector<uint8_t>& skyColored() const { return skyCol_; }
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
@@ -350,6 +375,17 @@ private:
         const auto& v = polOpen_[pol ? 1 : 0];
         return v.size() == mask_.size() && v[i];
     }
+    // облака по цвету (sky_color): цвет этого кадра; по тайлам за кадры обучения — суммы яркости
+    // и цвета (U, V от серого), гистограмма яркости по 8 уровней, отсчётов; итог — тайлы-облака
+    const uint8_t *colU_ = nullptr, *colV_ = nullptr;
+    int colW_ = 0, colH_ = 0, colStride_ = 0, colStep_ = 0, colPix_ = 1;
+    std::vector<float> colY_, colU0_, colV0_;
+    std::vector<uint32_t> colHist_, colN_;
+    std::vector<uint8_t> skyCol_, green_;   // ...и зелёные по цвету тайлы (листва, трава)
+    void sampleColor(const uint8_t* gray, int stride);
+    void markSkyColor(float frac);
+    void resetColor();
+    bool skyColAt(size_t i) const { return skyCol_.size() == mask_.size() && skyCol_[i]; }
     void markTexBad(float frac);
     void updateRecheck();
     bool lockOn_ = false;

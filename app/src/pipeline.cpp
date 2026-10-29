@@ -295,8 +295,8 @@ void Pipeline::decodeLoop() {
         f = allocFrame(W, H);
         const double t = now_ms();
         wrapped = false;
-        if (!src.read(f->px.data(), W, H, W)) {
-            if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W)) return false;
+        if (!src.read(f->px.data(), W, H, W, &f->color)) {
+            if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W, &f->color)) return false;
             ++loop;
             wrapped = true;
         }
@@ -783,6 +783,9 @@ void Pipeline::processLoop() {
                 }
                 det.setLockArea(on, lx, ly, lr, lp, lc);
             }
+            // цвет кадра — для облаков по цвету при обучении маски (окно поворотки — без цвета)
+            if (view == p.frame && f.color.w > 0)
+                det.setColor(f.color.u.data(), f.color.v.data(), f.color.w, f.color.h, f.color.w, f.color.step);
             det.detect(f.px.data(), f.w, f.h, f.w, cands);
             trk->setPartial(det.timing().partial);
             // силуэт захваченной цели: прицел в центре крупного БПЛА, а не на крыле или хвосте

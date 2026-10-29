@@ -1,5 +1,5 @@
-// Чтение кадров без FFmpeg: YUV4MPEG2 (.y4m, любой C420*/C422/C444/Cmono — берётся Y)
-// или сырой поток gray/yuv420p заданного размера. Источник — файл или stdin ("-"), поэтому
+// Чтение кадров без FFmpeg: YUV4MPEG2 (.y4m, любой C420*/C422/C444/Cmono — берётся Y, цвет —
+// по запросу, color()) или сырой поток gray/yuv420p заданного размера. Источник — файл или stdin ("-"), поэтому
 // на Raspberry Pi можно подать поток прямо из ffmpeg или rpicam-vid:
 //   ffmpeg -i in.mp4 -pix_fmt gray -f yuv4mpegpipe - | dronolok_bench -
 //   rpicam-vid -t 0 --codec yuv420 --width 4608 --height 2592 -o - | dronolok_bench - --size 4608x2592 --yuv420
@@ -41,6 +41,7 @@ public:
             w_ = rawW;
             h_ = rawH;
             skip_ = yuv420 ? (size_t)w_ * h_ / 2 : 0;
+            cw_ = w_ / 2, ch_ = h_ / 2, cstep_ = 2;
             y4m_ = false;
             return true;
         }
@@ -65,9 +66,9 @@ public:
         if (!sizeOk(w_, h_)) return false;
         const size_t n = (size_t)w_ * h_;
         if (cs.compare(0, 4, "mono") == 0) skip_ = 0;
-        else if (cs.compare(0, 3, "444") == 0) skip_ = 2 * n;
-        else if (cs.compare(0, 3, "422") == 0) skip_ = n;
-        else skip_ = 2 * (((size_t)(w_ + 1) / 2) * ((h_ + 1) / 2));
+        else if (cs.compare(0, 3, "444") == 0) skip_ = 2 * n, cw_ = w_, ch_ = h_, cstep_ = 1;
+        else if (cs.compare(0, 3, "422") == 0) skip_ = 2 * ((size_t)(w_ + 1) / 2) * h_, cw_ = (w_ + 1) / 2, ch_ = h_, cstep_ = 2, c422_ = true;
+        else skip_ = 2 * (((size_t)(w_ + 1) / 2) * ((h_ + 1) / 2)), cw_ = (w_ + 1) / 2, ch_ = (h_ + 1) / 2, cstep_ = 2;
         y4m_ = true;
         return true;
     }
@@ -94,9 +95,24 @@ public:
         return true;
     }
 
+    // Цвет последнего кадра (после next) для Detector::setColor: плоскости U и V cw x ch, stride байт
+    // между строками, отсчёт на блок step x step пикс. 4:2:2 — через строку (по вертикали цвета
+    // вдвое больше, чем нужно). false — цвета нет (Cmono, сырой gray)
+    bool color(const uint8_t*& u, const uint8_t*& v, int& cw, int& ch, int& stride, int& step) const {
+        if (!skip_ || skipBuf_.size() != skip_ || cw_ <= 0) return false;
+        u = skipBuf_.data();
+        v = u + (size_t)cw_ * ch_;
+        cw = cw_;
+        ch = c422_ ? ch_ / 2 : ch_;
+        stride = c422_ ? 2 * cw_ : cw_;
+        step = cstep_;
+        return true;
+    }
+
 private:
     std::FILE* f_ = nullptr;
-    int w_ = 0, h_ = 0;
+    int w_ = 0, h_ = 0, cw_ = 0, ch_ = 0, cstep_ = 0;
+    bool c422_ = false;
     double fps_ = 25;
     size_t skip_ = 0;
     bool y4m_ = false;

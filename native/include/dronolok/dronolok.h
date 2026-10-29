@@ -73,6 +73,15 @@ DL_API void dl_mask_begin(dl_detector* d);
 DL_API void dl_mask_end(dl_detector* d, float frac);
 /* Маска тайлов (1 = искать). Возвращает tw*th или 0, если маски нет. */
 DL_API int dl_mask_get(dl_detector* d, uint8_t* out, int cap, int* tw, int* th);
+/* Цвет кадра (необязательно): по нему облака, освещённые солнцем, не закрываются маской, как кроны.
+   Плоскости U и V (Cb, Cr; полный диапазон, 128 — серый) cw x ch, stride байт между строками и pix
+   между отсчётами строки, отсчёт — на блок step x step пикс. кадра: I420 с камеры как есть — step 2,
+   pix 1; NV12 — u = uv, v = uv + 1, pix 2. Действует на следующий dl_detect; читается только в кадры
+   обучения маски (между dl_mask_begin и dl_mask_end), 8x8 отсчётов на тайл. u = NULL — без цвета.
+   Тёмные цели в облаке ищутся по фону ячеек, а детектор C API пока без него (как детектор Python):
+   здесь цвет только не даёт перепроверке маски открыть зелень (кроны, траву). */
+DL_API void dl_detector_set_color(dl_detector* d, const uint8_t* u, const uint8_t* v, int cw, int ch, int stride,
+                                  int step, int pix);
 
 DL_API int dl_hardware_threads(void);
 DL_API int dl_available_isas(int* out, int cap);
