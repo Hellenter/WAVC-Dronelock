@@ -869,6 +869,92 @@ static void test_sky_color() {
     std::printf("sunlit clouds open by colour: ok\n");
 }
 
+// Мягкое облако у самой кромки леса (sky_soft): облако, касающееся крон, стоит на земле, и правило
+// "висит в небе" его не открывало, а линия горизонта шла через него вверх. Яркость в нём меняется
+// плавно (перепад на 1 пикс. — четверть перепада на 4) — облако: открыто для тёмных и светлых целей,
+// и обе там находятся. Резкая светлая текстура у кромки (крыша, освещённые стволы) и зелёная мягкая
+// (крона не в фокусе) остаются закрытыми
+static void test_soft_cloud() {
+    // тайлы 10 x 10; небо — ряды 0..5, земля — 6..9 (с 8-й строки ряда: отсчёты перепада на 4 пикс.
+    // у низа тайла облака смотрят ещё в небо, а не в лес). Облако — 2 x 2 тайла на земле; гребень
+    // холма в дымке — такая же мягкая, но голубоватая полоса в один тайл между небом и лесом в
+    // дымке (он тоже цвета неба, но не мягкий)
+    const int w = 640, h = 640, T = 64;
+    const float hz = 0.6125f;
+    const int cloud = 5 * 10 + 2, ridge = 5 * 10 + 4, haze = ridge + 10, roof = 5 * 10 + 6, crown = 5 * 10 + 8;
+    const int clouds[4] = {cloud - 10, cloud - 9, cloud, cloud + 1};
+    auto frame = [&](unsigned seed, int target) {
+        auto f = ground_frame(w, h, hz, seed);
+        std::mt19937 g(seed + 1000);
+        const float ph = 0.2f * (float)seed;   // облако медленно плывёт
+        for (int t : {cloud - 10, cloud - 9, cloud, cloud + 1, ridge, roof, crown})
+            for (int y = t / 10 * T; y < (t / 10 + 1) * T; ++y)
+                for (int x = t % 10 * T; x < (t % 10 + 1) * T; ++x)
+                    f[(size_t)y * w + x] = t == roof ? (uint8_t)(150 + g() % 80)
+                                                     : (uint8_t)(175.f + 12.f * std::sin(0.2618f * x + ph) * std::sin(0.2618f * y));
+        for (int y = (int)(hz * h); y < (haze / 10 + 1) * T; ++y)
+            for (int x = haze % 10 * T; x < (haze % 10 + 1) * T; ++x) f[(size_t)y * w + x] = (uint8_t)(125 + g() % 40);
+        if (target)   // тёмная (-1) или светлая (1) цель 4x4 в облаке
+            for (int y = 0; y < 4; ++y)
+                for (int x = 0; x < 4; ++x) f[(size_t)(5 * T + 22 + y) * w + 2 * T + 22 + x] = target < 0 ? 60 : 255;
+        return f;
+    };
+    const int cw = w / 2, ch = h / 2;
+    std::vector<uint8_t> u((size_t)cw * ch), v(u.size());
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            const int t = 2 * y / T * 10 + 2 * x / T;
+            const bool sky = 2 * y < hz * h || t == haze;
+            const bool grey = t == cloud - 10 || t == cloud - 9 || t == cloud || t == cloud + 1 || t == roof;
+            u[(size_t)y * cw + x] = grey ? 128 : sky && t != crown ? 138 : 118;   // голубое небо, зелёные трава и кроны
+            v[(size_t)y * cw + x] = grey ? 128 : sky && t != crown ? 123 : 120;
+        }
+    for (int variant = 0; variant < 3; ++variant) {   // мягкие облака; без них; только для тёмных целей
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.mask_recheck = false;
+        cfg.sky_soft = variant != 1;
+        cfg.sky_bright = variant != 2;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) {
+            d.setColor(u.data(), v.data(), cw, ch, cw, 2);
+            d.detect(frame(i, 0).data(), w, h, w, c);
+        }
+        d.endMaskLearning();
+        const auto& m = d.tileMask();
+        const auto& sc = d.skyColored();
+        const auto& o0 = d.polarityOpen(0);
+        const auto& o1 = d.polarityOpen(1);
+        const bool on = variant != 1;
+        bool soft = sc.size() == m.size(), dark = o0.size() == m.size(), bright = o1.size() == m.size();
+        for (int t : clouds) {
+            CHECK(!m[t], "soft cloud %d: tile %d not masked", variant, t);
+            soft = soft && sc[t], dark = dark && o0[t], bright = bright && o1[t];
+        }
+        CHECK(!m[ridge] && !m[haze] && !m[roof] && !m[crown], "soft cloud %d: tiles not masked", variant);
+        CHECK(soft == on && (sc.empty() || (!sc[ridge] && !sc[haze] && !sc[roof] && !sc[crown])),
+              "soft cloud %d: cloud %d, ridge %d, haze %d, roof %d, crown %d", variant, (int)soft,
+              sc.empty() ? -1 : sc[ridge], sc.empty() ? -1 : sc[haze], sc.empty() ? -1 : sc[roof],
+              sc.empty() ? -1 : sc[crown]);
+        CHECK(dark == on && bright == (variant == 0), "soft cloud %d: open for dark %d, bright %d", variant, (int)dark,
+              (int)bright);
+        for (const auto* o : {&o0, &o1})
+            CHECK(o->empty() || (!(*o)[ridge] && !(*o)[haze] && !(*o)[roof] && !(*o)[crown]),
+                  "soft cloud %d: ridge, haze, roof or crown open", variant);
+        for (int i = 0; i < 20; ++i) d.detect(frame(100 + i, 0).data(), w, h, w, c);   // фон ячеек облака
+        for (int pol : {-1, 1}) {
+            d.detect(frame(200, pol).data(), w, h, w, c);
+            int n = 0;
+            for (const auto& q : c) n += q.polarity == pol && std::hypot(q.x - 2 * T - 24, q.y - 5 * T - 24) < 6;
+            CHECK(n == ((pol < 0 ? dark : bright) ? 1 : 0), "soft cloud %d: %d %s targets in the cloud", variant, n,
+                  pol < 0 ? "dark" : "bright");
+        }
+    }
+    std::printf("soft clouds at the treeline open: ok\n");
+}
+
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
 // поверх кадра (неподвижные точки исключаются из оценки) и с повтором кадра
 static void test_motion() {
@@ -967,6 +1053,59 @@ static void test_bad_files() {
     }
     std::remove(path.c_str());
     std::printf("bad files (mask, json, y4m, tracker): ok\n");
+}
+
+// Файл маски: после сверки маска — новая. Закрытое в файле по текстуре (прошлый запуск, прошлая
+// версия программы) не держится; доращенное по помехам (слой второй версии файла) снова закрыто, и
+// перепроверка открывает его, когда там тихо; другая сцена — из файла ничего
+static void test_mask_file_layers() {
+    const int w = 640, h = 640;   // тайлы 10 x 10, земля — ряды 6..9
+    const std::string path = "test_layers.mask";
+    DetectorConfig cfg;
+    cfg.threads = 1;
+    std::vector<Candidate> c;
+    Detector a(cfg);
+    a.beginMaskLearning();
+    for (int i = 0; i < 25; ++i) a.detect(ground_frame(w, h, 0.6f, i).data(), w, h, w, c);
+    a.endMaskLearning();
+    const std::vector<uint8_t> m = a.tileMask();
+    const int tw = a.tilesX(), th = a.tilesY();
+    const size_t stale = 2 * tw + 3, gt = 3 * tw + 5;   // небо: закрыто по текстуре прошлым запуском; доращено
+    CHECK(m.size() == (size_t)tw * th && m[stale] && m[gt], "mask layers: sky tiles open");
+    for (int variant = 0; variant < 3; ++variant) {   // первая версия; вторая; вторая, а камеру повернули
+        {
+            const char magic[8] = {'D', 'L', 'M', 'A', 'S', 'K', variant ? '2' : '1', 0};
+            const int32_t hdr[6] = {w, h, cfg.pool, cfg.tile, tw, th};
+            std::vector<uint8_t> mm = m, grown(m.size(), 0);
+            mm[stale] = 0;
+            mm[gt] = 0;
+            grown[gt] = 1;
+            std::string s(magic, 8);
+            s.append((const char*)hdr, sizeof(hdr));
+            s.append((const char*)mm.data(), mm.size());
+            if (variant) s.append((const char*)grown.data(), grown.size());
+            put_file(path, s);
+        }
+        Detector b(cfg);
+        CHECK(b.loadMask(path, 10) && !b.tileMask()[stale] && !b.tileMask()[gt], "mask layers %d: file mask", variant);
+        for (int i = 0; i < 10; ++i) b.detect(ground_frame(w, h, variant == 2 ? 0.3f : 0.6f, 100 + i).data(), w, h, w, c);
+        const auto& bm = b.tileMask();
+        CHECK(!b.verifyingMask() && b.maskReplaced() == (variant == 2), "mask layers %d: replaced %d", variant,
+              (int)b.maskReplaced());
+        if (variant == 2) continue;
+        CHECK(bm[stale] && bm[gt] == (variant == 0), "mask layers %d: stale closure %d, grown closure %d", variant,
+              (int)!bm[stale], (int)!bm[gt]);
+        if (variant == 0) continue;
+        CHECK(b.saveMask(path), "mask layers: save");   // слой доращивания сохраняется
+        Detector r(cfg);
+        r.loadMask(path, 10);
+        for (int i = 0; i < 10; ++i) r.detect(ground_frame(w, h, 0.6f, 300 + i).data(), w, h, w, c);
+        CHECK(!r.tileMask()[gt], "mask layers: grown closure lost on save");
+        for (int i = 0; i < 320; ++i) b.detect(ground_frame(w, h, 0.6f, 400 + i).data(), w, h, w, c);
+        CHECK(b.tileMask()[gt] && b.maskOpened() > 0, "mask layers: quiet grown tile not reopened");
+    }
+    std::remove(path.c_str());
+    std::printf("mask file: stale closures dropped, grown kept: ok\n");
 }
 
 // Оценка сцены: небо сверху, рваная кромка леса, ночь, резкая смена света, сдвиг камеры
@@ -1073,9 +1212,11 @@ int main() {
     test_halo();
     test_grow_mask();
     test_sky_color();
+    test_soft_cloud();
     test_scene();
     test_motion();
     test_bad_files();
+    test_mask_file_layers();
     std::printf(failures ? "FAILED: %d\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }
