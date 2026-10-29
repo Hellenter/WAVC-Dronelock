@@ -229,6 +229,8 @@ DetectorConfig detector_for_fps(const DetectorConfig& c0, float fps, float ref) 
     // перепроверка: и замер реже-чаще, и окно — замеров в окне столько же
     c.recheck_every = frames(c.recheck_every, 1);
     c.recheck_frames = frames(c.recheck_frames, 30);
+    // цель у земли (near_edge): на медленной камере — весь тайл у кромки
+    if (c.near_edge_fps > 0 && fps <= c.near_edge_fps) c.near_edge_px = 0;
     // фон ячеек (bg_frames) остаётся в кадрах: квантили мерцания копятся по числу замеров, и окно
     // в секундах на 15 к/с давало больше ложных захватов без дронов (6.6% -> 8%, на дронах так же).
     // Экономия "раз в N кадров" (full_every, coarse_every, upper_every) — не окна, а бюджет кадра
