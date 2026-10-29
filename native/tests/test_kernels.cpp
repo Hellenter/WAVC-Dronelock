@@ -955,6 +955,55 @@ static void test_soft_cloud() {
     std::printf("soft clouds at the treeline open: ok\n");
 }
 
+// Мягкое облако в ряду 3 над гладким просветом (ряд 4) и верхушкой дерева (ряд 5), земля — с ряда 6.
+// Над тёмной верхушкой облако линию горизонта поднимает (sky_tree): просвет закрыт. Над светлой
+// (лес в дымке) и без sky_tree — открыт. Само облако открыто всегда
+static void test_soft_tree() {
+    const int w = 640, h = 640, T = 64, col = 4;
+    const int cloud = 3 * 10 + col, gap = cloud + 10, top = gap + 10;
+    const int cw = w / 2, ch = h / 2;
+    std::vector<uint8_t> u((size_t)cw * ch), v(u.size());
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            const int t = 2 * y / T * 10 + 2 * x / T;
+            const bool grey = t == cloud, sky = t / 10 < 5 || (t / 10 == 5 && t != top);
+            u[(size_t)y * cw + x] = grey ? 128 : sky ? 138 : 118;   // голубое небо, серое облако, зелёные кроны
+            v[(size_t)y * cw + x] = grey ? 128 : sky ? 123 : 120;
+        }
+    for (int variant = 0; variant < 3; ++variant) {   // тёмная верхушка; светлая; тёмная без sky_tree
+        const bool darkTop = variant != 1;
+        auto frame = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            std::mt19937 g(seed + 1000);
+            const float ph = 0.2f * (float)seed;
+            for (int y = 3 * T; y < 4 * T; ++y)
+                for (int x = col * T; x < (col + 1) * T; ++x)
+                    f[(size_t)y * w + x] = (uint8_t)(175.f + 12.f * std::sin(0.2618f * x + ph) * std::sin(0.2618f * y));
+            for (int y = 5 * T; y < 6 * T; ++y)
+                for (int x = col * T; x < (col + 1) * T; ++x) f[(size_t)y * w + x] = (uint8_t)(darkTop ? 30 + g() % 60 : 120 + g() % 40);
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.mask_recheck = false;
+        if (variant == 2) cfg.sky_tree = 0;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) {
+            d.setColor(u.data(), v.data(), cw, ch, cw, 2);
+            d.detect(frame(i).data(), w, h, w, c);
+        }
+        d.endMaskLearning();
+        const auto& m = d.tileMask();
+        const auto& sc = d.skyColored();
+        CHECK(!m[cloud] && sc.size() == m.size() && sc[cloud], "soft tree %d: cloud not open by colour", variant);
+        CHECK(!m[top] && m[cloud - 10], "soft tree %d: tree top open or sky above the cloud closed", variant);
+        CHECK(m[gap] == (variant != 0), "soft tree %d: gap under the cloud %s", variant, m[gap] ? "open" : "closed");
+    }
+    std::printf("soft cloud over a dark tree top keeps the skyline: ok\n");
+}
+
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
 // поверх кадра (неподвижные точки исключаются из оценки) и с повтором кадра
 static void test_motion() {
@@ -1213,6 +1262,7 @@ int main() {
     test_grow_mask();
     test_sky_color();
     test_soft_cloud();
+    test_soft_tree();
     test_scene();
     test_motion();
     test_bad_files();
