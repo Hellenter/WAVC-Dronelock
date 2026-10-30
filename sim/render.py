@@ -3,6 +3,9 @@
 
     python sim/render.py --godot <путь к Godot 4.3> --scene sim/scenes/forest_village.json --out out/fv
     python sim/render.py --encode-only --out out/fv        # только собрать mp4 из готовых PNG
+    python sim/render.py --scene sim/scenes/city_sectors.json --sector highrise --out out/hr   # камера на сектор
+    python sim/render.py --scene sim/scenes/city_sectors.json --view      # окно: крутить камеру, 1/2/3 — сектора
+    python sim/render.py --scene sim/scenes/city_sectors.json --panorama --out out/pano   # полоса 360°
 
 Godot пишет кадры PNG (out/wide, out/fine), разметку <имя>_wide.mp4.gt.json и <имя>_fine.mp4.gt.json,
 meta.json (позы камер, траектории). Затем ffmpeg собирает <имя>_wide.mp4 и <имя>_fine.mp4 (H.264).
@@ -47,11 +50,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--godot", default=os.environ.get("GODOT", "godot"))
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "forest_village.json"))
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default="out/view")
     ap.add_argument("--seconds", type=float)
     ap.add_argument("--scale", type=float, help="множитель разрешения камер (0.5 — быстрый просмотр)")
     ap.add_argument("--crf", type=int, default=18)
     ap.add_argument("--noise", type=int, default=2, help="шум ffmpeg noise alls (0 — без шума)")
+    ap.add_argument("--sector", help="навести широкую камеру на середину сектора world.sectors (имя или тип)")
+    ap.add_argument("--az", type=float, help="азимут широкой камеры, °")
+    ap.add_argument("--el", type=float, help="угол места широкой камеры, °")
+    ap.add_argument("--pan", type=float, help="поворот широкой камеры, °/с (обзор по кругу)")
+    ap.add_argument("--sweep", type=float, help="качание ±° вместо обзора по кругу (вместе с --pan)")
+    ap.add_argument("--view", action="store_true", help="окно просмотра вместо рендера роликов")
+    ap.add_argument("--panorama", action="store_true", help="12 снимков по кругу и склейка pano.jpg")
     ap.add_argument("--keep-png", action="store_true")
     ap.add_argument("--encode-only", action="store_true")
     a = ap.parse_args()
@@ -64,6 +74,20 @@ def main():
             cmd += ["--seconds", str(a.seconds)]
         if a.scale:
             cmd += ["--scale", str(a.scale)]
+        for k in ("sector", "az", "el", "pan", "sweep"):
+            if getattr(a, k) is not None:
+                cmd += ["--" + k, str(getattr(a, k))]
+        if a.view:
+            cmd += ["--view", "1"]
+            print(" ".join(cmd))
+            subprocess.run(cmd, check=True)
+            return
+        if a.panorama:
+            cmd += ["--panorama", "1"]
+            print(" ".join(cmd))
+            subprocess.run(cmd, check=True)
+            subprocess.run([sys.executable, os.path.join(HERE, "panorama.py"), out], check=True)
+            return
         print(" ".join(cmd))
         subprocess.run(cmd, check=True)
         if not os.path.exists(os.path.join(out, "meta.json")):

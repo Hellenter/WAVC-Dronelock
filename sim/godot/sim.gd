@@ -11,6 +11,9 @@ extends Node
 #
 # Запуск: godot --path sim/godot --rendering-driver opengl3 -- --config <сцена.json> --out <папка>
 #   [--seconds N] [--scale K] — K < 1 уменьшает разрешение обеих камер (быстрый просмотр).
+#   [--sector forest|lowrise|highrise] [--az A] [--el E] [--pan DPS] [--sweep DEG] — куда смотрит широкая камера.
+#   [--panorama 1] — вместо ролика 12 снимков по кругу (pano_NN.png) для склейки панорамы.
+#   --view 1 — окно просмотра: стрелки поворачивают камеру, 1/2/3 — сектора, см. sim/README.md.
 
 const DEG := PI / 180.0
 
@@ -32,7 +35,15 @@ var time_mats: Array = []      # материалы с параметром sim_
 var targets: Array = []        # {id, kind, cfg, node, wings, size}
 var trees: Array = []          # для заслонения: [x, z, r, y0, y1] в координатах Godot
 var tree_buckets: Array = []   # 360 корзин по азимуту от установки -> индексы trees
-var boxes: Array = []          # AABB домов и столбов
+var boxes: Array = []          # [обратное преобразование, AABB в своих осях] домов и столбов
+var box_buckets: Array = []    # 360 корзин по азимуту -> индексы boxes
+var view_mode := false         # окно просмотра (--view)
+var view_az := 0.0
+var view_el := 15.0
+var view_t := 0.0
+var view_speed := 1.0
+var view_pan := false
+var view_hud: Label
 
 # поворотка точной камеры
 var f_az := 0.0
@@ -65,8 +76,36 @@ func _ready() -> void:
 	if args.has("seconds"):
 		cfg["seconds"] = float(args["seconds"])
 	var scale = float(args.get("scale", 1.0))
+	view_mode = args.has("view")
+	if not cfg.has("world"):
+		cfg["world"] = {}
 	wcfg = cfg.get("wide", {})
 	fcfg = cfg.get("fine", {})
+	cfg["wide"] = wcfg
+	# куда смотрит широкая камера: сектор (его середина) или явный азимут; имя ролика с суффиксом
+	if args.has("sector"):
+		var sc = sector_by_name(str(args["sector"]))
+		if sc.is_empty():
+			push_error("нет сектора " + str(args["sector"]) + " в world.sectors")
+			get_tree().quit(2)
+			return
+		wcfg["az"] = sector_mid(sc)
+		cfg["name"] = str(cfg.get("name", "sim")) + "_" + str(args["sector"])
+	if args.has("az"):
+		wcfg["az"] = float(args["az"])
+		cfg["name"] = str(cfg.get("name", "sim")) + "_az%d" % int(round(float(args["az"])))
+	if args.has("el"):
+		wcfg["el"] = float(args["el"])
+	if args.has("pan"):
+		wcfg["pan_dps"] = float(args["pan"])
+	if args.has("sweep"):
+		wcfg["sweep_deg"] = float(args["sweep"])
+	if view_mode:
+		get_window().size = Vector2i(1280, 800)
+		get_window().move_to_center()
+		wcfg["w"] = 1280
+		wcfg["h"] = 800
+		scale = 1.0
 	if scale != 1.0:
 		for c in [wcfg, fcfg]:
 			c["w"] = int(round(float(c.get("w", 640)) * scale))
@@ -74,10 +113,11 @@ func _ready() -> void:
 	rng.seed = int(cfg.get("seed", 1))
 	noise.seed = int(cfg.get("seed", 1))
 	noise.frequency = 0.004
-	Engine.max_fps = 0
-	DirAccess.make_dir_recursive_absolute(out_dir + "/wide")
-	if fine_enabled():
-		DirAccess.make_dir_recursive_absolute(out_dir + "/fine")
+	Engine.max_fps = 60 if view_mode else 0
+	if not view_mode:
+		DirAccess.make_dir_recursive_absolute(out_dir + "/wide")
+		if fine_enabled() and not args.has("panorama"):
+			DirAccess.make_dir_recursive_absolute(out_dir + "/fine")
 
 	setup_viewports()
 	build_environment()
@@ -85,9 +125,18 @@ func _ready() -> void:
 	build_hills()
 	build_trees()
 	build_houses()
+	build_lowrise()
+	build_highrise()
 	build_poles()
+	bucket_boxes()
 	build_targets()
-	await run()
+	if view_mode:
+		start_view()
+		return
+	if args.has("panorama"):
+		await run_panorama()
+	else:
+		await run()
 	get_tree().quit()
 
 
@@ -547,6 +596,8 @@ func tree_positions() -> Array:
 		var z = -cos(a) * r
 		if noise.get_noise_2d(x, z) * 0.5 + 0.5 < float(w.get("forest_threshold", 0.45)):
 			continue
+		if not sectors().is_empty() and rng.randf() > sector_trees(sector_at(a / DEG)):
+			continue
 		pos.append(Vector2(x, z))
 	# опушки: плотные полосы деревьев (кромка — главный источник ложных захватов)
 	for e in w.get("tree_lines", []):
@@ -629,16 +680,89 @@ func add_tree_occluder(p: Vector2, r: float, y0: float, y1: float) -> void:
 
 # ---------- дома и столбы ----------
 
-func build_houses() -> void:
-	var w: Dictionary = cfg.get("world", {})
-	var assets = list_glb("houses")
-	var models = []
-	for p in assets:
+const WALLS := [Color(0.85, 0.82, 0.74), Color(0.70, 0.55, 0.42), Color(0.62, 0.66, 0.70), Color(0.90, 0.88, 0.85), Color(0.55, 0.40, 0.30)]
+const ROOFS := [Color(0.45, 0.18, 0.14), Color(0.30, 0.32, 0.35), Color(0.20, 0.35, 0.25), Color(0.55, 0.55, 0.55)]
+
+var house_models: Array = []
+var house_items: Array = []    # процедурные дома: [Transform3D основания, ширина, глубина, высота стен, высота крыши]
+
+
+func load_house_models() -> void:
+	if not house_models.is_empty():
+		return
+	for p in list_glb("houses"):
 		var g = glb_mesh(p)
 		if g.size() > 0:
-			models.append(g)
-	var walls = [Color(0.85, 0.82, 0.74), Color(0.70, 0.55, 0.42), Color(0.62, 0.66, 0.70), Color(0.90, 0.88, 0.85), Color(0.55, 0.40, 0.30)]
-	var roofs = [Color(0.45, 0.18, 0.14), Color(0.30, 0.32, 0.35), Color(0.20, 0.35, 0.25), Color(0.55, 0.55, 0.55)]
+			house_models.append(g)
+	if house_models.is_empty():
+		house_models.append([])   # признак «моделей нет», чтобы не искать снова
+
+
+# Один дом в точке p (координаты Godot x, z), rot — поворот вокруг вертикали.
+func place_house(p: Vector2, rot: float) -> void:
+	if house_models[0].size() > 0:
+		var g: Array = house_models[rng.randi() % house_models.size()]
+		var h = rng.randf_range(6.0, 10.0)
+		var mi = MeshInstance3D.new()
+		mi.mesh = g[0]
+		mi.transform = Transform3D(Basis(Vector3.UP, rot).scaled(Vector3.ONE * h), Vector3(p.x, 0, p.y)) * g[3]
+		world.add_child(mi)
+		add_box(mi.transform, g[0].get_aabb())
+		return
+	var bw = rng.randf_range(6.0, 12.0)
+	var bd = rng.randf_range(6.0, 10.0)
+	var bh = rng.randf_range(3.0, 7.0)
+	var rh = rng.randf_range(2.0, 4.0)
+	var xf = Transform3D(Basis(Vector3.UP, rot), Vector3(p.x, 0, p.y))
+	house_items.append([xf, bw, bd, bh, rh, rng.randi() % WALLS.size(), rng.randi() % ROOFS.size()])
+	add_box(xf, AABB(Vector3(-bw / 2, 0, -bd / 2), Vector3(bw, bh + rh, bd)))
+
+
+# Процедурные дома одним MultiMesh на стены и одним на крыши (сотни домов — два вызова отрисовки).
+func flush_houses() -> void:
+	if house_items.is_empty():
+		return
+	var mw = StandardMaterial3D.new()
+	mw.vertex_color_use_as_albedo = true
+	mw.roughness = 1.0
+	var mr = StandardMaterial3D.new()
+	mr.vertex_color_use_as_albedo = true
+	mr.roughness = 0.8
+	var bm = BoxMesh.new()
+	bm.material = mw
+	var pr = PrismMesh.new()
+	pr.material = mr
+	var parts = [[bm, 0], [pr, 1]]
+	for pp in parts:
+		var mm = MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.use_colors = true
+		mm.mesh = pp[0]
+		mm.instance_count = house_items.size()
+		for i in house_items.size():
+			var it: Array = house_items[i]
+			var xf: Transform3D = it[0]
+			var bw: float = it[1]
+			var bd: float = it[2]
+			var bh: float = it[3]
+			var rh: float = it[4]
+			if pp[1] == 0:
+				mm.set_instance_transform(i, xf * Transform3D(Basis().scaled(Vector3(bw, bh, bd)), Vector3(0, bh * 0.5, 0)))
+				mm.set_instance_color(i, WALLS[it[5]])
+			else:
+				mm.set_instance_transform(i, xf * Transform3D(Basis().scaled(Vector3(bw + 0.6, rh, bd + 0.6)), Vector3(0, bh + rh * 0.5, 0)))
+				mm.set_instance_color(i, ROOFS[it[6]])
+		var mmi = MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		world.add_child(mmi)
+	house_items.clear()
+
+
+func build_houses() -> void:
+	var w: Dictionary = cfg.get("world", {})
+	if w.get("villages", []).is_empty():
+		return
+	load_house_models()
 	for v in w.get("villages", []):
 		var vaz = float(v.get("az", 60.0)) * DEG
 		var vd = float(v.get("dist", 250.0))
@@ -660,38 +784,277 @@ func build_houses() -> void:
 			if not ok:
 				continue
 			placed.append(p)
-			var rot = rng.randf() * TAU
-			if models.size() > 0:
-				var g: Array = models[rng.randi() % models.size()]
-				var h = rng.randf_range(6.0, 10.0)
-				var mi = MeshInstance3D.new()
-				mi.mesh = g[0]
-				mi.transform = Transform3D(Basis(Vector3.UP, rot).scaled(Vector3.ONE * h), Vector3(p.x, 0, p.y)) * g[3]
-				world.add_child(mi)
-				boxes.append(mi.transform * g[0].get_aabb())
+			place_house(p, rng.randf() * TAU)
+	flush_houses()
+
+
+# ---------- сектора панорамы: лес / малоэтажная / многоэтажная застройка ----------
+# world.sectors: [{"type": "forest"|"lowrise"|"highrise", "az_from": 0, "az_to": 120, ...}], азимуты в градусах.
+
+func sectors() -> Array:
+	return cfg.get("world", {}).get("sectors", [])
+
+
+func in_sector(sc: Dictionary, az: float) -> bool:
+	var a0 = float(sc.get("az_from", 0.0))
+	var span = fposmod(float(sc.get("az_to", 360.0)) - a0, 360.0)
+	if span == 0.0:
+		span = 360.0
+	return fposmod(az - a0, 360.0) < span
+
+
+func sector_at(az: float) -> Dictionary:
+	for sc in sectors():
+		if in_sector(sc, az):
+			return sc
+	return {}
+
+
+func sector_mid(sc: Dictionary) -> float:
+	var a0 = float(sc.get("az_from", 0.0))
+	var span = fposmod(float(sc.get("az_to", 360.0)) - a0, 360.0)
+	if span == 0.0:
+		span = 360.0
+	return fposmod(a0 + span * 0.5, 360.0)
+
+
+func sector_by_name(nm: String) -> Dictionary:
+	for sc in sectors():
+		if str(sc.get("name", sc.get("type", ""))) == nm or str(sc.get("type", "")) == nm:
+			return sc
+	return {}
+
+
+# доля деревьев леса, которая остаётся в секторе (дворы и скверы в застройке)
+func sector_trees(sc: Dictionary) -> float:
+	var def = {"forest": 1.0, "lowrise": 0.12, "highrise": 0.05}
+	return float(sc.get("trees", def.get(str(sc.get("type", "forest")), 1.0)))
+
+
+# Случайная точка в секторе на расстоянии r0..r1 (равномерно по площади): [Vector2 (x, z), азимут°].
+func sector_point(sc: Dictionary, r0: float, r1: float) -> Array:
+	var a0 = float(sc.get("az_from", 0.0))
+	var span = fposmod(float(sc.get("az_to", 360.0)) - a0, 360.0)
+	if span == 0.0:
+		span = 360.0
+	var az = a0 + rng.randf() * span
+	var r = sqrt(rng.randf_range(r0 * r0, r1 * r1))
+	return [Vector2(sin(az * DEG) * r, -cos(az * DEG) * r), az]
+
+
+# Сетка занятости для расстановки без пересечений: ключ — клетка cell×cell м.
+func grid_free(grid: Dictionary, p: Vector2, rad: float, cell: float) -> bool:
+	var c0 = Vector2i(floor((p.x - rad) / cell), floor((p.y - rad) / cell))
+	var c1 = Vector2i(floor((p.x + rad) / cell), floor((p.y + rad) / cell))
+	for gx in range(c0.x - 1, c1.x + 2):
+		for gz in range(c0.y - 1, c1.y + 2):
+			for q in grid.get(Vector2i(gx, gz), []):
+				if p.distance_to(Vector2(q[0], q[1])) < rad + float(q[2]):
+					return false
+	return true
+
+
+func grid_put(grid: Dictionary, p: Vector2, rad: float, cell: float) -> void:
+	var k = Vector2i(floor(p.x / cell), floor(p.y / cell))
+	if not grid.has(k):
+		grid[k] = []
+	grid[k].append([p.x, p.y, rad])
+
+
+# Частный сектор: дома вдоль улиц (фасадом к установке), кварталы и пустыри по шуму.
+func build_lowrise() -> void:
+	var any = false
+	for sc in sectors():
+		if str(sc.get("type", "")) != "lowrise":
+			continue
+		any = true
+		load_house_models()
+		var r0 = maxf(float(sc.get("from", 120.0)), float(cfg["world"].get("clear_radius", 35.0)))
+		var r1 = float(sc.get("to", 800.0))
+		var n = int(sc.get("houses", 350))
+		var grid = {}
+		var placed = 0
+		var tries = 0
+		while placed < n and tries < n * 20:
+			tries += 1
+			var sp = sector_point(sc, r0, r1)
+			var p: Vector2 = sp[0]
+			if noise.get_noise_2d(p.x * 0.6 + 900.0, p.y * 0.6) < -0.25:
+				continue   # пустыри и огороды
+			if not grid_free(grid, p, 8.0, 24.0):
 				continue
-			var bw = rng.randf_range(6.0, 12.0)
-			var bd = rng.randf_range(6.0, 10.0)
-			var bh = rng.randf_range(3.0, 7.0)
-			var rh = rng.randf_range(2.0, 4.0)
-			var node = Node3D.new()
-			node.transform = Transform3D(Basis(Vector3.UP, rot), Vector3(p.x, 0, p.y))
-			var body = MeshInstance3D.new()
-			var bm = BoxMesh.new()
-			bm.size = Vector3(bw, bh, bd)
-			body.mesh = bm
-			body.position.y = bh * 0.5
-			body.material_override = mat_color(walls[rng.randi() % walls.size()])
-			node.add_child(body)
-			var roof = MeshInstance3D.new()
-			var pr = PrismMesh.new()
-			pr.size = Vector3(bw + 0.6, rh, bd + 0.6)
-			roof.mesh = pr
-			roof.position.y = bh + rh * 0.5
-			roof.material_override = mat_color(roofs[rng.randi() % roofs.size()], 0.8)
-			node.add_child(roof)
-			world.add_child(node)
-			boxes.append(node.transform * AABB(Vector3(-bw / 2, 0, -bd / 2), Vector3(bw, bh + rh, bd)))
+			grid_put(grid, p, 8.0, 24.0)
+			var rot = -float(sp[1]) * DEG + (PI * 0.5 if rng.randf() < 0.3 else 0.0) + rng.randf_range(-0.12, 0.12)
+			place_house(p, rot)
+			placed += 1
+	if any:
+		flush_houses()
+
+
+const BUILDING_SHADER := """
+shader_type spatial;
+render_mode cull_back;
+uniform float floor_h = 2.9;
+uniform float win_w = 3.0;
+varying vec3 lv;
+varying vec3 ln;
+varying vec3 sc;
+varying vec2 seed;
+varying vec3 tint;
+float h21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+void vertex() {
+	sc = vec3(length(MODEL_MATRIX[0].xyz), length(MODEL_MATRIX[1].xyz), length(MODEL_MATRIX[2].xyz));
+	lv = VERTEX * sc + vec3(0.0, sc.y * 0.5, 0.0);   // метры, y от земли
+	ln = NORMAL;
+	seed = MODEL_MATRIX[3].xz;
+	tint = COLOR.rgb;
+}
+void fragment() {
+	vec3 wall = tint;
+	float glass = 0.0;
+	if (abs(ln.y) < 0.5) {
+		float u = (abs(ln.x) > 0.5 ? lv.z : lv.x) + (abs(ln.x) > 0.5 ? sc.z : sc.x) * 0.5;
+		vec2 cell = vec2(u / win_w, lv.y / floor_h);
+		vec2 f = fract(cell);
+		vec2 id = floor(cell);
+		float win = step(0.2, f.x) * step(f.x, 0.8) * step(0.3, f.y) * step(f.y, 0.8) * step(1.0, id.y);
+		// издалека окна сливаются: среднее вместо мельтешения пикселей
+		float aa = clamp(max(fwidth(cell.x), fwidth(cell.y)) * 1.5 - 0.4, 0.0, 1.0);
+		win = mix(win, 0.24, aa);
+		float r = h21(id + seed + ln.xz * 17.0);
+		vec3 g = mix(vec3(0.08, 0.10, 0.13), vec3(0.42, 0.48, 0.55), r * r);   // стекло: тёмное или с отражением неба
+		wall *= 1.0 - 0.10 * step(f.y, 0.05) * (1.0 - aa);                      // швы панелей
+		ALBEDO = mix(wall, g, win);
+		glass = win;
+	} else {
+		ALBEDO = wall * 0.5;
+	}
+	ROUGHNESS = mix(0.9, 0.25, glass);
+	SPECULAR = mix(0.3, 0.7, glass);
+}
+"""
+
+# Многоэтажки: микрорайоны из панельных «пластин» (9–17 эт.) и башен (16–25 эт.) с окнами,
+# на крышах машинные будки и мачты (тонкие вертикали у неба — источник ложных целей).
+func build_highrise() -> void:
+	var slabs = []     # [Transform3D основания, ширина, глубина, высота, цвет]
+	var masts = []     # [x, z, y0, h]
+	for sc in sectors():
+		if str(sc.get("type", "")) != "highrise":
+			continue
+		var r0 = maxf(float(sc.get("from", 250.0)), float(cfg["world"].get("clear_radius", 35.0)))
+		var r1 = float(sc.get("to", 1500.0))
+		var n = int(sc.get("buildings", 90))
+		var fl = sc.get("floors", [9, 25])
+		var grid = {}
+		var tries = 0
+		var placed = 0
+		var colors = [Color(0.82, 0.80, 0.76), Color(0.74, 0.74, 0.72), Color(0.86, 0.78, 0.66), Color(0.68, 0.72, 0.78), Color(0.78, 0.66, 0.58), Color(0.90, 0.90, 0.88)]
+		while placed < n and tries < n * 30:
+			tries += 1
+			var sp = sector_point(sc, r0, r1)
+			var p: Vector2 = sp[0]
+			var tower = rng.randf() < float(sc.get("towers", 0.4))
+			var bw = rng.randf_range(18.0, 28.0) if tower else rng.randf_range(40.0, 100.0)
+			var bd = bw * rng.randf_range(0.8, 1.0) if tower else rng.randf_range(12.0, 15.0)
+			var floors = rng.randi_range(maxi(int(fl[0]), 16) if tower else int(fl[0]), int(fl[1]) if tower else mini(int(fl[1]), 17))
+			var bh = floors * 2.9 + 1.0
+			var rad = 0.5 * sqrt(bw * bw + bd * bd) + 12.0
+			if not grid_free(grid, p, rad, 60.0):
+				continue
+			grid_put(grid, p, rad, 60.0)
+			# кварталы: оси домов по сетке района (шум даёт поворот на куски района)
+			var rot = -float(sp[1]) * DEG + (PI * 0.5 if rng.randf() < 0.45 else 0.0) + noise.get_noise_2d(p.x * 0.05, p.y * 0.05) * 0.6
+			var xf = Transform3D(Basis(Vector3.UP, rot), Vector3(p.x, 0, p.y))
+			var c: Color = colors[rng.randi() % colors.size()]
+			slabs.append([xf, bw, bd, bh, c])
+			add_box(xf, AABB(Vector3(-bw / 2, 0, -bd / 2), Vector3(bw, bh, bd)))
+			# машинное отделение лифта на крыше
+			var nb = 1 if tower else maxi(1, int(bw / 30.0))
+			for k in nb:
+				var ox = (k - (nb - 1) * 0.5) * (bw / nb)
+				slabs.append([xf * Transform3D(Basis(), Vector3(ox, bh, 0)), 5.0, 6.0, 3.2, c * 0.85])
+			if rng.randf() < float(sc.get("masts", 0.35)):
+				var mp = xf * Vector3(rng.randf_range(-bw * 0.4, bw * 0.4), 0, rng.randf_range(-bd * 0.3, bd * 0.3))
+				masts.append([mp.x, mp.z, bh, rng.randf_range(3.0, 9.0)])
+			placed += 1
+	if slabs.is_empty():
+		return
+	var m = ShaderMaterial.new()
+	m.shader = make_shader(BUILDING_SHADER)
+	var bm = BoxMesh.new()
+	bm.material = m
+	var mm = MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.mesh = bm
+	mm.instance_count = slabs.size()
+	for i in slabs.size():
+		var it: Array = slabs[i]
+		var xf: Transform3D = it[0]
+		mm.set_instance_transform(i, xf * Transform3D(Basis().scaled(Vector3(it[1], it[3], it[2])), Vector3(0, it[3] * 0.5, 0)))
+		mm.set_instance_color(i, it[4])
+	var mmi = MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	world.add_child(mmi)
+	if masts.is_empty():
+		return
+	var cm = CylinderMesh.new()
+	cm.top_radius = 0.05
+	cm.bottom_radius = 0.1
+	cm.height = 1.0
+	cm.radial_segments = 6
+	cm.material = mat_color(Color(0.30, 0.30, 0.32), 0.7)
+	var m2 = MultiMesh.new()
+	m2.transform_format = MultiMesh.TRANSFORM_3D
+	m2.mesh = cm
+	m2.instance_count = masts.size()
+	for i in masts.size():
+		var it: Array = masts[i]
+		m2.set_instance_transform(i, Transform3D(Basis().scaled(Vector3(1, it[3], 1)), Vector3(it[0], it[2] + it[3] * 0.5, it[1])))
+	var mi2 = MultiMeshInstance3D.new()
+	mi2.multimesh = m2
+	world.add_child(mi2)
+
+
+# Препятствие для разметки: коробка ab в осях xf (дома повёрнуты — AABB в мировых осях раздувался бы).
+func add_box(xf: Transform3D, ab: AABB) -> void:
+	boxes.append([xf.affine_inverse(), ab, xf])
+
+
+# Корзины по азимуту, как у деревьев: проверка заслонения смотрит только коробки в направлении цели.
+func bucket_boxes() -> void:
+	box_buckets.resize(360)
+	for i in 360:
+		box_buckets[i] = PackedInt32Array()
+	for idx in boxes.size():
+		var ab: AABB = boxes[idx][1]
+		var xf: Transform3D = boxes[idx][2]
+		var lo = 1e9
+		var hi = -1e9
+		var ref = 0.0
+		var inside = false
+		for k in 8:
+			var q = xf * ab.get_endpoint(k)
+			var d = Vector2(q.x - rig_pos.x, q.z - rig_pos.z)
+			if d.length() < 1.0:
+				inside = true
+			var az = atan2(d.x, -d.y) / DEG
+			if k == 0:
+				ref = az
+			var rel = wrap180(az - ref)
+			lo = minf(lo, rel)
+			hi = maxf(hi, rel)
+		var full = inside or hi - lo > 179.0 or ab.has_point(xf.affine_inverse() * Vector3(rig_pos.x, ab.position.y + 0.01, rig_pos.z))
+		var a_lo = int(floor(ref + lo - 0.6))
+		var a_hi = int(floor(ref + hi + 0.6))
+		if full:
+			a_lo = 0
+			a_hi = 359
+		for a in range(a_lo, a_hi + 1):
+			var arr: PackedInt32Array = box_buckets[posmod(a, 360)]
+			arr.append(idx)
+			box_buckets[posmod(a, 360)] = arr
 
 
 func build_poles() -> void:
@@ -711,7 +1074,7 @@ func build_poles() -> void:
 		mi.position = Vector3(pos.x, h * 0.5, pos.z)
 		mi.material_override = mat_color(Color(0.35, 0.33, 0.30))
 		world.add_child(mi)
-		boxes.append(AABB(Vector3(pos.x - r, 0, pos.z - r), Vector3(2 * r, h, 2 * r)))
+		add_box(Transform3D(), AABB(Vector3(pos.x - r, 0, pos.z - r), Vector3(2 * r, h, 2 * r)))
 
 
 # ---------- цели ----------
@@ -748,8 +1111,10 @@ func random_targets() -> Array:
 		tot += float(types[k])
 	var half = float(wcfg.get("hfov", 120.0)) * 0.4
 	var az0 = float(wcfg.get("az", 0.0))
-	var n_dr = int(rc.get("drones", 6))
-	for i in n_dr + int(rc.get("birds", 3)):
+	var around = bool(rc.get("around", false)) or view_mode   # по всему кругу, а не только в кадре
+	var mult = 3 if view_mode and not bool(rc.get("around", false)) else 1
+	var n_dr = int(rc.get("drones", 6)) * mult
+	for i in n_dr + int(rc.get("birds", 3)) * mult:
 		var t = {}
 		var model = "bird"
 		var size = r.randf_range(0.3, 1.2)
@@ -781,6 +1146,8 @@ func random_targets() -> Array:
 		t["speed"] = speed
 		var dist = r.randf_range(float(rng_r[0]), float(rng_r[1]))
 		var az = (az0 + r.randf_range(-half, half)) * DEG
+		if around:
+			az = r.randf() * TAU
 		var el = r.randf_range(3, 25) * DEG
 		var c = Vector3(sin(az) * cos(el), cos(az) * cos(el), sin(el)) * dist   # восток, север, верх
 		var hd = r.randf() * TAU
@@ -992,9 +1359,10 @@ func occluded(c: Vector3, p: Vector3) -> bool:
 	for i in tree_buckets[az]:
 		if seg_hits_cyl(c, p, trees[i]):
 			return true
-	for bb in boxes:
-		var ab: AABB = bb
-		if ab.intersects_segment(c, p) != null:
+	for i in box_buckets[az]:
+		var inv: Transform3D = boxes[i][0]
+		var ab: AABB = boxes[i][1]
+		if ab.intersects_segment(inv * c, inv * p) != null:
 			return true
 	return false
 
@@ -1077,7 +1445,7 @@ func set_time(t: float) -> void:
 	for m in time_mats:
 		(m as ShaderMaterial).set_shader_parameter("sim_time", t)
 	update_targets(t)
-	var wp = wide_pose(t)
+	var wp = Vector2(view_az, view_el) if view_mode else wide_pose(t)
 	aim(wide_cam, wp.x, wp.y, float(wcfg.get("roll", 0.0)))
 	if fine_enabled():
 		f_target = pick_fine_target()
@@ -1141,6 +1509,133 @@ func run() -> void:
 	print("готово: %d кадров широкой, %d точной, %.1f с" % [gt_wide.size(), gt_fine.size(), (Time.get_ticks_msec() - t_start) / 1000.0])
 
 
+# ---------- панорама и окно просмотра ----------
+
+# 12 снимков по 30° (hfov 30, угол места 10°) — sim/panorama.py склеивает их в полосу 360°.
+func run_panorama() -> void:
+	var n = 12
+	wide_vp.size = Vector2i(480, 480)
+	wide_cam.fov = 360.0 / n
+	set_time(0.0)
+	var info = []
+	for i in n:
+		var az = (i + 0.5) * 360.0 / n
+		aim(wide_cam, az, 10.0)
+		wide_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+		await RenderingServer.frame_post_draw
+		if i == 0:   # первый кадр после смены размера — ещё с прогревом шейдеров
+			wide_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+			await RenderingServer.frame_post_draw
+		var img = wide_vp.get_texture().get_image()
+		img.convert(Image.FORMAT_RGB8)
+		img.save_png("%s/pano_%02d.png" % [out_dir, i])
+		var sc = sector_at(az)
+		info.append({"az": az, "sector": str(sc.get("name", sc.get("type", "")))})
+	save_json(out_dir + "/pano.json", {"name": str(cfg.get("name", "sim")), "hfov": 360.0 / n, "el": 10.0, "shots": info,
+		"sectors": sectors()})
+	print("панорама: %d снимков" % n)
+
+
+func start_view() -> void:
+	view_az = float(wcfg.get("az", 0.0))
+	view_el = float(wcfg.get("el", 15.0))
+	view_pan = float(wcfg.get("pan_dps", 0.0)) != 0.0
+	wide_vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	var tr = TextureRect.new()
+	tr.texture = wide_vp.get_texture()
+	tr.set_anchors_preset(Control.PRESET_FULL_RECT)
+	tr.stretch_mode = TextureRect.STRETCH_SCALE
+	add_child(tr)
+	if fine_enabled():
+		fine_vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+		var ft = TextureRect.new()
+		ft.texture = fine_vp.get_texture()
+		ft.stretch_mode = TextureRect.STRETCH_SCALE
+		ft.size = Vector2(320, 240)
+		ft.position = Vector2(get_window().size.x - 330, get_window().size.y - 250)
+		add_child(ft)
+	view_hud = Label.new()
+	view_hud.position = Vector2(10, 8)
+	view_hud.add_theme_color_override("font_color", Color(1, 1, 0.4))
+	view_hud.add_theme_color_override("font_outline_color", Color(0, 0, 0))
+	view_hud.add_theme_constant_override("outline_size", 4)
+	add_child(view_hud)
+	set_time(0.0)
+
+
+func _process(delta: float) -> void:
+	if not view_mode or view_hud == null:
+		return
+	var k = 4.0 if Input.is_key_pressed(KEY_SHIFT) else 1.0
+	var rate = 30.0 * k * wide_cam.fov / 120.0
+	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A):
+		view_az -= rate * delta
+	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_D):
+		view_az += rate * delta
+	if Input.is_key_pressed(KEY_UP) or Input.is_key_pressed(KEY_W):
+		view_el = minf(view_el + rate * delta, 89.0)
+	if Input.is_key_pressed(KEY_DOWN) or Input.is_key_pressed(KEY_S):
+		view_el = maxf(view_el - rate * delta, -10.0)
+	if view_pan:
+		var pd = float(wcfg.get("pan_dps", 0.0))
+		view_az += (pd if pd != 0.0 else 10.0) * delta
+	view_az = fposmod(view_az, 360.0)
+	var secs = float(cfg.get("seconds", 10.0))
+	view_t += delta * view_speed
+	if view_t > secs:
+		view_t = 0.0
+		f_t = 0.0
+	set_time(view_t)
+	var sc = sector_at(view_az)
+	var nm = str(sc.get("name", sc.get("type", "—")))
+	var tid = targets[f_target]["id"] if f_target >= 0 else "—"
+	view_hud.text = "az %.1f°  el %.1f°  fov %.0f°  сектор: %s  t %.1f/%.0f с%s  точная → цель %s\n" % [
+		view_az, view_el, wide_cam.fov, nm, view_t, secs, " (пауза)" if view_speed == 0.0 else "", str(tid)] + \
+		"←→↑↓/WASD поворот (Shift быстрее)  1-9 сектор  Tab следующий  колесо/+- зум  M обзор по кругу  Пробел пауза  R сначала  F12 снимок  Esc выход"
+
+
+func _unhandled_input(ev: InputEvent) -> void:
+	if not view_mode:
+		return
+	if ev is InputEventMouseButton and ev.pressed:
+		if ev.button_index == MOUSE_BUTTON_WHEEL_UP:
+			wide_cam.fov = maxf(wide_cam.fov / 1.15, 2.0)
+		elif ev.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			wide_cam.fov = minf(wide_cam.fov * 1.15, 150.0)
+		return
+	if not (ev is InputEventKey and ev.pressed and not ev.echo):
+		return
+	var key = ev.keycode
+	var sl = sectors()
+	if key >= KEY_1 and key <= KEY_9 and key - KEY_1 < sl.size():
+		view_az = sector_mid(sl[key - KEY_1])
+	elif key == KEY_TAB and sl.size() > 0:
+		var cur = -1
+		for i in sl.size():
+			if in_sector(sl[i], view_az):
+				cur = i
+		view_az = sector_mid(sl[(cur + 1) % sl.size()])
+	elif key == KEY_EQUAL or key == KEY_KP_ADD:
+		wide_cam.fov = maxf(wide_cam.fov / 1.25, 2.0)
+	elif key == KEY_MINUS or key == KEY_KP_SUBTRACT:
+		wide_cam.fov = minf(wide_cam.fov * 1.25, 150.0)
+	elif key == KEY_M:
+		view_pan = not view_pan
+	elif key == KEY_SPACE:
+		view_speed = 1.0 if view_speed == 0.0 else 0.0
+	elif key == KEY_R:
+		view_t = 0.0
+		f_t = 0.0
+	elif key == KEY_F12:
+		var dir = out_dir if out_dir != "" else "."
+		DirAccess.make_dir_recursive_absolute(dir)
+		var fn = "%s/view_%s_az%03d.png" % [dir, str(cfg.get("name", "sim")), int(view_az)]
+		wide_vp.get_texture().get_image().save_png(fn)
+		print("снимок: ", fn)
+	elif key == KEY_ESCAPE:
+		get_tree().quit()
+
+
 func save_json(path: String, obj) -> void:
 	var f = FileAccess.open(path, FileAccess.WRITE)
 	f.store_string(JSON.stringify(obj))
@@ -1173,4 +1668,5 @@ func write_outputs(secs: float, wfps: float, ffps: float) -> void:
 		"wide": {"w": wide_vp.size.x, "h": wide_vp.size.y, "fps": wfps, "hfov": wide_cam.fov, "poses": poses_wide},
 		"fine": {"enabled": fine_enabled(), "w": fine_vp.size.x, "h": fine_vp.size.y, "fps": ffps, "hfov": fine_cam.fov,
 			"poses": poses_fine, "pose_fields": ["t", "az", "el", "vaz", "vel", "target"]},
-		"rig_height": rig_pos.y, "targets": tracks})
+		"rig_height": rig_pos.y, "targets": tracks,
+		"sector": str(sector_at(float(wcfg.get("az", 0.0))).get("type", "")), "sectors": sectors()})

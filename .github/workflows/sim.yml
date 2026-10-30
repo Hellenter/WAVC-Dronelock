@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
     inputs:
       scenes:
-        description: 'Сцены из sim/scenes через пробел'
-        default: 'forest_village forest_polyhaven drone_types pan_sweep overcast_birds'
+        description: 'Сцены из sim/scenes через пробел; сцена:сектор — камера на сектор'
+        default: 'forest_polyhaven drone_types city_sectors:forest city_sectors:lowrise city_sectors:highrise'
       seconds:
         description: 'Длина роликов, с (пусто — как в сцене)'
         default: ''
@@ -54,18 +54,24 @@ jobs:
           SCENES: ${{ github.event.inputs.scenes }}
           SECS: ${{ github.event.inputs.seconds }}
         run: |
-          scenes="$SCENES"; [ -z "$scenes" ] && scenes="quick forest_polyhaven drone_types"
+          scenes="$SCENES"; [ -z "$scenes" ] && scenes="quick city_sectors:forest city_sectors:lowrise city_sectors:highrise"
           secs="$SECS"
           mkdir -p vids
-          for s in $scenes; do
-            extra=(); [ -n "$secs" ] && extra=(--seconds "$secs")
-            time xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene "sim/scenes/$s.json" --out "out/$s" --keep-png "${extra[@]}"
+          for tok in $scenes; do
+            sc=${tok%%:*}; sector=""; [ "$tok" != "$sc" ] && sector=${tok#*:}
+            s=$sc; extra=(); [ -n "$secs" ] && extra=(--seconds "$secs")
+            [ -n "$sector" ] && { s=${sc}_${sector}; extra+=(--sector "$sector"); }
+            time xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene "sim/scenes/$sc.json" --out "out/$s" --keep-png "${extra[@]}"
             n=$(ls "out/$s/wide" | wc -l)
             python sim/preview.py "out/$s" 0
             python sim/preview.py "out/$s" $((n / 2))
             cp out/$s/*.mp4 out/$s/*.gt.json vids/
           done
           ls -la vids
+          # панорама 360° сцен с секторами
+          for sc in $(echo $scenes | tr ' ' '\n' | grep ':' | cut -d: -f1 | sort -u); do
+            xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene "sim/scenes/$sc.json" --out "pano/$sc" --panorama
+          done
       - name: Сводка разметки
         run: python sim/ci_report.py out | tee report.txt
       - name: Приложение
@@ -91,6 +97,7 @@ jobs:
             # короткий фрагмент точной камеры (640x480) — посмотреть ведение
             ffmpeg -loglevel error -i out/$s/*_fine.mp4 -t 4 -c copy "$d/$s/fine_4s.mp4" || true
           done
+          for p in pano/*/pano.jpg; do [ -f "$p" ] && cp "$p" "$d/pano_$(basename $(dirname $p)).jpg"; done
           cd previews
           git -c user.name=ci -c user.email=ci@localhost add -A
           git -c user.name=ci -c user.email=ci@localhost commit -qm "превью ${GITHUB_SHA::7}"

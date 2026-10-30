@@ -19,7 +19,16 @@
    Быстрый просмотр: `--scale 0.5 --seconds 3`. В `out\fv` будут `forest_village_wide.mp4`,
    `forest_village_fine.mp4`, их `.gt.json` и `meta.json` (позы камер по кадрам, траектории целей).
    Ролики открываются в Dronolok.exe и в мультитесте как обычные записи с разметкой.
-4. Посмотреть и поправить сцену глазами: открыть `sim/godot/project.godot` в Godot. Сцена строится
+4. Покрутить камеру в окне (без записи роликов):
+
+       python sim\render.py --godot C:\Godot\Godot_v4.3-stable_win64.exe --scene sim\scenes\city_sectors.json --view
+
+   Стрелки или WASD — поворот (Shift быстрее), колесо или +/- — зум, 1/2/3 — сектора (лес, частный сектор,
+   многоэтажки), Tab — следующий сектор, M — обзор по кругу, Пробел — пауза, R — время сначала, F12 — снимок
+   в `out\view`, Esc — выход. Справа внизу — точная камера на поворотке. Цели в этом режиме летают по всему кругу.
+   Ролик с камерой на секторе: `--sector highrise` (или `--az 300`), обзор по кругу: `--pan 12`.
+   Полоса 360° с подписями секторов: `--panorama --out out\pano` → `out\pano\pano.jpg`.
+5. Посмотреть и поправить сцену глазами: открыть `sim/godot/project.godot` в Godot. Сцена строится
    скриптом `sim.gd` при запуске, поэтому расстановку меняют в `.json` сцены.
 
 ## Свои ассеты
@@ -43,6 +52,10 @@
   `dist`, `depth`, `az_from`, `az_to`, `count`), `villages` (`az`, `dist`, `radius`, `houses`), `poles`
   (`pos`, `height`, `radius`), `hills`, `cloud_cover`, `cloud_soft`, `cloud_wind`, `sun_az`, `sun_el`, `sun`,
   `ambient`, `fog`, `wind` (качание крон), `shadows`.
+  `sectors` — панорама по секторам, каждый `{"name", "type", "az_from", "az_to"}`: `forest` (лес как выше),
+  `lowrise` (частный сектор: `from`, `to` — м от установки, `houses`), `highrise` (многоэтажки: `from`, `to`,
+  `buildings`, `floors` [мин, макс], `towers` — доля башен, остальное панельные «пластины», `masts` — доля
+  домов с мачтой на крыше). `trees` в секторе — доля леса, что остаётся (по умолчанию 0.12 и 0.05 в застройке).
 - `targets`: `kind` (`drone`/`bird`), `model` (`quad`, `delta` — летающее крыло-треугольник, `wing`/`plane` — самолёт, птица — по умолчанию), `size` (м: размах
   дрона или крыльев птицы), `speed`, `start`/`end` (с), `path`:
   `line` (`from`, `to`), `waypoints` (`points`, `mode`: `once`/`loop`/`pingpong`), `orbit` (`center`,
@@ -52,15 +65,16 @@
 - `random_targets`: `drones`, `birds`, `range` [м, м], `types` (`quad`/`delta`/`plane` и доли), `seed` — случайные
   цели разных типов: квадрокоптер 0.3–0.8 м, крыло 1.8–3.5 м и 25–45 м/с, самолёт 1.5–4 м и 15–30 м/с, птицы 0.3–1.2 м.
 
-Готовые сцены: `drone_types` (8 дронов трёх типов и 4 птицы на 150–1500 м), `forest_village` (4 дрона, 2 птицы), `forest_polyhaven` (то же с деревьями Poly Haven из
+Готовые сцены: `city_sectors` (лес 0–120°, частный сектор 120–240°, многоэтажки 240–360°; камера по умолчанию
+на лес, `--sector lowrise`/`highrise` — на другие), `drone_types` (8 дронов трёх типов и 4 птицы на 150–1500 м), `forest_village` (4 дрона, 2 птицы), `forest_polyhaven` (то же с деревьями Poly Haven из
 `assets/polyhaven`), `pan_sweep` (камера качается ±25° на 10°/с),
 `overcast_birds` (пасмурно, только птицы — проверка ложных тревог), `quick` (3 с, полразрешения).
 
 ## CI
 
-`.github/workflows/sim.yml` рендерит `quick` и `forest_village` при каждом изменении `sim/` (программный
+`.github/workflows/sim.yml` рендерит `quick` и `city_sectors` по трём секторам (плюс панораму 360°) при каждом изменении `sim/` (программный
 рендер, видеокарта не нужна), прогоняет по роликам мультитест и выкладывает ролики с разметкой в артефакт
-`sim-videos`. Другие сцены и длина — через «Run workflow».
+`sim-videos`. Другие сцены и длина — через «Run workflow» (`сцена:сектор` — камера на сектор).
 
 Модели Poly Haven приходят как `.blend`; в `.glb` для сцены их перегоняет `sim/blend2glb.py` (Blender 4,
 прореживание до `--tris`, текстуры до `--tex`, простые материалы с прозрачностью листвы):
