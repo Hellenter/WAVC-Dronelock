@@ -839,6 +839,17 @@ void heading(const char* t) {
     ImGui::PopStyleColor();
 }
 
+// заголовок раздела настроек, который сворачивается щелчком; true — раздел открыт (состояние — в imgui.ini)
+bool heading(const char* t, bool) {
+    ImGui::Spacing();
+    FontSize f(1.1f);
+    ImGui::PushStyleColor(ImGuiCol_Text, TXT_HEAD);
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    const bool open = ImGui::CollapsingHeader(t, ImGuiTreeNodeFlags_DefaultOpen);
+    ImGui::PopStyleColor(2);
+    return open;
+}
+
 // подпись над полем, само поле — на всю ширину следующей строкой
 void label(const char* t, const char* help = nullptr) {
     ImGui::TextUnformatted(t);
@@ -1057,265 +1068,273 @@ void panel_main(App& a, bool& changed) {
         ImGui::TextDisabled("или перетащите файл в окно");
     }
 
-    heading("Устройство");
-    {
-        FontSize f(1.15f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x * 1.5f,
-                                                               ImGui::GetStyle().FramePadding.y * 1.6f));
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::BeginCombo("##device", DEVICES[a.devIdx].name)) {
-            for (int i = 0; i < N_DEVICES; ++i)
-                if (ImGui::Selectable(DEVICES[i].name, a.devIdx == i)) {
-                    apply_device(a, i);
-                    changed = true;
-                }
-            ImGui::EndCombo();
+    if (heading("Устройство", true)) {
+        {
+            FontSize f(1.15f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x * 1.5f,
+                                                                   ImGui::GetStyle().FramePadding.y * 1.6f));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##device", DEVICES[a.devIdx].name)) {
+                for (int i = 0; i < N_DEVICES; ++i)
+                    if (ImGui::Selectable(DEVICES[i].name, a.devIdx == i)) {
+                        apply_device(a, i);
+                        changed = true;
+                    }
+                ImGui::EndCombo();
+            }
+            ImGui::PopStyleVar();
         }
-        ImGui::PopStyleVar();
-    }
-    ImGui::SetItemTooltip("Имитация устройства на этом ПК: столько же ядер, векторы 128 бит (как NEON), а обработка "
-                          "каждого кадра растягивается во столько раз, во сколько ядро устройства медленнее ядра ПК. "
-                          "Вместе с устройством ставится подходящий профиль алгоритма. Тонкая настройка — на "
-                          "вкладке «Железо».");
-    if (a.devIdx > 0) {
-        ImGui::TextDisabled("%d ядра, 128 бит, обработка медленнее этого ПК в %.1f раза", DEVICES[a.devIdx].cores,
-                            a.s.slowdown);
-        if (a.devMs[a.devIdx] < a.pcMs)
-            ImGui::TextColored(TXT_WARN, "ядро ПК медленнее устройства: точная имитация невозможна");
-    } else {
-        ImGui::TextDisabled("все ядра и SIMD этого ПК");
+        ImGui::SetItemTooltip("Имитация устройства на этом ПК: столько же ядер, векторы 128 бит (как NEON), а обработка "
+                              "каждого кадра растягивается во столько раз, во сколько ядро устройства медленнее ядра ПК. "
+                              "Вместе с устройством ставится подходящий профиль алгоритма. Тонкая настройка — на "
+                              "вкладке «Железо».");
+        if (a.devIdx > 0) {
+            ImGui::TextDisabled("%d ядра, 128 бит, обработка медленнее этого ПК в %.1f раза", DEVICES[a.devIdx].cores,
+                                a.s.slowdown);
+            if (a.devMs[a.devIdx] < a.pcMs)
+                ImGui::TextColored(TXT_WARN, "ядро ПК медленнее устройства: точная имитация невозможна");
+        } else {
+            ImGui::TextDisabled("все ядра и SIMD этого ПК");
+        }
     }
 
-    heading("Профиль алгоритма");
-    static const char* profs[] = {"Полный", "Баланс", "Эконом", "Минимум"};
-    static const char* tips[] = {
-        "Всё включено: каждый кадр целиком, 3 масштаба. Для мощного ПК.",
-        "Как по умолчанию: хороший компромисс скорости и полноты.",
-        "Для Raspberry Pi 4-5: весь кадр через кадр, 2 масштаба.",
-        "Для Raspberry Pi 3: только точки и тёмные цели, кадр вдвое меньше, весь кадр раз в 3.",
-    };
-    int pi = a.profIdx;
-    {
-        FontSize f(1.1f);
-        if (segmented("profile", profs, 4, pi, bigH * 0.75f, tips)) {
-            apply_profile(a, pi);
-            changed = true;
+    if (heading("Профиль алгоритма", true)) {
+        static const char* profs[] = {"Полный", "Баланс", "Эконом", "Минимум"};
+        static const char* tips[] = {
+            "Всё включено: каждый кадр целиком, 3 масштаба. Для мощного ПК.",
+            "Как по умолчанию: хороший компромисс скорости и полноты.",
+            "Для Raspberry Pi 4-5: весь кадр через кадр, 2 масштаба.",
+            "Для Raspberry Pi 3: только точки и тёмные цели, кадр вдвое меньше, весь кадр раз в 3.",
+        };
+        int pi = a.profIdx;
+        {
+            FontSize f(1.1f);
+            if (segmented("profile", profs, 4, pi, bigH * 0.75f, tips)) {
+                apply_profile(a, pi);
+                changed = true;
+            }
         }
+        if (a.profIdx < 0) ImGui::TextColored(TXT_WARN, "свой набор: блоки изменены на вкладке «Алгоритм»");
+        {
+            FontSize f(1.1f);
+            changed |= ImGui::Checkbox("Держать темп камеры", &a.s.governor);
+        }
+        help_marker("Авто-упрощение. Если кадр обрабатывается дольше, чем приходит следующий с камеры, алгоритм "
+                    "упрощается ступенями: реже крупные масштабы, реже весь кадр, меньше масштабов. Когда запас "
+                    "появляется, возвращается обратно. Ступень видна справа на вкладке «Цели» и в CSV. Это же есть в "
+                    "ядре для устройства (dronolok::LoadGovernor).");
     }
-    if (a.profIdx < 0) ImGui::TextColored(TXT_WARN, "свой набор: блоки изменены на вкладке «Алгоритм»");
-    {
-        FontSize f(1.1f);
-        changed |= ImGui::Checkbox("Держать темп камеры", &a.s.governor);
-    }
-    help_marker("Авто-упрощение. Если кадр обрабатывается дольше, чем приходит следующий с камеры, алгоритм "
-                "упрощается ступенями: реже крупные масштабы, реже весь кадр, меньше масштабов. Когда запас "
-                "появляется, возвращается обратно. Ступень видна справа на вкладке «Цели» и в CSV. Это же есть в "
-                "ядре для устройства (dronolok::LoadGovernor).");
 }
 
 void tab_video(App& a, bool& changed) {
     const VideoInfo vi = a.pipe.info();
-    heading("Подача кадров");
-    static const char* paces[] = {"Как камера", "Максимально быстро"};
-    static const char* paceTips[] = {
-        "Кадры приходят с частотой видео (или заданной). Если обработка не успевает, лишние кадры "
-        "выбрасываются, как у настоящей камеры. Счётчик пропусков — справа.",
-        "Без пропусков и пауз: замер предельной скорости всего конвейера.",
-    };
-    int pace = a.s.pace == Pace::Realtime ? 0 : 1;
-    if (segmented("pace", paces, 2, pace, 0, paceTips)) {
-        a.s.pace = pace == 0 ? Pace::Realtime : Pace::MaxSpeed;
-        changed = true;
-    }
-    if (a.s.pace == Pace::Realtime) {
-        float fps = (float)a.s.targetFps;
-        label("частота камеры, к/с");
-        if (ImGui::SliderFloat("##fps", &fps, 0, 120, fps <= 0 ? "как в видео" : "%.0f")) {
-            a.s.targetFps = fps;
+    if (heading("Подача кадров", true)) {
+        static const char* paces[] = {"Как камера", "Максимально быстро"};
+        static const char* paceTips[] = {
+            "Кадры приходят с частотой видео (или заданной). Если обработка не успевает, лишние кадры "
+            "выбрасываются, как у настоящей камеры. Счётчик пропусков — справа.",
+            "Без пропусков и пауз: замер предельной скорости всего конвейера.",
+        };
+        int pace = a.s.pace == Pace::Realtime ? 0 : 1;
+        if (segmented("pace", paces, 2, pace, 0, paceTips)) {
+            a.s.pace = pace == 0 ? Pace::Realtime : Pace::MaxSpeed;
             changed = true;
         }
-        help_marker("Ниже частоты видео — камера реже видео: из файла берётся кадр на каждом такте камеры "
-                    "(14 к/с из 60 — через 4-5 кадров), видео идёт с обычной скоростью, и цель за кадр "
-                    "смещается дальше, как у настоящей камеры 16 Мп (10-15 к/с). Выше частоты видео — видео "
-                    "ускоряется. Замедлить видео, не пропуская кадров, — \"скорость видео\".");
-        label("камера реже видео: каждый N-й кадр");
-        if (ImGui::SliderInt("##fstep", &a.s.frameStep, 1, 8, a.s.frameStep <= 1 ? "все кадры" : "каждый %d-й")) {
-            a.s.frameStep = std::max(1, a.s.frameStep);
+        if (a.s.pace == Pace::Realtime) {
+            float fps = (float)a.s.targetFps;
+            label("частота камеры, к/с");
+            if (ImGui::SliderFloat("##fps", &fps, 0, 120, fps <= 0 ? "как в видео" : "%.0f")) {
+                a.s.targetFps = fps;
+                changed = true;
+            }
+            help_marker("Ниже частоты видео — камера реже видео: из файла берётся кадр на каждом такте камеры "
+                        "(14 к/с из 60 — через 4-5 кадров), видео идёт с обычной скоростью, и цель за кадр "
+                        "смещается дальше, как у настоящей камеры 16 Мп (10-15 к/с). Выше частоты видео — видео "
+                        "ускоряется. Замедлить видео, не пропуская кадров, — \"скорость видео\".");
+            label("камера реже видео: каждый N-й кадр");
+            if (ImGui::SliderInt("##fstep", &a.s.frameStep, 1, 8, a.s.frameStep <= 1 ? "все кадры" : "каждый %d-й")) {
+                a.s.frameStep = std::max(1, a.s.frameStep);
+                changed = true;
+            }
+            help_marker("Эмуляция медленной камеры: из видео 60 к/с с шагом 4 алгоритм видит 15 к/с (камера 16 Мп — "
+                        "10-15 к/с), и цель за кадр смещается вчетверо дальше. Разметка видео подходит без пересчёта. "
+                        "Складывается с \"частотой камеры\": 30 к/с и каждый 2-й — 15 к/с.");
+            float sp = (float)a.s.speed;
+            label("скорость видео", "Замедление: кадры подаются реже, каждый обрабатывается. Кнопки x0.1-x1 есть и "
+                                    "под видео. Клавиши + и -.");
+            if (ImGui::SliderFloat("##speed", &sp, 0.05f, 2.f, "x%.2f", ImGuiSliderFlags_Logarithmic)) set_speed(a, sp);
+        }
+    }
+    if (heading("Источник кадров", true)) {
+        static const char* srcs[] = {"Читать файл", "Предзагрузка"};
+        static const char* srcTips[] = {
+            "Кадры декодируются по ходу проигрывания.",
+            "Кадры заранее декодируются в память и подаются по кругу без копирования, как сырые буферы камеры. "
+            "Тогда декодирование видео не мешает замеру.",
+        };
+        int src = a.s.source == Source::Stream ? 0 : 1;
+        bool srcCh = segmented("src", srcs, 2, src, 0, srcTips);
+        if (src == 1) {
+            label("кадров в памяти");
+            srcCh |= ImGui::SliderInt("##preload", &a.s.preloadFrames, 10, 1000);
+            const int w = a.s.procW ? a.s.procW : vi.w, h = a.s.procH ? a.s.procH : vi.h;
+            ImGui::TextDisabled("памяти: ~%.0f МБ", (double)w * h * a.s.preloadFrames / (1024.0 * 1024.0));
+        }
+        if (srcCh) {
+            a.s.source = src == 0 ? Source::Stream : Source::Preload;
             changed = true;
         }
-        help_marker("Эмуляция медленной камеры: из видео 60 к/с с шагом 4 алгоритм видит 15 к/с (камера 16 Мп — "
-                    "10-15 к/с), и цель за кадр смещается вчетверо дальше. Разметка видео подходит без пересчёта. "
-                    "Складывается с \"частотой камеры\": 30 к/с и каждый 2-й — 15 к/с.");
-        float sp = (float)a.s.speed;
-        label("скорость видео", "Замедление: кадры подаются реже, каждый обрабатывается. Кнопки x0.1-x1 есть и "
-                                "под видео. Клавиши + и -.");
-        if (ImGui::SliderFloat("##speed", &sp, 0.05f, 2.f, "x%.2f", ImGuiSliderFlags_Logarithmic)) set_speed(a, sp);
     }
-    heading("Источник кадров");
-    static const char* srcs[] = {"Читать файл", "Предзагрузка"};
-    static const char* srcTips[] = {
-        "Кадры декодируются по ходу проигрывания.",
-        "Кадры заранее декодируются в память и подаются по кругу без копирования, как сырые буферы камеры. "
-        "Тогда декодирование видео не мешает замеру.",
-    };
-    int src = a.s.source == Source::Stream ? 0 : 1;
-    bool srcCh = segmented("src", srcs, 2, src, 0, srcTips);
-    if (src == 1) {
-        label("кадров в памяти");
-        srcCh |= ImGui::SliderInt("##preload", &a.s.preloadFrames, 10, 1000);
-        const int w = a.s.procW ? a.s.procW : vi.w, h = a.s.procH ? a.s.procH : vi.h;
-        ImGui::TextDisabled("памяти: ~%.0f МБ", (double)w * h * a.s.preloadFrames / (1024.0 * 1024.0));
-    }
-    if (srcCh) {
-        a.s.source = src == 0 ? Source::Stream : Source::Preload;
-        changed = true;
-    }
-    heading("Проигрывание");
-    changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
-    if (ImGui::Checkbox("Чистый старт (без накопленного опыта)", &a.s.fresh)) {
-        a.pipe.setSettings(a.s);
-        if (a.s.fresh) {   // забыть уже накопленное и пройти видео с начала
-            a.pipe.forget();
-            seek_to(a, 0, false);
+    if (heading("Проигрывание", true)) {
+        changed |= ImGui::Checkbox("Зациклить", &a.s.loop);
+        if (ImGui::Checkbox("Чистый старт (без накопленного опыта)", &a.s.fresh)) {
+            a.pipe.setSettings(a.s);
+            if (a.s.fresh) {   // забыть уже накопленное и пройти видео с начала
+                a.pipe.forget();
+                seek_to(a, 0, false);
+            }
         }
+        help_marker("Видео проверяется так, будто открыто впервые: память статичных помех (.static.bin) и маска неба "
+                    "(.mask.bin), накопленные прошлыми запусками рядом с видео, не загружаются и не перезаписываются, "
+                    "а на каждом новом проходе зацикленного видео маска неба учится заново. Включение забывает уже "
+                    "накопленное и начинает видео сначала. Для честной оценки настроек; мультитест всегда идёт так.");
+        changed |= ImGui::Checkbox("Пропускать повторы кадра", &a.s.skipDuplicates);
+        help_marker("Запись экрана 60 к/с с ролика 25-30 к/с повторяет каждый кадр 2-3 раза. Включено — повтор не "
+                    "обрабатывается, трекер видит ролик с его настоящей частотой, как с камеры 25-30 к/с. Выключено — "
+                    "повторы обрабатываются как новые кадры (у тусклой цели больше попыток найтись, но скорость цели "
+                    "скачет: то стоит, то прыгнула вдвое).");
+        int first, last;
+        if (a.pipe.paused() && a.pipe.historyRange(first, last) && last > first) {
+            int cur = a.viewSeq >= 0 ? a.viewSeq : last;
+            char fmt[64];
+            snprintf(fmt, sizeof(fmt), cur == last ? "последний" : "%d кадров назад", last - cur);
+            label("история обработанных кадров",
+                  "Последние обработанные кадры с разметкой (до 600 кадров и 1 ГБ памяти). Трекер при этом не "
+                  "откатывается: вперёд с последнего кадра идёт обработка следующего.");
+            if (ImGui::SliderInt("##history", &cur, first, last, fmt)) a.viewSeq = cur >= last ? -1 : cur;
+        }
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
+        ImGui::TextWrapped("Клавиши: пробел — пауза, стрелки — кадр назад/вперёд, Shift+стрелки — на секунду, "
+                           "Home — в начало, +/- — скорость.");
+        ImGui::PopStyleColor();
     }
-    help_marker("Видео проверяется так, будто открыто впервые: память статичных помех (.static.bin) и маска неба "
-                "(.mask.bin), накопленные прошлыми запусками рядом с видео, не загружаются и не перезаписываются, "
-                "а на каждом новом проходе зацикленного видео маска неба учится заново. Включение забывает уже "
-                "накопленное и начинает видео сначала. Для честной оценки настроек; мультитест всегда идёт так.");
-    changed |= ImGui::Checkbox("Пропускать повторы кадра", &a.s.skipDuplicates);
-    help_marker("Запись экрана 60 к/с с ролика 25-30 к/с повторяет каждый кадр 2-3 раза. Включено — повтор не "
-                "обрабатывается, трекер видит ролик с его настоящей частотой, как с камеры 25-30 к/с. Выключено — "
-                "повторы обрабатываются как новые кадры (у тусклой цели больше попыток найтись, но скорость цели "
-                "скачет: то стоит, то прыгнула вдвое).");
-    int first, last;
-    if (a.pipe.paused() && a.pipe.historyRange(first, last) && last > first) {
-        int cur = a.viewSeq >= 0 ? a.viewSeq : last;
-        char fmt[64];
-        snprintf(fmt, sizeof(fmt), cur == last ? "последний" : "%d кадров назад", last - cur);
-        label("история обработанных кадров",
-              "Последние обработанные кадры с разметкой (до 600 кадров и 1 ГБ памяти). Трекер при этом не "
-              "откатывается: вперёд с последнего кадра идёт обработка следующего.");
-        if (ImGui::SliderInt("##history", &cur, first, last, fmt)) a.viewSeq = cur >= last ? -1 : cur;
-    }
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
-    ImGui::TextWrapped("Клавиши: пробел — пауза, стрелки — кадр назад/вперёд, Shift+стрелки — на секунду, "
-                       "Home — в начало, +/- — скорость.");
-    ImGui::PopStyleColor();
 }
 
 void tab_hardware(App& a, bool& changed) {
-    heading("Скорость устройства");
-    if (a.devIdx > 0) {
-        label("мс на 1 Мп на устройстве",
-              "Сколько ядро устройства тратит на 1 Мп (1 поток, 128 бит). Сейчас — оценка; точное число даёт "
-              "dronolok_bench --calibrate, запущенный на самом устройстве.");
-        if (ImGui::InputFloat("##devms", &a.devMs[a.devIdx], 0, 0, "%.2f")) {
-            a.devMs[a.devIdx] = std::max(0.01f, a.devMs[a.devIdx]);
-            a.s.slowdown = std::max(1.0, a.devMs[a.devIdx] / std::max(1e-3, a.pcMs));
+    if (heading("Скорость устройства", true)) {
+        if (a.devIdx > 0) {
+            label("мс на 1 Мп на устройстве",
+                  "Сколько ядро устройства тратит на 1 Мп (1 поток, 128 бит). Сейчас — оценка; точное число даёт "
+                  "dronolok_bench --calibrate, запущенный на самом устройстве.");
+            if (ImGui::InputFloat("##devms", &a.devMs[a.devIdx], 0, 0, "%.2f")) {
+                a.devMs[a.devIdx] = std::max(0.01f, a.devMs[a.devIdx]);
+                a.s.slowdown = std::max(1.0, a.devMs[a.devIdx] / std::max(1e-3, a.pcMs));
+                changed = true;
+            }
+            ImGui::TextDisabled("этот ПК: %.2f мс/Мп, устройство медленнее в %.1f раза", a.pcMs, a.s.slowdown);
+        } else {
+            ImGui::TextDisabled("этот ПК: %.2f мс/Мп (1 поток, 128 бит)", a.pcMs);
+            ImGui::TextDisabled("выберите устройство сверху, чтобы имитировать Pi");
+        }
+    }
+
+    if (heading("Процессор", true)) {
+        const int hw = plat::logical_cpus();
+        int th = a.s.det.threads > 0 ? a.s.det.threads : hw;
+        label("потоков детектора");
+        if (ImGui::SliderInt("##threads", &th, 1, std::max(hw, 16))) {
+            a.s.det.threads = th;
             changed = true;
         }
-        ImGui::TextDisabled("этот ПК: %.2f мс/Мп, устройство медленнее в %.1f раза", a.pcMs, a.s.slowdown);
-    } else {
-        ImGui::TextDisabled("этот ПК: %.2f мс/Мп (1 поток, 128 бит)", a.pcMs);
-        ImGui::TextDisabled("выберите устройство сверху, чтобы имитировать Pi");
-    }
-
-    heading("Процессор");
-    const int hw = plat::logical_cpus();
-    int th = a.s.det.threads > 0 ? a.s.det.threads : hw;
-    label("потоков детектора");
-    if (ImGui::SliderInt("##threads", &th, 1, std::max(hw, 16))) {
-        a.s.det.threads = th;
-        changed = true;
-    }
-    label("набор инструкций (SIMD)", "На Raspberry Pi 3/5 есть только NEON (128 бит), по ширине это как SSE2. "
-                                     "AVX2 — 256 бит, есть на большинстве ПК.");
-    if (ImGui::BeginCombo("##simd", isa_ru(a.s.det.isa))) {
-        std::vector<Isa> isas = available_isas();
-        isas.insert(isas.begin(), Isa::Auto);
-        for (Isa i : isas)
-            if (ImGui::Selectable(isa_ru(i), a.s.det.isa == i)) {
-                a.s.det.isa = i;
-                changed = true;
+        label("набор инструкций (SIMD)", "На Raspberry Pi 3/5 есть только NEON (128 бит), по ширине это как SSE2. "
+                                         "AVX2 — 256 бит, есть на большинстве ПК.");
+        if (ImGui::BeginCombo("##simd", isa_ru(a.s.det.isa))) {
+            std::vector<Isa> isas = available_isas();
+            isas.insert(isas.begin(), Isa::Auto);
+            for (Isa i : isas)
+                if (ImGui::Selectable(isa_ru(i), a.s.det.isa == i)) {
+                    a.s.det.isa = i;
+                    changed = true;
+                }
+            ImGui::EndCombo();
+        }
+        ImGui::TextUnformatted("ядра процесса");
+        help_marker("Процесс (детектор, декодер, интерфейс) работает только на отмеченных логических ядрах. "
+                    "Например, 4 ядра — как у Raspberry Pi.");
+        bool cpuCh = false;
+        for (int i = 0; i < (int)a.cpuOn.size() && i < 64; ++i) {
+            if (i % 8) ImGui::SameLine();
+            char lbl[8];
+            snprintf(lbl, sizeof(lbl), "%d##c", i);
+            bool on = a.cpuOn[i] != 0;
+            ImGui::PushID(i);
+            if (ImGui::Checkbox(lbl, &on)) {
+                a.cpuOn[i] = on;
+                cpuCh = true;
             }
-        ImGui::EndCombo();
-    }
-    ImGui::TextUnformatted("ядра процесса");
-    help_marker("Процесс (детектор, декодер, интерфейс) работает только на отмеченных логических ядрах. "
-                "Например, 4 ядра — как у Raspberry Pi.");
-    bool cpuCh = false;
-    for (int i = 0; i < (int)a.cpuOn.size() && i < 64; ++i) {
-        if (i % 8) ImGui::SameLine();
-        char lbl[8];
-        snprintf(lbl, sizeof(lbl), "%d##c", i);
-        bool on = a.cpuOn[i] != 0;
-        ImGui::PushID(i);
-        if (ImGui::Checkbox(lbl, &on)) {
-            a.cpuOn[i] = on;
+            ImGui::PopID();
+        }
+        if (ImGui::SmallButton("все")) {
+            std::fill(a.cpuOn.begin(), a.cpuOn.end(), 1);
             cpuCh = true;
         }
-        ImGui::PopID();
-    }
-    if (ImGui::SmallButton("все")) {
-        std::fill(a.cpuOn.begin(), a.cpuOn.end(), 1);
-        cpuCh = true;
-    }
-    for (int n : {1, 2, 4}) {
-        if (n >= (int)a.cpuOn.size()) continue;
-        ImGui::SameLine();
-        char lbl[32];
-        snprintf(lbl, sizeof(lbl), "первые %d", n);
-        if (ImGui::SmallButton(lbl)) {
-            for (size_t i = 0; i < a.cpuOn.size(); ++i) a.cpuOn[i] = (int)i < n;
-            cpuCh = true;
+        for (int n : {1, 2, 4}) {
+            if (n >= (int)a.cpuOn.size()) continue;
+            ImGui::SameLine();
+            char lbl[32];
+            snprintf(lbl, sizeof(lbl), "первые %d", n);
+            if (ImGui::SmallButton(lbl)) {
+                for (size_t i = 0; i < a.cpuOn.size(); ++i) a.cpuOn[i] = (int)i < n;
+                cpuCh = true;
+            }
+        }
+        cpuCh |= ImGui::Checkbox("Закрепить потоки детектора за ядрами", &a.pinWorkers);
+        if (cpuCh) {
+            apply_resources(a);
+            changed = true;
+        }
+        int dth = a.s.decoderThreads;
+        label("потоков декодера");
+        if (ImGui::SliderInt("##decth", &dth, 0, hw, dth == 0 ? "авто" : "%d")) {
+            a.s.decoderThreads = dth;
+            changed = true;
+        }
+        ImGui::BeginDisabled(!plat::cpu_cap_supported());
+        label("потолок загрузки CPU",
+              "Жёсткое ограничение загрузки всем процессом, в процентах от всех ядер ПК (Windows Job Object). "
+              "Имитирует более медленный процессор.");
+        if (ImGui::SliderInt("##cpucap", &a.cpuCap, 5, 100, a.cpuCap >= 100 ? "нет" : "%d%%")) plat::set_cpu_cap(a.cpuCap);
+        ImGui::EndDisabled();
+        static const char* prios[] = {"низкий", "ниже среднего", "обычный", "выше среднего", "высокий"};
+        int pr = a.priority + 2;
+        label("приоритет процесса");
+        if (ImGui::Combo("##prio", &pr, prios, 5)) {
+            a.priority = pr - 2;
+            plat::set_process_priority(a.priority);
         }
     }
-    cpuCh |= ImGui::Checkbox("Закрепить потоки детектора за ядрами", &a.pinWorkers);
-    if (cpuCh) {
-        apply_resources(a);
-        changed = true;
-    }
-    int dth = a.s.decoderThreads;
-    label("потоков декодера");
-    if (ImGui::SliderInt("##decth", &dth, 0, hw, dth == 0 ? "авто" : "%d")) {
-        a.s.decoderThreads = dth;
-        changed = true;
-    }
-    ImGui::BeginDisabled(!plat::cpu_cap_supported());
-    label("потолок загрузки CPU",
-          "Жёсткое ограничение загрузки всем процессом, в процентах от всех ядер ПК (Windows Job Object). "
-          "Имитирует более медленный процессор.");
-    if (ImGui::SliderInt("##cpucap", &a.cpuCap, 5, 100, a.cpuCap >= 100 ? "нет" : "%d%%")) plat::set_cpu_cap(a.cpuCap);
-    ImGui::EndDisabled();
-    static const char* prios[] = {"низкий", "ниже среднего", "обычный", "выше среднего", "высокий"};
-    int pr = a.priority + 2;
-    label("приоритет процесса");
-    if (ImGui::Combo("##prio", &pr, prios, 5)) {
-        a.priority = pr - 2;
-        plat::set_process_priority(a.priority);
-    }
 
-    heading("Кадр");
-    label("разрешение обработки", "Кадр масштабируется перед детектором. 16 Мп — растянуть ролик до размера "
-                                  "кадра широкоугольной камеры (как --upscale в run_demo.py).");
-    if (ImGui::BeginCombo("##res", RES_OPTS[a.resIdx].label)) {
-        for (int i = 0; i < (int)(sizeof(RES_OPTS) / sizeof(RES_OPTS[0])); ++i)
-            if (ImGui::Selectable(RES_OPTS[i].label, a.resIdx == i)) {
-                a.resIdx = i;
-                set_resolution(a);
-                changed = true;
-            }
-        ImGui::EndCombo();
-    }
-    float emu = (float)a.s.emulateMs;
-    label("не быстрее, мс на кадр",
-          "Обработка кадра занимает не меньше заданного времени. Подставьте время, которое dronolok_bench "
-          "показал на Raspberry Pi, и посмотрите, сколько кадров будет теряться в режиме «как камера».");
-    if (ImGui::SliderFloat("##emu", &emu, 0, 200, emu <= 0 ? "выкл." : "%.0f мс")) {
-        a.s.emulateMs = emu;
-        changed = true;
+    if (heading("Кадр", true)) {
+        label("разрешение обработки", "Кадр масштабируется перед детектором. 16 Мп — растянуть ролик до размера "
+                                      "кадра широкоугольной камеры (как --upscale в run_demo.py).");
+        if (ImGui::BeginCombo("##res", RES_OPTS[a.resIdx].label)) {
+            for (int i = 0; i < (int)(sizeof(RES_OPTS) / sizeof(RES_OPTS[0])); ++i)
+                if (ImGui::Selectable(RES_OPTS[i].label, a.resIdx == i)) {
+                    a.resIdx = i;
+                    set_resolution(a);
+                    changed = true;
+                }
+            ImGui::EndCombo();
+        }
+        float emu = (float)a.s.emulateMs;
+        label("не быстрее, мс на кадр",
+              "Обработка кадра занимает не меньше заданного времени. Подставьте время, которое dronolok_bench "
+              "показал на Raspberry Pi, и посмотрите, сколько кадров будет теряться в режиме «как камера».");
+        if (ImGui::SliderFloat("##emu", &emu, 0, 200, emu <= 0 ? "выкл." : "%.0f мс")) {
+            a.s.emulateMs = emu;
+            changed = true;
+        }
     }
 }
 
@@ -1325,229 +1344,234 @@ void tab_algorithm(App& a, bool& changed) {
     TrackerConfig& t = a.s.trk;
     bool blk = false;   // блок поменяли вручную — профиль "свой"
     ImGui::TextWrapped("Блоки, из которых собран профиль. Любой можно переключить — профиль станет «свой».");
-    heading("Подстройка под сцену");
-    blk |= ImGui::Checkbox("Подстраиваться под сцену и погоду", &a.s.adapt);
-    help_marker("Раз в 0.2 с по кадру оцениваются свет (день, сумерки, ночь), шум матрицы, облачность, качание "
-                "кромки леса на ветру, осадки, дымка и что ниже горизонта (лес, город, поле). Под них "
-                "подстраиваются выставленные здесь настройки: в сумерки и в дымку — порог по шуму, ночью — только "
-                "светлые цели (огни), в снегопад — только тёмные, в осадки — строже подтверждение, в ветер цель у "
-                "крон должна пролететь дальше, а в штиль выдаётся раньше, в городе быстрее запоминаются антенны и "
-                "фонари. Облако закрыло солнце — фон ячеек учится заново; камеру повернули — маска неба заново. "
-                "Синтетика: сумерки 0% -> 28% дронов, ночь 0% -> 20%, снег 45 тыс. ложных в минуту -> 0. Что "
-                "сейчас подстроено — справа, вкладка «Цели».");
-    heading("Крупные цели и движение камеры");
-    static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
-    label("размер цели (масштабов)",
-          "Сколько масштабов просматривать. 1 — только точки (дальний дрон), каждый следующий — кадр, уменьшенный "
-          "ещё в 2 раза, для близкой крупной цели. Каждый добавляет ~20-35% времени. Авто: до 2 Мп — 3, больше — 1.");
-    blk |= ImGui::Combo("##scales", &a.s.scales, scl, 5);
-    static const char* mos[] = {"авто", "нет", "да"};
-    int mo = a.s.motion + 1;
-    label("учитывать движение камеры",
-          "Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается (~1-2 мс) и "
-          "прогноз целей переносится вместе с ним, иначе захват срывается при каждом движении камеры. Авто: до "
-          "2 Мп — учитывать.");
-    if (segmented("motion", mos, 3, mo)) {
-        a.s.motion = mo - 1;
-        blk = true;
+    if (heading("Подстройка под сцену", true)) {
+        blk |= ImGui::Checkbox("Подстраиваться под сцену и погоду", &a.s.adapt);
+        help_marker("Раз в 0.2 с по кадру оцениваются свет (день, сумерки, ночь), шум матрицы, облачность, качание "
+                    "кромки леса на ветру, осадки, дымка и что ниже горизонта (лес, город, поле). Под них "
+                    "подстраиваются выставленные здесь настройки: в сумерки и в дымку — порог по шуму, ночью — только "
+                    "светлые цели (огни), в снегопад — только тёмные, в осадки — строже подтверждение, в ветер цель у "
+                    "крон должна пролететь дальше, а в штиль выдаётся раньше, в городе быстрее запоминаются антенны и "
+                    "фонари. Облако закрыло солнце — фон ячеек учится заново; камеру повернули — маска неба заново. "
+                    "Синтетика: сумерки 0% -> 28% дронов, ночь 0% -> 20%, снег 45 тыс. ложных в минуту -> 0. Что "
+                    "сейчас подстроено — справа, вкладка «Цели».");
     }
-    int zo = a.s.zones + 1;
-    label("зоны кадра (небо, земля, кромки)",
-          "Кадр делится на небо, землю (кроны, дома, земля) и смешанные тайлы неба рядом с землёй. В смешанных "
-          "цель выдаётся, только когда полетела, — так пропадают ложные цели на кромках крон, крыш и столбов. "
-          "Авто: вместе с учётом движения камеры.");
-    if (segmented("zones", mos, 3, zo)) {
-        a.s.zones = zo - 1;
-        blk = true;
-    }
-    if (a.pipe.isOpen()) {
-        const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
-        ImGui::TextDisabled("сейчас: масштабов %d, камера %s, зоны %s", ef.scales, ef.motion ? "учитывается" : "нет",
-                            ef.zones ? "да" : "нет");
-    }
-    blk |= ImGui::Checkbox("тёмные цели", &d.dark);
-    ImGui::SameLine();
-    blk |= ImGui::Checkbox("яркие цели", &d.bright);
-    help_marker("Каждая полярность — отдельный проход морфологии. Дрон на фоне неба почти всегда темнее неба, "
-                "поэтому на слабом железе можно оставить только тёмные: вдвое быстрее.");
+    if (heading("Крупные цели и движение камеры", true)) {
+        static const char* scl[] = {"авто", "1: до ~7 пикс.", "2: до ~28 пикс.", "3: до ~56 пикс.", "4: до ~112 пикс."};
+        label("размер цели (масштабов)",
+              "Сколько масштабов просматривать. 1 — только точки (дальний дрон), каждый следующий — кадр, уменьшенный "
+              "ещё в 2 раза, для близкой крупной цели. Каждый добавляет ~20-35% времени. Авто: до 2 Мп — 3, больше — 1.");
+        blk |= ImGui::Combo("##scales", &a.s.scales, scl, 5);
+        static const char* mos[] = {"авто", "нет", "да"};
+        int mo = a.s.motion + 1;
+        label("учитывать движение камеры",
+              "Съёмка с рук или с поворотного устройства: сдвиг всей картинки между кадрами оценивается (~1-2 мс) и "
+              "прогноз целей переносится вместе с ним, иначе захват срывается при каждом движении камеры. Авто: до "
+              "2 Мп — учитывать.");
+        if (segmented("motion", mos, 3, mo)) {
+            a.s.motion = mo - 1;
+            blk = true;
+        }
+        int zo = a.s.zones + 1;
+        label("зоны кадра (небо, земля, кромки)",
+              "Кадр делится на небо, землю (кроны, дома, земля) и смешанные тайлы неба рядом с землёй. В смешанных "
+              "цель выдаётся, только когда полетела, — так пропадают ложные цели на кромках крон, крыш и столбов. "
+              "Авто: вместе с учётом движения камеры.");
+        if (segmented("zones", mos, 3, zo)) {
+            a.s.zones = zo - 1;
+            blk = true;
+        }
+        if (a.pipe.isOpen()) {
+            const Effective ef = effective(a.s, a.s.procW ? a.s.procW : vi.w, a.s.procH ? a.s.procH : vi.h);
+            ImGui::TextDisabled("сейчас: масштабов %d, камера %s, зоны %s", ef.scales, ef.motion ? "учитывается" : "нет",
+                                ef.zones ? "да" : "нет");
+        }
+        blk |= ImGui::Checkbox("тёмные цели", &d.dark);
+        ImGui::SameLine();
+        blk |= ImGui::Checkbox("яркие цели", &d.bright);
+        help_marker("Каждая полярность — отдельный проход морфологии. Дрон на фоне неба почти всегда темнее неба, "
+                    "поэтому на слабом железе можно оставить только тёмные: вдвое быстрее.");
 
-    blk |= ImGui::Checkbox("Трекер в секундах", &a.s.trkSeconds);
-    help_marker("Скорости, ворота и выдержки трекера настроены на 25 новых кадров в секунду. Включено — они "
-                "пересчитываются под частоту камеры (повторы кадров в записи экрана не считаются). Камера 16 Мп "
-                "на 10 к/с: птиц находится 77% вместо 51%, дронов, принятых за птиц, нет.");
-    blk |= ImGui::Checkbox("Настоящий интервал кадра", &a.s.frameDt);
-    help_marker("Камера реже видео берёт кадры файла неровным тактом: 14 к/с из записи 60 к/с — через 4 и 5 "
-                "кадров, а пропущенный кадр — двойной интервал. Включено — трекер прогнозирует цель на настоящее "
-                "время между кадрами, как у камеры с ровным тактом. При шаге кадров целым числом ничего не меняет.");
-    blk |= ImGui::Checkbox("Маска неба и поворот камеры в секундах", &a.s.fpsScale);
-    help_marker("Окна маски неба (обучение, уточнение у кромки леса, доращивание по помехам, перепроверка "
-                "облаков), оценка поворота камеры и признак панорамы подобраны на 60 к/с. Включено — они "
-                "пересчитываются под частоту камеры, и в секундах всё как на 60 к/с. Выключено на 15 к/с: "
-                "уточнение маски у кромки копится 10 с вместо 2.5, а медленный поворот, при котором часть кадра "
-                "стоит (своя техника, наложения записи экрана), считается \"камера стоит\" — маска не поспевает "
-                "за картинкой.");
-    heading("Камера ведёт цель");
-    changed |= ImGui::Checkbox("виртуальная поворотка", &a.s.follow);
-    help_marker("Проверка захвата для камеры на поворотном устройстве, которая следует за целью. Алгоритм видит "
-                "не весь кадр, а окно, и окно, как камера на подвесе, поворачивается за захваченной целью: цель "
-                "стоит почти в центре, фон едет навстречу её движению. Поворот окна трекер знает точно — как "
-                "показания датчиков поворотки. На экране — то, что видит такая камера.");
-    if (a.s.follow) {
-        label("поле зрения", "Окно — эта доля ширины и высоты кадра: узкое поле камеры на поворотке.");
-        float fr = a.s.followFrac * 100.f;
-        if (ImGui::SliderFloat("##ffrac", &fr, 20.f, 100.f, "%.0f%% кадра")) {
-            a.s.followFrac = fr / 100.f;
+        blk |= ImGui::Checkbox("Трекер в секундах", &a.s.trkSeconds);
+        help_marker("Скорости, ворота и выдержки трекера настроены на 25 новых кадров в секунду. Включено — они "
+                    "пересчитываются под частоту камеры (повторы кадров в записи экрана не считаются). Камера 16 Мп "
+                    "на 10 к/с: птиц находится 77% вместо 51%, дронов, принятых за птиц, нет.");
+        blk |= ImGui::Checkbox("Настоящий интервал кадра", &a.s.frameDt);
+        help_marker("Камера реже видео берёт кадры файла неровным тактом: 14 к/с из записи 60 к/с — через 4 и 5 "
+                    "кадров, а пропущенный кадр — двойной интервал. Включено — трекер прогнозирует цель на настоящее "
+                    "время между кадрами, как у камеры с ровным тактом. При шаге кадров целым числом ничего не меняет.");
+        blk |= ImGui::Checkbox("Маска неба и поворот камеры в секундах", &a.s.fpsScale);
+        help_marker("Окна маски неба (обучение, уточнение у кромки леса, доращивание по помехам, перепроверка "
+                    "облаков), оценка поворота камеры и признак панорамы подобраны на 60 к/с. Включено — они "
+                    "пересчитываются под частоту камеры, и в секундах всё как на 60 к/с. Выключено на 15 к/с: "
+                    "уточнение маски у кромки копится 10 с вместо 2.5, а медленный поворот, при котором часть кадра "
+                    "стоит (своя техника, наложения записи экрана), считается \"камера стоит\" — маска не поспевает "
+                    "за картинкой.");
+    }
+    if (heading("Камера ведёт цель", true)) {
+        changed |= ImGui::Checkbox("виртуальная поворотка", &a.s.follow);
+        help_marker("Проверка захвата для камеры на поворотном устройстве, которая следует за целью. Алгоритм видит "
+                    "не весь кадр, а окно, и окно, как камера на подвесе, поворачивается за захваченной целью: цель "
+                    "стоит почти в центре, фон едет навстречу её движению. Поворот окна трекер знает точно — как "
+                    "показания датчиков поворотки. На экране — то, что видит такая камера.");
+        if (a.s.follow) {
+            label("поле зрения", "Окно — эта доля ширины и высоты кадра: узкое поле камеры на поворотке.");
+            float fr = a.s.followFrac * 100.f;
+            if (ImGui::SliderFloat("##ffrac", &fr, 20.f, 100.f, "%.0f%% кадра")) {
+                a.s.followFrac = fr / 100.f;
+                changed = true;
+            }
+            label("резкость поворота", "Какую долю отклонения цели от центра поворотка выбирает за кадр (сверх "
+                                       "скорости цели). Больше — цель ближе к центру, но поворот дёрганее.");
+            changed |= ImGui::SliderFloat("##fgain", &a.s.followGain, 0.05f, 1.f, "%.2f");
+            label("предел поворота", "Сколько окно может повернуться за кадр, доля его ширины.");
+            changed |= ImGui::SliderFloat("##fpan", &a.s.followMaxPan, 0.005f, 0.2f, "%.3f");
+            changed |= ImGui::Checkbox("только за проверенным дроном", &a.s.followVerified);
+            help_marker("Поворачиваться только при жёстком захвате (цель проверена как дрон). Иначе окно уходит за "
+                        "первой попавшейся помехой, и настоящая цель оказывается за краем узкого поля зрения.");
+        }
+    }
+
+    if (heading("Неподвижная камера", true)) {
+        label("кадров на маску неба", "Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не "
+                                      "просматриваются. При учёте движения камеры маска не строится.");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.7f);
+        blk |= ImGui::SliderInt("##mask", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
+        ImGui::SameLine();
+        if (ImGui::Button("заново", ImVec2(-FLT_MIN, 0))) a.pipe.relearnMask();
+        blk |= ImGui::Checkbox("Маска из файла", &a.s.maskFile);
+        help_marker("Маска неба лежит рядом с видео (.mask.bin): на старте она закрывает лес сразу, а не через 25 "
+                    "кадров обучения (ложных треков в первые 3 с — в 6 раз меньше). Пока идут эти кадры, маска "
+                    "сверяется с видимым; если камеру сдвинули и больше 10% тайлов не совпало — учится заново и "
+                    "перезаписывается. «Заново» учит, не глядя в файл.");
+        bool pt2 = d.per_tile > 1;
+        if (ImGui::Checkbox("Два кандидата в тайле", &pt2)) {
+            d.per_tile = pt2 ? 2 : 1;
+            blk = true;
+        }
+        help_marker("Кроме самого сильного отклика тайла 64x64 берётся ещё один, из ячейки 16x16 подальше от первого: "
+                    "дрон рядом с бликом, птицей или вторым дроном. Пара дронов в 20 пикс.: 65% -> 99%. Цена ~0.5 мс на "
+                    "16 Мп.");
+        blk |= ImGui::Checkbox("Всё ниже горизонта — земля", &d.skyline);
+        help_marker("Маска неба: в каждом столбце всё ниже кромки леса или крыш считается землёй, даже гладкие места "
+                    "(трава, поляна, дорога, просветы между стволами). Дрон прилетает из-за горизонта и бывает над "
+                    "кромкой, ниже почти никогда. Записи War Thunder: ложных целей на кадр 8 -> ~1. Действует со "
+                    "следующего обучения маски.");
+        blk |= ImGui::Checkbox("Маска уточняется по ячейкам", &d.fine_mask);
+        help_marker("Тайлы земли 64x64 у самой кромки делятся на ячейки 16x16: ячейка, где несколько секунд "
+                    "подряд не бывает листвы и веток и над которой небо, становится небом (просветы между кронами, "
+                    "небо над низкой крышей). Маска так детализируется со временем, пока работает камера. Нужен "
+                    "фон по ячейкам у кромки.");
+        blk |= ImGui::Checkbox("Маска дорастает, где копятся помехи", &d.grow_mask);
+        help_marker("Где маска легла неточно (дальняя трава, поле у горизонта, просвет между домами), копятся "
+                    "помехи. Тайл неба, где их за пару секунд в несколько раз больше среднего по небу этой сцены, "
+                    "закрывается, если прирастает к маске: земля хотя бы с двух сторон и над ним не чистое небо. "
+                    "Ряд тайлов над кромкой крон и крыш так не закрывается, вокруг захваченной цели тоже. Только "
+                    "для неподвижной камеры.");
+        blk |= ImGui::Checkbox("Маска открывает облака", &d.mask_recheck);
+        help_marker("Облака с рваной кромкой при обучении текстурны, как кроны, и маска закрывала их — в облачную "
+                    "погоду до половины неба. Закрытые так тайлы раз в 10 кадров перепроверяются: у кроны и крыши "
+                    "отклик сильный по всему тайлу, у облака слабый. Слабый тайл, выше которого в столбце нет земли, "
+                    "за несколько секунд открывается; цель в нём подтверждается, только когда полетела.");
+        {
+            bool pm = d.pol_mask > 0;
+            if (ImGui::Checkbox("Облака закрыты только для светлых целей", &pm)) {
+                d.pol_mask = pm ? 1 : 0;
+                blk = true;
+            }
+        }
+        help_marker("Облака дают светлую текстуру (яркие клочья на небе), а кроны, дома и трава — и тёмную, и светлую. "
+                    "Тайл, который маска закрыла только из-за светлой текстуры, остаётся в поиске тёмных целей: дрон "
+                    "на фоне облаков тёмный. На экране такие тайлы закрашены едва заметно. Цель там подтверждается, когда "
+                    "полетела; если помехи копятся, тайл закрывается совсем. Действует со следующего обучения маски.");
+        blk |= ImGui::Checkbox("Облака по цвету", &d.sky_color);
+        help_marker("Облака у солнца дают и светлую, и тёмную текстуру (яркие клочья и голубые просветы между ними), и "
+                    "маска закрывала их целиком, как кроны. По цвету кадра такой тайл — небо: не зелёный (листва, трава), "
+                    "не темнее открытого неба этой сцены, без глубоких теней (у крон и домов они есть) и не стоит на "
+                    "земле. Он остаётся в поиске целей (по фону своих ячеек, цель подтверждается, когда полетела), а "
+                    "доращивание маски его не закрывает. Нужно цветное видео; действует со следующего обучения маски.");
+        if (d.sky_color) {
+            blk |= ImGui::Checkbox("Мягкие облака и у кромки леса", &d.sky_soft);
+            help_marker("Облако, касающееся крон, стоит на земле, и правило выше его не открывало. В облаке яркость меняется "
+                        "плавно: перепад на 1 пиксель — около четверти перепада на 4 (у листвы, веток и леса в дымке — "
+                        "половина и больше). Такой тайл цвета неба — облако и у самой кромки леса, линия горизонта через "
+                        "него не идёт. Гребень дальнего холма в дымке так же мягок, но лежит полосой в один тайл между "
+                        "гладким небом и лесом — он остаётся закрытым. Над тёмной верхушкой близкого дерева облако линию "
+                        "горизонта всё же поднимает: просвет между ними закрыт, иначе при малейшем сдвиге камеры туда "
+                        "заходят ветки.");
+            blk |= ImGui::Checkbox("Облака по цвету — и для светлых целей", &d.sky_bright);
+            help_marker("Выкл.: облако по цвету открыто только для тёмных целей (дрон на фоне облака тёмный), на экране "
+                        "такие тайлы закрашены едва заметно.");
+        }
+        blk |= ImGui::Checkbox("Цель у самой земли — только когда полетела", &d.near_edge);
+        help_marker("Кончики веток и верхушки елей заходят в открытый тайл неба над кромкой и на фоне тёмных облаков "
+                    "или в дымке дают 60-75% ложных захватов неподвижной камеры. Цель, родившаяся в тайле неба рядом с "
+                    "землёй (не дальше 16 пикс. от закрытого тайла, а на камере до 20 к/с — во всём тайле), "
+                    "подтверждается, только когда полетела, как у кромки. 14 к/с: захват на дроне 76 -> 84%.");
+        {
+            bool lc = d.leaf_color > 0;
+            if (ImGui::Checkbox("Лист у камеры — не цель (по цвету)", &lc)) {
+                d.leaf_color = lc ? DetectorConfig().leaf_color : 0.f;
+                blk = true;
+            }
+        }
+        help_marker("Лист, пролетающий у самого объектива, — тёмное пятно, которое летит, как дрон. По цвету это листва: "
+                    "зелёное, жёлтое, оранжевое, красное или бурое (синего меньше яркости или зелёный выше красного и "
+                    "синего), и окрашено сильнее неба вокруг. Серый или чёрный дрон на фоне неба — смесь серого с цветом "
+                    "фона и окрашен не сильнее его. Трек, у которого среди последних 32 замеров цвета два таких, — лист: "
+                    "не захватывается, захват с него снимается. Нужно цветное видео. Дрон хаки или оливковый вблизи "
+                    "окрашен, как листва, — тогда выключить.");
+        blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
+        help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
+                    "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
+                    "лесом: 16% -> 52%, ложных не больше.");
+        blk |= ImGui::Checkbox("Накопление слабых целей (опыт)", &d.tbd);
+        help_marker("Track-before-detect: ячейка, где отклик чуть выше её фона кадр за кадром, даёт кандидата и ниже "
+                    "порога. Пока не окупается: на 16 Мп дальних 19% -> 28%, но на других сценах прироста нет, а ложных "
+                    "+10..70 в минуту; +4.7 мс на 16 Мп.");
+        label("полоса у горизонта, пикс.",
+              "Полоса над кромкой земли (по маске неба) смотрится каждый кадр, небо выше — раз в N кадров и вокруг "
+              "уже найденных целей. Дальние дроны — низко над горизонтом, близкие — выше, крупнее и контрастнее. "
+              "16 Мп, полоса 512: раз в 2 — без потерь, раз в 3 — на 24% быстрее, высокие цели 97% -> 90%.");
+        blk |= ImGui::SliderInt("##band", &d.band_px, 0, 1024, d.band_px > 0 ? "%d" : "выкл.");
+        if (d.band_px > 0) {
+            label("небо выше полосы раз в, кадров");
+            blk |= ImGui::SliderInt("##upev", &d.upper_every, 1, 4, d.upper_every > 1 ? "%d" : "каждый");
+        }
+        bool stOn = t.static_frames > 0;
+        if (ImGui::Checkbox("Память статичных помех", &stOn)) {
+            t.static_frames = stOn ? 3000 : 0;
+            blk = true;
+        }
+        help_marker("Места, где цели раз за разом появляются и никуда не летят (катушки и изоляторы ЛЭП, фонари, "
+                    "антенны), запоминаются, и там больше не рождаются цели. Дрон, пролетающий мимо такого места, не "
+                    "теряется. Память лежит рядом с видео (.static.bin). При учёте движения камеры не ведётся.");
+        if (stOn) {
+            ImGui::Indent();
+            label("запомнить после, откликов", "Меньше — быстрее учится, но зависший на одном месте дрон тоже может "
+                                               "стать «помехой».");
+            changed |= ImGui::SliderFloat("##sthits", &t.static_hits, 3, 40, "%.0f");
+            label("забывать за, кадров");
+            changed |= ImGui::SliderInt("##stframes", &t.static_frames, 300, 30000, "%d", ImGuiSliderFlags_Logarithmic);
+            if (ImGui::SmallButton("сохранить память")) a.pipe.staticSave();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("забыть всё")) a.pipe.staticClear();
+            ImGui::Unindent();
+        }
+    }
+
+    if (heading("Экономия", true)) {
+        label("весь кадр раз в, кадров",
+              "В остальные кадры детектор смотрит только вокруг уже найденных целей. Ведомая цель не теряется, новая "
+              "находится с задержкой до N-1 кадров. На 16 Мп раз в 2 кадра — минус ~35% времени.");
+        blk |= ImGui::SliderInt("##fullev", &d.full_every, 1, 4, d.full_every > 1 ? "%d" : "каждый");
+        label("крупные масштабы раз в, кадров",
+              "Уменьшенные копии кадра (поиск крупной цели) целиком — раз в N кадров, а между ними только если крупная "
+              "цель уже ведётся. 16 Мп, 3 масштаба: 7.4 мс -> 5.7 (раз в 2) -> 4.8 (раз в 4).");
+        blk |= ImGui::SliderInt("##coarseev", &d.coarse_every, 1, 4, d.coarse_every > 1 ? "%d" : "каждый");
+        if (blk) {
+            a.profIdx = -1;
             changed = true;
         }
-        label("резкость поворота", "Какую долю отклонения цели от центра поворотка выбирает за кадр (сверх "
-                                   "скорости цели). Больше — цель ближе к центру, но поворот дёрганее.");
-        changed |= ImGui::SliderFloat("##fgain", &a.s.followGain, 0.05f, 1.f, "%.2f");
-        label("предел поворота", "Сколько окно может повернуться за кадр, доля его ширины.");
-        changed |= ImGui::SliderFloat("##fpan", &a.s.followMaxPan, 0.005f, 0.2f, "%.3f");
-        changed |= ImGui::Checkbox("только за проверенным дроном", &a.s.followVerified);
-        help_marker("Поворачиваться только при жёстком захвате (цель проверена как дрон). Иначе окно уходит за "
-                    "первой попавшейся помехой, и настоящая цель оказывается за краем узкого поля зрения.");
-    }
-
-    heading("Неподвижная камера");
-    label("кадров на маску неба", "Тайлы, где по первым кадрам видна текстура (деревья, дома), дальше не "
-                                  "просматриваются. При учёте движения камеры маска не строится.");
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.7f);
-    blk |= ImGui::SliderInt("##mask", &a.s.learnMaskFrames, 0, 100, a.s.learnMaskFrames ? "%d" : "выкл.");
-    ImGui::SameLine();
-    if (ImGui::Button("заново", ImVec2(-FLT_MIN, 0))) a.pipe.relearnMask();
-    blk |= ImGui::Checkbox("Маска из файла", &a.s.maskFile);
-    help_marker("Маска неба лежит рядом с видео (.mask.bin): на старте она закрывает лес сразу, а не через 25 "
-                "кадров обучения (ложных треков в первые 3 с — в 6 раз меньше). Пока идут эти кадры, маска "
-                "сверяется с видимым; если камеру сдвинули и больше 10% тайлов не совпало — учится заново и "
-                "перезаписывается. «Заново» учит, не глядя в файл.");
-    bool pt2 = d.per_tile > 1;
-    if (ImGui::Checkbox("Два кандидата в тайле", &pt2)) {
-        d.per_tile = pt2 ? 2 : 1;
-        blk = true;
-    }
-    help_marker("Кроме самого сильного отклика тайла 64x64 берётся ещё один, из ячейки 16x16 подальше от первого: "
-                "дрон рядом с бликом, птицей или вторым дроном. Пара дронов в 20 пикс.: 65% -> 99%. Цена ~0.5 мс на "
-                "16 Мп.");
-    blk |= ImGui::Checkbox("Всё ниже горизонта — земля", &d.skyline);
-    help_marker("Маска неба: в каждом столбце всё ниже кромки леса или крыш считается землёй, даже гладкие места "
-                "(трава, поляна, дорога, просветы между стволами). Дрон прилетает из-за горизонта и бывает над "
-                "кромкой, ниже почти никогда. Записи War Thunder: ложных целей на кадр 8 -> ~1. Действует со "
-                "следующего обучения маски.");
-    blk |= ImGui::Checkbox("Маска уточняется по ячейкам", &d.fine_mask);
-    help_marker("Тайлы земли 64x64 у самой кромки делятся на ячейки 16x16: ячейка, где несколько секунд "
-                "подряд не бывает листвы и веток и над которой небо, становится небом (просветы между кронами, "
-                "небо над низкой крышей). Маска так детализируется со временем, пока работает камера. Нужен "
-                "фон по ячейкам у кромки.");
-    blk |= ImGui::Checkbox("Маска дорастает, где копятся помехи", &d.grow_mask);
-    help_marker("Где маска легла неточно (дальняя трава, поле у горизонта, просвет между домами), копятся "
-                "помехи. Тайл неба, где их за пару секунд в несколько раз больше среднего по небу этой сцены, "
-                "закрывается, если прирастает к маске: земля хотя бы с двух сторон и над ним не чистое небо. "
-                "Ряд тайлов над кромкой крон и крыш так не закрывается, вокруг захваченной цели тоже. Только "
-                "для неподвижной камеры.");
-    blk |= ImGui::Checkbox("Маска открывает облака", &d.mask_recheck);
-    help_marker("Облака с рваной кромкой при обучении текстурны, как кроны, и маска закрывала их — в облачную "
-                "погоду до половины неба. Закрытые так тайлы раз в 10 кадров перепроверяются: у кроны и крыши "
-                "отклик сильный по всему тайлу, у облака слабый. Слабый тайл, выше которого в столбце нет земли, "
-                "за несколько секунд открывается; цель в нём подтверждается, только когда полетела.");
-    {
-        bool pm = d.pol_mask > 0;
-        if (ImGui::Checkbox("Облака закрыты только для светлых целей", &pm)) {
-            d.pol_mask = pm ? 1 : 0;
-            blk = true;
-        }
-    }
-    help_marker("Облака дают светлую текстуру (яркие клочья на небе), а кроны, дома и трава — и тёмную, и светлую. "
-                "Тайл, который маска закрыла только из-за светлой текстуры, остаётся в поиске тёмных целей: дрон "
-                "на фоне облаков тёмный. На экране такие тайлы закрашены едва заметно. Цель там подтверждается, когда "
-                "полетела; если помехи копятся, тайл закрывается совсем. Действует со следующего обучения маски.");
-    blk |= ImGui::Checkbox("Облака по цвету", &d.sky_color);
-    help_marker("Облака у солнца дают и светлую, и тёмную текстуру (яркие клочья и голубые просветы между ними), и "
-                "маска закрывала их целиком, как кроны. По цвету кадра такой тайл — небо: не зелёный (листва, трава), "
-                "не темнее открытого неба этой сцены, без глубоких теней (у крон и домов они есть) и не стоит на "
-                "земле. Он остаётся в поиске целей (по фону своих ячеек, цель подтверждается, когда полетела), а "
-                "доращивание маски его не закрывает. Нужно цветное видео; действует со следующего обучения маски.");
-    if (d.sky_color) {
-        blk |= ImGui::Checkbox("Мягкие облака и у кромки леса", &d.sky_soft);
-        help_marker("Облако, касающееся крон, стоит на земле, и правило выше его не открывало. В облаке яркость меняется "
-                    "плавно: перепад на 1 пиксель — около четверти перепада на 4 (у листвы, веток и леса в дымке — "
-                    "половина и больше). Такой тайл цвета неба — облако и у самой кромки леса, линия горизонта через "
-                    "него не идёт. Гребень дальнего холма в дымке так же мягок, но лежит полосой в один тайл между "
-                    "гладким небом и лесом — он остаётся закрытым. Над тёмной верхушкой близкого дерева облако линию "
-                    "горизонта всё же поднимает: просвет между ними закрыт, иначе при малейшем сдвиге камеры туда "
-                    "заходят ветки.");
-        blk |= ImGui::Checkbox("Облака по цвету — и для светлых целей", &d.sky_bright);
-        help_marker("Выкл.: облако по цвету открыто только для тёмных целей (дрон на фоне облака тёмный), на экране "
-                    "такие тайлы закрашены едва заметно.");
-    }
-    blk |= ImGui::Checkbox("Цель у самой земли — только когда полетела", &d.near_edge);
-    help_marker("Кончики веток и верхушки елей заходят в открытый тайл неба над кромкой и на фоне тёмных облаков "
-                "или в дымке дают 60-75% ложных захватов неподвижной камеры. Цель, родившаяся в тайле неба рядом с "
-                "землёй (не дальше 16 пикс. от закрытого тайла, а на камере до 20 к/с — во всём тайле), "
-                "подтверждается, только когда полетела, как у кромки. 14 к/с: захват на дроне 76 -> 84%.");
-    {
-        bool lc = d.leaf_color > 0;
-        if (ImGui::Checkbox("Лист у камеры — не цель (по цвету)", &lc)) {
-            d.leaf_color = lc ? DetectorConfig().leaf_color : 0.f;
-            blk = true;
-        }
-    }
-    help_marker("Лист, пролетающий у самого объектива, — тёмное пятно, которое летит, как дрон. По цвету это листва: "
-                "зелёное, жёлтое, оранжевое, красное или бурое (синего меньше яркости или зелёный выше красного и "
-                "синего), и окрашено сильнее неба вокруг. Серый или чёрный дрон на фоне неба — смесь серого с цветом "
-                "фона и окрашен не сильнее его. Трек, у которого среди последних 32 замеров цвета два таких, — лист: "
-                "не захватывается, захват с него снимается. Нужно цветное видео. Дрон хаки или оливковый вблизи "
-                "окрашен, как листва, — тогда выключить.");
-    blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
-    help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
-                "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
-                "лесом: 16% -> 52%, ложных не больше.");
-    blk |= ImGui::Checkbox("Накопление слабых целей (опыт)", &d.tbd);
-    help_marker("Track-before-detect: ячейка, где отклик чуть выше её фона кадр за кадром, даёт кандидата и ниже "
-                "порога. Пока не окупается: на 16 Мп дальних 19% -> 28%, но на других сценах прироста нет, а ложных "
-                "+10..70 в минуту; +4.7 мс на 16 Мп.");
-    label("полоса у горизонта, пикс.",
-          "Полоса над кромкой земли (по маске неба) смотрится каждый кадр, небо выше — раз в N кадров и вокруг "
-          "уже найденных целей. Дальние дроны — низко над горизонтом, близкие — выше, крупнее и контрастнее. "
-          "16 Мп, полоса 512: раз в 2 — без потерь, раз в 3 — на 24% быстрее, высокие цели 97% -> 90%.");
-    blk |= ImGui::SliderInt("##band", &d.band_px, 0, 1024, d.band_px > 0 ? "%d" : "выкл.");
-    if (d.band_px > 0) {
-        label("небо выше полосы раз в, кадров");
-        blk |= ImGui::SliderInt("##upev", &d.upper_every, 1, 4, d.upper_every > 1 ? "%d" : "каждый");
-    }
-    bool stOn = t.static_frames > 0;
-    if (ImGui::Checkbox("Память статичных помех", &stOn)) {
-        t.static_frames = stOn ? 3000 : 0;
-        blk = true;
-    }
-    help_marker("Места, где цели раз за разом появляются и никуда не летят (катушки и изоляторы ЛЭП, фонари, "
-                "антенны), запоминаются, и там больше не рождаются цели. Дрон, пролетающий мимо такого места, не "
-                "теряется. Память лежит рядом с видео (.static.bin). При учёте движения камеры не ведётся.");
-    if (stOn) {
-        ImGui::Indent();
-        label("запомнить после, откликов", "Меньше — быстрее учится, но зависший на одном месте дрон тоже может "
-                                           "стать «помехой».");
-        changed |= ImGui::SliderFloat("##sthits", &t.static_hits, 3, 40, "%.0f");
-        label("забывать за, кадров");
-        changed |= ImGui::SliderInt("##stframes", &t.static_frames, 300, 30000, "%d", ImGuiSliderFlags_Logarithmic);
-        if (ImGui::SmallButton("сохранить память")) a.pipe.staticSave();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("забыть всё")) a.pipe.staticClear();
-        ImGui::Unindent();
-    }
-
-    heading("Экономия");
-    label("весь кадр раз в, кадров",
-          "В остальные кадры детектор смотрит только вокруг уже найденных целей. Ведомая цель не теряется, новая "
-          "находится с задержкой до N-1 кадров. На 16 Мп раз в 2 кадра — минус ~35% времени.");
-    blk |= ImGui::SliderInt("##fullev", &d.full_every, 1, 4, d.full_every > 1 ? "%d" : "каждый");
-    label("крупные масштабы раз в, кадров",
-          "Уменьшенные копии кадра (поиск крупной цели) целиком — раз в N кадров, а между ними только если крупная "
-          "цель уже ведётся. 16 Мп, 3 масштаба: 7.4 мс -> 5.7 (раз в 2) -> 4.8 (раз в 4).");
-    blk |= ImGui::SliderInt("##coarseev", &d.coarse_every, 1, 4, d.coarse_every > 1 ? "%d" : "каждый");
-    if (blk) {
-        a.profIdx = -1;
-        changed = true;
     }
 }
 
@@ -1568,181 +1592,187 @@ void tab_fine(App& a, bool& changed) {
     }
     ImGui::SetItemTooltip("Пороги, трекер и классификатор — как по умолчанию; блоки — по выбранному профилю.");
 
-    heading("Порог обнаружения");
-    {
-        FontSize f(1.05f);
-        changed |= ImGui::Checkbox("Порог по шуму", &d.auto_thr);
-    }
-    help_marker("Порог считается на каждом кадре от шума неба (как в радарах): чистое небо — порог ниже и видны "
-                "тусклые цели, шумная матрица вечером — выше и меньше ложных. Текущие шум и порог — справа на "
-                "вкладке «Цели».");
-    if (d.auto_thr) {
-        label("во сколько раз выше шума");
-        changed |= ImGui::SliderFloat("##noisek", &d.noise_k, 4, 30, "%.1f");
-        label("пределы порога");
-        changed |= ImGui::DragFloatRange2("##thrrange", &d.thr_min, &d.thr_max, 0.5f, 2, 80, "от %.0f", "до %.0f");
-    } else {
-        label("порог контраста", "Минимальная разница яркости цели и фона, уровни 0..255.");
-        changed |= ImGui::SliderFloat("##thr", &d.thr, 3, 40, "%.0f");
-    }
-    label("выше клаттера, раз");
-    changed |= ImGui::SliderFloat("##clutk", &d.clutter_k, 1, 8, "%.1f");
-    float dens = d.max_density * 100;
-    label("текстура тайла, %", "Тайл, где откликов больше этой доли, считается текстурой (листва, рябь облаков) "
-                               "и пропускается.");
-    if (ImGui::SliderFloat("##dens", &dens, 0.2f, 5, "%.1f")) {
-        d.max_density = dens / 100;
-        changed = true;
-    }
-    changed |= ImGui::Checkbox("крупная цель — не текстура", &d.compact_tex);
-    help_marker("Близкий контрастный дрон (5+ пикс.) сам даёт много откликов, и его тайл выглядел текстурой — "
-                "цель пропадала. С галочкой тайл, где все отклики собраны в одно пятно, текстурой не считается. "
-                "Синтетика: дрон 6 пикс. с контрастом 30 находится в 93% кадров вместо 29%.");
-    changed |= ImGui::Checkbox("сглаживание 3x3 (тусклые точки)", &d.smooth);
-    help_marker("Кадр сглаживается перед поиском (согласованный фильтр для точки 2-4 пикс.): шум падает втрое, "
-                "тусклая точка — меньше чем вдвое, порог вдвое ниже. Синтетика: нужный контраст 14 -> 9. Резкие "
-                "точки в 1 пикс. (запись игры) видны хуже — проверьте на своей камере.");
-    changed |= ImGui::Checkbox("положение точнее пикселя", &d.subpixel);
-    help_marker("Центр цели уточняется по пятну, а не по клетке 2x2: ошибка положения 0.8 -> 0.1-0.3 пикс. "
-                "Нужно для наведения узкой камеры и поворотки.");
-    label("порог крупных масштабов, раз", "Во сколько раз порог выше на уменьшенных масштабах: крупная близкая "
-                                          "цель контрастна, а пятна облаков на них дают ложные цели.");
-    changed |= ImGui::SliderFloat("##coarsek", &d.coarse_thr_k, 1, 6, "%.1f");
-    int kk = d.k;
-    label("макс. размер цели k, пикс.", "После пулинга (нечётное). При пулинге 2x2 цель до ~2k пикселей кадра.");
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
-    if (ImGui::SliderInt("##k", &kk, 3, 15)) {
-        d.k = kk | 1;
-        changed = true;
-    }
-    ImGui::SameLine();
-    bool pool2 = d.pool == 2;
-    if (ImGui::Checkbox("пулинг 2x2", &pool2)) {
-        d.pool = pool2 ? 2 : 1;
-        changed = true;
-    }
-    changed |= ImGui::Checkbox("Искать возле прогноза", &a.s.focus);
-    help_marker("Эксперимент: там, где трек ожидается на следующем кадре, порог ниже, чтобы не терять бледнеющую "
-                "цель. На ваших роликах пока чуть хуже, поэтому выключено.");
-    if (a.s.focus) {
-        label("порог там");
-        changed |= ImGui::SliderFloat("##focusk", &d.focus_k, 0.2f, 1, "x%.2f");
+    if (heading("Порог обнаружения", true)) {
+        {
+            FontSize f(1.05f);
+            changed |= ImGui::Checkbox("Порог по шуму", &d.auto_thr);
+        }
+        help_marker("Порог считается на каждом кадре от шума неба (как в радарах): чистое небо — порог ниже и видны "
+                    "тусклые цели, шумная матрица вечером — выше и меньше ложных. Текущие шум и порог — справа на "
+                    "вкладке «Цели».");
+        if (d.auto_thr) {
+            label("во сколько раз выше шума");
+            changed |= ImGui::SliderFloat("##noisek", &d.noise_k, 4, 30, "%.1f");
+            label("пределы порога");
+            changed |= ImGui::DragFloatRange2("##thrrange", &d.thr_min, &d.thr_max, 0.5f, 2, 80, "от %.0f", "до %.0f");
+        } else {
+            label("порог контраста", "Минимальная разница яркости цели и фона, уровни 0..255.");
+            changed |= ImGui::SliderFloat("##thr", &d.thr, 3, 40, "%.0f");
+        }
+        label("выше клаттера, раз");
+        changed |= ImGui::SliderFloat("##clutk", &d.clutter_k, 1, 8, "%.1f");
+        float dens = d.max_density * 100;
+        label("текстура тайла, %", "Тайл, где откликов больше этой доли, считается текстурой (листва, рябь облаков) "
+                                   "и пропускается.");
+        if (ImGui::SliderFloat("##dens", &dens, 0.2f, 5, "%.1f")) {
+            d.max_density = dens / 100;
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("крупная цель — не текстура", &d.compact_tex);
+        help_marker("Близкий контрастный дрон (5+ пикс.) сам даёт много откликов, и его тайл выглядел текстурой — "
+                    "цель пропадала. С галочкой тайл, где все отклики собраны в одно пятно, текстурой не считается. "
+                    "Синтетика: дрон 6 пикс. с контрастом 30 находится в 93% кадров вместо 29%.");
+        changed |= ImGui::Checkbox("сглаживание 3x3 (тусклые точки)", &d.smooth);
+        help_marker("Кадр сглаживается перед поиском (согласованный фильтр для точки 2-4 пикс.): шум падает втрое, "
+                    "тусклая точка — меньше чем вдвое, порог вдвое ниже. Синтетика: нужный контраст 14 -> 9. Резкие "
+                    "точки в 1 пикс. (запись игры) видны хуже — проверьте на своей камере.");
+        changed |= ImGui::Checkbox("положение точнее пикселя", &d.subpixel);
+        help_marker("Центр цели уточняется по пятну, а не по клетке 2x2: ошибка положения 0.8 -> 0.1-0.3 пикс. "
+                    "Нужно для наведения узкой камеры и поворотки.");
+        label("порог крупных масштабов, раз", "Во сколько раз порог выше на уменьшенных масштабах: крупная близкая "
+                                              "цель контрастна, а пятна облаков на них дают ложные цели.");
+        changed |= ImGui::SliderFloat("##coarsek", &d.coarse_thr_k, 1, 6, "%.1f");
+        int kk = d.k;
+        label("макс. размер цели k, пикс.", "После пулинга (нечётное). При пулинге 2x2 цель до ~2k пикселей кадра.");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+        if (ImGui::SliderInt("##k", &kk, 3, 15)) {
+            d.k = kk | 1;
+            changed = true;
+        }
+        ImGui::SameLine();
+        bool pool2 = d.pool == 2;
+        if (ImGui::Checkbox("пулинг 2x2", &pool2)) {
+            d.pool = pool2 ? 2 : 1;
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("Искать возле прогноза", &a.s.focus);
+        help_marker("Эксперимент: там, где трек ожидается на следующем кадре, порог ниже, чтобы не терять бледнеющую "
+                    "цель. На ваших роликах пока чуть хуже, поэтому выключено.");
+        if (a.s.focus) {
+            label("порог там");
+            changed |= ImGui::SliderFloat("##focusk", &d.focus_k, 0.2f, 1, "x%.2f");
+        }
     }
 
-    heading("Трекер и захват");
-    label("макс. радиус поиска, пикс.", "Где искать цель на следующем кадре: вокруг прогноза по её скорости. "
-                                        "Окно растёт с неуверенностью прогноза, но не больше этого.");
-    changed |= ImGui::SliderFloat("##gate", &t.gate, 5, 150, "%.0f");
-    label("манёвренность цели", "Ускорение в фильтре Калмана, пикс./кадр². Меньше — прогноз жёстче, захват "
-                                "плавно летящего дрона устойчивее; больше — не теряет резкие манёвры.");
-    changed |= ImGui::SliderFloat("##qacc", &t.q_accel, 0.25f, 20, "%.2f", ImGuiSliderFlags_Logarithmic);
-    label("держать на прогнозе, кадров", "Сколько кадров подряд цель может не находиться (ушла за провод, слилась "
-                                         "с фоном), а трек и захват идут по прогнозу.");
-    changed |= ImGui::SliderInt("##maxmiss", &t.max_miss, 1, 60);
-    label("смена захвата, раз", "Захват переходит на другую цель, только если она весомее текущей во столько раз.");
-    changed |= ImGui::SliderFloat("##lockswitch", &t.lock_switch, 1, 5, "%.1f");
-    label("подтверждение, кадров");
-    changed |= ImGui::SliderInt("##confirm", &t.confirm, 1, t.window);
-    changed |= ImGui::Checkbox("крупная цель целиком (силуэт)", &t.silhouette);
-    help_marker("У крупного БПЛА детектор находит части: крыло, хвост, подвес. Силуэт собирает их в один объект: "
-                "захват держится за центр всей цели, а части не становятся отдельными целями.");
-    if (t.silhouette) {
-        label("силуэт до, пикс.", "Больше этого — уже не цель, а земля, крона или облако.");
-        changed |= ImGui::SliderFloat("##silhmax", &t.silh_max, 50, 1000, "%.0f");
+    if (heading("Трекер и захват", true)) {
+        label("макс. радиус поиска, пикс.", "Где искать цель на следующем кадре: вокруг прогноза по её скорости. "
+                                            "Окно растёт с неуверенностью прогноза, но не больше этого.");
+        changed |= ImGui::SliderFloat("##gate", &t.gate, 5, 150, "%.0f");
+        label("манёвренность цели", "Ускорение в фильтре Калмана, пикс./кадр². Меньше — прогноз жёстче, захват "
+                                    "плавно летящего дрона устойчивее; больше — не теряет резкие манёвры.");
+        changed |= ImGui::SliderFloat("##qacc", &t.q_accel, 0.25f, 20, "%.2f", ImGuiSliderFlags_Logarithmic);
+        label("держать на прогнозе, кадров", "Сколько кадров подряд цель может не находиться (ушла за провод, слилась "
+                                             "с фоном), а трек и захват идут по прогнозу.");
+        changed |= ImGui::SliderInt("##maxmiss", &t.max_miss, 1, 60);
+        label("смена захвата, раз", "Захват переходит на другую цель, только если она весомее текущей во столько раз.");
+        changed |= ImGui::SliderFloat("##lockswitch", &t.lock_switch, 1, 5, "%.1f");
+        label("подтверждение, кадров");
+        changed |= ImGui::SliderInt("##confirm", &t.confirm, 1, t.window);
+        changed |= ImGui::Checkbox("крупная цель целиком (силуэт)", &t.silhouette);
+        help_marker("У крупного БПЛА детектор находит части: крыло, хвост, подвес. Силуэт собирает их в один объект: "
+                    "захват держится за центр всей цели, а части не становятся отдельными целями.");
+        if (t.silhouette) {
+            label("силуэт до, пикс.", "Больше этого — уже не цель, а земля, крона или облако.");
+            changed |= ImGui::SliderFloat("##silhmax", &t.silh_max, 50, 1000, "%.0f");
+        }
+        changed |= ImGui::Checkbox("ожидание размера", &t.size_predict);
+        help_marker("Видимый размер захваченной цели ведётся вместе со скоростью его изменения: дрон приближается — "
+                    "растёт, удаляется — уменьшается. По ожидаемому размеру выбирается масштаб детектора вокруг цели, "
+                    "а силуэт, внезапно ставший намного больше ожидаемого (слился с облаком или кроной), не "
+                    "принимается. Размер и «приближается / удаляется» видны в статусе захвата.");
+        bool quiet = t.quiet_frames > 0;
+        if (ImGui::Checkbox("новая точка в спокойном небе — дрон", &quiet)) {
+            t.quiet_frames = quiet ? 50 : 0;
+            changed = true;
+        }
+        help_marker("Дрон, который висит или летит прямо на камеру, по кадру почти не движется, и обычно его гасит "
+                    "карта помех. С галочкой точка, появившаяся там, где 2 с не было ни одного отклика (камера "
+                    "стоит), выдаётся как зависший дрон. Рядом появилось что-то ещё (облако, листва) — как обычно.");
+        label("у кромки — прямота полёта", "Цель, родившаяся у кромки крон, выдаётся, только если летит по прямой "
+                                           "(смещение / длина пути). Листва ходит туда-сюда (~0.4), дрон летит "
+                                           "прямо (0.9+). 0 — не проверять.");
+        changed |= ImGui::SliderFloat("##edgestraight", &t.edge_straight, 0, 0.9f, t.edge_straight > 0 ? "%.2f" : "не проверять");
+        changed |= ImGui::Checkbox("на мачте или столбе — не дрон", &t.anchor_check);
+        help_marker("Если от захваченной цели вверх или вниз тянется длинная тонкая линия (мачта прожектора, столб, "
+                    "ствол), это светильник или что-то на конструкции: захват снимается, цель становится помехой. "
+                    "При съёмке с рук такая цель «летит» по кадру и иначе может пройти проверку на дрона.");
     }
-    changed |= ImGui::Checkbox("ожидание размера", &t.size_predict);
-    help_marker("Видимый размер захваченной цели ведётся вместе со скоростью его изменения: дрон приближается — "
-                "растёт, удаляется — уменьшается. По ожидаемому размеру выбирается масштаб детектора вокруг цели, "
-                "а силуэт, внезапно ставший намного больше ожидаемого (слился с облаком или кроной), не "
-                "принимается. Размер и «приближается / удаляется» видны в статусе захвата.");
-    bool quiet = t.quiet_frames > 0;
-    if (ImGui::Checkbox("новая точка в спокойном небе — дрон", &quiet)) {
-        t.quiet_frames = quiet ? 50 : 0;
-        changed = true;
-    }
-    help_marker("Дрон, который висит или летит прямо на камеру, по кадру почти не движется, и обычно его гасит "
-                "карта помех. С галочкой точка, появившаяся там, где 2 с не было ни одного отклика (камера "
-                "стоит), выдаётся как зависший дрон. Рядом появилось что-то ещё (облако, листва) — как обычно.");
-    label("у кромки — прямота полёта", "Цель, родившаяся у кромки крон, выдаётся, только если летит по прямой "
-                                       "(смещение / длина пути). Листва ходит туда-сюда (~0.4), дрон летит "
-                                       "прямо (0.9+). 0 — не проверять.");
-    changed |= ImGui::SliderFloat("##edgestraight", &t.edge_straight, 0, 0.9f, t.edge_straight > 0 ? "%.2f" : "не проверять");
-    changed |= ImGui::Checkbox("на мачте или столбе — не дрон", &t.anchor_check);
-    help_marker("Если от захваченной цели вверх или вниз тянется длинная тонкая линия (мачта прожектора, столб, "
-                "ствол), это светильник или что-то на конструкции: захват снимается, цель становится помехой. "
-                "При съёмке с рук такая цель «летит» по кадру и иначе может пройти проверку на дрона.");
 
-    heading("Жёсткий захват дрона");
-    changed |= ImGui::Checkbox("включён", &t.hard_lock);
-    help_marker("Когда захваченная цель достаточно долго подряд классифицируется как дрон, захват становится "
-                "жёстким: «Захвачен дрон», на другие цели не переключается, дольше держится на прогнозе, "
-                "детектор смотрит в основном вокруг неё. Снимается, если цель оказалась надписью на кадре или "
-                "уверенно птицей.");
-    if (t.hard_lock) {
-        label("проверка: дрон подряд, кадров", "Сколько обработанных кадров подряд цель должна быть дроном (и уже "
-                                                "пролететь по сцене), прежде чем захват станет жёстким. Больше — "
-                                                "надёжнее, но дольше до жёсткого захвата.");
-        changed |= ImGui::SliderInt("##verify", &t.verify_frames, 1, 120);
-        label("держать на прогнозе, кадров", "Сколько кадров жёстко захваченный дрон может не находиться.");
-        changed |= ImGui::SliderInt("##hardmiss", &t.hard_miss, 5, 300);
-        label("весь кадр раз в, кадров", "Остальное время детектор смотрит только вокруг захваченного дрона: "
-                                         "быстрее и не отвлекается.");
-        changed |= ImGui::SliderInt("##hardfull", &t.hard_full_every, 1, 30);
+    if (heading("Жёсткий захват дрона", true)) {
+        changed |= ImGui::Checkbox("включён", &t.hard_lock);
+        help_marker("Когда захваченная цель достаточно долго подряд классифицируется как дрон, захват становится "
+                    "жёстким: «Захвачен дрон», на другие цели не переключается, дольше держится на прогнозе, "
+                    "детектор смотрит в основном вокруг неё. Снимается, если цель оказалась надписью на кадре или "
+                    "уверенно птицей.");
+        if (t.hard_lock) {
+            label("проверка: дрон подряд, кадров", "Сколько обработанных кадров подряд цель должна быть дроном (и уже "
+                                                    "пролететь по сцене), прежде чем захват станет жёстким. Больше — "
+                                                    "надёжнее, но дольше до жёсткого захвата.");
+            changed |= ImGui::SliderInt("##verify", &t.verify_frames, 1, 120);
+            label("держать на прогнозе, кадров", "Сколько кадров жёстко захваченный дрон может не находиться.");
+            changed |= ImGui::SliderInt("##hardmiss", &t.hard_miss, 5, 300);
+            label("весь кадр раз в, кадров", "Остальное время детектор смотрит только вокруг захваченного дрона: "
+                                             "быстрее и не отвлекается.");
+            changed |= ImGui::SliderInt("##hardfull", &t.hard_full_every, 1, 30);
+        }
+        bool slow = t.lock_slow > 0;
+        if (ImGui::Checkbox("захват: сначала мелкий медленный дрон", &slow)) {
+            t.lock_slow = slow ? 1.f : 0.f;
+            t.hard_switch = slow ? 2.f : 0.f;
+            changed = true;
+        }
+        help_marker("Из нескольких целей захват берёт ту, что медленнее и уже пролетела по сцене, а не самую "
+                    "контрастную: самолёт и вертолёт крупнее и быстрее дрона. Зависшая на месте точка уступает "
+                    "летящим, а жёсткий захват переходит только на цель вдвое весомее, которую ведёт камера. Записи War Thunder: дроны в захвате "
+                    "31% -> 47%, самолёты и вертолёты 53% -> 45%. Выключено — захват на самой контрастной цели.");
     }
-    bool slow = t.lock_slow > 0;
-    if (ImGui::Checkbox("захват: сначала мелкий медленный дрон", &slow)) {
-        t.lock_slow = slow ? 1.f : 0.f;
-        t.hard_switch = slow ? 2.f : 0.f;
-        changed = true;
-    }
-    help_marker("Из нескольких целей захват берёт ту, что медленнее и уже пролетела по сцене, а не самую "
-                "контрастную: самолёт и вертолёт крупнее и быстрее дрона. Зависшая на месте точка уступает "
-                "летящим, а жёсткий захват переходит только на цель вдвое весомее, которую ведёт камера. Записи War Thunder: дроны в захвате "
-                "31% -> 47%, самолёты и вертолёты 53% -> 45%. Выключено — захват на самой контрастной цели.");
 
-    heading("Птица или дрон");
-    label("отклонение от траектории, пикс.", "Средний разброс точек трека вокруг плавной траектории за последние "
-                                             "16 попаданий. Дрон летит плавно (~1 пикс.), ласточка дёргается (3-10).");
-    changed |= ImGui::SliderFloat("##birdresid", &t.bird_resid, 0.5f, 10, "%.1f");
-    label("мигание контраста (взмахи)");
-    changed |= ImGui::SliderFloat("##birdcv", &t.bird_contrast_cv, 0.05f, 1, "%.2f");
-    label("скорость птицы, пикс./кадр");
-    changed |= ImGui::SliderFloat("##birdspeed", &t.bird_speed, 0, 40, t.bird_speed > 0 ? "%.0f" : "не учитывать");
-    label("попаданий до решения");
-    changed |= ImGui::SliderInt("##clsmin", &t.cls_min_hits, 3, t.cls_window);
+    if (heading("Птица или дрон", true)) {
+        label("отклонение от траектории, пикс.", "Средний разброс точек трека вокруг плавной траектории за последние "
+                                                 "16 попаданий. Дрон летит плавно (~1 пикс.), ласточка дёргается (3-10).");
+        changed |= ImGui::SliderFloat("##birdresid", &t.bird_resid, 0.5f, 10, "%.1f");
+        label("мигание контраста (взмахи)");
+        changed |= ImGui::SliderFloat("##birdcv", &t.bird_contrast_cv, 0.05f, 1, "%.2f");
+        label("скорость птицы, пикс./кадр");
+        changed |= ImGui::SliderFloat("##birdspeed", &t.bird_speed, 0, 40, t.bird_speed > 0 ? "%.0f" : "не учитывать");
+        label("попаданий до решения");
+        changed |= ImGui::SliderInt("##clsmin", &t.cls_min_hits, 3, t.cls_window);
+    }
 }
 
 void tab_view(App& a) {
-    heading("Видео на экране");
-    static const char* modes[] = {"каждый кадр", "до 30 к/с", "до 10 к/с", "не показывать видео"};
-    label("обновление картинки", "Отрисовка 16 Мп кадра тоже тратит CPU. Для чистого замера скорости выберите "
-                                 "«не показывать».");
-    ImGui::Combo("##dispmode", &a.displayMode, modes, 4);
-    heading("Что рисовать на кадре");
-    if (ImGui::BeginTable("show", 2, ImGuiTableFlags_SizingStretchSame)) {
-        auto item = [](const char* name, bool* v, const char* help = nullptr) {
-            ImGui::TableNextColumn();
-            ImGui::Checkbox(name, v);
-            if (help) help_marker(help);
-        };
-        item("цели и классы", &a.showTracks);
-        item("траектории", &a.showPaths);
-        item("номера целей", &a.showIds);
-        item("прогноз движения", &a.showPred,
-             "Линия — куда цель придёт за 10 кадров при нынешней скорости (у захвата и устоявшихся треков). "
-             "Пунктирная рамка — трек идёт по прогнозу; у захвата круг — где цель может быть (3 сигмы).");
-        item("шум", &a.showNoise);
-        item("помехи", &a.showClutter);
-        item("маска неба и зоны", &a.showMask);
-        item("менее важное небо", &a.showUpper,
-             "Фиолетовым — небо, где дрон бывает реже: дальний дрон держится низко над горизонтом, а верх неба "
-             "нужен только близкой, крупной цели. С полосой у горизонта (вкладка «Алгоритм») это небо выше полосы, "
-             "его детектор смотрит раз в несколько кадров; без полосы — верхние 30% неба над землёй в каждом "
-             "столбце, они смотрятся каждый кадр, подсветка только показывает, где это.");
-        item("пониженный порог", &a.showFocus);
-        item("разметка (.gt.json)", &a.showGt);
-        item("вырезки целей", &a.showCrops);
-        ImGui::EndTable();
+    if (heading("Видео на экране", true)) {
+        static const char* modes[] = {"каждый кадр", "до 30 к/с", "до 10 к/с", "не показывать видео"};
+        label("обновление картинки", "Отрисовка 16 Мп кадра тоже тратит CPU. Для чистого замера скорости выберите "
+                                     "«не показывать».");
+        ImGui::Combo("##dispmode", &a.displayMode, modes, 4);
+    }
+    if (heading("Что рисовать на кадре", true)) {
+        if (ImGui::BeginTable("show", 2, ImGuiTableFlags_SizingStretchSame)) {
+            auto item = [](const char* name, bool* v, const char* help = nullptr) {
+                ImGui::TableNextColumn();
+                ImGui::Checkbox(name, v);
+                if (help) help_marker(help);
+            };
+            item("цели и классы", &a.showTracks);
+            item("траектории", &a.showPaths);
+            item("номера целей", &a.showIds);
+            item("прогноз движения", &a.showPred,
+                 "Линия — куда цель придёт за 10 кадров при нынешней скорости (у захвата и устоявшихся треков). "
+                 "Пунктирная рамка — трек идёт по прогнозу; у захвата круг — где цель может быть (3 сигмы).");
+            item("шум", &a.showNoise);
+            item("помехи", &a.showClutter);
+            item("маска неба и зоны", &a.showMask);
+            item("менее важное небо", &a.showUpper,
+                 "Фиолетовым — небо, где дрон бывает реже: дальний дрон держится низко над горизонтом, а верх неба "
+                 "нужен только близкой, крупной цели. С полосой у горизонта (вкладка «Алгоритм») это небо выше полосы, "
+                 "его детектор смотрит раз в несколько кадров; без полосы — верхние 30% неба над землёй в каждом "
+                 "столбце, они смотрятся каждый кадр, подсветка только показывает, где это.");
+            item("пониженный порог", &a.showFocus);
+            item("разметка (.gt.json)", &a.showGt);
+            item("вырезки целей", &a.showCrops);
+            ImGui::EndTable();
+        }
     }
 }
 
@@ -2482,229 +2512,239 @@ void panel_twocam(App& a) {
         a.emu.setSpeed(speeds[a.emuSpeed]);
     }
 
-    heading("Мир");
-    {
-        static const char* ws[] = {"Синтетическое небо", "3D-сцена"};
-        static const char* wt[] = {"Небо с облаками и кромкой леса, считается в самом приложении.",
-                                   "Сцена Godot (лес, частный сектор, многоэтажки): рисует отдельная программа на своих "
-                                   "ядрах, кадры и правда о целях приходят по запросу на модельный момент — скорость "
-                                   "отрисовки не влияет на работу и замеры алгоритма."};
-        if (segmented("emuworld", ws, 2, a.emuWorld, 0, wt) && a.emuWorld == 1) sim_scan(a);
-    }
-    if (a.emuWorld == 1) {
-        if (a.simDir.empty()) {
-            ImGui::TextWrapped("Нет папки sim рядом с программой (sim/godot, sim/scenes). Она входит в сборку Dronolok-win64.");
-        } else {
-            label("Сцена");
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::BeginCombo("##scene", a.simScenes.empty() ? "нет сцен" : a.simScenes[a.simScene].c_str())) {
-                for (int i = 0; i < (int)a.simScenes.size(); ++i)
-                    if (ImGui::Selectable(a.simScenes[i].c_str(), i == a.simScene)) {
-                        a.simScene = i;
-                        a.simSectors = scene::scene_sectors(a.simDir + "/scenes/" + a.simScenes[i]);
-                    }
-                ImGui::EndCombo();
+    if (heading("Мир", true)) {
+        {
+            static const char* ws[] = {"Синтетическое небо", "3D-сцена"};
+            static const char* wt[] = {"Небо с облаками и кромкой леса, считается в самом приложении.",
+                                       "Сцена Godot (лес, частный сектор, многоэтажки): рисует отдельная программа на своих "
+                                       "ядрах, кадры и правда о целях приходят по запросу на модельный момент — скорость "
+                                       "отрисовки не влияет на работу и замеры алгоритма."};
+            if (segmented("emuworld", ws, 2, a.emuWorld, 0, wt) && a.emuWorld == 1) sim_scan(a);
+        }
+        if (a.emuWorld == 1) {
+            if (a.simDir.empty()) {
+                ImGui::TextWrapped("Нет папки sim рядом с программой (sim/godot, sim/scenes). Она входит в сборку Dronolok-win64.");
+            } else {
+                label("Сцена");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##scene", a.simScenes.empty() ? "нет сцен" : a.simScenes[a.simScene].c_str())) {
+                    for (int i = 0; i < (int)a.simScenes.size(); ++i)
+                        if (ImGui::Selectable(a.simScenes[i].c_str(), i == a.simScene)) {
+                            a.simScene = i;
+                            a.simSectors = scene::scene_sectors(a.simDir + "/scenes/" + a.simScenes[i]);
+                        }
+                    ImGui::EndCombo();
+                }
+                label("Godot 4.3", "Программа, которая рисует сцену. В сборке лежит в sim\\Godot.exe.");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputText("##godot", a.godotPath, sizeof(a.godotPath))) {}
+                if (!a.godotPath[0]) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Godot не найден: укажите путь к Godot 4.3");
+                const int n = std::min(64, plat::logical_cpus());
+                label("Ядра для отрисовки сцены",
+                      "Столько последних ядер получает только Godot, алгоритм работает на остальных (это видно и во "
+                      "вкладке «Железо»). 0 — общие ядра. Видеокарту сцена занимает свою, ограничение CPU алгоритма на "
+                      "неё не действует.");
+                ImGui::SliderInt("##rcores", &a.renderCores, 0, std::max(0, n - 1), a.renderCores ? "%d" : "общие");
             }
-            label("Godot 4.3", "Программа, которая рисует сцену. В сборке лежит в sim\\Godot.exe.");
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::InputText("##godot", a.godotPath, sizeof(a.godotPath))) {}
-            if (!a.godotPath[0]) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Godot не найден: укажите путь к Godot 4.3");
-            const int n = std::min(64, plat::logical_cpus());
-            label("Ядра для отрисовки сцены",
-                  "Столько последних ядер получает только Godot, алгоритм работает на остальных (это видно и во "
-                  "вкладке «Железо»). 0 — общие ядра. Видеокарту сцена занимает свою, ограничение CPU алгоритма на "
-                  "неё не действует.");
-            ImGui::SliderInt("##rcores", &a.renderCores, 0, std::max(0, n - 1), a.renderCores ? "%d" : "общие");
         }
     }
 
-    heading("Поворот широкой камеры");
-    {
-        twocam::Config& cc = a.emuCfg;
-        const twocam::Pose cur = a.emu.running() ? a.emuView.widePose : twocam::Pose{cc.wideAz, cc.wideEl, 0};
-        ImGui::Text("Азимут %.0f°, угол места %.0f°", cur.az, cur.el);
-        bool turn = false;
-        const float bw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4;
-        const float steps[] = {-30, -5, 5, 30};
-        const char* names[] = {"-30°", "-5°", "+5°", "+30°"};
-        for (int i = 0; i < 4; ++i) {
-            if (i) ImGui::SameLine();
-            if (ImGui::Button(names[i], ImVec2(bw, 0))) {
-                cc.wideAz = std::fmod(cc.wideAz + steps[i] + 360.f, 360.f);
-                turn = true;
-            }
-        }
-        ImGui::SetItemTooltip("Повернуть по азимуту. Стрелки ← → на клавиатуре — по 5°, ↑ ↓ — угол места.");
-        if (ImGui::Button("Выше 5°", ImVec2(bw * 2 + ImGui::GetStyle().ItemSpacing.x, 0))) {
-            cc.wideEl = std::min(80.f, cc.wideEl + 5);
-            turn = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Ниже 5°", ImVec2(-FLT_MIN, 0))) {
-            cc.wideEl = std::max(-5.f, cc.wideEl - 5);
-            turn = true;
-        }
-        if (a.emuWorld == 1 && !a.simSectors.empty()) {
-            const float sw = (ImGui::GetContentRegionAvail().x - (a.simSectors.size() - 1) * ImGui::GetStyle().ItemSpacing.x) /
-                             a.simSectors.size();
-            for (size_t i = 0; i < a.simSectors.size(); ++i) {
-                const auto& sc = a.simSectors[i];
-                static const char* ru[][2] = {{"forest", "Лес"}, {"lowrise", "Частный"}, {"highrise", "Многоэтажки"}};
-                const char* nm = sc.name.c_str();
-                for (const auto& r : ru)
-                    if (sc.name == r[0]) nm = r[1];
+    if (heading("Поворот широкой камеры", true)) {
+        {
+            twocam::Config& cc = a.emuCfg;
+            const twocam::Pose cur = a.emu.running() ? a.emuView.widePose : twocam::Pose{cc.wideAz, cc.wideEl, 0};
+            ImGui::Text("Азимут %.0f°, угол места %.0f°", cur.az, cur.el);
+            bool turn = false;
+            const float bw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4;
+            const float steps[] = {-30, -5, 5, 30};
+            const char* names[] = {"-30°", "-5°", "+5°", "+30°"};
+            for (int i = 0; i < 4; ++i) {
                 if (i) ImGui::SameLine();
-                ImGui::PushID((int)i);
-                if (ImGui::Button(nm, ImVec2(sw, 0))) {
-                    cc.wideAz = sc.mid;
+                if (ImGui::Button(names[i], ImVec2(bw, 0))) {
+                    cc.wideAz = std::fmod(cc.wideAz + steps[i] + 360.f, 360.f);
                     turn = true;
                 }
-                ImGui::SetItemTooltip("Сектор %s: %.0f–%.0f°", sc.name.c_str(), sc.from, sc.to);
-                ImGui::PopID();
             }
+            ImGui::SetItemTooltip("Повернуть по азимуту. Стрелки ← → на клавиатуре — по 5°, ↑ ↓ — угол места.");
+            if (ImGui::Button("Выше 5°", ImVec2(bw * 2 + ImGui::GetStyle().ItemSpacing.x, 0))) {
+                cc.wideEl = std::min(80.f, cc.wideEl + 5);
+                turn = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Ниже 5°", ImVec2(-FLT_MIN, 0))) {
+                cc.wideEl = std::max(-5.f, cc.wideEl - 5);
+                turn = true;
+            }
+            if (a.emuWorld == 1 && !a.simSectors.empty()) {
+                const float sw = (ImGui::GetContentRegionAvail().x - (a.simSectors.size() - 1) * ImGui::GetStyle().ItemSpacing.x) /
+                                 a.simSectors.size();
+                for (size_t i = 0; i < a.simSectors.size(); ++i) {
+                    const auto& sc = a.simSectors[i];
+                    static const char* ru[][2] = {{"forest", "Лес"}, {"lowrise", "Частный"}, {"highrise", "Многоэтажки"}};
+                    const char* nm = sc.name.c_str();
+                    for (const auto& r : ru)
+                        if (sc.name == r[0]) nm = r[1];
+                    if (i) ImGui::SameLine();
+                    ImGui::PushID((int)i);
+                    if (ImGui::Button(nm, ImVec2(sw, 0))) {
+                        cc.wideAz = sc.mid;
+                        turn = true;
+                    }
+                    ImGui::SetItemTooltip("Сектор %s: %.0f–%.0f°", sc.name.c_str(), sc.from, sc.to);
+                    ImGui::PopID();
+                }
+            }
+            if (turn && a.emu.running()) a.emu.setWidePose(cc.wideAz, cc.wideEl);
         }
-        if (turn && a.emu.running()) a.emu.setWidePose(cc.wideAz, cc.wideEl);
     }
 
-    heading("Маска неба");
-    ImGui::Checkbox("Панорамная маска 360°", &c.panoMask);
-    ImGui::SetItemTooltip("Маска неба копится по кругу: после поворота широкая берёт маску из панорамы, если та "
-                          "покрывает от 85%% вида, и не учится заново. Применяется при перезапуске.");
-    ImGui::Checkbox("Показывать маску на широкой", &a.emuShowMask);
-    ImGui::SetItemTooltip("Закрытые маской тайлы (земля, дома, деревья) — затемнены красным, пока маска учится — "
-                          "рамка жёлтая.");
-    if (a.emu.running() && c.panoMask) {
-        const twocam::View& v = a.emuView;
-        ImGui::BeginDisabled(v.scanning);
-        if (ImGui::Button(v.scanning ? "Идёт обзор 360°..." : "Обзор 360°", ImVec2(-FLT_MIN, 0))) a.emu.startScan();
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Широкая проходит круг шагами в полкадра и учит маску на каждом, потом возвращается.");
-        draw_pano(a);
+    if (heading("Переключение целей", true)) {
+        static const char* modes[] = {"Вручную", "По очереди", "Ближайшая"};
+        static const char* mtips[] = {
+            "Точная берёт цель, подтверждённую широкой как дрон, и держит её. Другую — щелчком по цели на "
+            "широкой, кнопкой справа или Tab.",
+            "Ведёт цель заданное время, потом переходит к следующей в очереди широкой (по весомости).",
+            "Ведёт цель заданное время, потом переходит к той, до которой меньше поворачиваться."};
+        int m = (int)c.switchMode;
+        if (segmented("emumode", modes, 3, m, 0, mtips)) {
+            c.switchMode = (twocam::SwitchMode)m;
+            a.emu.setSwitchMode(c.switchMode);
+        }
+        if (ImGui::Button("Следующая цель (Tab)", ImVec2(-FLT_MIN, 0))) a.emu.nextTarget();
+        label("Вести цель, с", "В авто-режимах: столько точная ведёт цель, прежде чем перейти к следующей.");
+        ImGui::SliderFloat("##dwell", &c.dwell, 1, 30, "%.0f с");
+        ImGui::Checkbox("Только дроны (птиц широкой пропускать)", &c.dronesOnly);
     }
 
-    heading("Переключение целей");
-    static const char* modes[] = {"Вручную", "По очереди", "Ближайшая"};
-    static const char* mtips[] = {
-        "Точная берёт цель, подтверждённую широкой как дрон, и держит её. Другую — щелчком по цели на "
-        "широкой, кнопкой справа или Tab.",
-        "Ведёт цель заданное время, потом переходит к следующей в очереди широкой (по весомости).",
-        "Ведёт цель заданное время, потом переходит к той, до которой меньше поворачиваться."};
-    int m = (int)c.switchMode;
-    if (segmented("emumode", modes, 3, m, 0, mtips)) {
-        c.switchMode = (twocam::SwitchMode)m;
-        a.emu.setSwitchMode(c.switchMode);
+    if (heading("Маска неба", true)) {
+        ImGui::Checkbox("Панорамная маска 360°", &c.panoMask);
+        ImGui::SetItemTooltip("Маска неба копится по кругу: после поворота широкая берёт маску из панорамы, если та "
+                              "покрывает от 85%% вида, и не учится заново. Применяется при перезапуске.");
+        ImGui::Checkbox("Показывать маску на широкой", &a.emuShowMask);
+        ImGui::SetItemTooltip("Закрытые маской тайлы (земля, дома, деревья) — затемнены красным, пока маска учится — "
+                              "рамка жёлтая.");
+        if (a.emu.running() && c.panoMask) {
+            const twocam::View& v = a.emuView;
+            ImGui::BeginDisabled(v.scanning);
+            if (ImGui::Button(v.scanning ? "Учится по кругу..." : "Обучить маску на панораме", ImVec2(-FLT_MIN, 0))) a.emu.startScan();
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip("Одной кнопкой строит круговую маску: широкая проходит 360° шагами в полкадра, учит маску на каждом виде, "
+                                  "складывает в панораму и возвращается. Дальше при любом повороте маска берётся из панорамы.");
+            draw_pano(a);
+        }
     }
-    if (ImGui::Button("Следующая цель (Tab)", ImVec2(-FLT_MIN, 0))) a.emu.nextTarget();
-    label("Вести цель, с", "В авто-режимах: столько точная ведёт цель, прежде чем перейти к следующей.");
-    ImGui::SliderFloat("##dwell", &c.dwell, 1, 30, "%.0f с");
-    ImGui::Checkbox("Только дроны (птиц широкой пропускать)", &c.dronesOnly);
 
-    heading("Точная камера на поворотке");
-    label("Максимальная скорость поворота", "По каждой оси. Маленькая скорость — дольше до цели и легче потерять "
-                                            "быструю близкую цель.");
-    ImGui::SliderFloat("##rate", &c.maxRate, 5, 180, "%.0f °/с");
-    label("Ускорение поворотки");
-    ImGui::SliderFloat("##acc", &c.maxAccel, 20, 1000, "%.0f °/с²", ImGuiSliderFlags_Logarithmic);
-    label("Зум (поле зрения 20° без зума)", "Зум сужает поле точной: ошибка захвата в градусах падает во столько же "
-                                          "раз (x2 — 0.015°, x4 — 0.008° на эмуляторе), но захват дольше, и близкую "
-                                          "быструю цель легче упустить из кадра. Дальние цели, которых не видит широкая, "
-                                          "зум не вернёт: точную наводит широкая.");
-    {
-        static const char* zs[] = {"x1", "x2", "x4"};
-        int z = c.narrowFov > 15 ? 0 : c.narrowFov > 7.5f ? 1 : 2;
-        if (segmented("emuzoom", zs, 3, z)) c.narrowFov = 20.f / (1 << z);
+    if (heading("Точная камера на поворотке", true)) {
+        label("Максимальная скорость поворота", "По каждой оси. Маленькая скорость — дольше до цели и легче потерять "
+                                                "быструю близкую цель.");
+        ImGui::SliderFloat("##rate", &c.maxRate, 5, 180, "%.0f °/с");
+        label("Ускорение поворотки");
+        ImGui::SliderFloat("##acc", &c.maxAccel, 20, 1000, "%.0f °/с²", ImGuiSliderFlags_Logarithmic);
+        label("Зум (поле зрения 20° без зума)", "Зум сужает поле точной: ошибка захвата в градусах падает во столько же "
+                                              "раз (x2 — 0.015°, x4 — 0.008° на эмуляторе), но захват дольше, и близкую "
+                                              "быструю цель легче упустить из кадра. Дальние цели, которых не видит широкая, "
+                                              "зум не вернёт: точную наводит широкая.");
+        {
+            static const char* zs[] = {"x1", "x2", "x4"};
+            int z = c.narrowFov > 15 ? 0 : c.narrowFov > 7.5f ? 1 : 2;
+            if (segmented("emuzoom", zs, 3, z)) c.narrowFov = 20.f / (1 << z);
+        }
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderFloat("##nfov", &c.narrowFov, 2, 40, "%.1f°");
+        label("Частота кадров");
+        ImGui::SliderFloat("##nfps", &c.narrowFps, 15, 240, "%.0f к/с");
+        label("Задержка передачи цели", "От кадра широкой до команды поворотке: обработка, связь между Pi.");
+        ImGui::SliderFloat("##lat", &c.handoffLatency, 0, 0.5f, "%.2f с");
+        label("Дискретность датчиков угла");
+        ImGui::SliderFloat("##enc", &c.encoderDeg, 0.001f, 0.1f, "%.3f°", ImGuiSliderFlags_Logarithmic);
     }
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::SliderFloat("##nfov", &c.narrowFov, 2, 40, "%.1f°");
-    label("Частота кадров");
-    ImGui::SliderFloat("##nfps", &c.narrowFps, 15, 240, "%.0f к/с");
-    label("Задержка передачи цели", "От кадра широкой до команды поворотке: обработка, связь между Pi.");
-    ImGui::SliderFloat("##lat", &c.handoffLatency, 0, 0.5f, "%.2f с");
-    label("Дискретность датчиков угла");
-    ImGui::SliderFloat("##enc", &c.encoderDeg, 0.001f, 0.1f, "%.3f°", ImGuiSliderFlags_Logarithmic);
 
-    heading("Алгоритм точной");
-    ImGui::Checkbox("Сдвиг кадра по датчикам угла", &c.encoderMotion);
-    help_marker("Поворотка знает, на сколько повернулась: сдвиг картинки считается по углам точно и "
-                "мгновенно. Выключено — оценка по самому кадру, как при съёмке с рук.");
-    ImGui::Checkbox("Поворот со скоростью цели", &c.feedForward);
-    help_marker("Поворотка сразу идёт со скоростью цели (по сообщению широкой или по треку точной) и "
-                "с упреждением на кадр, а ошибку до центра добирает. Выключено — только по ошибке.");
-    ImGui::Checkbox("Окно поиска от широкой", &c.windowFocus);
-    help_marker("В окне, где по прогнозу должна быть цель, порог ниже, и берётся ближайший к прогнозу "
-                "трек внутри окна. Выключено — порог везде обычный, и берётся ближайший к прогнозу трек по "
-                "всему кадру точной.");
-    ImGui::Checkbox("Пониженный порог у своей цели", &c.lockFocus);
-    help_marker("Пока точная ведёт цель, вокруг её прогноза порог тоже ниже: слабая дальняя цель не "
-                "пропадает на кадр и не подхватывается заново новым треком.");
-    label("Отказ от цели, с", "Если за это время точная так и не удержала цель (ищет, берёт и теряет), она "
-                              "считает цель неподтверждённой и в авто-режимах переходит к следующей. "
-                              "К этой цели — не раньше чем через 10 с.");
-    ImGui::SliderFloat("##giveup", &c.giveUp, 1, 15, "%.1f с");
+    if (heading("Алгоритм точной", true)) {
+        ImGui::Checkbox("Сдвиг кадра по датчикам угла", &c.encoderMotion);
+        help_marker("Поворотка знает, на сколько повернулась: сдвиг картинки считается по углам точно и "
+                    "мгновенно. Выключено — оценка по самому кадру, как при съёмке с рук.");
+        ImGui::Checkbox("Поворот со скоростью цели", &c.feedForward);
+        help_marker("Поворотка сразу идёт со скоростью цели (по сообщению широкой или по треку точной) и "
+                    "с упреждением на кадр, а ошибку до центра добирает. Выключено — только по ошибке.");
+        ImGui::Checkbox("Окно поиска от широкой", &c.windowFocus);
+        help_marker("В окне, где по прогнозу должна быть цель, порог ниже, и берётся ближайший к прогнозу "
+                    "трек внутри окна. Выключено — порог везде обычный, и берётся ближайший к прогнозу трек по "
+                    "всему кадру точной.");
+        ImGui::Checkbox("Пониженный порог у своей цели", &c.lockFocus);
+        help_marker("Пока точная ведёт цель, вокруг её прогноза порог тоже ниже: слабая дальняя цель не "
+                    "пропадает на кадр и не подхватывается заново новым треком.");
+        label("Отказ от цели, с", "Если за это время точная так и не удержала цель (ищет, берёт и теряет), она "
+                                  "считает цель неподтверждённой и в авто-режимах переходит к следующей. "
+                                  "К этой цели — не раньше чем через 10 с.");
+        ImGui::SliderFloat("##giveup", &c.giveUp, 1, 15, "%.1f с");
+    }
 
-    heading("Обмен между камерами");
-    ImGui::Checkbox("Крупная цель — по силуэту", &c.narrowSilhouette);
-    help_marker("Крупный дрон на точной — десятки пикселей, детектор находит на нём несколько точек (концы "
-                "крыльев, нос, хвост). Точная ведёт центр силуэта и не перескакивает с одной части на другую.");
-    ImGui::Checkbox("Точная держит цель без широкой", &c.narrowHold);
-    help_marker("Точная ведёт цель и сама видит, что это дрон: если широкая потеряла цель или её трек ушёл на "
-                "другую цель (соседа, облако), точная не бросает свою, а ведёт её дальше. Как только широкая снова "
-                "видит цель, точная передаёт ей номер её трека.");
-    ImGui::Checkbox("Точная отсеивает птиц", &c.narrowVeto);
-    help_marker("На точной цель крупнее и кадров вчетверо больше — взмахи крыльев видны. Цель, которую точная "
-                "видит птицей, отсеивается, и к ней (и к новым трекам широкой на её пути) точная 30 с не "
-                "возвращается. Цель, выбранную вручную, не отсеивает.");
-    ImGui::Checkbox("Птица по силуэту", &c.narrowShape);
-    help_marker("Сразу после захвата точная смотрит, как меняется силуэт цели: крылья птицы машут (3–12 Гц), "
-                "и «масса» силуэта колеблется, а дрон жёсткий. Решение — за полсекунды; с зумом x4 птица на "
-                "точной в несколько пикселей, и взмахи видны даже у дальних.");
-    ImGui::Checkbox("Сообщать широкой о птице", &c.vetoToWide);
-    help_marker("Трек широкой, который точная рассмотрела и отсеяла, у широкой становится птицей (и новые "
-                "треки там, где по прогнозу летит отсеянная): жёсткий захват широкой с него снимается.");
-    ImGui::Checkbox("Точная подсказывает широкой", &c.wideCue);
-    help_marker("Где точная видит подтверждённый дрон, у широкой порог ниже: потерянную цель она находит "
-                "снова быстрее, а слабую не теряет.");
+    if (heading("Обмен между камерами", true)) {
+        ImGui::Checkbox("Крупная цель — по силуэту", &c.narrowSilhouette);
+        help_marker("Крупный дрон на точной — десятки пикселей, детектор находит на нём несколько точек (концы "
+                    "крыльев, нос, хвост). Точная ведёт центр силуэта и не перескакивает с одной части на другую.");
+        ImGui::Checkbox("Точная держит цель без широкой", &c.narrowHold);
+        help_marker("Точная ведёт цель и сама видит, что это дрон: если широкая потеряла цель или её трек ушёл на "
+                    "другую цель (соседа, облако), точная не бросает свою, а ведёт её дальше. Как только широкая снова "
+                    "видит цель, точная передаёт ей номер её трека.");
+        ImGui::Checkbox("Точная отсеивает птиц", &c.narrowVeto);
+        help_marker("На точной цель крупнее и кадров вчетверо больше — взмахи крыльев видны. Цель, которую точная "
+                    "видит птицей, отсеивается, и к ней (и к новым трекам широкой на её пути) точная 30 с не "
+                    "возвращается. Цель, выбранную вручную, не отсеивает.");
+        ImGui::Checkbox("Птица по силуэту", &c.narrowShape);
+        help_marker("Сразу после захвата точная смотрит, как меняется силуэт цели: крылья птицы машут (3–12 Гц), "
+                    "и «масса» силуэта колеблется, а дрон жёсткий. Решение — за полсекунды; с зумом x4 птица на "
+                    "точной в несколько пикселей, и взмахи видны даже у дальних.");
+        ImGui::Checkbox("Сообщать широкой о птице", &c.vetoToWide);
+        help_marker("Трек широкой, который точная рассмотрела и отсеяла, у широкой становится птицей (и новые "
+                    "треки там, где по прогнозу летит отсеянная): жёсткий захват широкой с него снимается.");
+        ImGui::Checkbox("Точная подсказывает широкой", &c.wideCue);
+        help_marker("Где точная видит подтверждённый дрон, у широкой порог ниже: потерянную цель она находит "
+                    "снова быстрее, а слабую не теряет.");
+    }
 
-    heading("Широкая камера");
-    static const char* rs[] = {"4608x3456", "2304x1728"};
-    label("Разрешение", "16 Мп — как настоящая. Половина — если ПК не успевает в реальном времени.");
-    segmented("emures", rs, 2, a.emuRes);
-    label("Поле зрения");
-    ImGui::SliderFloat("##wfov", &c.wideFov, 60, 170, "%.0f°");
-    ImGui::Checkbox("Рыбий глаз", &c.wideFisheye);
-    label("Частота кадров");
-    ImGui::SliderFloat("##wfps", &c.wideFps, 2, 30, "%.0f к/с");
-    label("Угол места оси");
-    if (ImGui::SliderFloat("##wel", &c.wideEl, 0, 60, "%.0f°") && a.emu.running()) a.emu.setWidePose(c.wideAz, c.wideEl);
+    if (heading("Широкая камера", true)) {
+        static const char* rs[] = {"4608x3456", "2304x1728"};
+        label("Разрешение", "16 Мп — как настоящая. Половина — если ПК не успевает в реальном времени.");
+        segmented("emures", rs, 2, a.emuRes);
+        label("Поле зрения");
+        ImGui::SliderFloat("##wfov", &c.wideFov, 60, 170, "%.0f°");
+        ImGui::Checkbox("Рыбий глаз", &c.wideFisheye);
+        label("Частота кадров");
+        ImGui::SliderFloat("##wfps", &c.wideFps, 2, 30, "%.0f к/с");
+        label("Угол места оси");
+        if (ImGui::SliderFloat("##wel", &c.wideEl, 0, 60, "%.0f°") && a.emu.running()) a.emu.setWidePose(c.wideAz, c.wideEl);
+    }
 
-    heading("Сцена");
-    label("Дронов");
-    ImGui::SliderInt("##dr", &c.drones, 0, 10);
-    label("Птиц");
-    ImGui::SliderInt("##bi", &c.birds, 0, 10);
-    label("Дальность, м");
-    ImGui::DragFloatRange2("##rng", &c.rangeMin, &c.rangeMax, 10, 50, 5000, "от %.0f", "до %.0f");
-    label("Скорость целей, м/с");
-    ImGui::DragFloatRange2("##spd", &c.speedMin, &c.speedMax, 0.5f, 0, 80, "от %.0f", "до %.0f");
-    label("Размер квадрокоптера, м", "Средний размах; у каждого дрона свой, от 0.6 до 1.6 этого значения.");
-    ImGui::SliderFloat("##dsz", &c.droneSize, 0.1f, 3, "%.2f");
-    label("Типы дронов", "Доли: квадрокоптеры, летающие крылья (треугольник 1.8–3.5 м, 25–45 м/с) и самолёты (1.5–4 м, 15–30 м/с).");
-    ImGui::SliderFloat("##tq", &c.quadShare, 0, 1, "квадро %.2f");
-    ImGui::SliderFloat("##td", &c.deltaShare, 0, 1, "крыло %.2f");
-    ImGui::SliderFloat("##tp", &c.planeShare, 0, 1, "самолёт %.2f");
-    label("Размытие объектива, пикс.");
-    ImGui::SliderFloat("##psf", &c.psf, 0, 2, "%.2f");
-    label("Облачность");
-    ImGui::SliderFloat("##cl", &c.clouds, 0, 1, "%.2f");
-    label("Шум датчика");
-    ImGui::SliderFloat("##ns", &c.noise, 0, 8, "%.1f");
-    label("Видимость, м");
-    ImGui::SliderFloat("##vis", &c.visibility, 500, 20000, "%.0f", ImGuiSliderFlags_Logarithmic);
-    label("Номер сцены");
-    int seed = (int)c.seed;
-    if (ImGui::InputInt("##seed", &seed)) c.seed = (uint32_t)std::max(1, seed);
-    ImGui::TextDisabled("Сцена, камеры и алгоритм применяются при перезапуске.");
-    ImGui::Checkbox("Показывать правду (где цели на самом деле)", &a.emuTruth);
+    if (heading("Сцена", true)) {
+        label("Дронов");
+        ImGui::SliderInt("##dr", &c.drones, 0, 10);
+        label("Птиц");
+        ImGui::SliderInt("##bi", &c.birds, 0, 10);
+        label("Дальность, м");
+        ImGui::DragFloatRange2("##rng", &c.rangeMin, &c.rangeMax, 10, 50, 5000, "от %.0f", "до %.0f");
+        label("Скорость целей, м/с");
+        ImGui::DragFloatRange2("##spd", &c.speedMin, &c.speedMax, 0.5f, 0, 80, "от %.0f", "до %.0f");
+        label("Размер квадрокоптера, м", "Средний размах; у каждого дрона свой, от 0.6 до 1.6 этого значения.");
+        ImGui::SliderFloat("##dsz", &c.droneSize, 0.1f, 3, "%.2f");
+        label("Типы дронов", "Доли: квадрокоптеры, летающие крылья (треугольник 1.8–3.5 м, 25–45 м/с) и самолёты (1.5–4 м, 15–30 м/с).");
+        ImGui::SliderFloat("##tq", &c.quadShare, 0, 1, "квадро %.2f");
+        ImGui::SliderFloat("##td", &c.deltaShare, 0, 1, "крыло %.2f");
+        ImGui::SliderFloat("##tp", &c.planeShare, 0, 1, "самолёт %.2f");
+        label("Размытие объектива, пикс.");
+        ImGui::SliderFloat("##psf", &c.psf, 0, 2, "%.2f");
+        label("Облачность");
+        ImGui::SliderFloat("##cl", &c.clouds, 0, 1, "%.2f");
+        label("Шум датчика");
+        ImGui::SliderFloat("##ns", &c.noise, 0, 8, "%.1f");
+        label("Видимость, м");
+        ImGui::SliderFloat("##vis", &c.visibility, 500, 20000, "%.0f", ImGuiSliderFlags_Logarithmic);
+        label("Номер сцены");
+        int seed = (int)c.seed;
+        if (ImGui::InputInt("##seed", &seed)) c.seed = (uint32_t)std::max(1, seed);
+        ImGui::TextDisabled("Сцена, камеры и алгоритм применяются при перезапуске.");
+        ImGui::Checkbox("Показывать правду (где цели на самом деле)", &a.emuTruth);
+    }
 }
 
 static ImU32 cls_col(int cls) {
