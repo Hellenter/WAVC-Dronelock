@@ -41,6 +41,8 @@ int dl_motion_estimate(dl_motion* m, const uint8_t* gray, int w, int h, int stri
     return e.valid ? 1 : 0;
 }
 
+void dl_motion_set_fps(dl_motion* m, float fps) { m->gm.setFps(fps); }
+
 void dl_config_default(dl_config* c) {
     DetectorConfig d;
     c->k = d.k; c->pool = d.pool; c->thr = d.thr; c->clutter_k = d.clutter_k; c->tile = d.tile;

@@ -22,6 +22,7 @@ constexpr int MAX_SIDE = 320;   // размер уменьшенной копи�
 constexpr int MIN_SIDE = 40;    // верхний уровень пирамиды не меньше
 constexpr int TOP_RANGE = 6;    // перебор на верхнем уровне, пикс. этого уровня
 constexpr int REFINE = 2;
+constexpr float REF_FPS = 60.f;   // частота, на которой подобрана проверка по частям кадра
 
 double now_ms() {
     using namespace std::chrono;
@@ -130,19 +131,46 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     }
     if (prev_.size() != pyr.size()) {
         prev_ = std::move(pyr);
+        hist_.clear();
         ms_ = now_ms() - t0;
         return res;
     }
+    // Длинная база (setLong): на 60 к/с плавный поворот сдвигает картинку за кадр меньше чем на
+    // пиксель уменьшенной копии, и оценка по соседнему кадру занижена втрое (точки, не сдвинувшиеся
+    // и на уровень, считаются неподвижными, парабола по V-образной ошибке тянет к нулю) — панорама
+    // находилась на 2 с позже, ведомая цель по сцене "дёргалась" и звалась птицей. Сдвиг
+    // от кадра 1/15 с назад — в K раз больше, его хватает уменьшенной копии; за кадр — его K-я доля
+    const int K = long_ && fps_ >= 22.5f ? std::min(8, (int)std::lround(fps_ / 15.f)) : 1;
+    bool found = false;
+    if (K > 1 && (int)hist_.size() >= K && hist_.front().size() == pyr.size()) {
+        res = match(pyr, hist_.front(), K);
+        found = res.valid;
+    }
+    // по соседнему кадру — только когда длинной базы нет (начало ролика, сброс) или она не нашлась:
+    // иначе её оценка всё равно заменяет соседнюю, а считать обе — вдвое дольше (на Pi заметно)
+    if (!found) res = match(pyr, prev_, 1);
+    if (K > 1) {
+        hist_.push_back(pyr);
+        while ((int)hist_.size() > K) hist_.pop_front();
+    } else {
+        hist_.clear();
+    }
+    prev_ = std::move(pyr);
+    ms_ = now_ms() - t0;
+    return res;
+}
+
+// Сдвиг картинки cur относительно ref, снятого gap кадров назад; в ответе — сдвиг за кадр
+MotionEstimate GlobalMotion::match(const std::vector<Img>& pyr, const std::vector<Img>& ref, int gap) const {
+    MotionEstimate res;
     // кадр повторился (запись 25 к/с в ролике 60 к/с) или вся текстура на месте — сдвига нет
     std::vector<std::vector<uint8_t>> skip(pyr.size());
-    if (static_mask(pyr[0].px, prev_[0].px, skip[0]) > 0.9) {
+    if (static_mask(pyr[0].px, ref[0].px, skip[0]) > 0.9) {
         res.valid = true;
         res.quality = 1.f;
-        prev_ = std::move(pyr);
-        ms_ = now_ms() - t0;
         return res;
     }
-    for (size_t L = 1; L < pyr.size(); ++L) static_mask(pyr[L].px, prev_[L].px, skip[L]);
+    for (size_t L = 1; L < pyr.size(); ++L) static_mask(pyr[L].px, ref[L].px, skip[L]);
     static const Kernels* const K = select_kernels(Isa::Auto);
     int u = 0, v = 0;
     double best = 0;
@@ -150,7 +178,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     int cnt = 0;
     for (int L = (int)pyr.size() - 1; L >= 0; --L) {
         const Img& c = pyr[L];
-        const Img& p = prev_[L];
+        const Img& p = ref[L];
         const int range = L == (int)pyr.size() - 1 ? TOP_RANGE : REFINE;
         const int margin = 2;
         if (L != (int)pyr.size() - 1) {
@@ -170,7 +198,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     }
     // субпиксель: парабола по трём точкам вдоль каждой оси на нижнем уровне
     const Img& c = pyr[0];
-    const Img& p = prev_[0];
+    const Img& p = ref[0];
     auto sub = [&](double em, double e0, double ep) {
         const double den = em - 2 * e0 + ep;
         return den > 1e-9 ? std::max(-0.5, std::min(0.5, 0.5 * (em - ep) / den)) : 0.0;
@@ -193,7 +221,13 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     // неподвижной камере: неподвижный фон мы сами исключили маской, и оценка ушла за
     // ветками. Считаем по всем точкам, с неподвижными; наложения на кадр при настоящем
     // повороте — малая часть кусков.
-    if (res.valid && (u != 0 || v != 0)) {
+    // Проверяем сдвиг от полпикселя уменьшенной копии за кадр при 60 к/с, то есть по скорости:
+    // на медленной камере тот же плавный поворот даёт за кадр сдвиг вчетверо больше, и на 15 к/с
+    // проверка шла уже с 60 пикс./с вместо 240 — поворот, при котором часть кадра стоит (наложения
+    // записи экрана, своя техника внизу кадра), объявлялся "камера стоит": панорама находилась на
+    // секунды позже, маска неба не успевала за картинкой и затем училась заново
+    const double minShift = (fps_ > 0 && fps_ < REF_FPS ? 0.5 * REF_FPS / fps_ : 0.5) * gap;
+    if (res.valid && (u != 0 || v != 0) && std::max(std::fabs(u + fx), std::fabs(v + fy)) >= minShift) {
         int forShift = 0, forZero = 0;
         const int G = 4, m = 2 + std::max(std::abs(u), std::abs(v));
         for (int gy = 0; gy < G; ++gy)
@@ -218,17 +252,13 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
             }
         if (forShift < 2 * forZero || forShift == 0) {
             res.quality = 1.f;
-            prev_ = std::move(pyr);
-            ms_ = now_ms() - t0;
             return res;   // valid, сдвиг 0
         }
     }
     if (res.valid) {
-        res.dx = (float)((u + fx) * f_);
-        res.dy = (float)((v + fy) * f_);
+        res.dx = (float)((u + fx) * f_) / (float)gap;
+        res.dy = (float)((v + fy) * f_) / (float)gap;
     }
-    prev_ = std::move(pyr);
-    ms_ = now_ms() - t0;
     return res;
 }
 

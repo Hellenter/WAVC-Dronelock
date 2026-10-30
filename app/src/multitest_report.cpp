@@ -47,13 +47,9 @@ std::string num(double v, int digits) {
     return b;
 }
 
-// значение метрики или null: у метрик по разметке отрицательное — нет данных
-bool has(const Metric& m, const RunResult& r, double& v) {
-    if (!r.done) return false;
-    if (m.gtOnly && !r.gt) return false;
-    v = m.get(r);
-    return v >= 0 && std::isfinite(v);   // отрицательное — нет данных
-}
+bool has(const Metric& m, const RunResult& r, double& v) { return metric_value(m, r, v); }
+
+size_t metric_index(const Metric& m) { return (size_t)(&m - metrics().data()); }
 
 std::string jnum(const Metric& m, const RunResult& r) {
     double v;
@@ -80,10 +76,11 @@ std::string join_path(const std::string& dir, const char* name) {
     return dir + (last == '/' || last == '\\' ? "" : "/") + name;
 }
 
-// среднее по видео для варианта k; only — только видео, где есть разметка
+// среднее по видео для варианта k (у метрик по разметке — по размеченным видео)
 struct Avg {
     double v = 0;
     int n = 0;
+    double lo = -1, hi = -1;   // все сдвиги такта: худший и лучший сдвиг (среднее по видео на каждом сдвиге)
 };
 Avg avg_of(const Metric& m, const std::vector<RunResult>& res, int k) {
     Avg a;
@@ -97,6 +94,26 @@ Avg avg_of(const Metric& m, const std::vector<RunResult>& res, int k) {
     if (a.n) a.v /= a.n;
     return a;
 }
+// то же с разбросом по сдвигам: среднее по видео на сдвиге 0, 1, ... — меньшее и большее из них.
+// runs — прогоны по сдвигам; видео, у которого такого сдвига нет (другая частота), в нём не участвует
+Avg avg_spread(const Metric& m, const std::vector<RunResult>& res, const std::vector<RunResult>& runs, int k) {
+    Avg a = avg_of(m, res, k);
+    std::map<int, Avg> byPhase;
+    for (const auto& r : runs) {
+        double v;
+        if (r.variant == k && r.phase >= 0 && has(m, r, v)) {
+            byPhase[r.phase].v += v;
+            ++byPhase[r.phase].n;
+        }
+    }
+    if (byPhase.size() < 2) return a;
+    for (auto& kv : byPhase) {
+        const double v = kv.second.v / kv.second.n;
+        if (a.lo < 0 || v < a.lo) a.lo = v;
+        if (a.hi < 0 || v > a.hi) a.hi = v;
+    }
+    return a;
+}
 
 const RunResult* find_run(const std::vector<RunResult>& res, int video, int variant) {
     for (const auto& r : res)
@@ -104,8 +121,16 @@ const RunResult* find_run(const std::vector<RunResult>& res, int video, int vari
     return nullptr;
 }
 
-// ячейка: значение и разница с базой, цвет — лучше/хуже
-std::string cell(const Metric& m, bool ok, double v, bool baseOk, double b, bool isBase, bool best = false) {
+// разброс по сдвигам такта под значением: «2.0…6.5» (lo < 0 — нет)
+std::string spread_html(const Metric& m, double lo, double hi) {
+    if (lo < 0 || hi < 0) return "";
+    return "<small class=spr title=\"худший и лучший сдвиг такта\">" + num(lo, m.digits) + "…" + num(hi, m.digits) +
+           "</small>";
+}
+
+// ячейка: значение и разница с базой, цвет — лучше/хуже; extra — что дописать под числом
+std::string cell(const Metric& m, bool ok, double v, bool baseOk, double b, bool isBase, bool best = false,
+                 const std::string& extra = "") {
     if (!ok) return "<td class=na data-v=\"\">—</td>";
     std::string cls = best ? "best" : "", d;
     if (!isBase && baseOk) {
@@ -117,7 +142,7 @@ std::string cell(const Metric& m, bool ok, double v, bool baseOk, double b, bool
         }
     }
     if (!cls.empty()) cls = " class=\"" + cls + "\"";
-    return "<td" + cls + " data-v=\"" + num(v, 6) + "\">" + num(v, m.digits) + d + "</td>";
+    return "<td" + cls + " data-v=\"" + num(v, 6) + "\">" + num(v, m.digits) + d + extra + "</td>";
 }
 
 const char* CSS = R"CSS(
@@ -138,7 +163,7 @@ th{background:var(--head);position:sticky;top:0;cursor:pointer;font-weight:600;u
 th:first-child,td:first-child{text-align:left;white-space:normal;min-width:220px}
 td small{display:block;font-size:11px;opacity:.85}
 td.good{color:var(--good);background:var(--goodbg)}td.bad{color:var(--bad);background:var(--badbg)}
-td.na{color:var(--muted)}tr.base td:first-child{font-weight:700}td.best{outline:2px solid var(--acc);outline-offset:-2px}
+td.na{color:var(--muted)}td small.spr{color:var(--muted)}tr.base td:first-child{font-weight:700}td.best{outline:2px solid var(--acc);outline-offset:-2px}
 .kpis{display:flex;flex-wrap:wrap;gap:10px}.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-width:150px}
 .kpi b{display:block;font-size:20px}dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}
 dt{font-weight:600}dd{margin:0;color:var(--muted)}code{background:var(--head);padding:1px 5px;border-radius:4px}
@@ -156,13 +181,16 @@ if(x==='')return 1;if(y==='')return -1;return asc?x-y:y-x});rows.forEach(r=>b.ap
 }  // namespace
 
 bool write_report(const std::string& dir, const Config& c, const std::vector<VideoMeta>& videos,
-                  const std::vector<Variant>& variants, const std::vector<RunResult>& res, bool finished,
+                  const std::vector<Variant>& variants, const std::vector<RunResult>& runs, bool finished,
                   double elapsedS, std::string& err) {
     const auto& M = metrics();
-    bool anyGt = false;
+    // итог на «видео x вариант»: при всех сдвигах такта — среднее по сдвигам
+    const std::vector<RunResult> res = merge_phases(runs);
+    bool anyGt = false, anyPhases = false;
     int done = 0;
-    for (const auto& r : res) {
+    for (const auto& r : runs) {
         anyGt |= r.done && r.gt;
+        anyPhases |= r.phase >= 0;
         done += r.done;
     }
     // ---------------- JSON
@@ -176,7 +204,8 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
     j += "  \"frames_limit\": " + std::to_string(c.maxFrames) + ", \"warmup\": " + std::to_string(c.warmup) +
          ", \"radius_px\": " + num(c.radius, 1) + ", \"parallel\": " + std::to_string(c.parallel) +
          ", \"realtime\": " + (c.realtime ? "true" : "false") + ", \"emulate\": " + (c.emulate ? "true" : "false") +
-         ", \"mask_file\": " + (c.maskFile ? "true" : "false") + ",\n";
+         ", \"mask_file\": " + (c.maskFile ? "true" : "false") + ", \"all_phases\": " +
+         (c.allPhases ? "true" : "false") + ",\n";
     j += "  \"vary\": {";
     for (size_t i = 0; i < c.choices.size(); ++i) {
         j += (i ? ", " : "") + jstr(c.choices[i].key) + ": [";
@@ -211,26 +240,57 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
             j += (k ? ", " : "") + jstr(variants[i].changes[k].first) + ": " + num(variants[i].changes[k].second, 4);
         j += "}}" + std::string(i + 1 < variants.size() ? ",\n" : "\n");
     }
+    // прогон: метрики; при всех сдвигах такта — среднее по сдвигам, phases и spread {метрика: [худший, лучший]}
+    auto run_json = [&](const RunResult& r) {
+        std::string o = "{\"video\": " + std::to_string(r.video) + ", \"variant\": " + std::to_string(r.variant);
+        if (r.phase >= 0) o += ", \"phase\": " + std::to_string(r.phase);
+        if (r.phases > 1) o += ", \"phases\": " + std::to_string(r.phases);
+        const int fd = r.phases > 1 ? 1 : 0;
+        o += ", \"done\": " + std::string(r.done ? "true" : "false") + ", \"error\": " + jstr(r.error) +
+             ", \"gt\": " + (r.gt ? "true" : "false") + ", \"wall_s\": " + num(r.wallS, 2) + ", \"eval_frames\": " +
+             num(r.evalFrames, fd) + ", \"gt_drone_frames\": " + num(r.gtDroneFrames, fd);
+        for (const auto& m : M) o += ", " + jstr(m.key) + ": " + jnum(m, r);
+        if (r.phases > 1 && r.lo.size() == M.size()) {
+            o += ", \"spread\": {";
+            bool first = true;
+            for (size_t i = 0; i < M.size(); ++i) {
+                if (r.lo[i] < 0 || !r.done) continue;
+                const int dg = std::max(2, M[i].digits + 1);
+                o += std::string(first ? "" : ", ") + jstr(M[i].key) + ": [" + num(r.lo[i], dg) + ", " + num(r.hi[i], dg) + "]";
+                first = false;
+            }
+            o += "}";
+        }
+        return o + "}";
+    };
     j += "  ],\n  \"runs\": [\n";
     bool firstRun = true;
     for (const auto& r : res) {
         if (!r.done && r.error.empty()) continue;   // ещё не дошли
-        j += std::string(firstRun ? "" : ",\n") + "    {\"video\": " + std::to_string(r.video) +
-             ", \"variant\": " + std::to_string(r.variant) + ", \"done\": " + (r.done ? "true" : "false") +
-             ", \"error\": " + jstr(r.error) + ", \"gt\": " + (r.gt ? "true" : "false") + ", \"wall_s\": " +
-             num(r.wallS, 2) + ", \"eval_frames\": " + std::to_string(r.evalFrames) + ", \"gt_drone_frames\": " +
-             std::to_string(r.gtDroneFrames);
-        for (const auto& m : M) j += ", " + jstr(m.key) + ": " + jnum(m, r);
-        j += "}";
+        j += std::string(firstRun ? "" : ",\n") + "    " + run_json(r);
         firstRun = false;
+    }
+    if (anyPhases) {
+        // каждый сдвиг такта отдельно — для разбора
+        j += "\n  ],\n  \"phase_runs\": [\n";
+        firstRun = true;
+        for (const auto& r : runs) {
+            if (!r.done && r.error.empty()) continue;
+            j += std::string(firstRun ? "" : ",\n") + "    " + run_json(r);
+            firstRun = false;
+        }
     }
     j += "\n  ],\n  \"summary\": [\n";
     for (size_t k = 0; k < variants.size(); ++k) {
         j += "    {\"variant\": " + std::to_string(k);
+        std::string spr;
         for (const auto& m : M) {
-            const Avg a = avg_of(m, res, (int)k);
-            j += ", " + jstr(m.key) + ": " + (a.n ? num(a.v, std::max(2, m.digits + 1)) : "null");
+            const Avg a = avg_spread(m, res, runs, (int)k);
+            const int dg = std::max(2, m.digits + 1);
+            j += ", " + jstr(m.key) + ": " + (a.n ? num(a.v, dg) : "null");
+            if (a.n && a.lo >= 0) spr += (spr.empty() ? "" : ", ") + jstr(m.key) + ": [" + num(a.lo, dg) + ", " + num(a.hi, dg) + "]";
         }
+        if (anyPhases) j += ", \"spread\": {" + spr + "}";
         j += "}" + std::string(k + 1 < variants.size() ? ",\n" : "\n");
     }
     j += "  ]\n}\n";
@@ -238,6 +298,10 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
     // ---------------- CSV (разделитель ';' — Excel с русской локалью открывает сразу)
     std::string csv = "\xEF\xBB\xBFvideo;variant;changes;done;error";
     for (const auto& m : M) csv += std::string(";") + m.key;
+    if (anyPhases) {   // все сдвиги такта: сколько сдвигов и худший/лучший по каждой метрике
+        csv += ";phases";
+        for (const auto& m : M) csv += std::string(";") + m.key + "_lo;" + m.key + "_hi";
+    }
     csv += "\n";
     for (const auto& r : res) {
         if (!r.done && r.error.empty()) continue;
@@ -254,6 +318,14 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
             double v;
             csv += ";";
             if (has(m, r, v)) csv += num(v, std::max(2, m.digits + 1));
+        }
+        if (anyPhases) {
+            csv += ";" + std::to_string(r.phases);
+            for (size_t i = 0; i < M.size(); ++i) {
+                const bool ok = r.done && r.phases > 1 && r.lo.size() == M.size() && r.lo[i] >= 0;
+                const int dg = std::max(2, M[i].digits + 1);
+                csv += ok ? ";" + num(r.lo[i], dg) + ";" + num(r.hi[i], dg) : ";;";
+            }
         }
         csv += "\n";
     }
@@ -298,11 +370,11 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
          html(c.folder) + "</div>";
     h += "<div class=kpis style=\"margin-top:14px\">";
     h += "<div class=kpi><span class=muted>Состояние</span><b>" +
-         std::string(finished ? (done == (int)res.size() ? "готово" : "остановлен") : "идёт") + "</b></div>";
+         std::string(finished ? (done == (int)runs.size() ? "готово" : "остановлен") : "идёт") + "</b></div>";
     h += "<div class=kpi><span class=muted>Видео</span><b>" + std::to_string(videos.size()) + "</b></div>";
     h += "<div class=kpi><span class=muted>Вариантов</span><b>" + std::to_string(variants.size()) + "</b></div>";
     h += "<div class=kpi><span class=muted>Прогонов сделано</span><b>" + std::to_string(done) + " из " +
-         std::to_string(res.size()) + "</b></div>";
+         std::to_string(runs.size()) + "</b></div>";
     h += "<div class=kpi><span class=muted>Время</span><b>" + num(elapsedS / 60, 1) + " мин</b></div></div>";
 
     // вывод
@@ -369,16 +441,18 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
     // сводка
     h += "<h2>Сводка по вариантам</h2><div class=muted>Среднее по видео" +
          std::string(anyGt ? " (метрики по разметке — по размеченным видео)" : "") +
-         ". Под числом — разница с базой: зелёный — лучше, красный — хуже. Рамка — лучшее в столбце. "
+         ". Под числом — разница с базой: зелёный — лучше, красный — хуже. Рамка — лучшее в столбце. " +
+         (anyPhases ? "Все сдвиги такта: число — среднее по сдвигам, ниже серым — худший…лучший сдвиг (среднее по "
+                      "видео на каждом сдвиге). "
+                    : "") +
          "Щелчок по заголовку сортирует.</div>";
     h += "<div class=wrap><table class=sort>" + header(cols) + "<tbody>";
     for (size_t k = 0; k < variants.size(); ++k) {
         h += std::string("<tr") + (k == 0 ? " class=base" : "") + "><td>" + html(variants[k].name) + "</td>";
         for (const Metric* m : cols) {
-            const Avg a = avg_of(*m, res, (int)k), b = avg_of(*m, res, 0);
+            const Avg a = avg_spread(*m, res, runs, (int)k), b = avg_of(*m, res, 0);
             const bool best = bestOf.count(m->key) && bestOf[m->key] == (int)k && variants.size() > 1;
-            const std::string td = cell(*m, a.n > 0, a.v, b.n > 0, b.v, k == 0, best);
-            h += td;
+            h += cell(*m, a.n > 0, a.v, b.n > 0, b.v, k == 0, best, spread_html(*m, a.lo, a.hi));
         }
         h += "</tr>";
     }
@@ -403,7 +477,9 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
                 double val = 0, b = 0;
                 const bool ok = r && has(*m, *r, val);
                 const bool bok = br && has(*m, *br, b);
-                h += cell(*m, ok, val, bok, b, k == 0);
+                const size_t mi = metric_index(*m);
+                const bool spr = ok && r->phases > 1 && mi < r->lo.size();
+                h += cell(*m, ok, val, bok, b, k == 0, false, spr ? spread_html(*m, r->lo[mi], r->hi[mi]) : "");
             }
             h += "</tr>";
         }
@@ -421,6 +497,10 @@ bool write_report(const std::string& dir, const Config& c, const std::vector<Vid
                       "учатся заново и в файлы рядом с видео не пишутся.";
     h += c.realtime ? " Кадры шли в темпе видео, как с камеры: что не успели — пропущено."
                     : " Кадры шли без пропусков, так быстро, как успевает ПК.";
+    if (c.allPhases)
+        h += " Все сдвиги такта: у камеры реже видео (шаг кадров, частота камеры) каждый вариант прогонялся с "
+             "каждым сдвигом — с какого кадра файла пошёл такт (шаг 4 — 4 прогона, 14 к/с из 60 — 5); в таблицах "
+             "среднее по сдвигам и разброс от худшего до лучшего.";
     if (c.parallel > 1)
         h += " Прогонов шло одновременно " + std::to_string(c.parallel) + " — время обработки выше, чем при одном.";
     h += "</p></div>";

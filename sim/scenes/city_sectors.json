@@ -1,0 +1,40 @@
+{
+ "name": "city_sectors",
+ "seed": 11,
+ "seconds": 6,
+ "rig": {"height": 4.0},
+ "wide": {"w": 4608, "h": 3456, "hfov": 120, "fps": 14, "az": 60, "el": 15, "msaa": 4},
+ "fine": {"enabled": true, "w": 640, "h": 480, "hfov": 20, "fps": 60, "max_dps": 30, "accel": 150,
+  "latency": 0.06, "target": "auto"},
+ "world": {
+  "sectors": [
+   {"name": "forest", "type": "forest", "az_from": 0, "az_to": 120},
+   {"name": "lowrise", "type": "lowrise", "az_from": 120, "az_to": 240, "from": 110, "to": 900,
+    "villages": 4, "streets": 5, "plots": 16},
+   {"name": "highrise", "type": "highrise", "az_from": 240, "az_to": 360, "from": 260, "to": 1600,
+    "districts": 3, "blocks": [3, 2], "block": [150, 120], "street": 30, "floors": [9, 25], "towers": 0.25,
+    "masts": 0.35}
+  ],
+  "trees": 1400,
+  "trees_from": 90,
+  "trees_to": 1200,
+  "forest_threshold": 0.42,
+  "tree_lines": [{"dist": 140, "depth": 35, "az_from": 8, "az_to": 112, "count": 380}],
+  "poles": [
+   {"pos": [-120, -150, 0], "height": 22, "radius": 0.2},
+   {"pos": [-60, -190, 0], "height": 22, "radius": 0.2},
+   {"pos": [10, -230, 0], "height": 22, "radius": 0.2}
+  ],
+  "hills": 120,
+  "hills_from": 1700,
+  "cloud_cover": 0.35,
+  "sun_az": 150,
+  "sun_el": 35,
+  "fog": 0.00025,
+  "wind": 1.0,
+  "shadows": false,
+  "assets": "res://assets/polyhaven"
+ },
+ "targets": [],
+ "random_targets": {"drones": 8, "birds": 4, "range": [150, 1500], "types": {"quad": 0.4, "delta": 0.3, "plane": 0.3}}
+}

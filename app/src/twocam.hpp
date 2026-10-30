@@ -21,6 +21,8 @@
 #include "dronolok/detector.hpp"
 #include "dronolok/geometry.hpp"
 #include "pipeline.hpp"
+#include "scenelink.hpp"
+#include "silhouette.hpp"
 
 namespace twocam {
 
@@ -29,14 +31,28 @@ using dronolok::Pose;
 using dronolok::TargetReport;
 using dronolok::Vec3;
 
+constexpr int PANO_W = 1440, PANO_H = 360;   // 0.25° на ячейку: азимут 0..360, угол места -20..70
+constexpr float PANO_STEP = 0.25f, PANO_EL0 = -20.f;
+
 enum class SwitchMode : int { Manual = 0, Queue = 1, Nearest = 2 };
 
 struct Config {
+    // мир: пусто — синтетическое небо; иначе 3D-сцена Godot (путь к sim/scenes/*.json), см. scenelink.hpp.
+    // Цели тогда летают в сцене (числа, дальность и доли типов — ниже), облака и видимость — из сцены.
+    std::string scene, sector, godot, simProject;
+    uint64_t renderAffinity = 0;   // ядра для отрисовки сцены, 0 — любые
+    // Панорамная маска 360°: маска неба широкой копится по азимуту и углу места; после поворота
+    // широкой маска берётся из панорамы (если она покрывает новый вид), а не учится заново
+    bool panoMask = true;
     // сцена
     int drones = 3, birds = 1;
-    float rangeMin = 250, rangeMax = 1200;   // м
+    float rangeMin = 100, rangeMax = 750;    // м
     float speedMin = 6, speedMax = 22;       // м/с
-    float droneSize = 0.5f, birdSize = 0.35f;   // м
+    float droneSize = 0.5f, birdSize = 0.35f;   // м: размах квадрокоптера (средний) и птицы (не используется)
+    // доли типов дронов: квадрокоптер (0.3–0.8 м при размере 0.5), летающее крыло (1.8–3.5 м, 25–45 м/с),
+    // самолёт (1.5–4 м, 15–30 м/с)
+    float quadShare = 0.5f, deltaShare = 0.25f, planeShare = 0.25f;
+    float psf = 0.6f;   // пятно объектива, СКО в пикселях
     float clouds = 0.35f;                    // 0..1
     float noise = 2.0f;                      // СКО шума датчика, уровни яркости
     float visibility = 6000;                 // м: контраст падает как exp(-R/visibility)
@@ -56,7 +72,7 @@ struct Config {
     float encoderDeg = 0.01f;             // дискретность датчиков угла
     float handoffLatency = 0.06f;         // от кадра широкой до команды поворотке, с
     // наведение
-    SwitchMode switchMode = SwitchMode::Queue;
+    SwitchMode switchMode = SwitchMode::Manual;
     float dwell = 6;          // сколько вести цель, прежде чем перейти к следующей (авто), с
     bool dronesOnly = true;   // не наводиться на цели, которые широкая считает птицами
     float simSpeed = 1;       // во сколько раз быстрее реального времени; 0 — как успевает ПК
@@ -71,16 +87,30 @@ struct Config {
     float minHold = 0.08f;       // трек в окне берётся, если держится столько секунд (не шум на один-два кадра)
     float giveUp = 3;            // столько секунд точная ищет и не может удержать цель — цель «не подтверждена»
     float coolDown = 10;         // столько секунд к неподтверждённой цели не возвращаться (авто-режимы)
+    // обмен между камерами: точная видит цель крупнее, чаще и без лишних пикселей
+    bool narrowSilhouette = true;   // точная ведёт крупную цель по силуэту (центр), а не по частям: не скачет с крыла на хвост
+    float silhMinPx = 8;            // ...если силуэт не меньше стольких пикселей (мелкая цель на части не разваливается)
+    bool narrowHold = true;    // точная, уверенная, что это дрон, держит цель сама, когда широкая её теряет или
+                               // её трек уходит на другое; как только широкая снова видит цель — передаёт ей её трек
+    bool narrowVeto = true;    // точная отсеивает цель, которую сама видит птицей (взмахи крыльев)
+    bool wideCue = true;       // точная сообщает широкой, где цель: там у широкой порог ниже
+    float confirmT = 0.5f;     // точная уверена в дроне: ведёт цель столько секунд и её классификатор — «дрон»
+    float vetoT = 0.6f;        // столько секунд подряд птица у точной — цель отсеивается
+    float vetoCool = 30;       // к отсеянной цели и к целям широкой на её прогнозе не возвращаться, с
+    float narrowLostHold = 2;  // цель есть только у точной: столько секунд искать её по своему прогнозу
 };
 
 // Тело в мире: прямолинейное движение (у птиц — с покачиванием и взмахами)
 struct Body {
     int id = 0;
     bool bird = false;
+    Shape shape = Shape::Quad;
     Vec3 p0, v;          // м, м/с; камеры в начале координат
     double t0 = 0;       // когда появилось
     float size = 0.5f;   // м
     float flapHz = 0, phase = 0;
+    bool wobble = true;    // покачивание птицы (в 3D-сцене траекторию задаёт сцена)
+    bool hidden = false;   // в 3D-сцене: заслонено от установки домом или деревом
     Vec3 at(double t) const;
 };
 
@@ -94,6 +124,7 @@ struct WideTarget {
     int cls = 0;
     bool hard = false;
     int truth = 0;   // ближайшее тело по правде (для оценки), 0 — ни одного рядом
+    int verdict = 0; // что сказала точная: 1 — дрон (подтвердила), 2 — птица (отсеяна)
 };
 
 struct Event {
@@ -112,6 +143,15 @@ struct Stats {
     double slewSum = 0, acqSum = 0;           // с: до цели в кадре точной и до захвата, сумма по назначениям
     int slewN = 0, acqN = 0;
     std::vector<float> errLock, errAxis, errWide;   // град: захват точной, ось точной, сообщение широкой — от правды
+    // обмен между камерами
+    double narrowOnly = 0, narrowOnlyCorrect = 0;   // с: цель есть только у точной (широкая потеряла или ушла с неё)
+    double trackDrone = 0;                    // с: точная ведёт настоящий дрон (любой, не птицу и не пустое место)
+    int kept = 0;                             // точная не бросила цель, когда широкая её потеряла или ушла с неё
+    int rebinds = 0;                          // широкая снова видит цель, которую держала точная, — трек передан
+    int confirmed = 0;                        // точная подтвердила дрон
+    int vetoBird = 0, vetoDrone = 0;          // точная отсеяла как птицу: по правде птица / дрон (ошибка)
+    int vetoNone = 0;                         // ...и там по правде ничего нет (помеха)
+    int partJumps = 0;                        // захват точной перешёл на соседний трек той же цели (часть крупной)
     double wideMs = 0, narrowMs = 0;          // среднее время обработки кадра
     double renderWideMs = 0, renderNarrowMs = 0;   // отрисовка кадров, сумма, мс
 };
@@ -125,8 +165,12 @@ struct View {
     int nlock = 0;
     NState state = NState::Idle;
     int assigned = 0;                     // id трека широкой
+    bool nConf = false, nOnly = false;    // точная подтвердила дрон; цель только у точной
+    float nWu = -1, nWv = -1;             // где точная видит цель, на кадре широкой
+    std::vector<std::pair<float, float>> vetoW;   // отсеянные точной (прогноз), на кадре широкой
     std::vector<WideTarget> targets;
     Pose axis, cmd;
+    Pose widePose;                        // куда смотрит широкая
     float rateAz = 0, rateEl = 0;
     dronolok::SearchWindow win;
     bool winOn = false;
@@ -139,6 +183,11 @@ struct View {
     std::vector<std::pair<float, float>> footprint;   // контур кадра точной на широкой
     std::deque<Event> events;
     Stats st;
+    // панорамная маска: PANO_W x PANO_H ячеек по PANO_STEP°, угол места от PANO_EL0; 0 — не видели,
+    // 1 — небо (искать), 2 — закрыто маской
+    std::vector<uint8_t> pano;
+    float panoKnown = 0;                  // доля тайлов текущего вида, покрытых панорамой
+    bool scanning = false;                // идёт обзор 360°
     bool running = false, paused = false;
     std::string status;
 };
@@ -157,6 +206,15 @@ public:
     void selectTarget(int wideId) { cmd_ = wideId; }
     void setSwitchMode(SwitchMode m) { switchMode_ = (int)m; }
     void setSpeed(float s) { speed_ = s; }
+    // повернуть широкую камеру (вступает с ближайшего её кадра); поворотка точной не трогается
+    // обзор 360°: широкая поворачивается шагами по полкадра, на каждом шаге маска учится и
+    // ложится в панораму, в конце — обратно
+    void startScan() { scanReq_ = true; }
+    void setWidePose(float az, float el) {
+        wantAz_ = az;
+        wantEl_ = el;
+        ++poseReq_;
+    }
     View view() const;
     // без интерфейса: прогнать seconds модельного времени как можно быстрее
     Stats runBlocking(const Config& c, double seconds, bool verbose);
@@ -165,6 +223,8 @@ public:
 private:
     void loop();
     void spawn(Body& b, double t, bool first);
+    void prepareWide();   // фон синтетического неба под текущий поворот широкой
+    bool sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out);
     void renderWide(double t, std::vector<uint8_t>& out);
     void renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out);
     void drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h);
@@ -173,6 +233,8 @@ private:
     void stepNarrow(double t, double dt);
     void choose(double t);
     void assign(double t, int wideId, const char* why);
+    void rebind(double t);
+    bool vetoed(double t, const TargetReport& r) const;
     void event(double t, const std::string& s);
     int nearestBody(double t, double az, double el, double maxDeg) const;
 
@@ -181,6 +243,27 @@ private:
     std::atomic<bool> running_{false}, stop_{false}, paused_{false};
     std::atomic<int> cmd_{0}, switchMode_{1};
     std::atomic<float> speed_{1};
+    std::atomic<float> wantAz_{0}, wantEl_{0};
+    std::atomic<int> poseReq_{0};
+    std::atomic<bool> scanReq_{false};
+    // панорамная маска
+    std::vector<uint8_t> pano_;
+    int panoTw_ = 0, panoTh_ = 0, panoTile_ = 0;   // тайлы маски широкой (из её результата)
+    int sincePose_ = 0;          // кадров широкой с последнего поворота
+    bool lastLearning_ = true;
+    bool scan_ = false;
+    int scanStep_ = 0;
+    float scanAz0_ = 0, scanEl0_ = 0;
+    void panoLearn(const Result& r);
+    float panoMaskFor(std::vector<uint8_t>& m) const;
+    int poseSeen_ = 0;
+    // 3D-сцена: отдельный процесс Godot
+    bool sceneMode_ = false;
+    std::unique_ptr<scene::Link> link_;
+    scene::Options linkOpt_;
+    std::string linkHello_;
+    int linkRestarts_ = 0;
+    std::vector<scene::Body> sbodies_;
     mutable std::mutex vm_;
     View view_;
 
@@ -211,6 +294,7 @@ private:
     std::vector<WideTarget> targets_;   // последнее дошедшее сообщение
     std::vector<int> visited_;          // уже обслуженные цели (авто: по очереди)
     std::vector<std::pair<int, double>> cool_;   // не подтверждённые точной цели широкой и до какого времени
+    std::vector<std::pair<TargetReport, double>> veto_;   // отсеянные точной (где были) и до какого времени
 
     // точная
     struct Mount {
@@ -232,6 +316,14 @@ private:
     double tAssign_ = 0, tInView_ = -1, tState_ = 0, tLastSeen_ = 0, tTrackStart_ = 0;
     double tSearch_ = -1;    // с какого момента точная ищет цель и не может удержать; -1 — держит
     bool gotThis_ = false;   // назначенную цель точная уже брала (захват считаем раз на назначение)
+    bool manualPick_ = false;   // цель выбрал оператор: точная её не отсеивает
+    bool nConf_ = false;     // точная уверена, что ведёт дрон
+    bool nOnly_ = false;     // цель есть только у точной: трек широкой assigned_ уже не она (или пропал)
+    double tBird_ = -1;      // с какого момента точная видит в цели птицу
+    int detachId_ = 0;       // трек широкой, от которого точная только что отказалась (ушёл с цели)
+    double tDetach_ = -10;
+    double tWideSeen_ = 0;   // когда широкая последний раз сообщала о назначенной цели
+    float lastU_ = 0, lastV_ = 0, lastSz_ = 0;   // захват точной на прошлом кадре: где и какого размера, пикс.
     TargetReport nrep_;      // последнее положение по точной
     bool haveNrep_ = false;
     dronolok::SearchWindow win_;

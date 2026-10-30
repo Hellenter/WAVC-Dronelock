@@ -221,9 +221,10 @@ void VideoSource::convert(uint8_t* dst, int outW, int outH, int dstStride) {
     sws_scale(sws_, frame_->data, frame_->linesize, 0, frame_->height, planes, strides);
 }
 
-// Цвет: отсчёт U и V в центре каждого блока step x step выходного кадра (уменьшение и увеличение —
-// пересчётом координат). Плоскости 8-16 бит, планарные и NV12/P010; RGB и палитра — без цвета.
-// Смещения в строке и перевод диапазона — таблицами: 16 Мп (664x373 отсчётов) ~0.3 мс
+// Цвет: отсчёт U и V в точке (off, off) каждого блока step x step выходного кадра (уменьшение и
+// увеличение — пересчётом координат). Плоскости 8-16 бит, планарные и NV12/P010; RGB и палитра — без
+// цвета. Смещения в строке и перевод диапазона — таблицами: 2560x1440 с шагом 4 (640x360 отсчётов)
+// ~0.7 мс, половина — чтение строк цвета из памяти (с шагом 8 — 0.25 мс)
 void VideoSource::sampleColor(ColorPlanes& c, int outW, int outH) {
     c.w = c.h = 0;
     const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((AVPixelFormat)frame_->format);
@@ -246,7 +247,7 @@ void VideoSource::sampleColor(ColorPlanes& c, int outW, int outH) {
     colOffU_.resize(c.w);
     colOffV_.resize(c.w);
     for (int bx = 0; bx < c.w; ++bx) {   // байт отсчёта в строке (шаг и смещение — из описания формата)
-        const int x = std::min(frame_->width - 1, (int)((bx * c.step + c.step / 2) * sx));
+        const int x = std::min(frame_->width - 1, (int)((bx * c.step + c.off) * sx));
         const int cx = std::min(cwMax, x >> d->log2_chroma_w);
         colOffU_[bx] = cx * cu.step + cu.offset;
         colOffV_[bx] = cx * cv.step + cv.offset;
@@ -259,7 +260,7 @@ void VideoSource::sampleColor(ColorPlanes& c, int outW, int outH) {
     const bool wide = cu.depth > 8;   // отсчёт в 16 битах: старшие 8 бит значения
     const int su = cu.shift + cu.depth - 8, sv = cv.shift + cv.depth - 8;
     for (int by = 0; by < c.h; ++by) {
-        const int y = std::min(frame_->height - 1, (int)((by * c.step + c.step / 2) * sy));
+        const int y = std::min(frame_->height - 1, (int)((by * c.step + c.off) * sy));
         const int cy = std::min(chMax, y >> d->log2_chroma_h);
         const uint8_t* ru = frame_->data[cu.plane] + (size_t)cy * frame_->linesize[cu.plane];
         const uint8_t* rv = frame_->data[cv.plane] + (size_t)cy * frame_->linesize[cv.plane];

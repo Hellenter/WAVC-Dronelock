@@ -594,6 +594,15 @@ static void test_stationary() {
     CHECK(b.loadMask(path, 10) && b.tileMask() == a.tileMask(), "loadMask");
     for (int i = 0; i < 10; ++i) b.detect(ground_frame(w, h, 0.6f, 100 + i).data(), w, h, w, c);
     CHECK(!b.verifyingMask() && !b.maskReplaced() && b.tileMask() == a.tileMask(), "mask verify, same scene");
+    {   // сверка при жёстком захвате (детектор смотрит весь кадр раз в hard_full_every): землю
+        // сверка видит каждый кадр, иначе она выходит гладкой и открывается (wt6, 30.10)
+        DetectorConfig k = cfg;
+        k.full_every = 6;
+        Detector v(k);
+        CHECK(v.loadMask(path, 10), "loadMask full_every 6");
+        for (int i = 0; i < 10; ++i) v.detect(ground_frame(w, h, 0.6f, 100 + i).data(), w, h, w, c);
+        CHECK(!v.verifyingMask() && !v.maskReplaced() && v.tileMask() == a.tileMask(), "mask verify, full_every 6");
+    }
     Detector m(cfg);   // камеру повернули: земли стало больше — маска учится заново
     m.loadMask(path, 10);
     for (int i = 0; i < 10; ++i) m.detect(ground_frame(w, h, 0.3f, 200 + i).data(), w, h, w, c);
@@ -644,7 +653,40 @@ static void test_stationary() {
     TrackerConfig t;
     const TrackerConfig t25 = tracker_for_fps(t, 25.f), t10 = tracker_for_fps(t, 10.f);
     CHECK(t25.gate == t.gate && t25.max_miss == t.max_miss, "tracker_for_fps 25");
-    CHECK(t10.gate > t.gate && t10.max_miss < t.max_miss && t10.confirm == t.confirm, "tracker_for_fps 10");
+    // предел ворот — в пикселях кадра, на редких кадрах не меньше пути за кадр (gate_pps); растёт манёвренность
+    CHECK(std::fabs(t10.gate - t.gate_pps / 10.f) < 1e-3f && t10.q_accel > t.q_accel && t10.max_miss < t.max_miss &&
+              t10.confirm == t.confirm, "tracker_for_fps 10: gate %.1f", t10.gate);
+    // окно ведомой цели: заданное от 30 к/с, ниже — во времени, не меньше 9; окно дрейфа — во времени, не меньше 8
+    const TrackerConfig t30 = tracker_for_fps(t, 30.f), t14 = tracker_for_fps(t, 14.f), t60f = tracker_for_fps(t, 60.f);
+    CHECK(t14.gate == t.gate && t30.gate == t.gate && t60f.gate == t.gate, "tracker_for_fps: gate %.1f %.1f %.1f", t14.gate,
+          t30.gate, t60f.gate);
+    CHECK(t60f.follow_min_obs == t.follow_min_obs && t30.follow_min_obs == t.follow_min_obs && t14.follow_min_obs == 9 &&
+              t14.drift_obs == 8 && t60f.drift_obs > t.drift_obs,
+          "tracker_for_fps: follow_min_obs %d %d %d, drift_obs %d %d", t60f.follow_min_obs, t30.follow_min_obs,
+          t14.follow_min_obs, t14.drift_obs, t60f.drift_obs);
+    // круг передачи захвата: на медленной камере — lost_r_max_slow, если lost_r_max не задан; на 60 к/с — без предела
+    TrackerConfig tl = t;
+    tl.lost_r_max = 2.f;
+    TrackerConfig t0 = t;
+    t0.lost_r_max_slow = 0.f;
+    CHECK(t14.lost_r_max == t.lost_r_max_slow && t30.lost_r_max == t.lost_r_max_slow && t60f.lost_r_max == t.lost_r_max &&
+              tracker_for_fps(tl, 14.f).lost_r_max == 2.f && tracker_for_fps(t0, 14.f).lost_r_max == 0.f,
+          "tracker_for_fps: lost_r_max %.1f %.1f %.1f", t14.lost_r_max, t30.lost_r_max, t60f.lost_r_max);
+    // правила в пикс./с: на 60 к/с — прежние числа за кадр
+    const TrackerConfig t60 = tracker_for_fps(t, 60.f);
+    CHECK(std::fabs(t60.still_speed - 0.25f) < 1e-3f && std::fabs(t60.lost_grow - 4.f) < 1e-3f &&
+              std::fabs(t60.flock_speed - 0.5f) < 1e-3f, "tracker_for_fps 60: %.3f %.3f %.3f", t60.still_speed, t60.lost_grow,
+          t60.flock_speed);
+    // окна маски неба в кадрах подобраны на 60 к/с: там и без частоты — как есть, на 15 к/с — в
+    // секундах; фон ячеек и экономия "раз в N кадров" — как есть
+    const DetectorConfig dd;
+    const DetectorConfig d60 = detector_for_fps(dd, 60.f), d0 = detector_for_fps(dd, 0.f), d15 = detector_for_fps(dd, 15.f);
+    CHECK(d60.fine_frames == dd.fine_frames && d60.grow_frames == dd.grow_frames && d60.coarse_every == dd.coarse_every &&
+              d0.bg_frames == dd.bg_frames, "detector_for_fps 60");
+    CHECK(d15.fine_frames < dd.fine_frames && d15.fine_frames >= 20 && d15.bg_frames == dd.bg_frames && d15.recheck_every >= 1 &&
+              d15.recheck_frames / d15.recheck_every >= dd.recheck_frames / dd.recheck_every * 3 / 4 &&
+              d15.coarse_every == dd.coarse_every && d15.full_every == dd.full_every,
+          "detector_for_fps 15: fine %d bg %d recheck %d/%d", d15.fine_frames, d15.bg_frames, d15.recheck_frames, d15.recheck_every);
     std::printf("stationary camera (mask file, per_tile, fps): ok\n");
 }
 
@@ -955,6 +997,122 @@ static void test_soft_cloud() {
     std::printf("soft clouds at the treeline open: ok\n");
 }
 
+// Мягкое облако в ряду 3 над гладким просветом (ряд 4) и верхушкой дерева (ряд 5), земля — с ряда 6.
+// Над тёмной верхушкой облако линию горизонта поднимает (sky_tree): просвет закрыт. Над светлой
+// (лес в дымке) и без sky_tree — открыт. Само облако открыто всегда
+static void test_soft_tree() {
+    const int w = 640, h = 640, T = 64, col = 4;
+    const int cloud = 3 * 10 + col, gap = cloud + 10, top = gap + 10;
+    const int cw = w / 2, ch = h / 2;
+    std::vector<uint8_t> u((size_t)cw * ch), v(u.size());
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            const int t = 2 * y / T * 10 + 2 * x / T;
+            const bool grey = t == cloud, sky = t / 10 < 5 || (t / 10 == 5 && t != top);
+            u[(size_t)y * cw + x] = grey ? 128 : sky ? 138 : 118;   // голубое небо, серое облако, зелёные кроны
+            v[(size_t)y * cw + x] = grey ? 128 : sky ? 123 : 120;
+        }
+    for (int variant = 0; variant < 3; ++variant) {   // тёмная верхушка; светлая; тёмная без sky_tree
+        const bool darkTop = variant != 1;
+        auto frame = [&](unsigned seed) {
+            auto f = ground_frame(w, h, 0.6f, seed);
+            std::mt19937 g(seed + 1000);
+            const float ph = 0.2f * (float)seed;
+            for (int y = 3 * T; y < 4 * T; ++y)
+                for (int x = col * T; x < (col + 1) * T; ++x)
+                    f[(size_t)y * w + x] = (uint8_t)(175.f + 12.f * std::sin(0.2618f * x + ph) * std::sin(0.2618f * y));
+            for (int y = 5 * T; y < 6 * T; ++y)
+                for (int x = col * T; x < (col + 1) * T; ++x) f[(size_t)y * w + x] = (uint8_t)(darkTop ? 30 + g() % 60 : 120 + g() % 40);
+            return f;
+        };
+        DetectorConfig cfg;
+        cfg.threads = 1;
+        cfg.mask_recheck = false;
+        if (variant == 2) cfg.sky_tree = 0;
+        Detector d(cfg);
+        std::vector<Candidate> c;
+        d.beginMaskLearning();
+        for (int i = 0; i < 25; ++i) {
+            d.setColor(u.data(), v.data(), cw, ch, cw, 2);
+            d.detect(frame(i).data(), w, h, w, c);
+        }
+        d.endMaskLearning();
+        const auto& m = d.tileMask();
+        const auto& sc = d.skyColored();
+        CHECK(!m[cloud] && sc.size() == m.size() && sc[cloud], "soft tree %d: cloud not open by colour", variant);
+        CHECK(!m[top] && m[cloud - 10], "soft tree %d: tree top open or sky above the cloud closed", variant);
+        CHECK(m[gap] == (variant != 0), "soft tree %d: gap under the cloud %s", variant, m[gap] ? "open" : "closed");
+    }
+    std::printf("soft cloud over a dark tree top keeps the skyline: ok\n");
+}
+
+// Лист у камеры (leaf_color): тёмное пятно на голубом небе — зелёное, жёлтое, оранжевое, красное или бурое —
+// с цветом листвы; серое и серое, смешанное с цветом неба, — нет, как и серое на тёплом облаке. Трек с
+// попаданиями цвета листвы не захватывается, а захваченный отпускается
+static void test_leaf_color() {
+    const int w = 640, h = 480, X = 322, Y = 238;
+    struct Case { const char* name; int bu, bv, tu, tv; bool leafy; };
+    const Case cases[] = {{"green", 8, -10, -12, -8, true},  {"yellow", 8, -10, -25, 5, true},
+                          {"orange", 8, -10, -18, 20, true}, {"red", 8, -10, -8, 35, true},
+                          {"brown", 8, -10, -10, 8, true},   {"grey", 8, -10, 0, 0, false},
+                          {"grey in haze", 8, -10, 3, -4, false}, {"grey on a warm cloud", -8, 2, -4, 1, false},
+                          {"dark, colour of the cloud", -8, 2, -8, 2, false}};
+    std::mt19937 g(5);
+    std::vector<uint8_t> f((size_t)w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const bool in = (x - X) * (x - X) + (y - Y) * (y - Y) <= 25;
+            f[(size_t)y * w + x] = (uint8_t)((in ? 110 : 180) + (int)(g() % 5) - 2);
+        }
+    // отсчёт цвета — в углу блока 4x4 (как в приложении) и в середине блока 2x2 (yuv420 с камеры)
+    for (const int st : {4, 2})
+        for (const Case& k : cases) {
+            const int cw = w / st, ch = h / st, off = st == 4 ? 0 : 1;
+            std::vector<uint8_t> u((size_t)cw * ch), v(u.size());
+            for (int by = 0; by < ch; ++by)
+                for (int bx = 0; bx < cw; ++bx) {
+                    const int x = st * bx + off, y = st * by + off;
+                    const bool in = (x - X) * (x - X) + (y - Y) * (y - Y) <= 25;
+                    u[(size_t)by * cw + bx] = (uint8_t)(128 + (in ? k.tu : k.bu));
+                    v[(size_t)by * cw + bx] = (uint8_t)(128 + (in ? k.tv : k.bv));
+                }
+            DetectorConfig cfg;
+            cfg.threads = 1;
+            Detector d(cfg);
+            std::vector<Candidate> c;
+            d.setColor(u.data(), v.data(), cw, ch, cw, st, 1, off);
+            d.detect(f.data(), w, h, w, c);
+            const Candidate* t = nullptr;
+            for (const auto& q : c)
+                if (std::fabs(q.x - X) < 4 && std::fabs(q.y - Y) < 4) t = &q;
+            CHECK(t && t->colored && t->leafy == k.leafy, "leaf colour %s, step %d: %s, leaf %.1f", k.name, st,
+                  !t ? "no candidate" : !t->colored ? "colour not measured" : t->leafy ? "leafy" : "not leafy", t ? t->leaf : 0.f);
+            d.detect(f.data(), w, h, w, c);   // цвет — только на кадр, где он задан
+            for (const auto& q : c) CHECK(!q.colored, "leaf colour %s: colour measured without colour planes", k.name);
+        }
+    // трек: лист с первых кадров не захватывается; цвет листвы, увиденный позже, снимает захват; дрон — захвачен,
+    // и редкие случайные попадания с цветом листвы (раз в 40 замеров) за долгое ведение его не срывают
+    for (int variant = 0; variant < 4; ++variant) {
+        Tracker t(1280, 720, TrackerConfig());
+        bool locked = false, lockedLate = false, dropped = false;
+        const int n = variant == 3 ? 240 : 60;
+        for (int i = 0; i < n; ++i) {
+            Candidate d{};
+            d.x = 100 + 4.f * (float)i; d.y = 300 + 1.f * (float)i; d.contrast = 30; d.snr = 5; d.polarity = -1; d.margin = 3;
+            d.colored = true;
+            d.leafy = variant == 0 || (variant == 1 && i >= 40) || (variant == 3 && i % 40 == 39);
+            t.update({d});
+            dropped |= locked && t.lockedId() == 0;
+            locked |= t.lockedId() != 0;
+            if (i >= 45) lockedLate |= t.lockedId() != 0;
+        }
+        if (variant == 0) CHECK(!locked, "leaf track locked");
+        if (variant == 1) CHECK(locked && !lockedLate, "late leaf colour: locked %d, still locked %d", locked, lockedLate);
+        if (variant >= 2) CHECK(locked && !dropped, "drone lock (variant %d): locked %d, dropped %d", variant, locked, dropped);
+    }
+    std::printf("leaf colour: ok\n");
+}
+
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
 // поверх кадра (неподвижные точки исключаются из оценки) и с повтором кадра
 static void test_motion() {
@@ -981,6 +1139,23 @@ static void test_motion() {
               osd ? " with overlay" : "", e.dx, e.dy);
         const MotionEstimate z = gm.estimate(f1.data(), w, h, w);   // повтор кадра
         CHECK(z.valid && z.dx == 0 && z.dy == 0, "motion: repeated frame %.2f %.2f", z.dx, z.dy);
+    }
+    // Плавный поворот, а нижние 40% кадра стоят (своя техника в кадре, как в записях игры): на 60 к/с
+    // сдвиг 6 пикс. за кадр — 360 пикс./с, и проверка по частям кадра считает это шевелением в кадре
+    // при неподвижной камере; на 15 к/с это 90 пикс./с, поворот должен найтись
+    auto still = [&](int ox) {
+        std::vector<uint8_t> f = frame(ox, 0, false), s0 = frame(0, 0, false);
+        std::copy(s0.begin() + (size_t)(h * 6 / 10) * w, s0.end(), f.begin() + (size_t)(h * 6 / 10) * w);
+        return f;
+    };
+    for (float fps : {0.f, 15.f}) {
+        GlobalMotion gm;
+        gm.setFps(fps);
+        auto f0 = still(0), f1 = still(-6);
+        gm.estimate(f0.data(), w, h, w);
+        const MotionEstimate e = gm.estimate(f1.data(), w, h, w);
+        if (fps > 0) CHECK(e.valid && std::fabs(e.dx - 6) <= 1.5f && std::fabs(e.dy) <= 1.f, "motion 15 fps, still part: %.2f %.2f (6, 0)", e.dx, e.dy);
+        else CHECK(e.valid && e.dx == 0 && e.dy == 0, "motion 60 fps, still part: %.2f %.2f (0, 0)", e.dx, e.dy);
     }
     std::printf("motion: ok\n");
 }
@@ -1149,6 +1324,23 @@ static void test_scene() {
         moved |= sa.update(f.data(), w, h, w, 25.f) && sa.state().moved;
     }
     CHECK(moved, "сдвиг камеры не замечен");
+    // густой туман: земля лишь чуть темнее неба, по яркости на пороге "темнее неба"; облака плывут,
+    // яркость неба над кромкой меняется, и столбцы то находят кромку, то нет. Камера стоит —
+    // сдвигом сцены это не считается
+    SceneAnalyzer fog;
+    bool fogMoved = false;
+    for (int i = 0; i < 80; ++i) {
+        f.resize((size_t)w * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const int top = 300 + (int)(20 * std::sin(x * 0.05f));
+                const float sky = 175.f + 12.f * std::sin(x * 0.03f - i * 0.4f);
+                const float v = (y < top ? sky : 147.f) + n(g);
+                f[(size_t)y * w + x] = (uint8_t)std::min(255.f, std::max(0.f, v));
+            }
+        fogMoved |= fog.update(f.data(), w, h, w, 25.f) && fog.state().moved;
+    }
+    CHECK(!fogMoved, "дрожащая кромка (туман) принята за сдвиг камеры");
     SceneAnalyzer night;
     for (int i = 0; i < 40; ++i) {
         frame(25, 0.4f, 0, f);
@@ -1213,6 +1405,8 @@ int main() {
     test_grow_mask();
     test_sky_color();
     test_soft_cloud();
+    test_soft_tree();
+    test_leaf_color();
     test_scene();
     test_motion();
     test_bad_files();
