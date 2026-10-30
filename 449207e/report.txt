@@ -1,0 +1,48 @@
+drone_types wide 4608x3456 14 к/с, кадров 140, с целями 140
+   drone id=1: в кадре  85.7%  6.8–25.7 пикс.  109–412 м
+   drone id=2: в кадре 100.0%  1.3–1.4 пикс.  569–616 м
+   drone id=3: в кадре 100.0%  6.2–11.9 пикс.  216–410 м
+   drone id=4: в кадре  94.3%  6.2–8.4 пикс.  546–735 м
+   drone id=6: в кадре 100.0%  3.0–3.5 пикс.  1086–1248 м
+   drone id=7: в кадре 100.0%  4.7–6.1 пикс.  658–856 м
+   drone id=8: в кадре 100.0%  0.7–0.8 пикс.  1173–1252 м
+   bird  id=9: в кадре 100.0%  2.2–2.7 пикс.  366–447 м
+   bird  id=10: в кадре 100.0%  0.8–0.8 пикс.  1168–1239 м
+   bird  id=12: в кадре 100.0%  0.4–0.4 пикс.  1036–1132 м
+drone_types fine 640x480 60 к/с, кадров 600, с целями 544
+   drone id=1: в кадре  79.8%  10.1–36.9 пикс.  104–380 м
+   drone id=4: в кадре   5.7%  11.2–11.4 пикс.  546–556 м
+   drone id=7: в кадре   3.3%  6.4–6.4 пикс.  850–857 м
+   drone id=8: в кадре  30.0%  1.0–1.0 пикс.  1218–1242 м
+   bird  id=10: в кадре  61.3%  1.0–1.1 пикс.  1168–1232 м
+   точная: цель назначена в 100% кадров
+forest_polyhaven wide 4608x3456 14 к/с, кадров 140, с целями 140
+   drone id=1: в кадре 100.0%  1.6–2.1 пикс.  222–287 м
+   drone id=2: в кадре 100.0%  1.1–1.1 пикс.  348–379 м
+   drone id=3: в кадре 100.0%  2.4–2.4 пикс.  165–168 м
+   drone id=4: в кадре  70.0%  4.5–5.7 пикс.  418–538 м
+   bird  id=5: в кадре 100.0%  7.4–9.1 пикс.  132–161 м
+   bird  id=6: в кадре 100.0%  4.5–6.8 пикс.  117–176 м
+forest_polyhaven fine 640x480 60 к/с, кадров 600, с целями 594
+   drone id=1: в кадре  89.2%  2.3–2.9 пикс.  222–278 м
+   drone id=2: в кадре   1.5%  1.4–1.4 пикс.  378–378 м
+   drone id=3: в кадре  35.8%  3.2–3.3 пикс.  165–168 м
+   bird  id=5: в кадре   7.5%  10.1–10.2 пикс.  159–161 м
+   точная: цель назначена в 100% кадров
+quick wide 2304x1728 14 к/с, кадров 42, с целями 42
+   drone id=1: в кадре 100.0%  0.8–0.9 пикс.  264–287 м
+   drone id=2: в кадре  31.0%  0.5–0.5 пикс.  379–379 м
+   drone id=3: в кадре 100.0%  1.2–1.2 пикс.  165–167 м
+   bird  id=5: в кадре 100.0%  3.7–3.9 пикс.  152–161 м
+   bird  id=6: в кадре 100.0%  2.3–2.6 пикс.  152–176 м
+quick fine 640x480 60 к/с, кадров 180, с целями 174
+   drone id=1: в кадре  63.9%  2.3–2.4 пикс.  264–278 м
+   drone id=3: в кадре  22.2%  3.3–3.3 пикс.  165–166 м
+   bird  id=5: в кадре  25.0%  10.1–10.2 пикс.  159–161 м
+   точная: цель назначена в 100% кадров
+{"video": 0, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 1.4, "eval_frames": 575, "gt_drone_frames": 508, "score": 55.47, "recall_drone": 44.33, "lock_on_drone": 56.89, "hard_on_drone": 0.0, "false_lock": 22.31, "false_per_frame": 0.111, "false_tracks": 6.0, "drone_as_drone": 58.36, "recall_bird": 0.0, "first_detect_s": 0.033, "first_lock_s": 0.033, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 65.33, "hard_pct": 0.0, "lock_acq": 16.0, "targets_per_frame": 0.71, "tracks": 27.0, "drone_ids": 7.0, "bird_ids": 4.0, "proc_ms": 2.15, "proc_p95_ms": 4.478, "detect_ms": 0.972, "fps": 427.55, "frames": 600.0}
+{"video": 1, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 4.76, "eval_frames": 115, "gt_drone_frames": 115, "score": 80.77, "recall_drone": 79.79, "lock_on_drone": 86.09, "hard_on_drone": 73.91, "false_lock": 7.48, "false_per_frame": 0.817, "false_tracks": 4.0, "drone_as_drone": 70.65, "recall_bird": 6.09, "first_detect_s": 0.143, "first_lock_s": 1.286, "sky_pct": 92.41, "sky_dark_pct": 92.44, "lock_pct": 88.57, "hard_pct": 66.43, "lock_acq": 4.0, "targets_per_frame": 9.8, "tracks": 127.0, "drone_ids": 20.0, "bird_ids": 20.0, "proc_ms": 14.537, "proc_p95_ms": 29.114, "detect_ms": 13.207, "fps": 29.38, "frames": 140.0}
+{"video": 2, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 2.51, "eval_frames": 575, "gt_drone_frames": 569, "score": 92.29, "recall_drone": 92.07, "lock_on_drone": 93.32, "hard_on_drone": 47.45, "false_lock": 3.98, "false_per_frame": 0.214, "false_tracks": 6.0, "drone_as_drone": 96.5, "recall_bird": 100.0, "first_detect_s": 0.367, "first_lock_s": 1.117, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 96.0, "hard_pct": 45.0, "lock_acq": 2.0, "targets_per_frame": 1.435, "tracks": 13.0, "drone_ids": 6.0, "bird_ids": 4.0, "proc_ms": 3.936, "proc_p95_ms": 11.064, "detect_ms": 2.424, "fps": 238.94, "frames": 600.0}
+{"video": 3, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 4.41, "eval_frames": 115, "gt_drone_frames": 115, "score": 20.9, "recall_drone": 54.85, "lock_on_drone": 0.0, "hard_on_drone": 0.0, "false_lock": 100.0, "false_per_frame": 0.209, "false_tracks": 4.0, "drone_as_drone": 72.02, "recall_bird": 98.26, "first_detect_s": 0.143, "first_lock_s": null, "sky_pct": 92.59, "sky_dark_pct": 92.67, "lock_pct": 89.29, "hard_pct": 31.43, "lock_acq": 6.0, "targets_per_frame": 7.5, "tracks": 120.0, "drone_ids": 14.0, "bird_ids": 11.0, "proc_ms": 14.229, "proc_p95_ms": 25.749, "detect_ms": 12.858, "fps": 31.77, "frames": 140.0}
+{"video": 4, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.79, "eval_frames": 155, "gt_drone_frames": 149, "score": 79.58, "recall_drone": 81.88, "lock_on_drone": 79.87, "hard_on_drone": 22.82, "false_lock": 15.6, "false_per_frame": 0.4, "false_tracks": 10.0, "drone_as_drone": 87.7, "recall_bird": 100.0, "first_detect_s": 0.383, "first_lock_s": 0.433, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 90.56, "hard_pct": 18.89, "lock_acq": 5.0, "targets_per_frame": 1.311, "tracks": 15.0, "drone_ids": 5.0, "bird_ids": 5.0, "proc_ms": 3.697, "proc_p95_ms": 9.523, "detect_ms": 2.213, "fps": 227.26, "frames": 180.0}
+{"video": 5, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.74, "eval_frames": 17, "gt_drone_frames": 17, "score": 0.0, "recall_drone": 0.0, "lock_on_drone": 0.0, "hard_on_drone": 0.0, "false_lock": 100.0, "false_per_frame": 1.471, "false_tracks": 7.0, "drone_as_drone": null, "recall_bird": 100.0, "first_detect_s": null, "first_lock_s": null, "sky_pct": 89.81, "sky_dark_pct": 90.64, "lock_pct": 83.33, "hard_pct": 33.33, "lock_acq": 2.0, "targets_per_frame": 10.595, "tracks": 69.0, "drone_ids": 4.0, "bird_ids": 12.0, "proc_ms": 8.852, "proc_p95_ms": 14.459, "detect_ms": 7.696, "fps": 56.73, "frames": 42.0}
