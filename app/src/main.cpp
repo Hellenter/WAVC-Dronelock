@@ -3198,6 +3198,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-scene-shift") s.sceneShift = false;
         else if (a == "--no-pan") s.panDetect = false;
         else if (a == "--pan-motion") s.panMotion = true;
+        else if (a == "--no-motion-long") s.motionLong = false;
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--static-file") s.staticFile = true;
@@ -3492,7 +3493,7 @@ int run_stress(int argc, char** argv) {
                 break;
             case 36:   // трекер: захват на летавший трек, переход жёсткого, птица, скорости в секундах
                 s.trk.lock_mover = R(2);
-                s.trk.lock_mover_fps = R(3) ? 20.f : F(0, 120);
+                s.trk.lock_mover_fps = R(3) ? 31.f : F(0, 120);
                 s.trk.hard_switch_drone = R(3) != 0;
                 s.trk.hover_first = R(3) != 0;
                 s.trk.reupdate = R(2) ? 0.f : F(0, 1);
@@ -3502,8 +3503,21 @@ int run_stress(int argc, char** argv) {
                 s.trk.lock_slow = R(2) ? 1.f : F(0, 3);
                 s.trk.hard_switch = F(0, 4);
                 s.trk.lock_dwell = R(40);
+                s.trk.lock_dwell_keep = R(3) != 0;
+                s.trk.lock_bird_yield = R(3) != 0;
                 s.trk.follow_k = F(0, 6);
                 s.trkSeconds = R(4) != 0;
+                // ночной подбор 30.10: дрейф фона, ведомая цель, ворота, класс по кадру, наложение у края
+                s.trk.hard_switch_follow = R(3) != 0;
+                s.trk.follow_min_obs = R(3) ? 16 : R(64);
+                s.trk.drift_min = R(3) ? 0.25f : F(0, 2);
+                s.trk.drift_obs = R(3) ? 13 : R(80);
+                s.trk.resid_frame = R(3) != 0;
+                s.trk.overlay_rel = R(3) ? 0.f : F(0, 0.5f);
+                s.trk.gate = R(3) ? 26.f : F(0, 150);
+                s.trk.gate_speed_k = R(3) ? 0.f : F(0, 4);
+                s.trk.gate_pps = R(3) ? 360.f : F(0, 2000);
+                s.motionLong = R(3) != 0;
                 break;
             default:   // частота камеры и шаг: ниже частоты видео кадры файла пропускаются
                 s.targetFps = R(2) ? 0 : F(1, 120);

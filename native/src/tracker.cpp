@@ -42,6 +42,11 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     // медленная камера: новый захват — только на летавший трек (см. lock_mover_fps)
     if (fps > 0 && fps <= c.lock_mover_fps) c.lock_mover = true;
     if (!(fps > 0) || !(ref > 0)) return c;
+    // предел ворот — не меньше пути цели за кадр при gate_pps пикс./с (на 10 к/с — 36 пикс.)
+    if (c.gate_pps > 0) c.gate = std::max(c.gate, c.gate_pps / fps);
+    // окно ведомой цели: заданное — от 30 к/с и выше, ниже — во времени, но не меньше 9
+    if (c.follow_min_obs > 0)
+        c.follow_min_obs = std::min(c.follow_min_obs, std::max(9, (int)std::lround(c.follow_min_obs * fps / 30.f)));
     // правила на кадр жизни трека — по частоте вызовов update
     const float vu = ref / (ufps > 0 ? ufps : fps);
     c.still_speed *= vu;
@@ -53,12 +58,16 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     // по физике ворота растут как v, а СКО ускорения в пикс./кадр^2 как v^2. Замер на 10 к/с
     // (30 с синтетики): так птиц находится больше всех (88%), но 12% попаданий по дронам
     // уходят в "птицу" — трек слишком вольно гнётся. С v^0.5 и v^1.5 птиц 77% (без пересчёта
-    // 51%), дронов-"птиц" 0, ложных тревог столько же
-    c.gate *= std::sqrt(v);
+    // 51%), дронов-"птиц" 0, ложных тревог столько же.
+    // Предел ворот gate — в пикселях кадра без пересчёта по v (ночной тест 30.10; ниже 14 к/с — путь за кадр,
+    // gate_pps): ворота по ошибке прогноза растут и так (q_accel), а предел 40·√v на 14 к/с (53 пикс.)
+    // цеплял чужие отклики — без дронов кадров с захватом 19 -> 3%, на 60 к/с 20·√v (13 пикс.) рвал
+    // ведомую цель (wt17, wt16)
     c.q_accel *= v * std::sqrt(v);
     c.bird_speed *= v;
     c.hover_speed *= v;
     c.lock_slow *= v;
+    c.drift_min *= v;
     c.size_rate_max = std::min(0.5f, c.size_rate_max * v);
     c.clutter_decay = std::pow(c.clutter_decay, v);
     c.max_miss = frames(c.max_miss, 3);
@@ -70,7 +79,8 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     // окно взмахов: не короче 32 кадров — на 10 к/с частые взмахи приходят сложенными в
     // низкие частоты, на их период нужно несколько секунд
     c.flap_window = c.flap_window > 0 ? std::min(64, std::max(32, (int)std::lround(c.flap_window * t))) : 0;
-    c.verify_frames = frames(c.verify_frames, 8);
+    c.verify_frames = frames(c.verify_frames, std::max(1, c.verify_min));
+    c.drift_obs = std::min(40, frames(c.drift_obs, 8));
     c.lock_dwell = frames(c.lock_dwell, 3);
     c.hard_miss = frames(c.hard_miss, 6);
     c.hard_full_every = frames(c.hard_full_every, 1);
@@ -100,6 +110,8 @@ void Tracker::resetTracks() {
     hard_ = false;
     manual_ = false;
     lockSilh_ = Silhouette();
+    driftX_ = driftY_ = 0;
+    driftOn_ = false;
 }
 
 void Tracker::resetTracksKeepFollowed() {
@@ -209,14 +221,14 @@ bool Tracker::loadStatic(const std::string& path) {
 }
 
 // МНК-парабола p(t) = a + b t + c t^2; возвращает сумму квадратов остатков, b — скорость в середине окна
-static double fit_quad(const std::deque<Track::Obs>& obs, size_t from, bool useX, double& slope) {
+static double fit_quad(const std::deque<Track::Obs>& obs, size_t from, bool useX, double& slope, bool frame = false) {
     const auto o0 = obs.begin() + (std::ptrdiff_t)from;
     const int n = (int)(obs.size() - from);
     const double tm = 0.5 * (o0->t + obs.back().t);
     double S[5] = {0, 0, 0, 0, 0}, B[3] = {0, 0, 0};
     for (auto it = o0; it != obs.end(); ++it) {
         const auto& q = *it;
-        const double t = q.t - tm, v = useX ? q.x : q.y;
+        const double t = q.t - tm, v = frame ? (useX ? q.fx : q.fy) : (useX ? q.x : q.y);
         double tp = 1;
         for (int i = 0; i < 5; ++i) { S[i] += tp; if (i < 3) B[i] += tp * v; tp *= t; }
     }
@@ -240,7 +252,7 @@ static double fit_quad(const std::deque<Track::Obs>& obs, size_t from, bool useX
     double ss = 0;
     for (auto it = o0; it != obs.end(); ++it) {
         const auto& q = *it;
-        const double t = q.t - tm, v = useX ? q.x : q.y;
+        const double t = q.t - tm, v = frame ? (useX ? q.fx : q.fy) : (useX ? q.x : q.y);
         const double r = v - (coef[0] + coef[1] * t + coef[2] * t * t);
         ss += r * r;
     }
@@ -313,7 +325,7 @@ bool Tracker::midFrame(float x, float y) const {
 // игра и оператор водят камеру за целью туда-обратно (по сцене цель "летает" на месте, пробег
 // мал), а дрожь замера по кадру в путь не копится — с рук неподвижное ведомым не становится
 bool Tracker::followedNow(const Track& t) const {
-    if (cfg_.follow_k <= 0 || !movingCam_ || t.obs.size() < 16) return false;
+    if (cfg_.follow_k <= 0 || !movingCam_ || (int)t.obs.size() < std::max(9, cfg_.follow_min_obs)) return false;
     const int n = (int)std::min<size_t>(48, t.obs.size()), a = (int)t.obs.size() - n;
     float cam = 0, frame = 0;
     for (int s = 0; s < 8; ++s) {
@@ -366,6 +378,11 @@ void Tracker::classify(Track& t) const {
         double sx, sy;
         const double ss = fit_quad(o, from, true, sx) + fit_quad(o, from, false, sy);
         t.resid = (float)std::sqrt(ss / n);
+        if (cfg_.resid_frame) {   // по кадру ровнее (камера ведёт цель) — шум поворота не в счёт
+            double fx, fy;
+            const double sf = fit_quad(o, from, true, fx, true) + fit_quad(o, from, false, fy, true);
+            t.resid = std::min(t.resid, (float)std::sqrt(sf / n));
+        }
         t.speed = (float)std::hypot(sx, sy);
         double mc = 0, vc = 0;
         for (size_t i = from; i < o.size(); ++i) mc += o[i].c;
@@ -420,6 +437,11 @@ void Tracker::classify(Track& t) const {
     if (t.cls == TargetClass::Unknown || t.cls == TargetClass::Clutter) t.birdScore = inst;
     else t.birdScore = 0.8f * t.birdScore + 0.2f * inst;
     t.cls = t.birdScore > 0.5f ? TargetClass::Bird : TargetClass::Drone;
+}
+
+// Скорость цели для захвата, пикс./кадр по сцене; пока есть дрейф фона — относительно него
+float Tracker::relSpeed(const Track& t) const {
+    return driftOn_ ? std::hypot(t.vsx - driftX_, t.vsy - driftY_) : t.speed;
 }
 
 // Сколько кадров подтверждённый трек держится на прогнозе: короткий (возможно, шум) —
@@ -507,7 +529,7 @@ void Tracker::focus(float camDx, float camDy, std::vector<FocusArea>& out) const
         if (t.id != lockId_ && (t.hits < cfg_.cls_min_hits || (t.travel < cfg_.mover_px && !quietHold(t)))) continue;
         const KfPeek k = kf_peek(t, camDx, camDy, q);
         const float S = k.p00 + measVar(t.level);
-        const float r = std::min(cfg_.gate, std::max(cfg_.gate_min, cfg_.gate_sigma * std::sqrt(S)));
+        const float r = std::min(gateCap(t), std::max(cfg_.gate_min, cfg_.gate_sigma * std::sqrt(S)));
         out.push_back({k.x, k.y, r});
     }
 }
@@ -532,7 +554,7 @@ void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
         }
         // запас на размер цели: на грубом масштабе её отклик гуляет по корпусу
         out.push_back({k.x, k.y,
-                       std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << lv) +
+                       std::min(gateCap(t), std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << lv) +
                            0.5f * std::max(e, std::max(t.bw, t.bh)),
                        lv});
     }
@@ -575,6 +597,8 @@ bool Tracker::aim(float& x, float& y, float& vx, float& vy) const {
 
 const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, float camDx, float camDy) {
     ++frame_;
+    // сдвиг камеры известен (учёт движения, панорама): дрейф фона не оцениваем — его уже вычли
+    const bool camKnown = camDx != 0 || camDy != 0 || sceneDx_ != 0 || sceneDy_ != 0;
     gx_ += camDx + sceneDx_;
     gy_ += camDy + sceneDy_;
     const float q = cfg_.q_accel * cfg_.q_accel;
@@ -651,6 +675,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             if (L.hits >= 5) {
                 L.bx += sil.x - L.x;
                 L.by += sil.y - L.y;
+                L.rbx += sil.x - L.x;
+                L.rby += sil.y - L.y;
             }
             L.x = sil.x;
             L.y = sil.y;
@@ -721,7 +747,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             const float S = t.p00 + measVar(dets[di].level);
             // крупная цель (грубый масштаб) — протяжённая, её отклик гуляет по корпусу
             const float gmin = cfg_.gate_min * (float)(1 << std::min(4, std::max(dets[di].level, t.level)));
-            const float r = std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S)));
+            const float r = std::min(gateCap(t), std::max(gmin, cfg_.gate_sigma * std::sqrt(S)));
             const float ex = dets[di].x - t.x, ey = dets[di].y - t.y, d2 = ex * ex + ey * ey;
             if (d2 < r * r) pairs.push_back({d2 / S, ti, di});
         }
@@ -828,10 +854,10 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         tr.path.push_back({tr.x, tr.y});
         while (tr.path.size() > 30) tr.path.pop_front();
         const float sx = d.x - gx_, sy = d.y - gy_;
-        if (tr.hits <= 5) tr.travel = tr.camPath = 0;
+        if (tr.hits <= 5) tr.travel = tr.camPath = tr.travelRel = 0;
         else if (!tr.obs.empty())
             tr.camPath += std::hypot((d.x - sx) - (tr.obs.back().fx - tr.obs.back().x), (d.y - sy) - (tr.obs.back().fy - tr.obs.back().y));
-        tr.obs.push_back({frame_, sx, sy, d.contrast, d.level, d.energy, d.x, d.y});
+        tr.obs.push_back({frame_, sx, sy, d.contrast, d.level, d.energy, d.x, d.y, driftAx_, driftAy_});
         while ((int)tr.obs.size() > std::max({48, cfg_.cls_window, cfg_.flap_window, cfg_.overlay_hits})) tr.obs.pop_front();
         // прямота пути: последние до 48 попаданий, 8 отрезков (шум замера на коротких шагах
         // не делает медленный дрон "дрожащим")
@@ -860,6 +886,16 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             // соседний тайл) не делает из неподвижной помехи "летавшую" цель
             if (tr.hits == 5) { tr.bx = xs[2]; tr.by = ys[2]; }
             tr.travel = std::max(tr.travel, std::hypot(xs[2] - tr.bx, ys[2] - tr.by));
+            // то же относительно фона (за вычетом дрейфа, см. drift_min); без дрейфа — как travel
+            for (int i = 0; i < 5; ++i) {
+                const auto& o = tr.obs[tr.obs.size() - 5 + i];
+                xs[i] = o.x - o.dx;
+                ys[i] = o.y - o.dy;
+            }
+            std::nth_element(xs, xs + 2, xs + 5);
+            std::nth_element(ys, ys + 2, ys + 5);
+            if (tr.hits == 5) { tr.rbx = xs[2]; tr.rby = ys[2]; }
+            tr.travelRel = std::max(tr.travelRel, std::hypot(xs[2] - tr.rbx, ys[2] - tr.rby));
         }
         // наложение на кадр: стоит в одной точке кадра, пока сцена (камера) уехала
         const int no = cfg_.overlay_hits;
@@ -874,7 +910,10 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             const float spread = std::hypot(tr.obs.back().x - tr.obs[from].x, tr.obs.back().y - tr.obs[from].y);
             // за захваченной целью камера следит сама (setFollowing): стоять в кадре — её дело
             // в середине кадра надписей и логотипов нет, а цель, которую ведёт камера, есть
-            if (std::sqrt(vv / no) < cfg_.overlay_px && spread > cfg_.overlay_cam && !(following_ && tr.id == lockId_) &&
+            const float sd = (float)std::sqrt(vv / no);
+            const bool still = sd < cfg_.overlay_px ||
+                               (cfg_.overlay_rel > 0 && sd < cfg_.overlay_rel * spread && !midFrame((float)mx, (float)my));
+            if (still && spread > cfg_.overlay_cam && !(following_ && tr.id == lockId_) &&
                 !(cfg_.follow_k > 0 && midFrame((float)mx, (float)my)))
                 tr.overlay = true;
         }
@@ -890,6 +929,55 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 tr.pend.clear();
             }
         }
+    }
+    // дрейф фона: медиана скорости устоявшихся треков этого кадра (большинство из них — неподвижные
+    // предметы), сглаженная; учитывается, пока быстрее drift_min (с запасом на выход)
+    if (cfg_.drift_min > 0) {
+        std::vector<float> vx, vy;
+        // скорость трека — по его последним drift_obs попаданиям (у фильтра Калмана она скачет от
+        // квантования положения отклика)
+        const size_t W = (size_t)std::max(2, cfg_.drift_obs);
+        if (!camKnown)
+            for (const Track& t : tracks_) {
+                if (t.hits < cfg_.cls_min_hits || t.miss != 0 || t.followed || t.overlay || (hard_ && t.id == lockId_) ||
+                    t.obs.size() < W)
+                    continue;
+                const auto& a = t.obs[t.obs.size() - W];
+                const auto& b = t.obs.back();
+                if (b.t <= a.t) continue;
+                vx.push_back((b.x - a.x) / (float)(b.t - a.t));
+                vy.push_back((b.y - a.y) / (float)(b.t - a.t));
+            }
+        // большинство (половина) — в пределах допуска от медианы: фон плывёт как целое, а не разброд
+        bool agree = false;
+        float mx = 0, my = 0;
+        if ((int)vx.size() >= std::max(3, cfg_.drift_tracks)) {
+            std::vector<float> sx = vx, sy = vy;
+            const size_t m = sx.size() / 2;
+            std::nth_element(sx.begin(), sx.begin() + (std::ptrdiff_t)m, sx.end());
+            std::nth_element(sy.begin(), sy.begin() + (std::ptrdiff_t)m, sy.end());
+            mx = sx[m];
+            my = sy[m];
+            const float tol = std::max(cfg_.drift_min, 0.5f * std::hypot(mx, my));
+            size_t near = 0;
+            for (size_t i = 0; i < vx.size(); ++i) near += std::hypot(vx[i] - mx, vy[i] - my) < tol;
+            agree = near * 2 >= vx.size();
+        }
+        if (agree) {
+            driftX_ = 0.7f * driftX_ + 0.3f * mx;
+            driftY_ = 0.7f * driftY_ + 0.3f * my;
+        } else {
+            driftX_ *= 0.7f;
+            driftY_ *= 0.7f;
+        }
+        const float dv = std::hypot(driftX_, driftY_);
+        driftOn_ = dv > (driftOn_ ? 0.7f : 1.f) * cfg_.drift_min;
+        if (driftOn_) {
+            driftAx_ += driftX_;
+            driftAy_ += driftY_;
+        }
+    } else {
+        driftOn_ = false;
     }
     // трек умер, так и не полетев: его отклики — в долгую память
     if (cfg_.static_frames > 0)
@@ -941,7 +1029,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         t.by = d.y - gy_;
         t.hist.push_back(true);
         t.path.push_back({t.x, t.y});
-        t.obs.push_back({frame_, t.bx, t.by, t.contrast, d.level, d.energy, d.x, d.y});
+        t.obs.push_back({frame_, t.bx, t.by, t.contrast, d.level, d.energy, d.x, d.y, driftAx_, driftAy_});
         t.edgeBorn = d.edge;
         t.quiet = quietBirth(d);
         if (learn && !t.quiet) t.pend.push_back((uint32_t)cellOf(d));
@@ -993,11 +1081,13 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         // в кроне тоже "медленный"
         // в кроне тоже "медленный", а зависший на месте (неподвижная точка в кроне, к которой
         // перешёл трек пролетевшей цели) уступает летящим
+        // при дрейфе фона — пробег и скорость относительно фона: плывущее с ним весит как зависшее
         if (tr.followed)
             tr.lockW *= cfg_.follow_k;
-        else if (cfg_.lock_slow > 0)
-            tr.lockW *= std::min(1.f, tr.travel / 64.f) * (tr.speed < cfg_.hover_speed ? 0.05f : 1.f) /
-                        (1.f + tr.speed / cfg_.lock_slow);
+        else if (cfg_.lock_slow > 0) {
+            const float sp = relSpeed(tr), tv = driftOn_ ? tr.travelRel : tr.travel;
+            tr.lockW *= std::min(1.f, tv / 64.f) * (sp < cfg_.hover_speed ? 0.05f : 1.f) / (1.f + sp / cfg_.lock_slow);
+        }
         // родился у кромки неба (кроны, крыши): цель, только если полетела
         if (!tr.solid || tr.miss > coastLimit(tr) || (tr.edgeBorn && (!tr.everMover || edgeJitter(tr)))) continue;
         out_.push_back(tr);
@@ -1016,7 +1106,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // новый захват (lock_mover): только на устоявшийся трек, который уже летал по сцене (или
     // ведомый камерой, или точку спокойного неба) — не на первый подтверждённый блик
     auto lockable = [&](const Track& t) {
-        return !cfg_.lock_mover || t.followed || quietHold(t) || (t.hits >= cfg_.cls_min_hits && t.everMover);
+        return !cfg_.lock_mover || t.followed || quietHold(t) ||
+               (t.hits >= cfg_.cls_min_hits && t.everMover && (!driftOn_ || t.travelRel >= cfg_.mover_px));
     };
     for (const Track& t : out_) {
         if (t.id == lockId_ && !outside(t)) cur = &t;
@@ -1057,8 +1148,10 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             auto wins = [&](const Track& t) {
                 // жёсткий — только на цель, которую классификатор зовёт дроном: медленная
                 // птица рядом весомее (lock_slow), и на 15 к/с захват уходил с дрона на неё (wt16, wt18)
+                // с самолёта на медленный дрон, не на яркую; на ведомую камерой — и без этого
+                // (её скорость по сцене — скорость камеры, hard_switch_follow)
                 return hard_ ? cfg_.hard_switch > 0 && t.lockW > cfg_.hard_switch * cur->lockW &&
-                                   t.speed < 0.5f * cur->speed &&   // с самолёта на медленный дрон, не на яркую
+                                   ((cfg_.hard_switch_follow && t.followed) || relSpeed(t) < 0.5f * relSpeed(*cur)) &&
                                    (!cfg_.hard_switch_drone || t.followed ||   // камера ведёт её — это и есть цель (wt17)
                                     (t.cls == TargetClass::Drone && t.birdScore < 0.5f))
                              : t.lockW > cfg_.lock_switch * cur->lockW;
@@ -1073,11 +1166,23 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 // счёт с утечкой: кадр перевеса +1, кадр без него -1 — претендент, весомый
                 // большую часть времени, своё набирает, хоть вес и скачет
                 const bool w = wins(t);
+                // мягкий захват на «птице» уступает «дрону» сразу (lock_bird_yield)
+                if (w && cfg_.lock_bird_yield && !hard_ && cur->cls == TargetClass::Bird && t.cls == TargetClass::Drone &&
+                    t.birdScore < 0.5f)
+                    n = std::max(n, cfg_.lock_dwell - 1);
                 n += w ? 1 : -1;
                 if (n <= 0) continue;
                 nb.emplace_back(t.id, n);
                 if (w && n >= cfg_.lock_dwell && (!sw || t.lockW > sw->lockW)) sw = &t;
             }
+            // претендент жив, но в выдаче его нет (на прогнозе дольше выдачи) — счёт стоит
+            if (cfg_.lock_dwell_keep)
+                for (const auto& b : beat_) {
+                    bool shown = false, alive = false;
+                    for (const Track& t : out_) shown |= t.id == b.first;
+                    for (const Track& t : tracks_) alive |= t.id == b.first;
+                    if (!shown && alive) nb.push_back(b);
+                }
             beat_.swap(nb);
             if (sw) cur = sw, beat_.clear();
         }
@@ -1135,7 +1240,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             else if (t.cls == TargetClass::Bird || t.cls == TargetClass::Clutter) verify_ = 0;
             // с приоритетом летящих (lock_slow) зависшая цель жёсткий захват не держит: иначе
             // трек пролетевшей цели, перешедший на неподвижную точку в кроне, держит его до конца
-            if (cfg_.lock_slow > 0 && t.speed < cfg_.hover_speed) verify_ = 0, hard_ = false;
+            if (cfg_.lock_slow > 0 && relSpeed(t) < cfg_.hover_speed) verify_ = 0, hard_ = false;
         }
         if (cfg_.hard_lock && verify_ >= cfg_.verify_frames) hard_ = true;
         if (!cfg_.hard_lock || t.overlay || t.anchored || (hard_ && t.cls == TargetClass::Bird && t.birdScore > 0.8f)) {
