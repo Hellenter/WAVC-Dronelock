@@ -620,6 +620,7 @@ struct TrackerConfig {
     // карту помех, трек на нём умирал, и 7 с трека не было вовсе (найден 63 -> 91%). 0 — выключено.
     int creep_frames = 100;
     float creep_px = 24.f;
+    float creep_lag = 8.f;      // ...и ползёт сейчас: за последние creep_frames ушёл на столько пикс.
     float creep_step = 4.f;     // ...и только отклик не дальше стольких пикс. за кадр от прошлой отметки
     int clutter_cell = 8;       // ячейка карты статичного клаттера
     float clutter_decay = 0.97f;
@@ -631,6 +632,8 @@ struct TrackerConfig {
     // мимо такой точки, не теряется. static_frames = 0 — выключено.
     int static_frames = 3000;
     float static_hits = 8.f;
+    // ...умерший на месте трек добавляет в ячейку не больше static_death откликов (0 — все)
+    int static_death = 3;
     // классификатор по движению
     int cls_window = 16;        // сколько последних попаданий смотреть
     int cls_min_hits = 8;       // меньше — класс Unknown
@@ -825,6 +828,8 @@ struct Track {
     float vsx = 0, vsy = 0;  // скорость относительно сцены
     float p00 = 0, p01 = 0, p11 = 0;   // ковариация Калмана (одинакова для x и y)
     float bx = 0, by = 0;    // точка рождения в координатах сцены
+    std::deque<TrackPoint> cps;   // позиция по сцене раз в creep_frames/8 кадров (см. Tracker::creeper)
+    int cpT = -1000000;
     int level = 0;
     bool everMover = false;
     bool crept = false;      // жил в горячей ячейке (см. TrackerConfig::creep_frames): летит — только дальше creep_px

@@ -471,9 +471,27 @@ bool Tracker::quietHold(const Track& t) const {
 // Ползёт при неподвижной камере: ушёл по сцене дальше creep_px (и дальше пути камеры за то же
 // время) — медленно летящий дрон, а не помеха, хоть и медленнее still_speed. Пятно на земле,
 // плывущее от неточной оценки поворота (из-за него still_speed), уходит на 10-20% пути камеры
+// Пробег — наибольший за жизнь, и скачок отклика в начале его раздувает: ещё и ползёт сейчас — за
+// последние creep_frames ушёл на creep_lag, и за их вторую половину — на треть этого (неподвижное
+// пятно на земле wt9, прыгнувшее на 29 пикс. в первые кадры, иначе держало захват весь ролик)
 bool Tracker::creeper(const Track& t) const {
-    return cfg_.creep_frames > 0 && t.travel >= cfg_.creep_px && t.travel >= t.camPath && !t.overlay && !t.anchored &&
-           !edgeJitter(t);
+    if (cfg_.creep_frames <= 0 || t.travel < cfg_.creep_px || t.travel < t.camPath || t.overlay || t.anchored ||
+        t.cps.size() < 5 || edgeJitter(t))
+        return false;
+    const auto& a = t.cps.front();
+    const auto& m = t.cps[t.cps.size() / 2];
+    const auto& b = t.cps.back();
+    const float x1 = m.x - a.x, y1 = m.y - a.y, x2 = b.x - m.x, y2 = b.y - m.y;
+    const float d1 = std::hypot(x1, y1), d2 = std::hypot(x2, y2);
+    // в одну сторону (пятно на земле, дрожащее на 15 пикс., ходит туда-сюда)
+    if (std::hypot(b.x - a.x, b.y - a.y) < cfg_.creep_lag || d1 < cfg_.creep_lag / 3.f || d2 < cfg_.creep_lag / 3.f ||
+        x1 * x2 + y1 * y2 < 0.5f * d1 * d2)
+        return false;
+    // и без скачков: медленная цель за восьмую часть creep_frames уходит не дальше двух still_speed
+    const float step = 2.f * cfg_.still_speed * (float)std::max(1, cfg_.creep_frames / 8) + 4.f;
+    for (size_t i = 1; i < t.cps.size(); ++i)
+        if (std::hypot(t.cps[i].x - t.cps[i - 1].x, t.cps[i].y - t.cps[i - 1].y) > step) return false;
+    return true;
 }
 
 // Медленная цель в горячей ячейке: трек, начатый до того, как ячейка стала помехой, ведёт её
@@ -485,7 +503,7 @@ bool Tracker::creeper(const Track& t) const {
 // иначе трек помехи перескакивает на соседнее пятно и за пару скачков "пролетает" mover_px (n1)
 bool Tracker::creepKeep(const Track& t, const Candidate& d) const {
     if (cfg_.creep_frames <= 0 || !t.confirmed || t.overlay || t.anchored || t.edgeBorn || t.camPath >= cfg_.mover_px ||
-        t.obs.empty() || (t.age >= cfg_.creep_frames && t.travel < cfg_.creep_px))
+        t.obs.empty() || (t.age >= cfg_.creep_frames && !creeper(t)))
         return false;
     const auto& o = t.obs.back();
     const float gap = (float)std::max(1, frame_ - o.t);
@@ -916,6 +934,13 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             // соседний тайл) не делает из неподвижной помехи "летавшую" цель
             if (tr.hits == 5) { tr.bx = xs[2]; tr.by = ys[2]; }
             tr.travel = std::max(tr.travel, std::hypot(xs[2] - tr.bx, ys[2] - tr.by));
+            // позиция по сцене раз в восьмую часть creep_frames (см. creeper): сдвиг за последние
+            // creep_frames и за их вторую половину
+            if (cfg_.creep_frames > 0 && frame_ - tr.cpT >= std::max(1, cfg_.creep_frames / 8)) {
+                tr.cpT = frame_;
+                tr.cps.push_back({xs[2], ys[2]});
+                while (tr.cps.size() > 9) tr.cps.pop_front();
+            }
             // то же относительно фона (за вычетом дрейфа, см. drift_min); без дрейфа — как travel
             for (int i = 0; i < 5; ++i) {
                 const auto& o = tr.obs[tr.obs.size() - 5 + i];
@@ -1013,8 +1038,20 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     if (cfg_.static_frames > 0)
         for (const Track& t : tracks_)
             if (t.miss > (t.confirmed ? coastLimit(t) : cfg_.tentative_miss) && !t.everMover && !t.everLocked &&
-                t.id != lockId_)
-                for (uint32_t c : t.pend) staticAdd(c);
+                t.id != lockId_) {
+                // один умерший трек — не больше static_death откликов на ячейку: иначе трек в полсекунды
+                // (30 отметок в одной ячейке) сразу делал её и соседние запретными для рождения, и
+                // дрон, медленно летящий на камеру рядом, так и не получал трека (wt9: найден 1%)
+                std::vector<std::pair<uint32_t, int>> cnt;
+                for (uint32_t c : t.pend) {
+                    auto it = std::find_if(cnt.begin(), cnt.end(), [&](const auto& p) { return p.first == c; });
+                    if (it == cnt.end()) cnt.push_back({c, 1});
+                    else ++it->second;
+                }
+                for (const auto& p : cnt)
+                    for (int k = 0; k < (cfg_.static_death > 0 ? std::min(p.second, cfg_.static_death) : p.second); ++k)
+                        staticAdd(p.first);
+            }
     tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
                                  [&](const Track& t) {
                                      return t.miss > (t.confirmed ? coastLimit(t) : cfg_.tentative_miss);
