@@ -819,20 +819,30 @@ void Emulator::choose(double t) {
         afterBird_ = next;   // взяли её сами вместо отсеянной птицы — ищем дальше
     }
     if (mode == SwitchMode::Manual) {
+        // цель взяли сами после птицы, точная её ещё не подтвердила, а широкая жёстко захватила другую — к ней
+        if (assigned_ && nextPick_ && !nConf_) {
+            const WideTarget* cur = find(assigned_);
+            if (!(cur && cur->hard))
+                for (const auto& w : targets_)
+                    if (ok(w) && w.hard && w.id != assigned_) {
+                        assign(t, w.id, "жёсткий захват широкой");
+                        break;
+                    }
+        }
         if (!assigned_ && !targets_.empty())
             for (const auto& w : targets_)
                 if (ok(w) && w.hard) {   // вручную: сами берём только подтверждённый дрон
                     assign(t, w.id, "жёсткий захват широкой");
                     break;
                 }
-        // ...а отсеяв птицу — следующую цель широкой: жёсткий захват, потом «дрон», потом прочие по её весомости
-        // (птиц широкой — нет, если «только дроны»); если целей нет — ждём, пока появятся
+        // ...а отсеяв птицу — следующую цель широкой: жёсткий захват, потом «дрон», потом прочие (птиц широкой —
+        // нет, если «только дроны»), среди равных — ближайшую по повороту; если целей нет — ждём, пока появятся
         if (!assigned_ && afterBird_ && c_.nextOnBird) {
-            int best = 0, bestP = 1 << 30, rank = 0;
+            int best = 0;
+            double bestP = 1e18;
             for (const auto& w : targets_) {
-                ++rank;
                 if (!ok(w)) continue;
-                const int p = (w.hard ? 0 : w.cls == 1 ? 1 : w.cls == 2 ? 3 : 2) * 100000 + rank;
+                const double p = (w.hard ? 0 : w.cls == 1 ? 1 : w.cls == 2 ? 3 : 2) * 1000 + ang(mount_.az, mount_.el, w.rep.az, w.rep.el);
                 if (p < bestP) {
                     bestP = p;
                     best = w.id;
