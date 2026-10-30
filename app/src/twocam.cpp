@@ -506,7 +506,7 @@ void Emulator::start(const Config& c) {
     cool_.clear();
     veto_.clear();
     wideBirds_.clear();
-    nConf_ = nOnly_ = manualPick_ = false;
+    nConf_ = nOnly_ = manualPick_ = afterBird_ = false;
     detachId_ = 0;
     tDetach_ = -10;
     tBird_ = -1;
@@ -697,7 +697,9 @@ void Emulator::assign(double t, int wideId, const char* why) {
     shapeId_ = shapeBirdN_ = 0;
     shapeRigid_ = false;
     ntrk_->setFollowing(false);
+    nextPick_ = false;
     if (!wideId) return;
+    afterBird_ = false;
     ++st_.assignments;
     double slew = 0;
     if (w) slew = ang(mount_.az, mount_.el, w->rep.az, w->rep.el);
@@ -812,7 +814,9 @@ void Emulator::choose(double t) {
     }
     if (assigned_ && !nOnly_ && !find(assigned_) && state_ != NState::Track && t - tState_ > 1.5) {
         event(t, "цель " + std::to_string(assigned_) + " пропала у широкой");
+        const bool next = nextPick_;
         assign(t, 0, "");
+        afterBird_ = next;   // взяли её сами вместо отсеянной птицы — ищем дальше
     }
     if (mode == SwitchMode::Manual) {
         if (!assigned_ && !targets_.empty())
@@ -821,6 +825,25 @@ void Emulator::choose(double t) {
                     assign(t, w.id, "жёсткий захват широкой");
                     break;
                 }
+        // ...а отсеяв птицу — следующую цель широкой: жёсткий захват, потом «дрон», потом прочие по её весомости
+        // (птиц широкой — нет, если «только дроны»); если целей нет — ждём, пока появятся
+        if (!assigned_ && afterBird_ && c_.nextOnBird) {
+            int best = 0, bestP = 1 << 30, rank = 0;
+            for (const auto& w : targets_) {
+                ++rank;
+                if (!ok(w)) continue;
+                const int p = (w.hard ? 0 : w.cls == 1 ? 1 : w.cls == 2 ? 3 : 2) * 100000 + rank;
+                if (p < bestP) {
+                    bestP = p;
+                    best = w.id;
+                }
+            }
+            if (best) {
+                assign(t, best, "следующая после птицы");
+                nextPick_ = true;
+                ++st_.nextAfterBird;
+            }
+        }
         return;
     }
     if (!assigned_) {
@@ -1159,7 +1182,11 @@ void Emulator::stepNarrow(double t, double dt) {
             } else {
                 tBird_ = -1;
             }
-            if (c_.narrowVeto && !manualPick_ && (shapeBird || (tBird_ >= 0 && t - tBird_ >= c_.vetoT))) {
+            // цель выбрал оператор: отсеиваем, только если точная уверена вдвое (вдвое больше оценок силуэта или
+            // вдвое дольше птица у классификатора)
+            const bool birdSure = manualPick_ ? c_.vetoManual && (shapeBirdN_ >= 2 * c_.shapeHits || (tBird_ >= 0 && t - tBird_ >= 2 * c_.vetoT))
+                                              : shapeBird || (tBird_ >= 0 && t - tBird_ >= c_.vetoT);
+            if (c_.narrowVeto && birdSure) {
                 bool bird = false;
                 for (const Body& b : bodies_)
                     if (b.id == who) bird = b.bird;
@@ -1178,6 +1205,7 @@ void Emulator::stepNarrow(double t, double dt) {
                 event(t, "точная: цель " + std::to_string(assigned_) + " — птица (" + why + "), отсеяна" +
                              (bird || !who ? "" : " — НА САМОМ ДЕЛЕ ДРОН"));
                 assign(t, 0, "");
+                afterBird_ = true;
                 goto ui;
             }
             // широкая видит назначенную цель далеко от того, что ведёт точная: не та цель.
@@ -1216,13 +1244,16 @@ void Emulator::stepNarrow(double t, double dt) {
     }
     // не может удержать цель giveUp секунд (ищет, берёт и теряет): точная её не подтверждает —
     // это шум или облако у широкой, или цель для точной слишком слабая. В авто-режимах — к следующей
-    if (assigned_ && tSearch_ >= 0 && t - tSearch_ > c_.giveUp && (SwitchMode)switchMode_.load() != SwitchMode::Manual) {
+    // (и в ручном, если цель точная взяла сама после птицы)
+    if (assigned_ && tSearch_ >= 0 && t - tSearch_ > c_.giveUp && ((SwitchMode)switchMode_.load() != SwitchMode::Manual || nextPick_)) {
         ++st_.unconfirmed;
         cool_.push_back({assigned_, t + c_.coolDown});
         event(t, "точная не подтверждает цель " + std::to_string(assigned_) + ": за " +
                      std::to_string((int)c_.giveUp) + " с не удержала, к ней — не раньше чем через " +
                      std::to_string((int)c_.coolDown) + " с");
+        const bool next = nextPick_;
         assign(t, 0, "");
+        afterBird_ = next;
     }
 ui:
     // 5. для интерфейса
@@ -1620,7 +1651,10 @@ int run_cli(int argc, char** argv) {
         else if (a == "--with-birds") c.dronesOnly = false;   // широкая указывает и тех, кого считает птицами
         else if (a == "--shape") sscanf(val().c_str(), "%f,%f,%d,%f", &c.shapeAmp, &c.shapeR, &c.shapeHits, &c.shapeWin);
         else if (a == "--no-cue") c.wideCue = false;
-        else if (a == "--legacy") c.narrowSilhouette = c.narrowHold = c.narrowVeto = c.wideCue = c.narrowShape = c.vetoToWide = false;
+        else if (a == "--no-next") c.nextOnBird = false;
+        else if (a == "--no-veto-manual") c.vetoManual = false;
+        else if (a == "--legacy")
+            c.narrowSilhouette = c.narrowHold = c.narrowVeto = c.wideCue = c.narrowShape = c.vetoToWide = c.nextOnBird = c.vetoManual = false;
         else if (a == "--scene") c.scene = val();
         else if (a == "--sector") c.sector = val();
         else if (a == "--godot") c.godot = val();
@@ -1628,12 +1662,12 @@ int run_cli(int argc, char** argv) {
         else if (a == "--el") c.wideEl = (float)atof(val().c_str());
         else {
             printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 100,750]\n"
-                   "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--types 0.5,0.25,0.25] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
+                   "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--types 0.5,0.25,0.25] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 5 (x4; 20 — без зума)]\n"
                    "  [--fps 60] [--rate 30] [--accel 150] [--latency 0.06] [--dwell 6]\n"
                    "  [--switch manual|queue|nearest] [--json out.json] [--quiet]\n"
                    "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window] [--no-lock-focus]\n"
                    "  [--min-hold 0.08] [--give-up 3] [--cool-down 10]\n"
-                   "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--no-shape] [--shape амп,автокорр,оценок,окно] [--no-veto-wide] [--with-birds] [--legacy — всё выключено]\n"
+                   "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--no-shape] [--shape амп,автокорр,оценок,окно] [--no-veto-wide] [--no-next] [--no-veto-manual] [--with-birds] [--legacy — всё выключено]\n"
                    "  3D-сцена Godot вместо синтетического неба: [--scene sim/scenes/city_sectors.json] [--sector highrise]\n"
                    "  [--godot путь] [--az 0] [--el 32]\n");
             return a == "--help" ? 0 : 2;
@@ -1678,8 +1712,9 @@ int run_cli(int argc, char** argv) {
            "  вернула широкой %d; подтвердила дронов %d; отсеяла как птицу: птиц %d, дронов %d, пустых мест %d; переходов по частям цели %d\n",
            100 * s.trackDrone / T, s.narrowOnly, s.narrowOnly > 0 ? 100 * s.narrowOnlyCorrect / s.narrowOnly : 0, s.kept,
            s.rebinds, s.confirmed, s.vetoBird, s.vetoDrone, s.vetoNone, s.partJumps);
-    printf("птицы у точной: вела птицу %.1f с, назвала дроном птиц %d, отсеяла птицу в среднем через %.2f с после захвата, по силуэту %d\n",
-           s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape);
+    printf("птицы у точной: вела птицу %.1f с, назвала дроном птиц %d, отсеяла птицу в среднем через %.2f с после захвата, по силуэту %d, "
+           "сразу на следующую %d\n",
+           s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape, s.nextAfterBird);
     printf("ошибка: захват точной %.3f° (90%% %.3f°, %.1f пикс. точной), ось %.3f° (90%% %.3f°), широкая %.3f° (90%% %.3f°)\n",
            lm, l9, lm / nPd, am, a9, wm, w9);
     printf("обработка: широкая %.1f мс/кадр, точная %.2f мс/кадр; отрисовка широкой %.1f, точной %.1f мс/кадр\n",
@@ -1694,13 +1729,14 @@ int run_cli(int argc, char** argv) {
                     " \"unconfirmed\": %d, \"wide_swaps\": %d, \"idle_pct\": %.2f, \"false_target_pct\": %.2f, \"wide_ms\": %.2f, \"narrow_ms\": %.3f,\n"
                     " \"track_drone_pct\": %.2f, \"narrow_only_s\": %.2f, \"narrow_only_correct_s\": %.2f, \"kept\": %d, \"rebinds\": %d,\n"
                     " \"confirmed\": %d, \"veto_bird\": %d, \"veto_drone\": %d, \"veto_none\": %d, \"part_jumps\": %d,\n"
-                    " \"track_bird_s\": %.2f, \"confirmed_bird\": %d, \"veto_delay_s\": %.3f, \"veto_shape\": %d}\n",
+                    " \"track_bird_s\": %.2f, \"confirmed_bird\": %d, \"veto_delay_s\": %.3f, \"veto_shape\": %d, \"next_after_bird\": %d}\n",
                     s.simT, s.assignments, s.acquired, s.wrongLocks, s.losses, s.slewN ? s.slewSum / s.slewN : 0,
                     s.acqN ? s.acqSum / s.acqN : 0, 100 * s.trackTime / T,
                     s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0, lm, l9, am, a9, wm, w9,
                     s.unconfirmed, s.wideSwaps, 100 * s.idleTime / T, 100 * s.falseTarget / T, s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0,
                     100 * s.trackDrone / T, s.narrowOnly, s.narrowOnlyCorrect, s.kept, s.rebinds, s.confirmed, s.vetoBird,
-                    s.vetoDrone, s.vetoNone, s.partJumps, s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape);
+                    s.vetoDrone, s.vetoNone, s.partJumps, s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape,
+                    s.nextAfterBird);
             fclose(f);
         }
     }
