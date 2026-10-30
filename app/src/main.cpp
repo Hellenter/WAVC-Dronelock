@@ -3493,6 +3493,11 @@ int run_stress(int argc, char** argv) {
                 s.det.sky_s14 = F(0, 1);
                 s.det.lock_through = R(3) != 0;
                 s.det.lock_through_k = F(0.5f, 3);
+                // ночной тест маски 30.10: цель у самой земли, перепроверка над текстурной землёй
+                s.det.near_edge = R(3) != 0;
+                s.det.near_edge_px = R(3) ? 16.f : F(0, 64);
+                s.det.near_edge_fps = R(3) ? 20.f : F(0, 120);
+                s.det.recheck_edge = R(3) == 0;
                 s.det.bg_frames = R(3) ? 250 : 1 + R(1000);
                 s.det.per_tile = 1 + R(2);
                 s.det.band_px = R(3) ? 0 : R(1024);
