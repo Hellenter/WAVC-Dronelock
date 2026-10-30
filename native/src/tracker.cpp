@@ -445,6 +445,7 @@ void Tracker::classify(Track& t) const {
     if (t.cls == TargetClass::Unknown || t.cls == TargetClass::Clutter) t.birdScore = inst;
     else t.birdScore = 0.8f * t.birdScore + 0.2f * inst;
     t.cls = t.birdScore > 0.5f ? TargetClass::Bird : TargetClass::Drone;
+    if (t.cls == TargetClass::Drone) ++t.droneN;
 }
 
 // Скорость цели для захвата, пикс./кадр по сцене; пока есть дрейф фона — относительно него
@@ -1055,7 +1056,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     if (cfg_.static_frames > 0)
         for (const Track& t : tracks_)
             if (t.miss > (t.confirmed ? coastLimit(t) : cfg_.tentative_miss) && !t.everMover && !t.everLocked &&
-                t.id != lockId_) {
+                t.id != lockId_ && !(cfg_.static_drone > 0 && t.droneN >= cfg_.static_drone)) {
                 // один умерший трек — не больше static_death откликов на ячейку: иначе трек в полсекунды
                 // (30 отметок в одной ячейке) сразу делал её и соседние запретными для рождения, и
                 // дрон, медленно летящий на камеру рядом, так и не получал трека (wt9: найден 1%)
