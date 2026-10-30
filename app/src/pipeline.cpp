@@ -216,11 +216,13 @@ double Pipeline::fileStep(const Settings& s) const {
 }
 
 // снимок камеры — первый кадр файла на её такте или после него: шаг 4 — каждый 4-й, камера
-// 14 к/с из 60 — через 4-5 кадров, в среднем 60/14
+// 14 к/с из 60 — через 4-5 кадров, в среднем 60/14. Такт отсчитывается от кадра framePhase
 bool Pipeline::skipFrame(const Settings& s, int64_t index) const {
     const double r = fileStep(s);
-    if (r < 1.0001 || index <= 0) return false;
-    return std::floor((double)index / r) == std::floor((double)(index - 1) / r);
+    if (r < 1.0001) return false;
+    const int64_t i = index - std::max(0, s.framePhase);
+    if (i <= 0) return i < 0;   // до первого снимка камеры кадров нет
+    return std::floor((double)i / r) == std::floor((double)(i - 1) / r);
 }
 
 void Pipeline::setSettings(const Settings& s) {
@@ -230,7 +232,8 @@ void Pipeline::setSettings(const Settings& s) {
         const Settings& o = settings_;
         restart = open_ && (o.source != s.source || o.preloadFrames != s.preloadFrames || o.procW != s.procW ||
                             o.procH != s.procH || o.decoderThreads != s.decoderThreads || o.loop != s.loop ||
-                            (s.source == Source::Preload && fileStep(o) != fileStep(s)));
+                            (s.source == Source::Preload &&
+                             (fileStep(o) != fileStep(s) || o.framePhase != s.framePhase)));
         settings_ = s;
         ++settingsVer_;
     }
@@ -496,15 +499,18 @@ void Pipeline::processLoop() {
     LoadGovernor gov;
     SceneAnalyzer scene;
     std::string sceneWhy;
-    std::vector<FocusArea> focus, roi, keepGrow;
+    std::vector<FocusArea> focus, roi, keepGrow, tintAt;
+    size_t cueN = 0;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
     int grownSaved = 0;   // тайлов маски, доросших и открытых, на момент сохранения в файл
     bool maskOn = false, motionWas = false, maskChecking = false;
+    int extLeft = 0;   // кадров после маски снаружи, когда смена вида не переучивает маску
     bool relearnMoved = false;   // маска учится заново после плавного поворота камеры (панорамы)
     // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
     float uniqShare = 1.f, trkFps = 0.f;
+    int64_t trkIdx = -1;   // кадр файла, который трекер видел последним (интервал до следующего)
     // кадров в секунду у детектора, маски неба и трекера (повторы кадра считаются, пока их не пропускаем)
     auto procFps = [&](const Settings& st) { return st.skipDuplicates && trkFps > 0 ? (double)trkFps : cameraFps(st); };
     auto trkCfg = [&](const Settings& st) {
@@ -691,6 +697,7 @@ void Pipeline::processLoop() {
                                   : "не удалось сохранить " + staticPath();
         }
         if (p.loopStart || p.seekStart) {   // склейка зацикленного видео или перемотка — треки не должны "прыгать"
+            trkIdx = -1;
             trk->resetTracks();
             trk->setStatic(statSnap);
             // чистый старт: каждый проход как первый — и маска неба учится заново
@@ -709,6 +716,30 @@ void Pipeline::processLoop() {
         // камера, ведущая цель, тоже поворачивается: маска неба не годится
         const bool camMoves = ef.motion || s.follow || panning;
         if (sceneLight) det.resetBackground();   // облако закрыло солнце: старый фон ячеек только мешает
+        {   // маска снаружи (панорама эмулятора): вместо обучения, смену вида в эти кадры не ловим
+            std::lock_guard<std::mutex> lk(extM_);
+            if (extNew_) {
+                extNew_ = false;
+                if (det.setMask(extMask_, extTw_, extTh_)) {
+                    maskOn = true;
+                    maskChecking = false;
+                    learnLeft = 0;
+                    relearn_ = false;
+                    maskForce_ = false;
+                    trkIdx = -1;
+                    trk->resetTracks();
+                    gm.reset();
+                    extLeft = extHold_;
+                } else {
+                    maskForce_ = true;
+                    relearn_ = true;
+                }
+            }
+        }
+        if (extLeft > 0) {
+            --extLeft;
+            sceneMoved = false;
+        }
         if (sceneMoved && !camMoves && maskOn) {   // камеру повернули: маска неба — заново, не из файла
             maskForce_ = true;
             relearn_ = true;
@@ -787,6 +818,7 @@ void Pipeline::processLoop() {
             MotionEstimate me;
             const bool autoMotion = s.motion < 0;
             gm.setFps(s.fpsScale ? (float)procFps(s) : 0.f);
+            gm.setLong(s.motionLong && autoMotion && !ef.motion);
             if (ef.motion || autoMotion) me = gm.estimate(src.px.data(), src.w, src.h, src.w);
             else gm.reset();
             if (autoMotion || s.follow) {
@@ -834,13 +866,30 @@ void Pipeline::processLoop() {
             me.dx -= cropDx;
             me.dy -= cropDy;
             trk->setFollowing(s.follow);
+            // интервал до этого кадра в номинальных: шаг по файлу на шаг камеры. Номер кадра — по метке
+            // времени, и разрыв в самой записи (запись экрана теряет кадр-другой) — тоже длинный интервал.
+            // Повторы кадров записи экрана — своим порядком, интервал там не меняем
+            float fdt = 1.f;
+            if (s.frameDt && !s.skipDuplicates && trkIdx >= 0 && f.index > trkIdx)
+                fdt = (float)std::min(16.0, (double)(f.index - trkIdx) / fileStep(s));
+            if (std::fabs(fdt - 1.f) < 1e-4f) fdt = 1.f;
+            trk->setFrameDt(fdt);
+            trkIdx = f.index;
             const double tm = now_ms();
             focus.clear();
             if (s.focus) trk->focus(me.dx, me.dy, focus);
+            {   // подсказка от другой камеры
+                std::lock_guard<std::mutex> lk(cueM_);
+                focus.insert(focus.end(), cue_.begin(), cue_.end());
+                cueN = cue_.size();
+            }
             det.setFocus(focus);
             // экономия: между полными просмотрами кадра детектор смотрит только вокруг треков
             roi.clear();
-            if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) trk->roi(me.dx, me.dy, roi);
+            if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) {
+                trk->roi(me.dx, me.dy, roi);
+                roi.insert(roi.end(), focus.end() - cueN, focus.end());
+            }
             det.setRoi(roi);
             {   // цель в захвате может залететь под маску (облако, кромка): там ищется её продолжение
                 float lx = 0, ly = 0, lr = 0, lc = 0;
@@ -855,9 +904,14 @@ void Pipeline::processLoop() {
                 }
                 det.setLockArea(on, lx, ly, lr, lp, lc);
             }
-            // цвет кадра — для облаков по цвету при обучении маски (окно поворотки — без цвета)
-            if (view == p.frame && f.color.w > 0)
-                det.setColor(f.color.u.data(), f.color.v.data(), f.color.w, f.color.h, f.color.w, f.color.step);
+            // цвет кадра — для облаков по цвету при обучении маски и цвета целей у треков, которые можно
+            // захватить (окно поворотки — без цвета)
+            if (view == p.frame && f.color.w > 0) {
+                det.setColor(f.color.u.data(), f.color.v.data(), f.color.w, f.color.h, f.color.w, f.color.step, 1,
+                             f.color.off);
+                trk->roi(me.dx, me.dy, tintAt, true);
+                det.setTintAreas(tintAt);
+            }
             det.detect(f.px.data(), f.w, f.h, f.w, cands);
             trk->setPartial(det.timing().partial);
             // силуэт захваченной цели: прицел в центре крупного БПЛА, а не на крыле или хвосте
@@ -869,6 +923,11 @@ void Pipeline::processLoop() {
                                                               std::max(6.f, 0.8f * det.threshold()), trk->config().silh_max));
             }
             const double t1 = now_ms();
+            {
+                std::lock_guard<std::mutex> lk(cueM_);
+                for (int id : birds_) trk->markBird(id);
+                birds_.clear();
+            }
             const auto& tracks = trk->update(cands, me.dx, me.dy);
             // маска дорастает там, где копятся помехи (неподвижная камера); у цели в захвате — нет
             if (!camMoves && maskOn && !det.learningMask()) {
@@ -1068,24 +1127,26 @@ void Pipeline::processLoop() {
         // качество считаем после первого прохода (как run_demo.py) или после обучения маски
         // при съёмке с рук маска неба не учится — качество считаем сразу (своя разметка роликов)
         const bool evalOn =
-            camMoves || (s.loop ? p.loop >= 1 : f.index >= (int64_t)std::lround(perSec(s, s.learnMaskFrames, 10) * fileStep(s)));
+            camMoves || (s.loop ? p.loop >= 1
+                                : f.index >= (int64_t)std::lround(perSec(s, s.learnMaskFrames, 10) * fileStep(s)) +
+                                                 (fileStep(s) > 1.0001 ? std::max(0, s.framePhase) : 0));
         if (gtFrame && evalOn) eval_.add(r->gt, tracks, r->gsx, r->gsy);
         if (!s.trackLog.empty()) {
             if (!tlog) {
                 tlog.reset(open_file(s.trackLog, "w"));
-                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w,resid,contrast_cv,speed,bird_score,flap_r2\n");
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w,resid,contrast_cv,speed,bird_score,flap_r2,edge_born,ever_mover,straight,travel_rel,age\n");
             }
             if (tlog) {
                 if (tracks.empty())
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,,,,,,\n", p.loop, (long long)f.index, r->lockId,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,,,,,,,,,,,\n", p.loop, (long long)f.index, r->lockId,
                             (int)r->lockState, statCells.size(), r->fx, r->fy);
                 // координаты — исходного кадра (и при виртуальной поворотке)
                 for (const auto& t : tracks)
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", p.loop,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%.2f,%.0f,%d\n", p.loop,
                             (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x + (float)r->fx, t.y + (float)r->fy,
                             t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits, t.travel, t.score, statCells.size(), t.bw,
                             t.bh, t.expectedSize(), r->fx, r->fy, (int)t.followed, t.lockW, t.resid, t.contrastCv, t.speed,
-                            t.birdScore, t.flapR2);
+                            t.birdScore, t.flapR2, (int)t.edgeBorn, (int)t.everMover, t.straight, t.travelRel, t.age);
             }
         }
         if (observer_) observer_(*r);

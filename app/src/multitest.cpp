@@ -57,7 +57,9 @@ const std::vector<Param>& params() {
         {"dark", "Тёмные цели", "Алгоритм", true, "1, 0", D(dark)},
         {"bright", "Яркие цели", "Алгоритм", true, "1, 0", D(bright)},
         {"trk_seconds", "Трекер в секундах", "Алгоритм", true, "1, 0", S(trkSeconds)},
+        {"frame_dt", "Настоящий интервал кадра в трекер (камера реже видео, пропуски)", "Алгоритм", true, "1, 0", S(frameDt)},
         {"fps_scale", "Маска неба и поворот камеры в секундах", "Алгоритм", true, "1, 0", S(fpsScale)},
+        {"motion_long", "Поворот камеры по кадру 1/15 с назад (крупный кадр)", "Алгоритм", true, "1, 0", S(motionLong)},
         {"follow", "Виртуальная поворотка", "Алгоритм", true, "0, 1", S(follow)},
         {"mask", "Кадров на маску неба (0 выкл.)", "Алгоритм", false, "0, 25, 50", S(learnMaskFrames)},
         {"per_tile", "Кандидатов в тайле", "Алгоритм", false, "1, 2", D(per_tile)},
@@ -67,7 +69,8 @@ const std::vector<Param>& params() {
         {"bg_near", "Фон по ячейкам и в небе у кромки (кончики веток)", "Алгоритм", true, "1, 0", D(bg_near)},
         {"grow_mask", "Маска дорастает, где копятся помехи", "Алгоритм", true, "1, 0", D(grow_mask)},
         {"mask_recheck", "Маска перепроверяется (облака открываются)", "Алгоритм", true, "1, 0", D(mask_recheck)},
-        {"pol_mask", "Облака закрыты только для светлых целей (0 нет, 1 тёмные ищутся, 2 и наоборот)", "Алгоритм", true, "1, 0, 2", D(pol_mask)},
+        {"recheck_edge", "Перепроверка открывает и тайл прямо над сильной землёй", "Тонко", true, "0, 1", D(recheck_edge)},
+        {"pol_mask", "Облака закрыты только для светлых целей (0 нет, 1 тёмные ищутся, 2 и наоборот)", "Алгоритм", false, "1, 0, 2", D(pol_mask)},
         {"pol_tex", "Маска по полярности: другой текстуры не чаще доли кадров", "Тонко", false, "0.02, 0.05, 0.1", D(pol_tex)},
         {"sky_color", "Облака по цвету: не зелёное, не темнее неба и не стоит на земле — не закрывать как землю", "Алгоритм", true, "1, 0", D(sky_color)},
         {"sky_green", "Облака по цвету: листва — зелёный выше синего больше доли яркости", "Тонко", false, "0.05, 0.08, 0.12", D(sky_green)},
@@ -78,6 +81,11 @@ const std::vector<Param>& params() {
         {"sky_s14", "Мягкое облако: перепад на 1 пикс. меньше доли перепада на 4", "Тонко", false, "0.28, 0.32, 0.36", D(sky_s14)},
         {"sky_tree", "Мягкое облако над тёмной верхушкой (доля точек темнее sky_dark неба) поднимает линию горизонта", "Тонко", false, "0, 0.25, 0.35, 0.45", D(sky_tree)},
         {"sky_bright", "Облако по цвету открыто и для светлых целей", "Алгоритм", true, "1, 0", D(sky_bright)},
+        {"near_edge", "Цель из тайла неба у самой земли — только когда полетела (как у кромки)", "Алгоритм", true, "1, 0", D(near_edge)},
+        {"near_edge_px", "Цель у земли: не дальше пикс. от закрытого тайла (0 — весь тайл)", "Тонко", false, "16, 0, 24", D(near_edge_px)},
+        {"near_edge_fps", "Цель у земли: весь тайл при камере не быстрее, к/с", "Тонко", false, "20, 0, 30", D(near_edge_fps)},
+        {"leaf_color", "Лист у камеры: цель зеленее или желтее фона на столько уровней (0 выкл.)", "Алгоритм", false, "0, 6, 8, 12", D(leaf_color)},
+        {"leaf_hits", "Лист у камеры: попаданий с цветом листвы из последних 32 замеров, чтобы трек не захватывался (0 выкл.)", "Тонко", false, "0, 2, 3, 4", T(leaf_hits)},
         {"lock_through", "Цель в захвате ищется и под маской (только продолжение трека)", "Алгоритм", true, "1, 0", D(lock_through)},
         {"lock_through_k", "Под маской: порог выше общего, раз", "Тонко", false, "1.2, 1.5, 2", D(lock_through_k)},
         {"reopen_quiet", "Доросшая маска открывается: тихих замеров не меньше доли (1.01 — никогда)", "Тонко", false, "0.8, 0.9, 1.01", D(reopen_quiet)},
@@ -96,6 +104,7 @@ const std::vector<Param>& params() {
         {"coarse_every", "Крупные масштабы раз в, кадров", "Алгоритм", false, "1, 2, 4", D(coarse_every)},
         {"dedup", "Пропускать повторы кадра", "Видео", true, "0, 1", S(skipDuplicates)},
         {"step", "Камера реже видео: каждый N-й кадр", "Видео", false, "1, 4, 6", S(frameStep)},
+        {"phase", "Камера реже видео: с какого кадра файла считать шаг (сдвиг)", "Видео", false, "0, 1, 2, 3", S(framePhase)},
         {"cam_fps", "Частота камеры, к/с (0 — как в видео)", "Видео", false, "0, 15, 30", S(targetFps)},
         // Тонко: порог
         {"auto_thr", "Порог по шуму", "Тонко", true, "0, 1", D(auto_thr)},
@@ -110,25 +119,66 @@ const std::vector<Param>& params() {
         {"k", "Макс. размер цели k, пикс.", "Тонко", false, "5, 7, 9", D(k)},
         {"focus", "Искать возле прогноза", "Тонко", true, "0, 1", S(focus)},
         // Тонко: трекер и захват
-        {"gate", "Макс. радиус поиска, пикс.", "Тонко", false, "20, 40, 80", T(gate)},
+        {"gate", "Макс. радиус поиска, пикс.", "Тонко", false, "20, 26, 40", T(gate)},
+        {"gate_speed_k", "Макс. радиус поиска: плюс скоростей цели", "Тонко", false, "0, 1, 2", T(gate_speed_k)},
+        {"gate_speed_straight", "Предел ворот по скорости: только у трека прямее этого (0 — у любого)", "Тонко", false, "0, 0.6, 0.8", T(gate_speed_straight)},
+        {"gate_pps", "Макс. радиус поиска: не меньше пути за кадр при скорости, пикс./с (0 выкл.)", "Тонко", false, "0, 360, 500", T(gate_pps)},
         {"q_accel", "Манёвренность цели", "Тонко", false, "1, 4, 8", T(q_accel)},
         {"max_miss", "Держать на прогнозе, кадров", "Тонко", false, "3, 6, 12", T(max_miss)},
         {"lock_switch", "Смена захвата, раз", "Тонко", false, "1.2, 1.5, 2.5", T(lock_switch)},
+        {"lock_dwell", "Смена захвата: перевес держится, кадров при 25 к/с", "Тонко", false, "0, 6, 12, 24", T(lock_dwell)},
+        {"lock_dwell_keep", "Смена захвата: перевес не теряется, пока претендент на миг пропал", "Тонко", true, "1, 0", T(lock_dwell_keep)},
+        {"lock_bird_yield", "Смена захвата: с «птицы» на «дрон» без выдержки", "Тонко", true, "1, 0", T(lock_bird_yield)},
+        {"hard_switch", "Жёсткий захват переходит на цель весомее, раз (0 — никогда)", "Тонко", false, "0, 2, 4", T(hard_switch)},
+        {"follow_k", "Ведомая камерой цель весомее, раз (0 выкл.)", "Тонко", false, "0, 3, 6", T(follow_k)},
+        {"follow_min_obs", "Ведомая цель: попаданий на оценку от 30 к/с (ниже — во времени, не меньше 9)", "Тонко", false, "9, 16, 24", T(follow_min_obs)},
+        {"ev_confirm", "Подтверждение по уверенности (0 выкл.)", "Тонко", false, "0, 3, 6", T(ev_confirm)},
+        {"mover_px", "Летит: ушёл по сцене дальше, пикс.", "Тонко", false, "8, 16, 32", T(mover_px)},
+        {"edge_mover_k", "У кромки: летит дальше, раз", "Тонко", false, "1, 3, 5", T(edge_mover_k)},
+        {"lost_grow", "Пропавший захват: круг поиска растёт, пикс. за кадр при 25 к/с", "Тонко", false, "4, 9.6, 20", T(lost_grow)},
+        {"lost_r_max", "...но не больше стольких ворот (0 — без предела)", "Тонко", false, "0, 2, 4, 8", T(lost_r_max)},
+        {"lost_r_max_slow", "...на камере не быстрее lock_mover_fps, если не задано выше (0 — без предела)", "Тонко", false, "0, 2, 4, 8", T(lost_r_max_slow)},
+        {"tentative_miss", "Неподтверждённый трек держится, кадров", "Тонко", false, "1, 2, 3", T(tentative_miss)},
+        {"clutter_level", "Карта помех: порог ячейки", "Тонко", false, "0.25, 0.35, 0.5", T(clutter_level)},
+        {"hover_speed", "Зависла: медленнее, пикс./кадр при 25 к/с", "Тонко", false, "0.15, 0.3, 0.6", T(hover_speed)},
+        {"flap_r2", "Птица: взмахи объясняют долю дисперсии", "Тонко", false, "0.35, 0.45, 0.6", T(flap_r2)},
         {"confirm", "Подтверждение, кадров", "Тонко", false, "2, 3, 4", T(confirm)},
         {"quiet", "Новая точка в спокойном небе, кадров (0 выкл.)", "Тонко", false, "0, 50", T(quiet_frames)},
         {"edge_straight", "У кромки — только прямой полёт", "Тонко", false, "0, 0.5", T(edge_straight)},
         {"lock_mover", "Новый захват — только на летавший трек", "Тонко", true, "0, 1", T(lock_mover)},
         {"hard_switch_drone", "Жёсткий захват переходит только на «дрон» или ведомую камерой цель", "Тонко", true, "1, 0", T(hard_switch_drone)},
         {"hover_first", "Птица: зависание важнее взмахов", "Тонко", true, "1, 0", T(hover_first)},
+        {"hard_switch_follow", "Жёсткий захват переходит на ведомую камерой цель и без условия «медленнее»", "Тонко", true, "1, 0", T(hard_switch_follow)},
+        {"hard_switch_slow", "Жёсткий захват переходит на вдвое более медленную цель, которую камера не ведёт", "Тонко", true, "0, 1", T(hard_switch_slow)},
+        {"drift_min", "Дрейф фона: учитывать быстрее, пикс./кадр при 25 к/с (0 выкл.)", "Тонко", false, "0, 0.15, 0.25, 0.4", T(drift_min)},
+        {"drift_tracks", "Дрейф фона: треков на оценку, не меньше", "Тонко", false, "3, 5, 8", T(drift_tracks)},
+        {"drift_obs", "Дрейф фона: скорость трека по попаданиям при 25 к/с", "Тонко", false, "5, 13, 25", T(drift_obs)},
+        {"overlay_px", "Наложение на кадр: стоит в кадре не дальше, пикс. (СКО)", "Тонко", false, "1, 2, 4", T(overlay_px)},
+        {"overlay_rel", "Наложение у края: СКО по кадру меньше доли пути по сцене (0 выкл.)", "Тонко", false, "0, 0.05, 0.1", T(overlay_rel)},
+        {"resid_frame", "Птица: отклонение от траектории — меньшее по сцене и по кадру", "Тонко", true, "1, 0", T(resid_frame)},
         {"reupdate", "Нашлась после пропуска: скорость по прямой от последней отметки, доля", "Тонко", false, "0, 0.5, 1", T(reupdate)},
-        {"lock_mover_fps", "Захват только на летавший трек при камере не быстрее, к/с", "Тонко", false, "0, 20, 30", T(lock_mover_fps)},
+        {"lock_mover_fps", "Захват только на летавший трек при камере не быстрее, к/с", "Тонко", false, "20, 31, 61", T(lock_mover_fps)},
+        {"lock_dwell_strong", "Претендент весомее захвата во столько раз набирает перевес втрое быстрее (0 выкл.)", "Тонко", false, "0, 6, 12", T(lock_dwell_strong)},
+        {"lock_solid", "Захваченная цель в выдаче, пока трек жив (и при редких отметках)", "Тонко", true, "1, 0", T(lock_solid)},
+        {"weak_gate", "Слабая отметка продолжает устоявшийся трек ближе стольких его невязок (0 выкл.)", "Тонко", false, "0, 2, 4", T(weak_gate)},
+        {"relock_frames", "Память о потерянной цели захвата, кадров при 25 к/с (0 выкл.)", "Тонко", false, "0, 25, 50, 100", T(relock_frames)},
+        {"lock_speed_max", "Захват не берёт трек быстрее, пикс./кадр при 25 к/с (0 — без предела)", "Тонко", false, "0, 16, 24, 40", T(lock_speed_max)},
+        {"lock_established", "Новый захват — только на трек, набравший попаданий на класс", "Тонко", true, "1, 0", T(lock_established)},
+        {"relock_edge", "...и молодой трек у кромки, вошедший в круг памяти позже рождения, — та же цель", "Тонко", true, "1, 0", T(relock_edge)},
         {"mover_cam_k", "Летит: по сцене дальше доли пути камеры", "Тонко", false, "0, 0.25, 0.35, 0.5", T(mover_cam_k)},
         {"still_speed", "Помеха: по сцене медленнее, пикс./кадр при 25 к/с", "Тонко", false, "0.25, 0.6, 1", T(still_speed)},
+        {"creep_frames", "Медленная цель в помехе: трек не бросать, кадров при 25 к/с (0 выкл.)", "Тонко", false, "0, 100", T(creep_frames)},
+        {"creep_px", "Ползёт при неподвижной камере дальше, пикс. — не помеха", "Тонко", false, "16, 24, 40", T(creep_px)},
+        {"static_death", "Умерший на месте трек — в долгую память не больше откликов на ячейку (0 — все)", "Тонко", false, "0, 3, 6", T(static_death)},
+        {"static_drone", "Трек, столько кадров бывший дроном, — не в долгую память помех (0 — выкл.)", "Тонко", false, "0, 1, 8", T(static_drone)},
+        {"creep_lag", "Ползёт сейчас: за creep_frames ушёл дальше, пикс.", "Тонко", false, "4, 8, 16", T(creep_lag)},
+        {"creep_step", "Медленная цель в помехе: отклик не дальше, пикс./кадр", "Тонко", false, "2, 4, 8", T(creep_step)},
         {"silhouette", "Крупная цель целиком (силуэт)", "Тонко", true, "1, 0", T(silhouette)},
         {"size_predict", "Ожидание размера", "Тонко", true, "1, 0", T(size_predict)},
         {"anchor_check", "На мачте или столбе — не дрон", "Тонко", true, "1, 0", T(anchor_check)},
         {"hard_lock", "Жёсткий захват дрона", "Тонко", true, "1, 0", T(hard_lock)},
         {"verify", "Проверка: дрон подряд, кадров", "Тонко", false, "5, 10, 25", T(verify_frames)},
+        {"verify_min", "Проверка: не меньше кадров на любой частоте", "Тонко", false, "4, 6, 8", T(verify_min)},
         {"hard_miss", "Жёсткий: держать на прогнозе, кадров", "Тонко", false, "30, 60, 120", T(hard_miss)},
         {"hard_full_every", "Жёсткий: весь кадр раз в, кадров", "Тонко", false, "3, 6, 12", T(hard_full_every)},
         {"lock_slow", "Захват: сначала мелкий медленный дрон", "Тонко", true, "1, 0",
@@ -311,10 +361,13 @@ void apply_algo(Settings& dst, const Settings& src) {
     dst.focus = src.focus;
     dst.zones = src.zones;
     dst.trkSeconds = src.trkSeconds;
+    dst.frameDt = src.frameDt;
     dst.fpsScale = src.fpsScale;
+    dst.motionLong = src.motionLong;
     dst.governor = src.governor;
     dst.skipDuplicates = src.skipDuplicates;
     dst.frameStep = src.frameStep;
+    dst.framePhase = src.framePhase;
     dst.follow = src.follow;
     dst.followFrac = src.followFrac;
     dst.followGain = src.followGain;
@@ -516,10 +569,11 @@ static VideoMeta probe(const std::string& path) {
     return m;
 }
 
-static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& c, int threads,
+static RunResult run_one(const VideoMeta& vm, const Variant& var, int varIdx, int phase, const Config& c, int threads,
                          const std::atomic<bool>& stop, std::atomic<long>& live) {
     RunResult rr;
     Settings s = var.setup.s;
+    if (phase >= 0) s.framePhase = phase;
     s.pace = c.realtime ? Pace::Realtime : Pace::MaxSpeed;
     // частота камеры — только медленнее видео (пропуск кадров); быстрее — темп подачи, здесь не нужен
     if (!(s.targetFps > 0 && vm.fps > 0 && s.targetFps < 0.99 * vm.fps)) s.targetFps = 0;
@@ -530,6 +584,9 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     s.maskFile = c.maskFile;
     s.fresh = !c.maskFile;   // чистый старт: накопленное рядом с видео не читается и не пишется
     s.trackLog.clear();
+    if (!c.tracksDir.empty())
+        s.trackLog = ustr(upath(c.tracksDir) / (vm.file + "." + std::to_string(varIdx) +
+                                                (phase >= 0 ? ".p" + std::to_string(phase) : "") + ".csv"));
     if (!c.emulate) {
         s.slowdown = 1;
         s.emulateMs = 0;
@@ -547,7 +604,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     col.maxFrames = c.maxFrames;
     // номера кадров — файла, маска учится по обработанным
     const double fstep = std::max(1, s.frameStep) * (s.targetFps > 0 ? vm.fps / s.targetFps : 1.0);
-    col.warmup = (int)std::lround(c.warmup * fstep);
+    col.warmup = (int)std::lround(c.warmup * fstep) + (fstep > 1.0001 ? std::max(0, s.framePhase) : 0);
     // радиус задан в пикселях исходного кадра; при уменьшенной обработке — меньше
     col.radius = c.radius * (s.procW && vm.w ? (float)s.procW / vm.w : 1.f);
     if (vm.gt) {
@@ -598,12 +655,12 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
     rr.detectP95 = p95_of(col.det);
     rr.procMs = mean_of(col.proc);
     rr.procP95 = p95_of(col.proc);
-    const double F = std::max<long>(1, rr.frames);
+    const double F = std::max(1.0, rr.frames);
     rr.targetsPerFrame = col.tgtSum / F;
     rr.targetFramesPct = 100.0 * col.tgtFrames / F;
-    rr.tracks = (long)col.ids.size();
-    rr.droneIds = (long)col.drones.size();
-    rr.birdIds = (long)col.birds.size();
+    rr.tracks = (double)col.ids.size();
+    rr.droneIds = (double)col.drones.size();
+    rr.birdIds = (double)col.birds.size();
     rr.lockPct = 100.0 * col.lockF / F;
     rr.hardPct = 100.0 * col.hardF / F;
     rr.lockAcq = col.acq;
@@ -619,7 +676,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
         rr.falsePerFrame = (double)col.fp / col.evF;
         long ft = 0;
         for (const auto& kv : col.life) ft += !kv.second;
-        rr.falseTracks = ft;
+        rr.falseTracks = (double)ft;
         rr.lockOnDrone = col.dFrames ? 100.0 * col.lockOnD / col.dFrames : -1;
         rr.hardOnDrone = col.dFrames ? 100.0 * col.hardOnD / col.dFrames : -1;
         rr.falseLock = col.lockEv ? 100.0 * col.falseLockF / col.lockEv : 0;
@@ -697,9 +754,80 @@ const std::vector<Metric>& metrics() {
          "Среднее время детектора."},
         {"fps", "Кадров/с прогона", "", +1, false, 1, [](const RunResult& r) { return r.fps; },
          "Сколько кадров в секунду шёл прогон, вместе с декодированием видео."},
-        {"frames", "Кадров", "", 0, false, 0, [](const RunResult& r) { return (double)r.frames; }, "Обработано кадров."},
+        {"frames", "Кадров", "", 0, false, 0, [](const RunResult& r) { return r.frames; }, "Обработано кадров."},
     };
     return m;
+}
+
+bool metric_value(const Metric& m, const RunResult& r, double& v) {
+    if (!r.done) return false;
+    if (m.gtOnly && !r.gt) return false;
+    v = m.get(r);
+    return v >= 0 && std::isfinite(v);   // отрицательное — нет данных
+}
+
+// ------------------------------------------------------------ все сдвиги такта
+
+int phase_count(const Settings& s, double videoFps) {
+    // как Pipeline::fileStep: частота камеры — только медленнее видео
+    const bool slower = s.targetFps > 0 && videoFps > 0 && s.targetFps < 0.99 * videoFps;
+    const double r = std::max(1, s.frameStep) * (slower ? videoFps / s.targetFps : 1.0);
+    return r < 1.0001 ? 1 : (int)std::ceil(r - 1e-6);
+}
+
+std::vector<RunResult> merge_phases(const std::vector<RunResult>& runs) {
+    std::vector<RunResult> out;
+    std::map<std::pair<int, int>, std::vector<const RunResult*>> by;
+    for (const auto& r : runs) {
+        auto& g = by[{r.video, r.variant}];
+        if (g.empty()) {
+            out.push_back(r);   // порядок итогов — как у прогонов
+            out.back().phase = -1;
+        }
+        g.push_back(&r);
+    }
+    // поля, которые усредняются: среднее по сдвигам, где есть данные (не отрицательное), иначе -1
+    static double RunResult::*const NUM[] = {
+        &RunResult::frames, &RunResult::wallS, &RunResult::fps, &RunResult::detectMs, &RunResult::detectP95,
+        &RunResult::procMs, &RunResult::procP95, &RunResult::targetsPerFrame, &RunResult::targetFramesPct,
+        &RunResult::tracks, &RunResult::droneIds, &RunResult::birdIds, &RunResult::lockPct, &RunResult::hardPct,
+        &RunResult::lockAcq, &RunResult::skyPct, &RunResult::skyDarkPct, &RunResult::evalFrames,
+        &RunResult::gtDroneFrames, &RunResult::recallDrone, &RunResult::recallBird, &RunResult::droneAsDrone,
+        &RunResult::falsePerFrame, &RunResult::falseTracks, &RunResult::lockOnDrone, &RunResult::hardOnDrone,
+        &RunResult::falseLock, &RunResult::firstDetectS, &RunResult::firstLockS, &RunResult::score};
+    const auto& M = metrics();
+    for (auto& o : out) {
+        const auto& g = by[{o.video, o.variant}];
+        if (g.size() == 1 && g[0]->phase < 0) continue;   // один прогон без сдвигов — как есть
+        o.phases = (int)g.size();
+        o.done = true;
+        o.gt = false;
+        o.error.clear();
+        for (const RunResult* r : g) {
+            o.done &= r->done;
+            o.gt |= r->gt;
+            if (o.error.empty() && !r->error.empty())
+                o.error = "сдвиг " + std::to_string(r->phase) + ": " + r->error;
+        }
+        o.done &= o.error.empty();
+        for (auto f : NUM) {
+            double sum = 0;
+            int n = 0;
+            for (const RunResult* r : g)
+                if (r->done && r->*f >= 0 && std::isfinite(r->*f)) sum += r->*f, ++n;
+            o.*f = n ? sum / n : (f == &RunResult::frames || f == &RunResult::wallS ? 0 : -1);
+        }
+        o.lo.assign(M.size(), -1);
+        o.hi.assign(M.size(), -1);
+        for (size_t i = 0; i < M.size(); ++i)
+            for (const RunResult* r : g) {
+                double v;
+                if (!metric_value(M[i], *r, v)) continue;
+                if (o.lo[i] < 0 || v < o.lo[i]) o.lo[i] = v;
+                if (o.hi[i] < 0 || v > o.hi[i]) o.hi[i] = v;
+            }
+    }
+    return out;
 }
 
 // ------------------------------------------------------------ запуск
@@ -723,7 +851,19 @@ bool Runner::start(const Config& c, std::string& err) {
         return false;
     }
     std::string warn;
-    variants_ = make_variants(c.base, c.choices, c.mode, warn);
+    if (c.allPhases) {
+        // сдвиг перебирается сам — вариант с другим сдвигом был бы тем же прогоном
+        const size_t n0 = cfg_.choices.size();
+        cfg_.choices.erase(std::remove_if(cfg_.choices.begin(), cfg_.choices.end(),
+                                          [](const Choice& ch) { return ch.key == "phase"; }),
+                           cfg_.choices.end());
+        if (cfg_.choices.size() != n0) warn = "все сдвиги такта: перебор сдвига (phase) не нужен, убран";
+    }
+    {
+        std::string w2;
+        variants_ = make_variants(cfg_.base, cfg_.choices, cfg_.mode, w2);
+        if (!w2.empty()) warn += (warn.empty() ? "" : "; ") + w2;
+    }
     videos_.clear();
     for (const auto& f : files) videos_.push_back(probe(f));
     if (cfg_.outDir.empty()) {
@@ -739,15 +879,20 @@ bool Runner::start(const Config& c, std::string& err) {
         err = "не создать папку отчёта " + cfg_.outDir + ": " + ec.message();
         return false;
     }
+    if (!cfg_.tracksDir.empty()) fs::create_directories(upath(cfg_.tracksDir), ec);
     {
         std::lock_guard<std::mutex> lk(m_);
         res_.clear();
         for (int v = 0; v < (int)videos_.size(); ++v)
             for (int k = 0; k < (int)variants_.size(); ++k) {
-                RunResult r;
-                r.video = v;
-                r.variant = k;
-                res_.push_back(r);
+                const int np = cfg_.allPhases ? phase_count(variants_[k].setup.s, videos_[v].fps) : 1;
+                for (int ph = 0; ph < np; ++ph) {
+                    RunResult r;
+                    r.video = v;
+                    r.variant = k;
+                    r.phase = np > 1 ? ph : -1;
+                    res_.push_back(r);
+                }
             }
         error_ = warn;
         html_.clear();
@@ -779,9 +924,11 @@ bool Runner::start(const Config& c, std::string& err) {
                     liveJob_[i] = j;
                 }
                 *live_[i] = 0;
-                RunResult r = run_one(videos_[r0.video], variants_[r0.variant], cfg_, threads, stop_, *live_[i]);
+                RunResult r = run_one(videos_[r0.video], variants_[r0.variant], r0.variant, r0.phase, cfg_, threads, stop_,
+                                      *live_[i]);
                 r.video = r0.video;
                 r.variant = r0.variant;
+                r.phase = r0.phase;
                 {
                     std::lock_guard<std::mutex> lk(m_);
                     res_[j] = r;
@@ -848,7 +995,8 @@ Runner::Status Runner::status() const {
         const long f = *live_[i];
         if (n > 0) part += std::min(1.0, (double)f / n);
         if (!st.current.empty()) st.current += "\n";
-        st.current += vm.file + " — " + variants_[r.variant].name + " (кадр " + std::to_string(f) +
+        st.current += vm.file + " — " + variants_[r.variant].name +
+                      (r.phase >= 0 ? ", сдвиг " + std::to_string(r.phase) : "") + " (кадр " + std::to_string(f) +
                       (n > 0 ? " из " + std::to_string(n) : "") + ")";
     }
     st.frac = st.total ? std::min(1.0, (st.done + part) / st.total) : 0;
@@ -860,7 +1008,7 @@ void Runner::snapshot(std::vector<VideoMeta>& v, std::vector<Variant>& var, std:
     std::lock_guard<std::mutex> lk(m_);
     v = videos_;
     var = variants_;
-    res = res_;
+    res = merge_phases(res_);
 }
 
 // ------------------------------------------------------------ без окна
@@ -869,9 +1017,13 @@ static void usage() {
     printf("dronolok_app --multitest папка|видео... [--vary ключ[=знач,знач]]... [--mode one|grid]\n"
            "            [--frames N] [--warmup N] [--radius пикс] [--parallel N] [--out папка]\n"
            "            [--profile 0..3] [--set ключ=знач]... [--realtime] [--emulate] [--mask-file]\n"
+           "            [--tracks папка] [--phases]\n"
            "  --vary  что перебирать (без значений — значения по умолчанию); --set — изменить базу\n"
            "  --mode  one: база + каждая настройка по отдельности (по умолч.), grid: все сочетания\n"
-           "  --list  список настроек\n");
+           "  --list  список настроек\n"
+           "  --tracks журнал треков каждого прогона: папка/<видео>.<номер варианта>[.p<сдвиг>].csv\n"
+           "  --phases камера реже видео (step, cam_fps): прогон по каждому сдвигу такта, в отчёте среднее\n"
+           "           и разброс по сдвигам (вместо --vary phase=0,1,2,3)\n");
 }
 
 static bool parse_kv(const std::string& a, std::string& key, std::string& vals) {
@@ -928,6 +1080,8 @@ int run_cli(int argc, char** argv) {
         else if (a == "--realtime") c.realtime = true;
         else if (a == "--emulate") c.emulate = true;
         else if (a == "--mask-file") c.maskFile = true;
+        else if (a == "--tracks") c.tracksDir = val();
+        else if (a == "--phases") c.allPhases = true;
         else if (!a.empty() && a[0] == '-') {
             printf("неизвестный ключ %s\n", a.c_str());
             usage();
@@ -962,8 +1116,10 @@ int run_cli(int argc, char** argv) {
         std::vector<Variant> var;
         std::vector<RunResult> res;
         r.snapshot(v, var, res);
-        printf("мультитест: видео %zu, вариантов %zu, прогонов %zu -> %s\n", v.size(), var.size(), res.size(),
-               r.status().outDir.c_str());
+        const Runner::Status st = r.status();
+        printf("мультитест: видео %zu, вариантов %zu, прогонов %d -> %s\n", v.size(), var.size(), st.total,
+               st.outDir.c_str());
+        if (!st.error.empty()) printf("  %s\n", st.error.c_str());
         for (const auto& x : var) printf("  вариант: %s\n", x.name.c_str());
     }
     int shown = 0;

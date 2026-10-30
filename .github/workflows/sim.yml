@@ -1,0 +1,137 @@
+name: sim
+
+# Виртуальная сцена (Godot 4.3): рендер роликов с разметкой и прогон конвейера по ним.
+# Рендер программный (xvfb + llvmpipe), видеокарта не нужна.
+on:
+  push:
+    paths: ['sim/**', '.github/workflows/sim.yml', 'app/src/twocam*', 'app/src/scenelink*']
+  workflow_dispatch:
+    inputs:
+      scenes:
+        description: 'Сцены из sim/scenes через пробел; сцена:сектор — камера на сектор'
+        default: 'forest_polyhaven drone_types city_sectors:forest city_sectors:lowrise city_sectors:highrise'
+      seconds:
+        description: 'Длина роликов, с (пусто — как в сцене)'
+        default: ''
+
+permissions:
+  contents: write   # превью кладутся в ветку sim-previews (артефакты из сессий Claude не скачать)
+
+# Godot: сумма архива снята при первой загрузке 2026-10-29 (подпись не проверялась).
+env:
+  GODOT_VERSION: '4.3-stable'
+  GODOT_SHA256: '7de56444b130b10af84d19c7e0cf63cf9e9937ee4ba94364c3b7dd114253ca21'
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      - name: Godot
+        run: |
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          echo "${GODOT_SHA256}  godot.zip" | sha256sum -c -
+          unzip -q godot.zip -d godot-bin
+          echo "GODOT=$PWD/godot-bin/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Проверка скрипта
+        run: |
+          timeout 300 "$GODOT" --headless --path sim/godot --import || true
+          timeout 120 "$GODOT" --headless --path sim/godot --check-only --script res://sim.gd
+      - name: Пакеты
+        timeout-minutes: 35
+        run: |
+          .github/scripts/apt.sh xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl1 libxcursor1 libxinerama1 libxrandr2 libxi6 \
+            ffmpeg cmake ninja-build pkg-config libsdl2-dev libavformat-dev libavcodec-dev libswscale-dev libavutil-dev
+      - name: Python-пакеты
+        timeout-minutes: 10
+        run: pip install --quiet --timeout 60 --retries 3 numpy==2.5.4 opencv-python-headless==5.0.0.93
+      - name: Рендер
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          SCENES: ${{ github.event.inputs.scenes }}
+          SECS: ${{ github.event.inputs.seconds }}
+        run: |
+          scenes="$SCENES"; [ -z "$scenes" ] && scenes="quick city_sectors:forest city_sectors:lowrise city_sectors:highrise"
+          secs="$SECS"
+          mkdir -p vids
+          for tok in $scenes; do
+            sc=${tok%%:*}; sector=""; [ "$tok" != "$sc" ] && sector=${tok#*:}
+            s=$sc; extra=(); [ -n "$secs" ] && extra=(--seconds "$secs")
+            [ -n "$sector" ] && { s=${sc}_${sector}; extra+=(--sector "$sector"); }
+            time xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene "sim/scenes/$sc.json" --out "out/$s" --keep-png "${extra[@]}"
+            n=$(ls "out/$s/wide" | wc -l)
+            python sim/preview.py "out/$s" 0
+            python sim/preview.py "out/$s" $((n / 2))
+            cp out/$s/*.mp4 out/$s/*.gt.json vids/
+          done
+          ls -la vids
+          # панорама 360° сцен с секторами
+          for sc in $(echo $scenes | tr ' ' '\n' | grep ':' | cut -d: -f1 | sort -u); do
+            xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene "sim/scenes/$sc.json" --out "pano/$sc" --panorama
+          done
+      - name: Сводка разметки
+        run: python sim/ci_report.py out | tee report.txt
+      - name: Приложение
+        run: |
+          cmake -S app -B build-app -G Ninja
+          cmake --build build-app
+      - name: Эмулятор двух камер на 3D-сцене (Godot отдельным процессом)
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          set -o pipefail
+          # программная отрисовка медленная (секунды на кадр): коротко и в малом разрешении
+          for sec in forest highrise; do
+            echo "== эмулятор: city_sectors, сектор $sec" | tee -a report.txt
+            timeout 1500 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
+              --sector $sec --godot "$GODOT" --seconds 3 --wide 1152x864 --fps 30 --drones 3 --birds 1 --range 150,350 --size 1.5 --switch queue --json twocam-$sec.json | tee -a report.txt
+          done
+          # птицы: широкая указывает и их (--with-birds), точная с зумом x4 отсеивает по силуэту; для сравнения — без силуэта
+          for v in shape no-shape; do
+            ex=(); [ $v = no-shape ] && ex=(--no-shape --no-veto-wide)
+            echo "== эмулятор: птицы, зум x4, $v" | tee -a report.txt
+            timeout 1500 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
+              --sector forest --godot "$GODOT" --seconds 5 --wide 1152x864 --fps 30 --drones 1 --birds 4 --range 150,350 --fov 5 \
+              --with-birds "${ex[@]}" --json twocam-birds-$v.json | tee -a report.txt
+          done
+      - name: Мультитест по роликам сцены
+        run: |
+          ./build-app/dronolok_app --multitest vids --parallel 2 --out mt-sim
+          python sim/ci_report.py --multitest mt-sim/results.json | tee -a report.txt
+      - name: Превью в ветку sim-previews
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          REPO_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}
+        run: |
+          git clone -q --depth 1 --branch sim-previews "$REPO_URL" previews || \
+            { mkdir previews && git -C previews init -q && git -C previews checkout -q -b sim-previews; }
+          d=previews/${GITHUB_SHA::7}
+          mkdir -p "$d"
+          cp report.txt mt-sim/results.json "$d"/
+          for m in out/*/meta.json; do s=$(basename $(dirname $m)); mkdir -p "$d/$s"
+            cp out/$s/*.jpg out/$s/*.png out/$s/*.gt.json out/$s/meta.json "$d/$s"/ 2>/dev/null || true
+            # короткий фрагмент точной камеры (640x480) — посмотреть ведение
+            ffmpeg -loglevel error -i out/$s/*_fine.mp4 -t 4 -c copy "$d/$s/fine_4s.mp4" || true
+          done
+          for p in pano/*/pano.jpg; do [ -f "$p" ] && cp "$p" "$d/pano_$(basename $(dirname $p)).jpg"; done
+          cd previews
+          git -c user.name=ci -c user.email=ci@localhost add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "превью ${GITHUB_SHA::7}"
+          git push -q "$REPO_URL" HEAD:sim-previews
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sim-videos
+          path: |
+            vids/
+            out/*/meta.json
+            out/*/*.jpg
+            out/*/targets_*.png
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sim-multitest
+          path: mt-sim/
+          retention-days: 14

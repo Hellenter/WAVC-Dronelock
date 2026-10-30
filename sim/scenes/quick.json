@@ -1,0 +1,187 @@
+{
+ "name": "quick",
+ "seed": 1,
+ "seconds": 3,
+ "rig": {
+  "height": 4.0
+ },
+ "wide": {
+  "w": 2304,
+  "h": 1728,
+  "hfov": 120,
+  "fps": 14,
+  "az": 0,
+  "el": 15,
+  "msaa": 4
+ },
+ "fine": {
+  "enabled": true,
+  "w": 640,
+  "h": 480,
+  "hfov": 20,
+  "fps": 60,
+  "max_dps": 30,
+  "accel": 150,
+  "latency": 0.06,
+  "target": "auto"
+ },
+ "world": {
+  "trees": 1200,
+  "trees_from": 90,
+  "trees_to": 1200,
+  "forest_threshold": 0.45,
+  "tree_lines": [
+   {
+    "dist": 140,
+    "depth": 35,
+    "az_from": -70,
+    "az_to": 45,
+    "count": 500
+   }
+  ],
+  "villages": [
+   {
+    "az": 70,
+    "dist": 230,
+    "radius": 70,
+    "houses": 14
+   }
+  ],
+  "poles": [
+   {
+    "pos": [
+     -60,
+     180,
+     0
+    ],
+    "height": 28,
+    "radius": 0.25
+   },
+   {
+    "pos": [
+     30,
+     260,
+     0
+    ],
+    "height": 18,
+    "radius": 0.15
+   }
+  ],
+  "hills": 140,
+  "hills_from": 1500,
+  "cloud_cover": 0.35,
+  "sun_az": 150,
+  "sun_el": 35,
+  "fog": 0.00025,
+  "wind": 1.0,
+  "shadows": false
+ },
+ "targets": [
+  {
+   "kind": "drone",
+   "model": "quad",
+   "size": 0.35,
+   "speed": 12,
+   "path": {
+    "type": "line",
+    "from": [
+     -180,
+     220,
+     45
+    ],
+    "to": [
+     200,
+     180,
+     70
+    ]
+   }
+  },
+  {
+   "kind": "drone",
+   "model": "quad",
+   "size": 0.3,
+   "speed": 9,
+   "path": {
+    "type": "orbit",
+    "center": [
+     60,
+     300,
+     55
+    ],
+    "radius": 70
+   }
+  },
+  {
+   "kind": "drone",
+   "model": "quad",
+   "size": 0.3,
+   "path": {
+    "type": "hover",
+    "pos": [
+     -40,
+     160,
+     30
+    ],
+    "jitter": 1.5
+   }
+  },
+  {
+   "kind": "drone",
+   "model": "wing",
+   "size": 1.8,
+   "speed": 25,
+   "start": 3,
+   "path": {
+    "type": "line",
+    "from": [
+     -400,
+     350,
+     90
+    ],
+    "to": [
+     400,
+     300,
+     110
+    ]
+   }
+  },
+  {
+   "kind": "bird",
+   "size": 0.9,
+   "flap_hz": 3.5,
+   "flap_deg": 45,
+   "flap_period": 2.5,
+   "flap_on": 1.2,
+   "speed": 10,
+   "path": {
+    "type": "wander",
+    "center": [
+     20,
+     120,
+     35
+    ],
+    "radius": 50
+   }
+  },
+  {
+   "kind": "bird",
+   "size": 0.6,
+   "flap_hz": 6,
+   "flap_deg": 50,
+   "speed": 12,
+   "path": {
+    "type": "line",
+    "from": [
+     150,
+     90,
+     25
+    ],
+    "to": [
+     -150,
+     140,
+     40
+    ]
+   }
+  }
+ ]
+}

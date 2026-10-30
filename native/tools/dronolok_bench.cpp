@@ -51,18 +51,23 @@ static void usage() {
         "  --scales 1..4           доп. масштабы для крупных целей\n"
         "  --focus                 пониженный порог возле прогноза треков\n"
         "  --motion                компенсация движения камеры\n"
+        "  --motion-long           ...и сдвиг от кадра ~1/15 с назад (длинная база, как в приложении от 22.5 к/с,\n"
+        "                          частота — из y4m). Время оценки поворота — отдельной строкой\n"
         "  --zones                 зоны кадра: небо / смешанные / земля\n"
         "  --full-every N          весь кадр раз в N кадров, между ними — только вокруг треков\n"
         "  --coarse-every N        грубые масштабы целиком раз в N кадров\n"
         "  --per-tile N            до стольких кандидатов в тайле (2; второй — из ячеек 16x16)\n"
         "  --no-bg-map             без фона по ячейкам у кромки леса (маска неба с тайлом запаса, как раньше)\n"
         "  --no-sky-color          маска без облаков по цвету (цвет берётся из y4m и --yuv420)\n"
+        "  --no-leaf-color         лист у камеры не отсеивается по цвету\n"
         "  --bg-map [--bg-k 3 --bg-frames 250]  фон по ячейкам у кромки: порог ячейки = медиана + K*СКО\n"
         "  --tbd [--tbd-thr 7 --tbd-z0 1.5 --tbd-decay 0.7 --tbd-min 0.5]   накопление по кадрам (включает --bg-map)\n"
         "  --band PX [--band-k 1 --upper-every N]   полоса у горизонта каждый кадр, небо выше — раз в N\n"
         "  --smooth [--smooth-k 0.5] / --no-smooth   сглаживание 3x3 перед пулингом (согласованный фильтр)\n"
         "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
+        "  --gate 26 [--gate-speed-k 0 --gate-pps 360]   предел ворот ассоциации, пикс. кадра (+ столько скоростей\n"
+        "                          трека; с --fps-scale не меньше пути за кадр при gate-pps пикс./с)\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
         "  --flap-window 48 --flap-r2 0.45 --flap-depth 0.3 --flap-hold 50   взмахи (окно 0 — выкл.)\n"
         "  --hover 0.3 --flock 150     зависание = дрон, стая с машущей = птицы (0 — выкл.)\n"
@@ -78,22 +83,22 @@ static void usage() {
         "  --dump-tracks out.csv   признаки треков по кадрам (для настройки классификатора)\n");
 }
 
-// Цвет загруженного кадра для облаков по цвету (DetectorConfig::sky_color): по отсчёту U и V на
-// блок 8x8 — столько детектор и читает (8x8 отсчётов на тайл 64x64), в памяти это 1/32 кадра
-struct Color8 {
+// Цвет загруженного кадра, как в приложении: по отсчёту U и V в углу блока 4x4 (в памяти 1/8 кадра).
+// Каждый второй — в центре блока 8x8, по ним учится маска неба (sky_color), а все — цвет целей (leaf_color)
+struct Color4 {
     std::vector<uint8_t> u, v;
 };
-static bool sample_color8(const FrameReader& rd, int W, int H, Color8& c) {
+static bool sample_color4(const FrameReader& rd, int W, int H, Color4& c) {
     const uint8_t *u, *v;
     int cw, ch, stride, step;
     if (!rd.color(u, v, cw, ch, stride, step)) return false;
-    const int bw = W / 8, bh = H / 8;
+    const int bw = W / 4, bh = H / 4;
     c.u.resize((size_t)bw * bh);
     c.v.resize(c.u.size());
     for (int by = 0; by < bh; ++by) {
-        const size_t row = (size_t)std::min(ch - 1, (by * 8 + 4) / step) * stride;
+        const size_t row = (size_t)std::min(ch - 1, by * 4 / step) * stride;
         for (int bx = 0; bx < bw; ++bx) {
-            const int cx = std::min(cw - 1, (bx * 8 + 4) / step);
+            const int cx = std::min(cw - 1, bx * 4 / step);
             c.u[(size_t)by * bw + bx] = u[row + cx];
             c.v[(size_t)by * bw + bx] = v[row + cx];
         }
@@ -144,9 +149,9 @@ int main(int argc, char** argv) {
     int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0, learnLive = 0;
     bool evalAll = false, sceneOn = false, adapt = false;
     std::string sceneLog;
-    bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false, fpsScale = false;
+    bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false, fpsScale = false, motionLong = false;
     GlobalMotion gm;
-    std::vector<FocusArea> focusAreas, roiAreas;
+    std::vector<FocusArea> focusAreas, roiAreas, tintAreas;
     DetectorConfig cfg;
     TrackerConfig tcfg;
     for (int i = 1; i < argc; ++i) {
@@ -180,6 +185,9 @@ int main(int argc, char** argv) {
         else if (a == "--tile") cfg.tile = std::atoi(val().c_str());
         else if (a == "--job") { std::string v = val(); std::sscanf(v.c_str(), "%dx%d", &cfg.job_rows, &cfg.job_cols); }
         else if (a == "--polarity") { std::string v = val(); cfg.dark = v != "bright"; cfg.bright = v != "dark"; }
+        else if (a == "--gate") tcfg.gate = (float)std::atof(val().c_str());
+        else if (a == "--gate-speed-k") tcfg.gate_speed_k = (float)std::atof(val().c_str());
+        else if (a == "--gate-pps") tcfg.gate_pps = (float)std::atof(val().c_str());
         else if (a == "--bird-resid") tcfg.bird_resid = (float)std::atof(val().c_str());
         else if (a == "--bird-cv") tcfg.bird_contrast_cv = (float)std::atof(val().c_str());
         else if (a == "--bird-speed") tcfg.bird_speed = (float)std::atof(val().c_str());
@@ -201,6 +209,7 @@ int main(int argc, char** argv) {
         else if (a == "--q") tcfg.q_accel = (float)std::atof(val().c_str());
         else if (a == "--gate-sigma") tcfg.gate_sigma = (float)std::atof(val().c_str());
         else if (a == "--motion") motion = true;
+        else if (a == "--motion-long") motion = motionLong = true;
         else if (a == "--zones") cfg.zones = true;
         else if (a == "--mixed-k") cfg.mixed_k = (float)std::atof(val().c_str());
         else if (a == "--full-every") cfg.full_every = std::atoi(val().c_str());
@@ -211,6 +220,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-skyline") cfg.skyline = false;
         else if (a == "--no-fine-mask") cfg.fine_mask = false;
         else if (a == "--no-sky-color") cfg.sky_color = false;
+        else if (a == "--no-leaf-color") cfg.leaf_color = 0;
         else if (a == "--lock-slow") tcfg.lock_slow = (float)std::atof(val().c_str());
         else if (a == "--lock-dwell") tcfg.lock_dwell = std::atoi(val().c_str());
         else if (a == "--follow-k") tcfg.follow_k = (float)std::atof(val().c_str());
@@ -265,14 +275,15 @@ int main(int argc, char** argv) {
     const float gsx = haveGt && gt.w ? (float)W / gt.w : 1, gsy = haveGt && gt.h ? (float)H / gt.h : 1;
 
     std::vector<std::vector<uint8_t>> frames;
-    std::vector<Color8> colors;   // цвет загруженных кадров (пусто — его нет)
+    std::vector<Color4> colors;   // цвет загруженных кадров (пусто — его нет)
     std::vector<uint8_t> buf;
     if (!stream) {
         const double t0 = now_ms();
-        Color8 c8;
+        Color4 c4;
         while ((int)frames.size() < maxFrames && rd.next(buf)) {
             frames.push_back(buf);
-            if (cfg.sky_color && colors.size() + 1 == frames.size() && sample_color8(rd, W, H, c8)) colors.push_back(c8);
+            if ((cfg.sky_color || cfg.leaf_color > 0) && colors.size() + 1 == frames.size() && sample_color4(rd, W, H, c4))
+                colors.push_back(c4);
         }
         if (colors.size() != frames.size()) colors.clear();
         std::printf("загружено %zu кадров %dx%d за %.1f c\n", frames.size(), W, H, (now_ms() - t0) / 1000);
@@ -327,7 +338,7 @@ int main(int argc, char** argv) {
         det.beginMaskLearning();
         std::vector<Candidate> c;
         for (int i = 0; i < std::min(learn, (int)frames.size()); ++i) {
-            if (!colors.empty()) det.setColor(colors[i].u.data(), colors[i].v.data(), W / 8, H / 8, W / 8, 8);
+            if (!colors.empty()) det.setColor(colors[i].u.data(), colors[i].v.data(), W / 4, H / 4, W / 4, 4, 1, 0);
             det.detect(frames[i].data(), W, H, W, c);
         }
         det.endMaskLearning();
@@ -339,7 +350,11 @@ int main(int argc, char** argv) {
     }
     std::printf("бэкенд %s, потоков %d\n", det.backendName().c_str(), det.threads());
 
-    std::vector<double> total, resp, sel, trackMs, readMs;
+    std::vector<double> total, resp, sel, trackMs, readMs, motionMs;
+    if (motionLong) {   // длинная база включается от 22.5 к/с (GlobalMotion::setLong)
+        gm.setFps((float)rd.fps());
+        gm.setLong(true);
+    }
     std::vector<Candidate> cands;
     EvalStats ev, ev3;   // ev3 — первые 3 с первого прохода (с --eval-all)
     const int n = stream ? 0 : (int)frames.size();
@@ -367,6 +382,7 @@ int main(int argc, char** argv) {
         const double t0 = now_ms();
         MotionEstimate me;
         if (motion) me = gm.estimate(g, W, H, W);
+        const double tm1 = now_ms();
         if (focus) {
             trk.focus(me.dx, me.dy, focusAreas);
             det.setFocus(focusAreas);
@@ -407,11 +423,14 @@ int main(int argc, char** argv) {
                              ss.skyFrac, ss.hv, ss.skylineFlat, ss.skylineSd, light_name(ss.light), terrain_name(ss.terrain),
                              ss.lightJump || ss.moved ? ss.lastEvent.c_str() : "", det.threshold(), why.c_str());
         }
-        // цвет кадра: детектор читает его только в кадры обучения маски
+        // цвет кадра: маска неба читает его в кадры обучения, цвет целей (leaf_color) — у треков, которые
+        // можно захватить
         const uint8_t *cu, *cv;
         int cw, ch, cs, cst;
         if (stream && rd.color(cu, cv, cw, ch, cs, cst)) det.setColor(cu, cv, cw, ch, cs, cst);
-        else if (!stream && !colors.empty()) det.setColor(colors[fi].u.data(), colors[fi].v.data(), W / 8, H / 8, W / 8, 8);
+        else if (!stream && !colors.empty()) det.setColor(colors[fi].u.data(), colors[fi].v.data(), W / 4, H / 4, W / 4, 4, 1, 0);
+        trk.roi(me.dx, me.dy, tintAreas, true);
+        det.setTintAreas(tintAreas);
         det.detect(g, W, H, W, cands);
         trk.setPartial(det.timing().partial);
         const double t1 = now_ms();
@@ -422,6 +441,7 @@ int main(int argc, char** argv) {
             resp.push_back(det.timing().response_ms);
             sel.push_back(det.timing().select_ms);
             trackMs.push_back(t2 - t1);
+            if (motion) motionMs.push_back(tm1 - t0);
         }
         const bool evalFrame = haveGt && fi < (int)gt.frames.size() && (stream || evalAll || i >= n);
         if (evalFrame) {
@@ -463,14 +483,18 @@ int main(int argc, char** argv) {
                 pt.p50, pt.p95, pt.max, pt.mean > 0 ? 1000 / pt.mean : 0);
     std::printf("  отклик (бэкенд) %.2f мс, выбор кандидатов %.3f мс, трекер %.3f мс\n", pr.mean, ps.mean, pk.mean);
     if (stream) std::printf("  чтение кадра %.2f мс\n", pct(readMs).mean);
+    if (motion)
+        std::printf("  оценка поворота камеры %.2f мс (p95 %.2f)%s\n", pct(motionMs).mean, pct(motionMs).p95,
+                    motionLong ? (rd.fps() >= 22.5 ? ", с длинной базой" : ", длинной базы нет: ниже 22.5 к/с") : "");
     std::printf("  шум отклика %.2f, порог %.1f%s\n", det.noiseLevel(), det.threshold(), cfg.auto_thr ? " (по шуму)" : "");
     char json[1024];
     int len = std::snprintf(json, sizeof(json),
                             "{\"resolution\": \"%dx%d\", \"backend\": \"%s\", \"threads\": %d, \"pool\": %d, \"k\": %d, "
                             "\"mask\": %s, \"frames\": %zu, \"mean_ms\": %.2f, \"p95_ms\": %.2f, \"fps\": %.1f, "
-                            "\"response_ms\": %.2f, \"track_ms\": %.3f",
+                            "\"response_ms\": %.2f, \"track_ms\": %.3f, \"motion_ms\": %.3f, \"motion_long\": %s",
                             W, H, det.backendName().c_str(), det.threads(), cfg.pool, cfg.k, learn ? "true" : "false",
-                            total.size(), pt.mean, pt.p95, pt.mean > 0 ? 1000 / pt.mean : 0, pr.mean, pk.mean);
+                            total.size(), pt.mean, pt.p95, pt.mean > 0 ? 1000 / pt.mean : 0, pr.mean, pk.mean,
+                            motion ? pct(motionMs).mean : 0.0, motionLong ? "true" : "false");
     if (haveGt) {
         std::printf("  полнота: дроны %.1f%%, птицы %.1f%%; ложных треков на кадр %.2f\n", 100 * ev.recall(0),
                     100 * ev.recall(1), ev.falsePerFrame());

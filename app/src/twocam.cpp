@@ -65,6 +65,49 @@ void parallel_rows(int h, F&& f) {
     for (auto& t : th) t.join();
 }
 
+// Взмахи по ряду x (последние n): размах (СКО к среднему после снятия наклона) и наибольшая
+// автокорреляция на лагах lmin..lmax (период взмаха, кадров), у которой на половине лага — обратная
+// (колебание, а не медленный дрейф размера или шум). Возвращает автокорреляцию
+float flap_shape(const std::deque<float>& x, int n, int lmin, int lmax, float& amp, int& lag) {
+    amp = 0;
+    lag = 0;
+    n = std::min(n, (int)x.size());
+    if (n < 6 || lmax < lmin) return 0;
+    std::vector<double> v(x.end() - n, x.end());
+    double mx = 0, mi = (n - 1) * 0.5, sxy = 0, sxx = 0;
+    for (double a : v) mx += a;
+    mx /= n;
+    if (mx <= 0) return 0;
+    for (int i = 0; i < n; ++i) {
+        sxy += (i - mi) * (v[i] - mx);
+        sxx += (i - mi) * (i - mi);
+    }
+    const double k = sxy / sxx;
+    double var = 0;
+    for (int i = 0; i < n; ++i) {
+        v[i] -= mx + k * (i - mi);
+        var += v[i] * v[i];
+    }
+    var /= n;
+    amp = (float)(std::sqrt(var) / mx);
+    if (var <= 1e-12) return 0;
+    auto acf = [&](int L) {
+        double c = 0;
+        for (int i = L; i < n; ++i) c += v[i] * v[i - L];
+        return c / ((n - L) * var);
+    };
+    double best = 0;
+    // лаг не длиннее половины ряда: на длинных лагах слагаемых мало, и шум даёт ложный пик (3 Гц у дронов)
+    for (int L = std::max(2, lmin); L <= std::min(lmax, n / 2); ++L) {
+        const double c = acf(L);
+        if (c > best && acf((L + 1) / 2) <= -0.15) {
+            best = c;
+            lag = L;
+        }
+    }
+    return (float)best;
+}
+
 inline double ang(double az1, double el1, double az2, double el2) {
     return angle_between(dir_from_azel(az1, el1), dir_from_azel(az2, el2));
 }
@@ -85,7 +128,7 @@ const char* state_name(NState s) {
 Vec3 Body::at(double t) const {
     const double dt = t - t0;
     Vec3 p{p0.x + v.x * dt, p0.y + v.y * dt, p0.z + v.z * dt};
-    if (bird) {   // птица летит неровно: покачивание по высоте и в сторону
+    if (bird && wobble) {   // птица летит неровно: покачивание по высоте и в сторону
         p.z += 1.2 * std::sin(0.9 * dt + phase);
         p.x += 0.8 * std::sin(0.6 * dt + 2 * phase);
     }
@@ -141,51 +184,121 @@ void Emulator::spawn(Body& b, double t, bool first) {
         b.p0 = {d.x * R, d.y * R, d.z * R};
         break;
     }
-    const double sp = b.bird ? 8 + U(rng_) * 6 : c_.speedMin + U(rng_) * (c_.speedMax - c_.speedMin);
+    // тип дрона по долям из настроек; у каждого свой размах и скорость
+    if (b.bird) {
+        b.shape = Shape::Bird;
+    } else {
+        const double tot = std::max(1e-6f, c_.quadShare + c_.deltaShare + c_.planeShare), r = U(rng_) * tot;
+        b.shape = r < c_.quadShare ? Shape::Quad : r < c_.quadShare + c_.deltaShare ? Shape::Delta : Shape::Plane;
+    }
+    double sp = c_.speedMin + U(rng_) * (c_.speedMax - c_.speedMin);
+    switch (b.shape) {
+    case Shape::Bird: sp = 8 + U(rng_) * 6; b.size = (float)(0.3 + U(rng_) * 0.9); break;   // от воробья до вороны
+    case Shape::Quad: b.size = c_.droneSize * (float)(0.6 + U(rng_)); break;
+    case Shape::Delta: sp = 25 + U(rng_) * 20; b.size = (float)(1.8 + U(rng_) * 1.7); break;
+    case Shape::Plane: sp = 15 + U(rng_) * 15; b.size = (float)(1.5 + U(rng_) * 2.5); break;
+    }
     const double hd = U(rng_) * 2 * PI;
     b.v = {sp * std::cos(hd), sp * std::sin(hd), (U(rng_) * 2 - 1) * (b.bird ? 0.5 : 1.5)};
-    b.size = b.bird ? c_.birdSize : c_.droneSize * (float)(0.8 + 0.4 * U(rng_));
     b.flapHz = b.bird ? (float)(4 + U(rng_) * 4) : 0;
     b.phase = (float)(U(rng_) * 6.28);
     (void)first;
 }
 
 void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h) {
+    std::vector<Tri> tris;
     for (const Body& b : bodies_) {
         const Vec3 q = b.at(t);
         const double R = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
-        const Vec3 d{q.x / R, q.y / R, q.z / R};
         double u, v;
-        if (!project(m, p, d, u, v) || !in_frame(m, u, v, 20)) continue;
-        const double pd = pixel_deg(m, p, u, v);
-        double sizePx = rad2deg(b.size / R) / pd;
+        if (!project(m, p, q, u, v) || !in_frame(m, u, v, 20)) continue;
         double c = (b.bird ? -55.0 : -70.0) * std::exp(-R / c_.visibility);
-        if (b.bird) {   // взмахи: силуэт и контраст пульсируют
-            const double fl = std::sin(2 * PI * b.flapHz * t + b.phase);
-            sizePx *= 0.75 + 0.25 * fl;
-            c *= 0.8 + 0.2 * fl;
+        double flap = 0, pitch = 0, bank = 0;
+        const double sp = std::sqrt(b.v.x * b.v.x + b.v.y * b.v.y);
+        if (b.bird) {   // взмахи: крылья ходят вверх-вниз, силуэт меняется
+            flap = 0.7 * std::sin(2 * PI * b.flapHz * (t - b.t0) + b.phase);
+            bank = 0.15 * std::sin(0.7 * t + b.phase);
+        } else if (b.shape == Shape::Quad) {
+            pitch = -std::min(0.45, 0.02 * sp);   // квадрокоптер летит с наклоном носом вниз
+            bank = 0.05 * std::sin(1.3 * t + b.phase);
+        } else {
+            bank = 0.12 * std::sin(0.4 * t + b.phase);
         }
-        const double sx = std::max(0.5, 0.42 * sizePx), sy = std::max(0.5, (b.bird ? 0.3 : 0.55) * sizePx);
-        // точка меньше пикселя: та же сумма контраста, размазанная по пятну датчика
-        const double area = 0.785 * sizePx * sizePx * (b.bird ? 0.6 : 1.0);
-        const double A = c * std::min(1.0, area / (2 * PI * sx * sy));
-        const int rx = (int)std::ceil(3 * sx), ry = (int)std::ceil(3 * sy);
-        const int x0 = std::max(0, (int)u - rx), x1 = std::min(w - 1, (int)u + rx);
-        const int y0 = std::max(0, (int)v - ry), y1 = std::min(h - 1, (int)v + ry);
-        for (int y = y0; y <= y1; ++y)
-            for (int x = x0; x <= x1; ++x) {
-                const double dx = (x + 0.5 - u) / sx, dy = (y + 0.5 - v) / sy;
-                const double g = std::exp(-0.5 * (dx * dx + dy * dy));
-                uint8_t& o = px[(size_t)y * w + x];
-                o = (uint8_t)std::max(0.0, std::min(255.0, o + A * g));
-            }
+        build_silhouette(b.shape, b.size, flap, tris);
+        draw_silhouette(tris, q, body_frame(b.v, pitch, bank), c, c_.psf,
+                        [&](const Vec3& d, double& uu, double& vv) { return project(m, p, d, uu, vv); }, px, w, h);
     }
+}
+
+// Кадр из 3D-сцены: Godot рисует камеру при повороте p на момент t; шум датчика добавляем здесь,
+// цели (правда) — из ответа сцены.
+bool Emulator::sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out) {
+    int w = 0, h = 0;
+    std::string err;
+    bool ok = link_->render(t, cam, p.az, p.el, out, w, h, sbodies_, err);
+    // Godot закрыли или он упал: поднимаем заново (до 3 раз), мир тот же по seed, кадр просим повторно
+    while (!ok && !stop_ && linkRestarts_ < 3) {
+        ++linkRestarts_;
+        fprintf(stderr, "сцена: %s, перезапуск %d\n", err.c_str(), linkRestarts_);
+        event(t, "3D-сцена: " + err + ", перезапуск");
+        {
+            std::lock_guard<std::mutex> lk(vm_);
+            view_.status = "перезапуск 3D-сцены...";
+        }
+        err.clear();
+        ok = link_->start(linkOpt_, linkHello_, err) && link_->render(t, cam, p.az, p.el, out, w, h, sbodies_, err);
+        std::lock_guard<std::mutex> lk(vm_);
+        view_.status.clear();
+    }
+    if (!ok || w != W || h != H) {
+        if (err.empty()) err = "сцена прислала кадр не того размера";
+        std::lock_guard<std::mutex> lk(vm_);
+        view_.status = "3D-сцена: " + err;
+        stop_ = true;
+        out.assign((size_t)W * H, 0);
+        return false;
+    }
+    if (c_.noise > 0) {
+        const uint32_t seed = noiseSeed_ += 0x7f4a7c15u;
+        parallel_rows(H, [&](int ya, int yb) {
+            for (int y = ya; y < yb; ++y) {
+                uint32_t r = (seed ^ (uint32_t)(y * 2654435761u) ^ 0x51ed27u) | 1u;
+                uint8_t* o = &out[(size_t)y * W];
+                for (int x = 0; x < W; ++x) {
+                    r ^= r << 13;
+                    r ^= r >> 17;
+                    r ^= r << 5;
+                    const int v = o[x] + ((noiseTab_[r >> 16] + 4) >> 3);
+                    o[x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+            }
+        });
+    }
+    bodies_.clear();
+    for (const scene::Body& sb : sbodies_) {
+        Body b;
+        b.id = sb.id;
+        b.bird = sb.bird;
+        b.shape = (Shape)std::max(0, std::min(3, sb.shape));
+        b.size = sb.size;
+        b.p0 = {sb.x, sb.y, sb.z};
+        b.v = {sb.vx, sb.vy, sb.vz};
+        b.t0 = t;
+        b.wobble = false;
+        b.hidden = sb.hidden;
+        bodies_.push_back(b);
+    }
+    return true;
 }
 
 void Emulator::renderWide(double t, std::vector<uint8_t>& out) {
     const int W = wideCam_.w, H = wideCam_.h;
     const size_t N = (size_t)W * H;
     out.resize(N);
+    if (sceneMode_) {
+        sceneRender(t, 0, widePose_, W, H, out);
+        return;
+    }
     // облака плывут медленно (0.04 °/с — меньше пикселя за 0.5 с): фон с облаками считаем раз в
     // полсекунды, на сетке CLOUD_STEP, между узлами — линейно
     if (wideSky_.size() != N || t - wideSkyT_ >= 0.5) {
@@ -248,6 +361,10 @@ void Emulator::renderWide(double t, std::vector<uint8_t>& out) {
 void Emulator::renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out) {
     const int W = narrowCam_.w, H = narrowCam_.h;
     out.resize((size_t)W * H);
+    if (sceneMode_) {
+        sceneRender(t, 1, p, W, H, out);
+        return;
+    }
     const int gw = W / NARROW_STEP + 2, gh = H / NARROW_STEP + 2;
     std::vector<float> bg((size_t)gw * gh), gaz(bg.size()), gel(bg.size());
     std::vector<uint8_t> ground(bg.size());
@@ -265,8 +382,9 @@ void Emulator::renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out) 
     });
     const uint32_t seed = noiseSeed_ += 0x7f4a7c15u;
     parallel_rows(H, [&](int ya, int yb) {
-    uint32_t r = seed ^ (uint32_t)(ya * 2654435761u) ^ 0x51ed27u;
     for (int y = ya; y < yb; ++y) {
+        // свой генератор на строку: шум не зависит от числа потоков (ядер ПК)
+        uint32_t r = (seed ^ (uint32_t)(y * 2654435761u) ^ 0x51ed27u) | 1u;
         const float gy = (float)y / NARROW_STEP;
         const int j0 = std::min(gh - 2, (int)gy);
         const float ty = gy - j0;
@@ -301,7 +419,11 @@ int Emulator::nearestBody(double t, double az, double el, double maxDeg) const {
     double bd = maxDeg;
     const Vec3 d = dir_from_azel(az, el);
     for (const Body& b : bodies_) {
-        const double a = angle_between(d, b.at(t));
+        if (b.hidden) continue;
+        // крупная цель — не точка: попадание в её силуэт (крыло, хвост) — тоже она
+        const Vec3 q = b.at(t);
+        const double R = std::max(1.0, std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z));
+        const double a = angle_between(d, q) - 0.5 * b.size / R * 180 / PI;
         if (a < bd) {
             bd = a;
             best = b.id;
@@ -312,6 +434,10 @@ int Emulator::nearestBody(double t, double az, double el, double maxDeg) const {
 
 void Emulator::start(const Config& c) {
     stop();
+    {
+        std::lock_guard<std::mutex> lk(vm_);
+        view_ = View();
+    }
     c_ = c;
     switchMode_ = (int)c.switchMode;
     speed_ = c.simSpeed;
@@ -328,8 +454,109 @@ void Emulator::start(const Config& c) {
     narrowCam_.w = c.narrowW;
     narrowCam_.h = c.narrowH;
     narrowCam_.hfov_deg = c.narrowFov;
-    // фон широкой без облаков — один раз
-    const int W = c.wideW, H = c.wideH;
+    sceneMode_ = !c.scene.empty();
+    poseSeen_ = poseReq_;
+    scanReq_ = false;
+    scan_ = false;
+    pano_.clear();   // панорама — своя у каждой сцены
+    panoTw_ = panoTh_ = panoTile_ = 0;
+    sincePose_ = 0;
+    lastLearning_ = true;
+    if (!sceneMode_) prepareWide();
+    ngm_.reset();
+    noiseTab_.resize(65536);
+    {
+        std::mt19937 g(c.seed + 99);
+        std::normal_distribution<float> N(0, c.noise * 8);
+        for (auto& v : noiseTab_) v = (int16_t)std::max(-32000.f, std::min(32000.f, N(g)));
+    }
+    bodies_.clear();
+    if (!sceneMode_)
+        for (int i = 0; i < c.drones + c.birds; ++i) {
+            Body b;
+            b.bird = i >= c.drones;
+            spawn(b, 0, true);
+            bodies_.push_back(b);
+        }
+    wideNoise_.clear();
+    // точная
+    DetectorConfig dc;
+    dc.scales = c.narrowScales;   // цель в узком поле крупнее: несколько масштабов
+    dc.auto_thr = c.narrowAutoThr;
+    dc.thr_min = c.narrowThrMin;
+    dc.threads = 2;
+    ndet_.reset(new Detector(dc));
+    ntrk_.reset(new Tracker(c.narrowW, c.narrowH, tracker_for_fps(TrackerConfig(), c.narrowFps)));
+    ntrk_->setMovingCamera(true);
+    mount_ = Mount();
+    mount_.az = c.wideAz;
+    mount_.el = c.wideEl;
+    cmdPose_ = {(float)mount_.az, (float)mount_.el, 0};
+    ffAz_ = ffEl_ = 0;
+    havePrev_ = false;
+    state_ = NState::Idle;
+    assigned_ = assignedBody_ = nlock_ = 0;
+    haveNrep_ = false;
+    winOn_ = false;
+    st_ = Stats();
+    events_.clear();
+    targets_.clear();
+    inbox_.clear();
+    visited_.clear();
+    cool_.clear();
+    veto_.clear();
+    wideBirds_.clear();
+    nConf_ = nOnly_ = manualPick_ = afterBird_ = false;
+    detachId_ = 0;
+    tDetach_ = -10;
+    tBird_ = -1;
+    lastU_ = lastV_ = lastSz_ = 0;
+    pipe_.setCue({});
+    // широкая: настоящий конвейер, кадры — от нас
+    Settings s;
+    s.pace = Pace::MaxSpeed;
+    s.loop = false;
+    s.fresh = true;
+    s.staticFile = false;
+    s.maskFile = false;
+    pipe_.setSettings(s);
+    wideReady_ = false;
+    wideIdx_ = -1;
+    wideDone_ = -1;
+    wideRes_.reset();
+    pipe_.setObserver([this](const Result& r) {
+        auto p = std::make_shared<Result>(r);
+        std::lock_guard<std::mutex> lk(wm_);
+        wideRes_ = p;
+        wideDone_ = r.frame ? r.frame->index : wideDone_;
+        wcv_.notify_all();
+    });
+    VideoInfo vi;
+    vi.w = c.wideW;
+    vi.h = c.wideH;
+    vi.fps = c.wideFps;
+    vi.codec = "эмулятор";
+    stop_ = false;
+    pipe_.openGenerator(vi,
+                        [this](Frame& f) {
+                            std::unique_lock<std::mutex> lk(wm_);
+                            wcv_.wait(lk, [&] { return wideReady_ || stop_; });
+                            if (stop_) return false;
+                            memcpy(f.px.data(), wideFrame_.data(), std::min(f.px.size(), wideFrame_.size()));
+                            f.index = wideIdx_;
+                            wideReady_ = false;
+                            return true;
+                        },
+                        "эмулятор");
+    event(0, "старт: целей " + std::to_string(c.drones) + " дронов и " + std::to_string(c.birds) + " птиц" +
+                 (sceneMode_ ? ", 3D-сцена " + c.scene : std::string()));
+    running_ = true;
+    th_ = std::thread([this] { loop(); });
+}
+
+// фон широкой без облаков — при запуске и после поворота широкой
+void Emulator::prepareWide() {
+    const int W = wideCam_.w, H = wideCam_.h;
     wideBase_.assign((size_t)W * H, 0);
     wideGround_.assign((size_t)W * H, 0);
     parallel_rows(H, [&](int ya, int yb) {
@@ -354,84 +581,49 @@ void Emulator::start(const Config& c) {
             wideAz_[(size_t)j * cgW_ + i] = (float)az;
             wideEl_[(size_t)j * cgW_ + i] = (float)el;
         }
-    ngm_.reset();
     wideSky_.clear();
-    wideNoise_.clear();
     wideSkyT_ = -1;
-    noiseTab_.resize(65536);
-    {
-        std::mt19937 g(c.seed + 99);
-        std::normal_distribution<float> N(0, c.noise * 8);
-        for (auto& v : noiseTab_) v = (int16_t)std::max(-32000.f, std::min(32000.f, N(g)));
+}
+
+// маска широкой (по тайлам) -> ячейки панорамы, видимые сейчас
+void Emulator::panoLearn(const Result& r) {
+    if ((int)pano_.size() != PANO_W * PANO_H) pano_.assign((size_t)PANO_W * PANO_H, 0);
+    const int tw = r.tilesX, th = r.tilesY, tp = r.tilePx;
+    if (tw <= 0 || th <= 0 || tp <= 0 || r.mask.size() != (size_t)tw * th) return;
+    const double half = c_.wideFov * 0.5 + 5;
+    const int n = (int)std::ceil(half / PANO_STEP);
+    const int i0 = (int)std::floor(widePose_.az / PANO_STEP);
+    for (int j = 0; j < PANO_H; ++j) {
+        const double el = PANO_EL0 + (j + 0.5) * PANO_STEP;
+        for (int di = -n; di <= n; ++di) {
+            const int i = ((i0 + di) % PANO_W + PANO_W) % PANO_W;
+            double u, v;
+            if (!project(wideCam_, widePose_, dir_from_azel((i + 0.5) * PANO_STEP, el), u, v)) continue;
+            const int tx = (int)(u / tp), ty = (int)(v / tp);
+            if (u < 0 || v < 0 || tx >= tw || ty >= th) continue;
+            pano_[(size_t)j * PANO_W + i] = r.mask[(size_t)ty * tw + tx] ? 1 : 2;
+        }
     }
-    bodies_.clear();
-    for (int i = 0; i < c.drones + c.birds; ++i) {
-        Body b;
-        b.bird = i >= c.drones;
-        spawn(b, 0, true);
-        bodies_.push_back(b);
-    }
-    // точная
-    DetectorConfig dc;
-    dc.scales = 2;   // цель в узком поле крупнее: до 2 масштабов
-    dc.threads = 2;
-    ndet_.reset(new Detector(dc));
-    ntrk_.reset(new Tracker(c.narrowW, c.narrowH, tracker_for_fps(TrackerConfig(), c.narrowFps)));
-    ntrk_->setMovingCamera(true);
-    mount_ = Mount();
-    mount_.az = c.wideAz;
-    mount_.el = c.wideEl;
-    cmdPose_ = {(float)mount_.az, (float)mount_.el, 0};
-    ffAz_ = ffEl_ = 0;
-    havePrev_ = false;
-    state_ = NState::Idle;
-    assigned_ = assignedBody_ = nlock_ = 0;
-    haveNrep_ = false;
-    winOn_ = false;
-    st_ = Stats();
-    events_.clear();
-    targets_.clear();
-    inbox_.clear();
-    visited_.clear();
-    // широкая: настоящий конвейер, кадры — от нас
-    Settings s;
-    s.pace = Pace::MaxSpeed;
-    s.loop = false;
-    s.fresh = true;
-    s.staticFile = false;
-    s.maskFile = false;
-    pipe_.setSettings(s);
-    wideReady_ = false;
-    wideIdx_ = -1;
-    wideDone_ = -1;
-    wideRes_.reset();
-    pipe_.setObserver([this](const Result& r) {
-        auto p = std::make_shared<Result>(r);
-        std::lock_guard<std::mutex> lk(wm_);
-        wideRes_ = p;
-        wideDone_ = r.frame ? r.frame->index : wideDone_;
-        wcv_.notify_all();
-    });
-    VideoInfo vi;
-    vi.w = W;
-    vi.h = H;
-    vi.fps = c.wideFps;
-    vi.codec = "эмулятор";
-    stop_ = false;
-    pipe_.openGenerator(vi,
-                        [this](Frame& f) {
-                            std::unique_lock<std::mutex> lk(wm_);
-                            wcv_.wait(lk, [&] { return wideReady_ || stop_; });
-                            if (stop_) return false;
-                            memcpy(f.px.data(), wideFrame_.data(), std::min(f.px.size(), wideFrame_.size()));
-                            f.index = wideIdx_;
-                            wideReady_ = false;
-                            return true;
-                        },
-                        "эмулятор");
-    event(0, "старт: целей " + std::to_string(c.drones) + " дронов и " + std::to_string(c.birds) + " птиц");
-    running_ = true;
-    th_ = std::thread([this] { loop(); });
+}
+
+// маска широкой для текущего поворота из панорамы; возвращает долю тайлов, которые панорама покрывает
+float Emulator::panoMaskFor(std::vector<uint8_t>& m) const {
+    m.assign((size_t)panoTw_ * panoTh_, 1);
+    if ((int)pano_.size() != PANO_W * PANO_H) return 0.f;
+    int known = 0;
+    for (int ty = 0; ty < panoTh_; ++ty)
+        for (int tx = 0; tx < panoTw_; ++tx) {
+            double az, el;
+            azel_from_dir(unproject(wideCam_, widePose_, (tx + 0.5) * panoTile_, (ty + 0.5) * panoTile_), az, el);
+            const int j = (int)std::floor((el - PANO_EL0) / PANO_STEP);
+            uint8_t v = 0;
+            if (j >= PANO_H) v = 1;        // выше панорамы — небо
+            else if (j < 0) v = 2;         // ниже — земля
+            else v = pano_[(size_t)j * PANO_W + ((int)std::floor(az / PANO_STEP) % PANO_W + PANO_W) % PANO_W];
+            if (v) ++known;
+            m[(size_t)ty * panoTw_ + tx] = v != 2;
+        }
+    return (float)known / std::max(1, panoTw_ * panoTh_);
 }
 
 void Emulator::stop() {
@@ -439,6 +631,7 @@ void Emulator::stop() {
     wcv_.notify_all();
     if (th_.joinable()) th_.join();
     pipe_.close();
+    if (link_) link_->stop();
     running_ = false;
 }
 
@@ -455,6 +648,12 @@ void Emulator::onWide(double t, const Result& r) {
         w.rep.cls = w.cls;
         w.rep.hard = w.hard;
         w.truth = nearestBody(t, w.rep.az, w.rep.el, 0.25);
+        // новый трек широкой там, где точная отсеяла птицу: сказать широкой, что это птица
+        if (c_.vetoToWide && w.cls != 2 && std::find(wideBirds_.begin(), wideBirds_.end(), w.id) == wideBirds_.end() &&
+            vetoed(t, w.rep)) {
+            pipe_.markBird(w.id);
+            wideBirds_.push_back(w.id);
+        }
         if (w.truth)
             for (const Body& b : bodies_)
                 if (b.id == w.truth) {
@@ -487,10 +686,20 @@ void Emulator::assign(double t, int wideId, const char* why) {
     state_ = wideId ? NState::Slew : NState::Idle;
     nlock_ = 0;
     haveNrep_ = false;
-    tAssign_ = tState_ = t;
+    tAssign_ = tState_ = tWideSeen_ = t;
     tInView_ = -1;
+    tSearch_ = -1;
+    gotThis_ = false;
+    manualPick_ = !strcmp(why, "выбрана вручную");
+    nConf_ = nOnly_ = false;
+    tBird_ = -1;
+    shapeE_.clear();
+    shapeId_ = shapeBirdN_ = 0;
+    shapeRigid_ = false;
     ntrk_->setFollowing(false);
+    nextPick_ = false;
     if (!wideId) return;
+    afterBird_ = false;
     ++st_.assignments;
     double slew = 0;
     if (w) slew = ang(mount_.az, mount_.el, w->rep.az, w->rep.el);
@@ -500,8 +709,64 @@ void Emulator::assign(double t, int wideId, const char* why) {
     event(t, b);
 }
 
+// цель широкой там, где точная видела птицу (по прогнозу отсеянной): новый трек широкой на той же
+// птице не назначается заново
+bool Emulator::vetoed(double t, const TargetReport& r) const {
+    for (const auto& v : veto_) {
+        double a1, e1, s1, a2, e2, s2;
+        predict(v.first, t, a1, e1, s1);
+        predict(r, t, a2, e2, s2);
+        if (ang(a1, e1, a2, e2) < std::max(0.5, 0.05 * (t - v.first.t)) + 3 * s2) return true;
+    }
+    return false;
+}
+
+// Цель есть только у точной: широкая снова видит её — свой трек широкой у неё теперь этот
+void Emulator::rebind(double t) {
+    if (!nOnly_ || !haveNrep_ || (state_ != NState::Track && t - tLastSeen_ > c_.narrowLostHold)) return;
+    double naz, nel, nsg;
+    predict(nrep_, t, naz, nel, nsg);
+    const double half = 0.5 * nrep_.size_deg;
+    int best = 0;
+    double bd = 1e9;
+    for (const auto& w : targets_) {
+        if (c_.dronesOnly && w.cls == 2) continue;
+        if (w.id == detachId_ && t - tDetach_ < 1.5) continue;   // только что ушёл с цели: не мечемся
+        double az, el, sg;
+        predict(w.rep, t, az, el, sg);
+        const double a = ang(az, el, naz, nel);
+        // строже, чем расхождение, по которому точная от трека отказывается (0.5° / 6 СКО): без запаса
+        // трек на границе то отдаётся, то берётся каждый кадр
+        if (a < std::max(0.25, 3 * sg) + half && a < bd) {
+            bd = a;
+            best = w.id;
+        }
+    }
+    if (!best) return;
+    const int was = assigned_;
+    assigned_ = best;
+    nOnly_ = false;
+    ++st_.rebinds;
+    tWideSeen_ = t;
+    for (const auto& w : targets_)
+        if (w.id == best && w.truth) assignedBody_ = w.truth;
+    char b[160];
+    snprintf(b, sizeof(b), "широкая снова видит цель %d: теперь это её трек %d", was, best);
+    event(t, b);
+}
+
 void Emulator::choose(double t) {
-    auto ok = [&](const WideTarget& w) { return !(c_.dronesOnly && w.cls == 2); };
+    cool_.erase(std::remove_if(cool_.begin(), cool_.end(), [&](const std::pair<int, double>& c) { return c.second <= t; }),
+                cool_.end());
+    veto_.erase(std::remove_if(veto_.begin(), veto_.end(),
+                               [&](const std::pair<TargetReport, double>& c) { return c.second <= t; }),
+                veto_.end());
+    auto ok = [&](const WideTarget& w) {
+        if (c_.dronesOnly && w.cls == 2) return false;
+        for (const auto& c : cool_)
+            if (c.first == w.id) return false;
+        return !vetoed(t, w.rep);
+    };
     auto find = [&](int id) -> const WideTarget* {
         for (const auto& x : targets_)
             if (x.id == id) return &x;
@@ -537,18 +802,58 @@ void Emulator::choose(double t) {
         }
         if (n) assign(t, n, "следующая");
     }
-    // назначенную широкая потеряла: если точная её ведёт — ведём дальше, иначе отпускаем
-    if (assigned_ && !find(assigned_) && state_ != NState::Track && t - tState_ > 1.5) {
+    // назначенную широкая потеряла: точная, уверенная в дроне, держит её сама (и ищет по своему
+    // прогнозу); иначе — если точная её ведёт, ведём дальше, а нет — отпускаем
+    // (трек широкой выпадает из её сообщения на кадр-другой, когда цель слабая: это ещё не потеря)
+    if (assigned_ && find(assigned_)) tWideSeen_ = t;
+    if (assigned_ && !nOnly_ && !find(assigned_) && t - tWideSeen_ > 0.5 && c_.narrowHold && nConf_ &&
+        (state_ == NState::Track || t - tLastSeen_ < c_.narrowLostHold)) {
+        nOnly_ = true;
+        ++st_.kept;
+        event(t, "широкая потеряла цель " + std::to_string(assigned_) + ", точная видит дрон и держит его сама");
+    }
+    if (assigned_ && !nOnly_ && !find(assigned_) && state_ != NState::Track && t - tState_ > 1.5) {
         event(t, "цель " + std::to_string(assigned_) + " пропала у широкой");
+        const bool next = nextPick_;
         assign(t, 0, "");
+        afterBird_ = next;   // взяли её сами вместо отсеянной птицы — ищем дальше
     }
     if (mode == SwitchMode::Manual) {
+        // цель взяли сами после птицы, точная её ещё не подтвердила, а широкая жёстко захватила другую — к ней
+        if (assigned_ && nextPick_ && !nConf_) {
+            const WideTarget* cur = find(assigned_);
+            if (!(cur && cur->hard))
+                for (const auto& w : targets_)
+                    if (ok(w) && w.hard && w.id != assigned_) {
+                        assign(t, w.id, "жёсткий захват широкой");
+                        break;
+                    }
+        }
         if (!assigned_ && !targets_.empty())
             for (const auto& w : targets_)
                 if (ok(w) && w.hard) {   // вручную: сами берём только подтверждённый дрон
                     assign(t, w.id, "жёсткий захват широкой");
                     break;
                 }
+        // ...а отсеяв птицу — следующую цель широкой: жёсткий захват, потом «дрон», потом прочие (птиц широкой —
+        // нет, если «только дроны»), среди равных — ближайшую по повороту; если целей нет — ждём, пока появятся
+        if (!assigned_ && afterBird_ && c_.nextOnBird) {
+            int best = 0;
+            double bestP = 1e18;
+            for (const auto& w : targets_) {
+                if (!ok(w)) continue;
+                const double p = (w.hard ? 0 : w.cls == 1 ? 1 : w.cls == 2 ? 3 : 2) * 1000 + ang(mount_.az, mount_.el, w.rep.az, w.rep.el);
+                if (p < bestP) {
+                    bestP = p;
+                    best = w.id;
+                }
+            }
+            if (best) {
+                assign(t, best, "следующая после птицы");
+                nextPick_ = true;
+                ++st_.nextAfterBird;
+            }
+        }
         return;
     }
     if (!assigned_) {
@@ -571,11 +876,13 @@ void Emulator::choose(double t) {
 }
 
 void Emulator::stepNarrow(double t, double dt) {
+    // цель только у точной: трек широкой с этим номером (если ещё жив) — уже не она
     const WideTarget* wt = nullptr;
-    for (const auto& x : targets_)
-        if (x.id == assigned_) wt = &x;
+    if (!nOnly_)
+        for (const auto& x : targets_)
+            if (x.id == assigned_) wt = &x;
     // 1. куда смотреть: по точной, пока она ведёт цель (или недавно видела), иначе по широкой
-    const bool useN = haveNrep_ && (state_ == NState::Track || t - tLastSeen_ < 0.6);
+    const bool useN = haveNrep_ && (state_ == NState::Track || t - tLastSeen_ < (nOnly_ ? c_.narrowLostHold : 0.6));
     const TargetReport* rep = useN ? &nrep_ : wt ? &wt->rep : nullptr;
     const double lead = 1.5 / c_.narrowFps;   // команда исполняется к следующему кадру
     if (rep) {
@@ -630,12 +937,52 @@ void Emulator::stepNarrow(double t, double dt) {
     if (prior) win_ = search_window(*prior, t, narrowCam_, enc, 3.f, 10.f);
     // в окне детектор ищет с пониженным порогом (Detector::setFocus)
     std::vector<FocusArea> fa;
+    if (state_ == NState::Track) ntrk_->focus((float)dx, (float)dy, fa);
     if (c_.windowFocus && winOn_ && win_.visible && state_ != NState::Track)
         fa.push_back({win_.u, win_.v, std::min(win_.radius, 120.f)});
-    if (state_ == NState::Track) ntrk_->focus((float)dx, (float)dy, fa);
+    // ведём: вокруг прогноза своей цели тоже ниже порог. Трекер сам даёт это только устоявшемуся
+    // треку, а слабая дальняя цель без этого то пропадает, то находится заново другим треком
+    if (c_.lockFocus && state_ == NState::Track && winOn_ && win_.visible)
+        fa.push_back({win_.u, win_.v, std::min(win_.radius, 40.f)});
     ndet_->setFocus(fa);
     ndet_->detect(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, ncands_);
+    // силуэт захваченной цели: крупный дрон (крыло, самолёт) на точной — десятки пикселей, детектор
+    // находит на нём несколько точек (концы крыльев, нос, хвост). Без силуэта захват перескакивал
+    // между ними, а прицел вместе с поворотом — с одного края цели на другой
+    if (c_.narrowSilhouette) {
+        float lx, ly, lr;
+        int lp;
+        if (ntrk_->lockSearch((float)dx, (float)dy, lx, ly, lr, lp)) {
+            // только крупной цели: у дальней в 2–4 пикс. силуэт по шуму дёргает трек на пиксель-другой, его
+            // скорость сбивается, и поворотка по ней уводит цель из центра (сцена 5: крыло за 1 км потеряно за 0.4 с)
+            const Silhouette sh = measure_silhouette(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, lx, ly, lr, lp,
+                                                     std::max(6.f, 0.8f * ndet_->threshold()), ntrk_->config().silh_max);
+            if (sh.valid && std::max(sh.w, sh.h) >= c_.silhMinPx) ntrk_->setLockSilhouette(sh);
+        }
+    }
     const std::vector<Track>& tr = ntrk_->update(ncands_, (float)dx, (float)dy);
+    const double npd = pixel_deg(narrowCam_, enc, narrowCam_.w * 0.5, narrowCam_.h * 0.5);   // град на пиксель точной
+    if (dumpAt_ > 0 && t >= dumpAt_ && t < dumpAt_ + dumpLen_) {   // отладка: кадры точной в PGM и её треки
+        char fn[64];
+        snprintf(fn, sizeof(fn), "narrow_%07.3f.pgm", t);
+        if (FILE* f = fopen(fn, "wb")) {
+            fprintf(f, "P5 %d %d 255\n", narrowCam_.w, narrowCam_.h);
+            fwrite(nframe_.data(), 1, nframe_.size(), f);
+            fclose(f);
+        }
+        printf("t=%.3f state=%s lock=%d win=(%.0f,%.0f r%.0f vis%d) cands=%zu thr=%.1f noise=%.2f\n", t, state_name(state_), nlock_, win_.u,
+               win_.v, win_.radius, win_.visible, ncands_.size(), ndet_->threshold(), ndet_->noiseLevel());
+        for (const Track& x : tr)
+            printf("  трек %d (%.1f,%.1f) hits %d miss %d clutter %d cls %d\n", x.id, x.x, x.y, x.hits, x.miss, (int)x.clutter,
+                   (int)x.cls);
+        for (const Body& b : bodies_) {
+            double u, v;
+            const Vec3 q = b.at(t);
+            const double R = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+            if (project(narrowCam_, truth, {q.x / R, q.y / R, q.z / R}, u, v) && in_frame(narrowCam_, u, v))
+                printf("  тело %d %s %.1f м в (%.1f,%.1f), %.0f м\n", b.id, shape_name(b.shape), b.size, u, v, R);
+        }
+    }
     st_.narrowMs += (now_s() - t1) * 1000;
     ++st_.narrowFrames;
     auto truthOf = [&](double az, double el) { return nearestBody(t, az, el, 0.2); };
@@ -663,13 +1010,38 @@ void Emulator::stepNarrow(double t, double dt) {
             }
         }
     } else if (state_ == NState::Acquire || state_ == NState::Lost) {
-        // в окне — трек, ближайший к ожидаемому месту (летящий, не помеха)
+        // в окне — трек, ближайший к ожидаемому месту (летящий, не помеха, держится minHold)
+        const int minHits = std::max(3, (int)std::lround(c_.minHold * c_.narrowFps));
+        if (tSearch_ < 0) tSearch_ = t;
+        // где цель по широкой сейчас: сосед рядом (другой дрон в окне) не годится
+        double waz = 0, wel = 0, wsg = 0;
+        if (wt) predict(wt->rep, t, waz, wel, wsg);
         int best = 0;
         double bd = 1e18;
         for (const Track& x : tr) {
-            if (x.clutter || x.miss > 0 || x.hits < 3) continue;
+            if (!winOn_) break;   // ни широкая, ни своя память не говорят, где цель: любой трек в кадре — не она
+            // цель только у точной, и та её потеряла: сама заново не берёт — широкая не подтвердит, что
+            // найденное — она, а это обычно кромка леса или облако, куда цель ушла (на сценах: 1–2 с на
+            // чужом треке). Поворотка идёт по прогнозу, пока широкая не увидит цель снова (rebind)
+            if (nOnly_) break;
+            if (x.clutter || x.miss > 0 || x.hits < minHits) continue;
             const double d = std::hypot(x.x - win_.u, x.y - win_.v);
             if (c_.windowFocus && winOn_ && d > win_.radius) continue;
+            if (wt && c_.wideCheck) {
+                double az, el;
+                azel_from_dir(unproject(narrowCam_, enc, x.x, x.y), az, el);
+                const double a = ang(az, el, waz, wel), tol = std::max(0.4, 5 * wsg);
+                if (a > tol) {
+                    // крупная цель: широкая указывает её середину, а трек точной — на её части (крыло, хвост)
+                    if (!c_.narrowSilhouette || a > tol + 3) continue;
+                    const Silhouette sh = measure_silhouette(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, x.x, x.y, 6.f,
+                                                             x.polarity, std::max(6.f, 0.8f * ndet_->threshold()), 200.f);
+                    if (!sh.valid || std::max(sh.w, sh.h) < c_.silhMinPx) continue;
+                    double saz, sel;
+                    azel_from_dir(unproject(narrowCam_, enc, sh.x, sh.y), saz, sel);
+                    if (ang(saz, sel, waz, wel) > tol + 0.5 * npd * std::max(sh.w, sh.h)) continue;
+                }
+            }
             if (d < bd) {
                 bd = d;
                 best = x.id;
@@ -684,6 +1056,9 @@ void Emulator::stepNarrow(double t, double dt) {
             tState_ = tTrackStart_ = tLastSeen_ = t;
             for (const Track& x : tr)
                 if (x.id == best) {
+                    lastU_ = x.x;
+                    lastV_ = x.y;
+                    lastSz_ = 0;
                     double az, el;
                     azel_from_dir(unproject(narrowCam_, enc, x.x, x.y), az, el);
                     const int who = truthOf(az, el);
@@ -693,7 +1068,9 @@ void Emulator::stepNarrow(double t, double dt) {
                              t - tAssign_, who == assignedBody_ && who ? "" : " — НЕ та цель");
                     event(t, b);
                 }
-            if (!again) {
+            if (!gotThis_) {
+                gotThis_ = true;
+                tGot_ = t;
                 ++st_.acquired;
                 st_.acqSum += t - tAssign_;
                 ++st_.acqN;
@@ -701,7 +1078,7 @@ void Emulator::stepNarrow(double t, double dt) {
         } else if (winOn_ && !win_.visible && t - tState_ > 0.5) {
             state_ = NState::Slew;
             tState_ = t;
-        } else if (state_ == NState::Lost && t - tLastSeen_ > 3 && !wt) {
+        } else if (state_ == NState::Lost && t - tLastSeen_ > (nOnly_ ? c_.narrowLostHold : 3) && !wt) {
             event(t, "точная потеряла цель " + std::to_string(assigned_) + ", широкая её не видит");
             assign(t, 0, "");
         }
@@ -709,11 +1086,40 @@ void Emulator::stepNarrow(double t, double dt) {
         const Track* me = nullptr;
         for (const Track& x : tr)
             if (x.id == nlock_) me = &x;
-        if (me && me->miss <= std::max(2, (int)(0.15 * c_.narrowFps))) {
-            nrep_ = make_report(narrowCam_, enc, t, c_.narrowFps, me->x, me->y, me->vsx, me->vsy, me->sigma);
+        // захват перешёл на другой трек той же цели (трекер передал его наследнику, или трек части крупной
+        // цели пропал, а рядом, внутри её силуэта, — другой): ведём его, а не теряем цель
+        const int keepMiss = std::max(2, (int)(0.15 * c_.narrowFps));
+        if (c_.narrowSilhouette && (!me || me->miss > 0)) {
+            const float px = me ? me->x : lastU_, py = me ? me->y : lastV_;
+            const float reach = std::max(10.f, 0.6f * lastSz_ + 6.f);
+            const Track* alt = nullptr;
+            float bd = reach;
+            for (const Track& x : tr) {
+                if (x.id == nlock_ || x.clutter || x.miss > 0 || x.cls == TargetClass::Bird) continue;
+                const float d = std::hypot(x.x - px, x.y - py);
+                if (d < bd) {
+                    bd = d;
+                    alt = &x;
+                }
+            }
+            if (alt && (!me || me->miss > keepMiss / 2)) {
+                ++st_.partJumps;
+                nlock_ = alt->id;
+                ntrk_->selectLock(alt->id);
+                me = alt;
+            }
+        }
+        if (me && me->miss <= keepMiss) {
+            const float szPx = std::max(me->bw, me->bh);
+            lastU_ = me->x + me->vx;
+            lastV_ = me->y + me->vy;
+            lastSz_ = szPx;
+            nrep_ = make_report(narrowCam_, enc, t, c_.narrowFps, me->x, me->y, me->vsx, me->vsy, me->sigma, szPx);
+            nrep_.size_deg = (float)(szPx * npd);
             nrep_.id = assigned_;
             haveNrep_ = true;
             if (!me->miss) tLastSeen_ = t;
+            if (t - tTrackStart_ > 0.4) tSearch_ = -1;   // держит устойчиво
             st_.trackTime += dt;
             const int who = truthOf(nrep_.az, nrep_.el);
             double baz, bel;
@@ -722,9 +1128,116 @@ void Emulator::stepNarrow(double t, double dt) {
                 st_.errLock.push_back((float)ang(baz, bel, nrep_.az, nrep_.el));
                 st_.errAxis.push_back((float)ang(baz, bel, mount_.az, mount_.el));
             }
-            // широкая видит назначенную цель далеко от того, что ведёт точная: не та цель
-            if (wt && ang(wt->rep.az, wt->rep.el, nrep_.az, nrep_.el) > std::max(1.5, 6.0 * wt->rep.sigma) &&
-                t - tTrackStart_ > 1.0) {
+            bool whoBird = false;
+            for (const Body& b : bodies_)
+                if (b.id == who) {
+                    whoBird = b.bird;
+                    (b.bird ? st_.trackBird : st_.trackDrone) += dt;
+                }
+            if (nOnly_) {
+                st_.narrowOnly += dt;
+                if (who && who == assignedBody_) st_.narrowOnlyCorrect += dt;
+            }
+            // птица по силуэту: «масса» силуэта (контраст x площадь) по кадрам, взмахи — её колебания
+            // с периодом 1/12–1/3 с. Классификатор трекера смотрит то же по отклику детектора и копит
+            // дольше; по силуэту крупной на точной цели решение — за полсекунды после захвата
+            bool shapeBird = false;
+            if (c_.narrowShape) {
+                if (shapeId_ != me->id) {   // другой трек — та же цель, но ряд начинаем заново
+                    shapeE_.clear();
+                    shapeId_ = me->id;
+                    shapeBirdN_ = 0;
+                    shapeRigid_ = false;
+                }
+                if (!me->miss) {
+                    const float r = std::max(4.f, 0.6f * szPx + 3.f);
+                    const Silhouette sh = measure_silhouette(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, me->x, me->y, r,
+                                                             me->polarity, std::max(6.f, 0.8f * ndet_->threshold()), 120.f);
+                    // мельче 6 пикс. (дальняя цель без зума) форма — это шум и размытие, взмахов там не видно
+                    if (sh.valid && sh.area >= 6) shapeE_.push_back(sh.contrast * (float)sh.area);
+                    if (dumpAt_ > 0 && t >= dumpAt_ && t < dumpAt_ + dumpLen_)
+                        printf("  силуэт %d: %.1fx%.1f площадь %d контраст %.1f\n", (int)sh.valid, sh.w, sh.h, sh.area, sh.contrast);
+                    const int win = std::max(8, (int)std::lround(c_.shapeWin * c_.narrowFps));
+                    while ((int)shapeE_.size() > win) shapeE_.pop_front();
+                    if ((int)shapeE_.size() >= win) {
+                        float amp;
+                        int lag;
+                        const int lmin = std::max(2, (int)(c_.narrowFps / 12)), lmax = (int)std::ceil(c_.narrowFps / 3);
+                        const float R = flap_shape(shapeE_, win, lmin, lmax, amp, lag);
+                        const bool flap = amp >= c_.shapeAmp && R >= c_.shapeR;
+                        shapeBirdN_ = flap ? shapeBirdN_ + 1 : 0;
+                        if (flap) shapeHz_ = c_.narrowFps / std::max(1, lag);
+                        shapeRigid_ = !flap && amp < 0.5f * c_.shapeAmp;
+                        shapeBird = shapeBirdN_ >= (nConf_ ? 2 : 1) * c_.shapeHits;
+                        if (dumpAt_ > 0 && t >= dumpAt_ && t < dumpAt_ + dumpLen_)
+                            printf("  силуэт: размах %.3f, автокорр. %.2f на %d кадрах, подряд %d\n", amp, R, lag, shapeBirdN_);
+                    }
+                }
+            }
+            // точная сама решает, дрон ли это: у неё цель крупнее и кадров вчетверо больше (взмахи видны).
+            // Пока силуэт машет крыльями — не дрон, что бы ни говорил классификатор
+            // Силуэт крупный (ряд копится) — сначала досмотреть окно взмахов: птицу в дроны не записывать
+            const bool shapeWait = c_.narrowShape && !shapeE_.empty() &&
+                                   (int)shapeE_.size() < std::max(8, (int)std::lround(c_.shapeWin * c_.narrowFps));
+            const bool droneNow = (ntrk_->lockState() == LockState::Hard || me->cls == TargetClass::Drone) && !shapeBird &&
+                                  shapeBirdN_ == 0 && !shapeWait;
+            if (!nConf_ && droneNow && t - tTrackStart_ >= c_.confirmT) {
+                nConf_ = true;
+                ++st_.confirmed;
+                if (whoBird) ++st_.confirmedBird;
+                event(t, "точная: цель " + std::to_string(assigned_) + " — дрон");
+            }
+            if (me->cls == TargetClass::Bird) {
+                if (tBird_ < 0) tBird_ = t;
+            } else {
+                tBird_ = -1;
+            }
+            // цель выбрал оператор: отсеиваем, только если точная уверена вдвое (вдвое больше оценок силуэта или
+            // вдвое дольше птица у классификатора)
+            const bool birdSure = manualPick_ ? c_.vetoManual && (shapeBirdN_ >= 2 * c_.shapeHits || (tBird_ >= 0 && t - tBird_ >= 2 * c_.vetoT))
+                                              : shapeBird || (tBird_ >= 0 && t - tBird_ >= c_.vetoT);
+            if (c_.narrowVeto && birdSure) {
+                bool bird = false;
+                for (const Body& b : bodies_)
+                    if (b.id == who) bird = b.bird;
+                ++(bird ? st_.vetoBird : who ? st_.vetoDrone : st_.vetoNone);
+                if (bird) st_.vetoDelay += t - tGot_;
+                if (shapeBird) ++st_.vetoShape;
+                veto_.push_back({nrep_, t + c_.vetoCool});
+                if (c_.vetoToWide && !nOnly_ && assigned_) {
+                    pipe_.markBird(assigned_);
+                    wideBirds_.push_back(assigned_);
+                }
+                if (!nOnly_) cool_.push_back({assigned_, t + c_.vetoCool});
+                char why[64];
+                if (shapeBird) snprintf(why, sizeof(why), "силуэт машет крыльями, %.0f Гц", shapeHz_);
+                else snprintf(why, sizeof(why), "машет крыльями");
+                event(t, "точная: цель " + std::to_string(assigned_) + " — птица (" + why + "), отсеяна" +
+                             (bird || !who ? "" : " — НА САМОМ ДЕЛЕ ДРОН"));
+                assign(t, 0, "");
+                afterBird_ = true;
+                goto ui;
+            }
+            // широкая видит назначенную цель далеко от того, что ведёт точная: не та цель.
+            // Сравниваем с прогнозом широкой на этот момент: её сообщение старше на задержку и кадр
+            bool off = false;
+            if (wt) {
+                double waz = wt->rep.az, wel = wt->rep.el, wsg = wt->rep.sigma;
+                if (c_.wideCheck) predict(wt->rep, t, waz, wel, wsg);
+                // крупная цель: широкая указывает её середину, а захват точной может быть у края силуэта
+                const double tol = (c_.wideCheck ? std::max(0.5, 6.0 * wsg) : std::max(1.5, 6.0 * wsg)) +
+                                   (c_.narrowSilhouette ? 0.5 * nrep_.size_deg : 0.0);
+                off = ang(waz, wel, nrep_.az, nrep_.el) > tol && t - tTrackStart_ > (c_.wideCheck ? 0.3 : 1.0);
+            }
+            if (off && c_.narrowHold && nConf_) {
+                // широкая ушла с цели (перескок трека на соседа, помеху), а точная видит дрон: держит его
+                // сама, а трек широкой отпускает
+                nOnly_ = true;
+                ++st_.kept;
+                detachId_ = assigned_;
+                tDetach_ = t;
+                event(t, "широкая ушла с цели " + std::to_string(assigned_) + ", точная видит дрон и держит его сама");
+            } else if (off) {
                 event(t, "точная ведёт не то, что широкая: ищет заново");
                 state_ = NState::Lost;
                 haveNrep_ = false;
@@ -739,6 +1252,20 @@ void Emulator::stepNarrow(double t, double dt) {
             event(t, "точная потеряла цель " + std::to_string(assigned_) + ", ищет по прогнозу");
         }
     }
+    // не может удержать цель giveUp секунд (ищет, берёт и теряет): точная её не подтверждает —
+    // это шум или облако у широкой, или цель для точной слишком слабая. В авто-режимах — к следующей
+    // (и в ручном, если цель точная взяла сама после птицы)
+    if (assigned_ && tSearch_ >= 0 && t - tSearch_ > c_.giveUp && ((SwitchMode)switchMode_.load() != SwitchMode::Manual || nextPick_)) {
+        ++st_.unconfirmed;
+        cool_.push_back({assigned_, t + c_.coolDown});
+        event(t, "точная не подтверждает цель " + std::to_string(assigned_) + ": за " +
+                     std::to_string((int)c_.giveUp) + " с не удержала, к ней — не раньше чем через " +
+                     std::to_string((int)c_.coolDown) + " с");
+        const bool next = nextPick_;
+        assign(t, 0, "");
+        afterBird_ = next;
+    }
+ui:
     // 5. для интерфейса
     std::lock_guard<std::mutex> lk(vm_);
     view_.narrow = nframe_;
@@ -749,14 +1276,36 @@ void Emulator::stepNarrow(double t, double dt) {
     view_.state = state_;
     view_.assigned = assigned_;
     view_.targets = targets_;
+    for (auto& w : view_.targets) {
+        if (w.id == assigned_ && !nOnly_ && nConf_) w.verdict = 1;
+        if (vetoed(t, w.rep)) w.verdict = 2;
+    }
+    view_.nConf = nConf_;
+    view_.nOnly = nOnly_;
+    view_.nWu = view_.nWv = -1;
+    if (haveNrep_ && assigned_) {
+        double u, v;
+        if (project(wideCam_, widePose_, dir_from_azel(nrep_.az, nrep_.el), u, v)) {
+            view_.nWu = (float)u;
+            view_.nWv = (float)v;
+        }
+    }
+    view_.vetoW.clear();
+    for (const auto& vt : veto_) {
+        double az, el, sg, u, v;
+        predict(vt.first, t, az, el, sg);
+        if (project(wideCam_, widePose_, dir_from_azel(az, el), u, v)) view_.vetoW.push_back({(float)u, (float)v});
+    }
     view_.axis = truth;
     view_.cmd = cmdPose_;
     view_.rateAz = (float)mount_.vaz;
     view_.rateEl = (float)mount_.vel;
     view_.win = win_;
     view_.winOn = winOn_;
+    view_.widePose = widePose_;
     view_.truth.clear();
     for (const Body& b : bodies_) {
+        if (b.hidden) continue;
         View::TruthPt p{};
         const Vec3 d = b.at(t);
         double u, v;
@@ -782,10 +1331,44 @@ void Emulator::stepNarrow(double t, double dt) {
     }
     view_.events = events_;
     view_.st = st_;
-    view_.st.simT = t;
+    view_.st.simT = t + dt;   // шаг [t, t+dt] уже учтён в долях времени
 }
 
 void Emulator::loop() {
+    if (sceneMode_) {   // Godot — отдельный процесс на своих ядрах; сцена строится несколько секунд
+        {
+            std::lock_guard<std::mutex> lk(vm_);
+            view_.status = "запуск 3D-сцены...";
+        }
+        if (!link_) link_.reset(new scene::Link());
+        scene::Options o;
+        o.godot = c_.godot;
+        o.project = c_.simProject;
+        o.scene = c_.scene;
+        o.sector = c_.sector;
+        o.affinity = c_.renderAffinity;
+        char hello[600];
+        snprintf(hello, sizeof(hello),
+                 "{\"wide\": [%d, %d, %.3f, %.3f], \"fine\": [%d, %d, %.3f, %.3f], \"seed\": %u, \"drones\": %d, "
+                 "\"birds\": %d, \"range\": [%.1f, %.1f], \"types\": {\"quad\": %.3f, \"delta\": %.3f, \"plane\": %.3f}, "
+                 "\"az\": %.3f, \"el\": %.3f, \"sector\": %s}",
+                 c_.wideW, c_.wideH, c_.wideFov, c_.wideFps, c_.narrowW, c_.narrowH, c_.narrowFov, c_.narrowFps, c_.seed,
+                 c_.drones, c_.birds, c_.rangeMin, c_.rangeMax, c_.quadShare, c_.deltaShare, c_.planeShare, widePose_.az,
+                 widePose_.el, c_.sector.empty() ? "false" : "true");
+        std::string err;
+        linkOpt_ = o;
+        linkHello_ = hello;
+        linkRestarts_ = 0;
+        if (!link_->start(o, hello, err)) {
+            std::lock_guard<std::mutex> lk(vm_);
+            view_.status = "3D-сцена: " + err;
+            view_.running = false;
+            running_ = false;
+            return;
+        }
+        std::lock_guard<std::mutex> lk(vm_);
+        view_.status.clear();
+    }
     double t = 0, nextWide = 0;
     const double dtN = 1.0 / std::max(1.f, c_.narrowFps);
     const double wall0 = now_s();
@@ -793,6 +1376,7 @@ void Emulator::loop() {
     float lastSpeed = speed_;
     int64_t idx = 0;
     while (!stop_) {
+        if (c_.stopAt > 0 && t >= c_.stopAt - 1e-9) break;   // замер: ровно столько модельного времени
         if (paused_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             wallBase = now_s();
@@ -800,8 +1384,56 @@ void Emulator::loop() {
             continue;
         }
         if (t >= nextWide - 1e-9) {
-            // тела, вылетевшие из поля зрения широкой или ушедшие далеко, — заново
+            if (scanReq_.exchange(false) && !scan_) {
+                scan_ = true;
+                scanStep_ = 0;
+                scanAz0_ = widePose_.az;
+                scanEl0_ = widePose_.el;
+                event(t, "обзор 360°: маска неба по кругу");
+            }
+            if (scan_ && (!lastLearning_ && sincePose_ >= 3)) {   // этот вид выучен — дальше
+                const float step = std::max(20.f, c_.wideFov * 0.5f);
+                const int n = (int)std::ceil(360.f / step - 1e-3f);
+                if (scanStep_ + 1 >= n) {
+                    scan_ = false;
+                    wantAz_ = scanAz0_;
+                    wantEl_ = scanEl0_;
+                    event(t, "обзор 360° закончен");
+                } else {
+                    ++scanStep_;
+                    wantAz_ = std::fmod(scanAz0_ + scanStep_ * step, 360.f);
+                    wantEl_ = scanEl0_;
+                }
+                ++poseReq_;
+            }
+            if (poseReq_ != poseSeen_) {   // широкую повернули кнопками
+                poseSeen_ = poseReq_;
+                widePose_ = {wantAz_, std::max(-10.f, std::min(80.f, (float)wantEl_)), 0};
+                if (!sceneMode_) prepareWide();
+                sincePose_ = 0;
+                lastLearning_ = true;
+                char b[160];
+                // маска неба для нового вида: из панорамы, если она его покрывает, иначе — учить заново
+                std::vector<uint8_t> m;
+                const float known = c_.panoMask && !scan_ && panoTw_ > 0 ? panoMaskFor(m) : 0.f;
+                if (known >= 0.85f) {
+                    pipe_.setExternalMask(std::move(m), panoTw_, panoTh_, (int)std::lround(c_.wideFps));
+                    snprintf(b, sizeof(b), "широкая повёрнута: азимут %.0f°, угол места %.0f°; маска из панорамы (%.0f%% вида)",
+                             widePose_.az, widePose_.el, known * 100);
+                } else {
+                    pipe_.relearnMask();
+                    snprintf(b, sizeof(b), "широкая повёрнута: азимут %.0f°, угол места %.0f°; маска учится%s", widePose_.az,
+                             widePose_.el, c_.panoMask && !scan_ ? " (панорама покрывает мало)" : "");
+                }
+                {
+                    std::lock_guard<std::mutex> lk(vm_);
+                    view_.panoKnown = known;
+                }
+                event(t, b);
+            }
+            // тела, вылетевшие из поля зрения широкой или ушедшие далеко, — заново (в 3D-сцене их ведёт сцена)
             for (Body& b : bodies_) {
+                if (sceneMode_) break;
                 const Vec3 d = b.at(t);
                 const double R = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
                 double u, v, az, el;
@@ -811,6 +1443,20 @@ void Emulator::loop() {
                     if (b.id == assignedBody_) event(t, "цель " + std::to_string(assigned_) + " вышла из зоны");
                     spawn(b, t, false);
                 }
+            }
+            // точная уверена в дроне и видит его: широкой — где он будет на этом кадре (там её порог ниже,
+            // и потерянную цель она находит снова, а свою слабую не теряет)
+            {
+                std::vector<FocusArea> cue;
+                if (c_.wideCue && nConf_ && haveNrep_ && assigned_ && t - tLastSeen_ < 0.5) {
+                    double az, el, sg, u, v;
+                    predict(nrep_, t, az, el, sg);
+                    if (project(wideCam_, widePose_, dir_from_azel(az, el), u, v) && in_frame(wideCam_, u, v)) {
+                        const double wpd = pixel_deg(wideCam_, widePose_, u, v);
+                        cue.push_back({(float)u, (float)v, (float)std::max(12.0, std::min(60.0, (3 * sg + nrep_.size_deg) / wpd))});
+                    }
+                }
+                pipe_.setCue(cue);
             }
             const double r0 = now_s();
             std::vector<uint8_t> buf;
@@ -830,6 +1476,25 @@ void Emulator::loop() {
             }
             if (res && wideDone_ >= idx) {
                 onWide(t, *res);
+                // панорамная маска: маска этого вида — в панораму (после обучения и раз в полсекунды)
+                const bool learned = lastLearning_ && !res->learning;
+                lastLearning_ = res->learning;
+                ++sincePose_;
+                if (res->tilesX > 0) {
+                    panoTw_ = res->tilesX;
+                    panoTh_ = res->tilesY;
+                    panoTile_ = res->tilePx;
+                }
+                if (c_.panoMask && !res->learning && !res->mask.empty() &&
+                    (learned || st_.wideFrames % std::max(1, (int)(c_.wideFps / 2)) == 0)) {
+                    panoLearn(*res);
+                    std::lock_guard<std::mutex> lk(vm_);
+                    view_.pano = pano_;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(vm_);
+                    view_.scanning = scan_;
+                }
                 std::lock_guard<std::mutex> lk(vm_);
                 view_.wide = res;
                 view_.status.clear();
@@ -844,7 +1509,38 @@ void Emulator::loop() {
         while (!inbox_.empty() && inbox_.front().first <= t + 1e-9) {
             targets_ = std::move(inbox_.front().second);
             inbox_.pop_front();
+            // трек широкой, назначенный точной, перешёл на другое тело (перескок трека у широкой):
+            // точная честно ведёт то, что ей указали, — это ошибка широкой, считаем отдельно
+            for (const auto& w : targets_)
+                if (nOnly_) {
+                    break;   // трек широкой с этим номером уже не наша цель: её держит точная
+                } else if (w.id == assigned_ && w.truth && assignedBody_ && w.truth != assignedBody_ && c_.narrowHold && nConf_ &&
+                           state_ == NState::Track) {
+                    // точная ведёт и уверена: назначенная цель — та, что у неё; уйдёт ли широкая с неё,
+                    // точная решит сама (см. stepNarrow), а оценка — по прежнему телу
+                    ++st_.wideSwaps;
+                    event(t, "широкая: трек " + std::to_string(w.id) + " перескочил на другую цель");
+                } else if (w.id == assigned_ && w.truth && assignedBody_ && w.truth != assignedBody_) {
+                    ++st_.wideSwaps;
+                    event(t, "широкая: трек " + std::to_string(w.id) + " перескочил на другую цель");
+                    assignedBody_ = w.truth;
+                } else if (w.id == assigned_ && w.truth && !assignedBody_) {
+                    assignedBody_ = w.truth;   // назначили по шуму рядом с целью, теперь трек на ней
+                } else if (w.id == assigned_ && !w.truth && assignedBody_) {
+                    // трек широкой ушёл с цели на пустое место (помеха, облако): цель уже не та
+                    for (const Body& b : bodies_)
+                        if (b.id == assignedBody_) {
+                            double az, el;
+                            azel_from_dir(b.at(t), az, el);
+                            if (ang(az, el, w.rep.az, w.rep.el) > 1.0) {
+                                ++st_.wideSwaps;
+                                event(t, "широкая: трек " + std::to_string(w.id) + " ушёл с цели на помеху");
+                                if (!(c_.narrowHold && nConf_ && state_ == NState::Track)) assignedBody_ = 0;
+                            }
+                        }
+                }
         }
+        rebind(t);
         choose(t);
         stepNarrow(t, dtN);
         t += dtN;
@@ -888,6 +1584,7 @@ static void pct(std::vector<float> v, float& med, float& p90) {
 Stats Emulator::runBlocking(const Config& c, double seconds, bool verbose) {
     Config cc = c;
     cc.simSpeed = 0;
+    cc.stopAt = seconds;
     start(cc);
     double last = -1;
     while (running_) {
@@ -899,8 +1596,9 @@ Stats Emulator::runBlocking(const Config& c, double seconds, bool verbose) {
                    v.st.acquired, v.st.simT > 0 ? 100 * v.st.trackTime / v.st.simT : 0);
             fflush(stdout);
         }
-        if (v.st.simT >= seconds) break;
+        if (v.st.simT >= seconds - 1e-6 || (!v.running && v.st.simT > 0)) break;
     }
+    if (th_.joinable()) th_.join();   // цикл остановился сам на stopAt: итог — ровно на этот момент
     const View v = view();
     if (verbose)
         for (const auto& e : v.events) printf("  [%6.2f] %s\n", e.t, e.text.c_str());
@@ -910,6 +1608,7 @@ Stats Emulator::runBlocking(const Config& c, double seconds, bool verbose) {
 
 int run_cli(int argc, char** argv) {
     Config c;
+    Emulator e;
     double seconds = 60;
     std::string json;
     bool verbose = true;
@@ -923,6 +1622,10 @@ int run_cli(int argc, char** argv) {
         else if (a == "--range") sscanf(val().c_str(), "%f,%f", &c.rangeMin, &c.rangeMax);
         else if (a == "--speed") sscanf(val().c_str(), "%f,%f", &c.speedMin, &c.speedMax);
         else if (a == "--clouds") c.clouds = (float)atof(val().c_str());
+        else if (a == "--noise") c.noise = (float)atof(val().c_str());
+        else if (a == "--visibility") c.visibility = (float)atof(val().c_str());
+        else if (a == "--size") c.droneSize = (float)atof(val().c_str());
+        else if (a == "--types") sscanf(val().c_str(), "%f,%f,%f", &c.quadShare, &c.deltaShare, &c.planeShare);
         else if (a == "--wide") sscanf(val().c_str(), "%dx%d", &c.wideW, &c.wideH);
         else if (a == "--wide-fps") c.wideFps = (float)atof(val().c_str());
         else if (a == "--fisheye") c.wideFisheye = true;
@@ -940,17 +1643,67 @@ int run_cli(int argc, char** argv) {
         else if (a == "--image-motion") c.encoderMotion = false;
         else if (a == "--no-ff") c.feedForward = false;
         else if (a == "--no-window") c.windowFocus = false;
+        else if (a == "--no-lock-focus") c.lockFocus = false;
+        else if (a == "--nscales") c.narrowScales = atoi(val().c_str());
+        else if (a == "--nauto") c.narrowAutoThr = atoi(val().c_str()) != 0;
+        else if (a == "--nthr-min") c.narrowThrMin = (float)atof(val().c_str());
+        else if (a == "--dump") sscanf(val().c_str(), "%lf,%lf", &e.dumpAt_, &e.dumpLen_);
+        else if (a == "--no-wide-check") c.wideCheck = false;
+        else if (a == "--min-hold") c.minHold = (float)atof(val().c_str());
+        else if (a == "--give-up") c.giveUp = (float)atof(val().c_str());
+        else if (a == "--cool-down") c.coolDown = (float)atof(val().c_str());
+        else if (a == "--no-silhouette") c.narrowSilhouette = false;
+        else if (a == "--silh-min") c.silhMinPx = (float)atof(val().c_str());
+        else if (a == "--no-hold") c.narrowHold = false;
+        else if (a == "--no-veto") c.narrowVeto = false;
+        else if (a == "--no-shape") c.narrowShape = false;
+        else if (a == "--no-veto-wide") c.vetoToWide = false;
+        else if (a == "--with-birds") c.dronesOnly = false;   // широкая указывает и тех, кого считает птицами
+        else if (a == "--shape") sscanf(val().c_str(), "%f,%f,%d,%f", &c.shapeAmp, &c.shapeR, &c.shapeHits, &c.shapeWin);
+        else if (a == "--no-cue") c.wideCue = false;
+        else if (a == "--no-next") c.nextOnBird = false;
+        else if (a == "--no-veto-manual") c.vetoManual = false;
+        else if (a == "--legacy")
+            c.narrowSilhouette = c.narrowHold = c.narrowVeto = c.wideCue = c.narrowShape = c.vetoToWide = c.nextOnBird = c.vetoManual = false;
+        else if (a == "--scene") c.scene = val();
+        else if (a == "--sector") c.sector = val();
+        else if (a == "--godot") c.godot = val();
+        else if (a == "--az") c.wideAz = (float)atof(val().c_str());
+        else if (a == "--el") c.wideEl = (float)atof(val().c_str());
         else {
-            printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 250,1200]\n"
-                   "  [--speed 6,22] [--clouds 0.35] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
+            printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 100,750]\n"
+                   "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--types 0.5,0.25,0.25] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 5 (x4; 20 — без зума)]\n"
                    "  [--fps 60] [--rate 30] [--accel 150] [--latency 0.06] [--dwell 6]\n"
-                   "  [--switch queue|nearest|manual] [--json out.json] [--quiet]\n"
-                   "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window]\n");
+                   "  [--switch manual|queue|nearest] [--json out.json] [--quiet]\n"
+                   "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window] [--no-lock-focus]\n"
+                   "  [--min-hold 0.08] [--give-up 3] [--cool-down 10]\n"
+                   "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--no-shape] [--shape амп,автокорр,оценок,окно] [--no-veto-wide] [--no-next] [--no-veto-manual] [--with-birds] [--legacy — всё выключено]\n"
+                   "  3D-сцена Godot вместо синтетического неба: [--scene sim/scenes/city_sectors.json] [--sector highrise]\n"
+                   "  [--godot путь] [--az 0] [--el 32]\n");
             return a == "--help" ? 0 : 2;
         }
     }
-    Emulator e;
+    if (!c.scene.empty()) {
+        std::string sim, godot = c.godot;
+        if (c.simProject.empty() && scene::find_sim(".", sim, godot)) c.simProject = sim + "/godot";
+        if (c.simProject.empty()) {   // путь к сцене sim/scenes/x.json — проект рядом
+            const std::string d = c.scene.substr(0, c.scene.find_last_of("/\\"));
+            c.simProject = d + "/../godot";
+        }
+        if (c.godot.empty()) c.godot = godot;
+        if (c.godot.empty()) {
+            printf("не найден Godot 4.3: --godot путь или переменная GODOT\n");
+            return 2;
+        }
+        if (!c.sector.empty())   // ось широкой — на середину сектора
+            for (const auto& sc : scene::scene_sectors(c.scene))
+                if (sc.name == c.sector) c.wideAz = sc.mid;
+    }
     const Stats s = e.runBlocking(c, seconds, verbose);
+    if (!c.scene.empty() && s.wideFrames == 0) {
+        printf("%s\n", e.view().status.c_str());
+        return 1;
+    }
     float lm, l9, am, a9, wm, w9;
     pct(s.errLock, lm, l9);
     pct(s.errAxis, am, a9);
@@ -963,8 +1716,15 @@ int run_cli(int argc, char** argv) {
            s.acqN ? s.acqSum / s.acqN : 0);
     printf("ведёт цель %.0f%% времени, из них на назначенной %.0f%%\n", 100 * s.trackTime / T,
            s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0);
-    printf("нечего вести %.0f%% времени, назначена ложная цель широкой %.0f%%\n", 100 * s.idleTime / T,
-           100 * s.falseTarget / T);
+    printf("нечего вести %.0f%% времени, назначена ложная цель широкой %.0f%%; точная не подтвердила целей: %d; перескоков трека у широкой: %d\n",
+           100 * s.idleTime / T, 100 * s.falseTarget / T, s.unconfirmed, s.wideSwaps);
+    printf("ведёт настоящий дрон %.0f%% времени; цель только у точной %.1f с (на назначенной %.0f%%), не бросила цель %d раз,\n"
+           "  вернула широкой %d; подтвердила дронов %d; отсеяла как птицу: птиц %d, дронов %d, пустых мест %d; переходов по частям цели %d\n",
+           100 * s.trackDrone / T, s.narrowOnly, s.narrowOnly > 0 ? 100 * s.narrowOnlyCorrect / s.narrowOnly : 0, s.kept,
+           s.rebinds, s.confirmed, s.vetoBird, s.vetoDrone, s.vetoNone, s.partJumps);
+    printf("птицы у точной: вела птицу %.1f с, назвала дроном птиц %d, отсеяла птицу в среднем через %.2f с после захвата, по силуэту %d, "
+           "сразу на следующую %d\n",
+           s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape, s.nextAfterBird);
     printf("ошибка: захват точной %.3f° (90%% %.3f°, %.1f пикс. точной), ось %.3f° (90%% %.3f°), широкая %.3f° (90%% %.3f°)\n",
            lm, l9, lm / nPd, am, a9, wm, w9);
     printf("обработка: широкая %.1f мс/кадр, точная %.2f мс/кадр; отрисовка широкой %.1f, точной %.1f мс/кадр\n",
@@ -976,11 +1736,17 @@ int run_cli(int argc, char** argv) {
                     "{\"sim_s\": %.2f, \"assignments\": %d, \"acquired\": %d, \"wrong_locks\": %d, \"losses\": %d,\n"
                     " \"slew_s\": %.3f, \"acquire_s\": %.3f, \"track_pct\": %.2f, \"track_correct_pct\": %.2f,\n"
                     " \"err_lock_deg\": [%.4f, %.4f], \"err_axis_deg\": [%.4f, %.4f], \"err_wide_deg\": [%.4f, %.4f],\n"
-                    " \"idle_pct\": %.2f, \"false_target_pct\": %.2f, \"wide_ms\": %.2f, \"narrow_ms\": %.3f}\n",
+                    " \"unconfirmed\": %d, \"wide_swaps\": %d, \"idle_pct\": %.2f, \"false_target_pct\": %.2f, \"wide_ms\": %.2f, \"narrow_ms\": %.3f,\n"
+                    " \"track_drone_pct\": %.2f, \"narrow_only_s\": %.2f, \"narrow_only_correct_s\": %.2f, \"kept\": %d, \"rebinds\": %d,\n"
+                    " \"confirmed\": %d, \"veto_bird\": %d, \"veto_drone\": %d, \"veto_none\": %d, \"part_jumps\": %d,\n"
+                    " \"track_bird_s\": %.2f, \"confirmed_bird\": %d, \"veto_delay_s\": %.3f, \"veto_shape\": %d, \"next_after_bird\": %d}\n",
                     s.simT, s.assignments, s.acquired, s.wrongLocks, s.losses, s.slewN ? s.slewSum / s.slewN : 0,
                     s.acqN ? s.acqSum / s.acqN : 0, 100 * s.trackTime / T,
                     s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0, lm, l9, am, a9, wm, w9,
-                    100 * s.idleTime / T, 100 * s.falseTarget / T, s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0);
+                    s.unconfirmed, s.wideSwaps, 100 * s.idleTime / T, 100 * s.falseTarget / T, s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0,
+                    100 * s.trackDrone / T, s.narrowOnly, s.narrowOnlyCorrect, s.kept, s.rebinds, s.confirmed, s.vetoBird,
+                    s.vetoDrone, s.vetoNone, s.partJumps, s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape,
+                    s.nextAfterBird);
             fclose(f);
         }
     }

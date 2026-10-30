@@ -229,6 +229,8 @@ DetectorConfig detector_for_fps(const DetectorConfig& c0, float fps, float ref) 
     // перепроверка: и замер реже-чаще, и окно — замеров в окне столько же
     c.recheck_every = frames(c.recheck_every, 1);
     c.recheck_frames = frames(c.recheck_frames, 30);
+    // цель у земли (near_edge): на медленной камере — весь тайл у кромки
+    if (c.near_edge_fps > 0 && fps <= c.near_edge_fps) c.near_edge_px = 0;
     // фон ячеек (bg_frames) остаётся в кадрах: квантили мерцания копятся по числу замеров, и окно
     // в секундах на 15 к/с давало больше ложных захватов без дронов (6.6% -> 8%, на дронах так же).
     // Экономия "раз в N кадров" (full_every, coarse_every, upper_every) — не окна, а бюджет кадра
@@ -373,6 +375,77 @@ void Detector::sampleColor(const uint8_t* gray, int stride) {
                 colN_[i] += (uint32_t)k;
             }
         }
+}
+
+// Цвет цели против фона (DetectorConfig::leaf_color). Отсчёты цвета в кольце вокруг кандидата —
+// фон (медианы яркости и цвета) и его ровность. В круге тела — отсчёты, отклонённые от фона в
+// сторону цели не меньше половины самого сильного отклонения там: на облаке с голубыми просветами
+// просветы темнее облака, но слабее самой цели. Самое сильное — не меньше половины отклика цели,
+// иначе отсчёты прошли мимо неё. Листва — синего меньше яркости (жёлтое, оранжевое, красное, бурое)
+// или зелёный выше красного и синего: phi = max(Y - B, G - max(R, B)), уровни RGB (BT.709). Серая
+// цель — смесь серого с цветом фона (дымка, цвет yuv420 вдвое реже яркости и размыт), её phi не
+// больше max(0, phi фона), поэтому leaf — phi тела сверх max(0, phi фона). У кромки крон (в кольце
+// больше половины отсчётов не похожи на фон) цвет не измеряется: там и тело, и фон — от листвы
+void Detector::measureTint(const uint8_t* gray, int stride, Candidate& c) {
+    const int st = colStep_, rb = (cfg_.k * cfg_.pool / 2 + 2) << std::min(2, c.level);
+    const int r0 = 2 * rb, r1 = 3 * rb + rb / 2;
+    const int cx = (int)std::lround(c.x), cy = (int)std::lround(c.y);
+    auto at = [&](int b, int lim) { return std::min(b * st + colOff_, lim - 1); };
+    // отсчёты в круге радиуса r через k по каждой оси: f(яркость, u, v, квадрат расстояния)
+    auto each = [&](int r, int k, auto&& f) {
+        const int bx0 = std::max(0, (cx - r) / st), by0 = std::max(0, (cy - r) / st);
+        for (int by = (by0 + k - 1) / k * k; by <= std::min(colH_ - 1, (cy + r) / st); by += k) {
+            const int y = at(by, h_), dy = y - cy;
+            const uint8_t* g = gray + (size_t)y * stride;
+            const uint8_t* u = colU_ + (size_t)by * colStride_;
+            const uint8_t* v = colV_ + (size_t)by * colStride_;
+            for (int bx = (bx0 + k - 1) / k * k; bx <= std::min(colW_ - 1, (cx + r) / st); bx += k) {
+                const int x = at(bx, w_), d2 = (x - cx) * (x - cx) + dy * dy;
+                if (d2 <= r * r) f((int)g[x], (int)u[(size_t)bx * colPix_], (int)v[(size_t)bx * colPix_], d2);
+            }
+        }
+    };
+    tintY_.clear();
+    tintU_.clear();
+    tintV_.clear();
+    // фону хватает ~30 отсчётов: кольцо через kr; тело (цель 5-20 пикс.) — через 4 пикс. (цвет yuv420
+    // с камеры идёт через 2 — вчетверо дороже без пользы)
+    const int kr = std::max(1, (int)std::lround(0.9f * (float)rb / (float)st)), kb = std::max(1, 4 / st);
+    each(r1, kr, [&](int y, int u, int v, int d2) {
+        if (d2 < r0 * r0) return;
+        tintY_.push_back((uint8_t)y);
+        tintU_.push_back((uint8_t)u);
+        tintV_.push_back((uint8_t)v);
+    });
+    if (tintY_.size() < 8) return;
+    auto median = [](std::vector<uint8_t>& a) {
+        std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
+        return (int)a[a.size() / 2];
+    };
+    const int ybg = median(tintY_);
+    const float tol = std::max(6.f, 0.3f * c.contrast);
+    size_t rough = 0;
+    for (uint8_t y : tintY_) rough += std::fabs((float)(y - ybg)) > tol;
+    if (rough * 2 > tintY_.size()) return;
+    int top = 0;
+    each(rb, kb, [&](int y, int, int, int) { top = std::max(top, c.polarity * (y - ybg)); });
+    if ((float)top < std::max(8.f, 0.5f * c.contrast)) return;
+    const int need = (top + 1) / 2;
+    int nb = 0, su = 0, sv = 0;
+    each(rb, kb, [&](int y, int u, int v, int) {
+        if (c.polarity * (y - ybg) < need) return;
+        su += u - 128;
+        sv += v - 128;
+        ++nb;
+    });
+    auto phi = [](float u, float v) {   // max(Y - B, G - max(R, B)) по U, V от серого
+        const float gr = -0.1873f * u - 2.0429f * v, gb = -2.0429f * u - 0.4681f * v;
+        return std::max(-1.8556f * u, std::min(gr, gb));
+    };
+    const float ubg = (float)(median(tintU_) - 128), vbg = (float)(median(tintV_) - 128);
+    c.colored = true;
+    c.leaf = phi((float)su / nb, (float)sv / nb) - std::max(0.f, phi(ubg, vbg));
+    c.leafy = c.leaf >= cfg_.leaf_color;
 }
 
 // Облака по цвету (DetectorConfig::sky_color): тайл, закрытый маской по своей текстуре (доля frac
@@ -558,8 +631,11 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
 }
 
 namespace {
-// вторая версия — со слоем доращивания: 1 — тайл закрыт по помехам, 2 — закрыт так только для светлых
-const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '2', 0};
+// вторая версия — со слоем доращивания: 1 — тайл закрыт по помехам, 2 — закрыт так только для светлых.
+// Третья — тот же формат; тайлы, доращенные второй, снова небо: до creep_frames и static_drone (30.10)
+// отклики медленного дрона, летящего на камеру, были помехами, и маска дорастала по его пути
+const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '3', 0};
+const char kMaskMagic2[8] = {'D', 'L', 'M', 'A', 'S', 'K', '2', 0};
 const char kMaskMagic1[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
 const int32_t kMaxSide = 1 << 16;   // сторона кадра в файле маски, пикс.
 }
@@ -586,8 +662,9 @@ bool Detector::loadMask(const std::string& path, int verify) {
     char magic[8];
     int32_t hdr[6];
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    const bool v2 = ok && std::memcmp(magic, kMaskMagic, 8) == 0;
-    ok = ok && (v2 || std::memcmp(magic, kMaskMagic1, 8) == 0) && std::fread(hdr, sizeof(hdr), 1, f) == 1 &&
+    const bool v3 = ok && std::memcmp(magic, kMaskMagic, 8) == 0;
+    const bool v2 = ok && std::memcmp(magic, kMaskMagic2, 8) == 0;
+    ok = ok && (v3 || v2 || std::memcmp(magic, kMaskMagic1, 8) == 0) && std::fread(hdr, sizeof(hdr), 1, f) == 1 &&
          hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 && hdr[5] > 0 &&
          hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
          // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
@@ -596,9 +673,15 @@ bool Detector::loadMask(const std::string& path, int verify) {
     if (ok) {
         m.resize((size_t)hdr[4] * hdr[5]);
         ok = std::fread(m.data(), 1, m.size(), f) == m.size();
-        if (ok && v2) {
+        if (ok && (v3 || v2)) {
             g.resize(m.size());
             ok = std::fread(g.data(), 1, g.size(), f) == g.size();
+        }
+        // доращенное второй версией — снова небо (закрыто оно по помехам, которыми был и дрон)
+        if (ok && v2) {
+            for (size_t i = 0; i < g.size(); ++i)
+                if (g[i]) m[i] = 1;
+            g.clear();
         }
     }
     std::fclose(f);
@@ -624,6 +707,23 @@ bool Detector::loadMask(const std::string& path, int verify) {
         applyGrown();
         fileGrown_.clear();
     }
+    return true;
+}
+
+bool Detector::setMask(const std::vector<uint8_t>& m, int tw, int th) {
+    if (tw <= 0 || th <= 0 || m.size() != (size_t)tw * th || (tw_ > 0 && (tw != tw_ || th != th_))) return false;
+    tw_ = tw;
+    th_ = th;
+    mask_ = m;
+    fileGrown_.clear();
+    learning_ = false;
+    maskReplaced_ = false;
+    verifyLeft_ = 0;
+    texSum_.assign((size_t)tw_ * th_, 0.f);
+    for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
+    texN_ = 0;
+    resetGrow();
+    resetColor();
     return true;
 }
 
@@ -748,7 +848,11 @@ void Detector::updateRecheck() {
             const size_t i = (size_t)y * tw_ + x;
             if (!mask_[i] && (!texBad_[i] || recheckN_[i] < need || recheckTex_[i] >= cfg_.recheck_tex)) top = y;
         }
-        for (int y = 0; y < top; ++y) {
+        // тайл прямо над сильной землёй со своей текстурой (recheck_edge = false) не открываем: в
+        // дымке кромка леса слаба, как облако, а верхушки над ней вспыхивают (wt24: захват уходил на
+        // верхушку ели). Под облаком гладкое, закрытое линией горизонта, — не в счёт
+        const int lim = cfg_.recheck_edge || top >= th_ || !texBad_[(size_t)top * tw_ + x] ? top : top - 1;
+        for (int y = 0; y < lim; ++y) {
             const size_t i = (size_t)y * tw_ + x;
             if (mask_[i] || !texBad_[i]) continue;
             mask_[i] = 1;
@@ -967,7 +1071,9 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     // между полными просмотрами — только тайлы вокруг треков (маска неба тоже действует);
     // полоса у горизонта — всегда, небо выше неё — раз в upper_every кадров
     const long fn = frameNo_++;
-    timing_.partial = !learning_ && cfg_.full_every > 1 && fn % cfg_.full_every != 0;
+    // сверка маски из файла, как обучение, смотрит весь кадр: иначе при жёстком захвате (full_every)
+    // земля вне окна вокруг цели выходит гладкой, и сверка её открывает (wt6, 30.10)
+    timing_.partial = !learning_ && !verifyLeft_ && cfg_.full_every > 1 && fn % cfg_.full_every != 0;
     timing_.upperSkipped = !band_.empty() && m && cfg_.upper_every > 1 && fn % cfg_.upper_every != 0;
     timing_.coarsePartial = cfg_.coarse_every > 1 && fn % cfg_.coarse_every != 0;
     if (timing_.partial || timing_.upperSkipped) {
@@ -1161,9 +1267,19 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             }
             out.resize(keep);
         }
+        // цвет целей (leaf_color) — у кандидатов в прогнозах треков, которые можно захватить; прогнозы
+        // не заданы — у всех
+        const bool tint = cfg_.leaf_color > 0 && colU_ && colV_ && colStep_ > 0 && colPix_ > 0 && colW_ > 0 && colH_ > 0;
+        auto tintHere = [&](const Candidate& c) {
+            if (!tintSet_) return true;
+            for (const FocusArea& a : tint_)
+                if ((c.x - a.x) * (c.x - a.x) + (c.y - a.y) * (c.y - a.y) <= a.r * a.r) return true;
+            return false;
+        };
         for (Candidate& c : out) {
             measure_energy(gray, w, h, stride, c);
             if (cfg_.subpixel) refine_position(gray, w, h, stride, c);
+            if (tint && tintHere(c)) measureTint(gray, stride, c);
         }
     }
     if ((learning_ || verifyLeft_) && cfg_.sky_color) sampleColor(gray, stride);
@@ -1432,6 +1548,21 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const float thrB = thr0 * bk;   // порог тайла без фокуса
             const float thr = (focusTiles_[i] ? thrF : thr0) * zk * bk;
             int taken = 0, px[4], py[4];
+            // тайл неба у самой земли (near_edge): цель отсюда подтверждается, только когда полетела
+            const bool nearEdge = cfg_.near_edge && nearOn && nearGround_[i];
+            // ...и не дальше near_edge_px от закрытого тайла (0 — весь тайл)
+            auto nearClosed = [&](float x, float y) {
+                if (cfg_.near_edge_px <= 0) return true;
+                const float tp = (float)(T * f);
+                for (int yy = std::max(0, ty - 1); yy <= std::min(th - 1, ty + 1); ++yy)
+                    for (int xx = std::max(0, tx - 1); xx <= std::min(tw - 1, tx + 1); ++xx) {
+                        if (mask_[(size_t)yy * tw + xx]) continue;
+                        const float dx = std::max({(float)xx * tp - x, 0.f, x - (float)(xx + 1) * tp});
+                        const float dy = std::max({(float)yy * tp - y, 0.f, y - (float)(yy + 1) * tp});
+                        if (dx * dx + dy * dy <= cfg_.near_edge_px * cfg_.near_edge_px) return true;
+                    }
+                return false;
+            };
             auto push = [&](int gx, int gy, float mx, bool second) {   // gx, gy — пикс. после пулинга
                 Candidate c;
                 c.x = (float)(gx * f) + (f - 1) * 0.5f;
@@ -1443,7 +1574,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 c.level = lvl;
                 c.weak = focusTiles_[i] && !(mx >= thrB * zk && (edgeTex || mx >= cfg_.clutter_k * level + thrB * zk * 0.5f));
                 // открытое перепроверкой облако: цель там подтверждается, только когда полетела
-                c.edge = zone == 1 || edgeTex || polTile || (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
+                c.edge = zone == 1 || edgeTex || polTile || (nearEdge && nearClosed(c.x, c.y)) ||
+                         (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
                 c.second = second;
                 out.push_back(c);
                 px[taken] = gx;
