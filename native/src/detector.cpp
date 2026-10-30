@@ -1478,6 +1478,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
     // отклик сглаженного кадра меньше, контраст кандидата — в уровнях, как без сглаживания
     const float cScale = fineGrid ? 1.f / smoothK() : 1.f;
     const size_t first = out.size();
+    std::vector<uint8_t> late;   // кандидат из текстуры у кромки, облака, смешанной зоны: при обрезке до max_cands — после неба
+    late.reserve((size_t)cfg_.max_cands + 64);
     const bool useMask = fineGrid && !learning_ && !mask_.empty();
     // ячейки основного масштаба: второй кандидат, фон по ячейкам
     const int cpt = T / CELL, ctw = tw * cpt;
@@ -1578,6 +1580,7 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                          (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
                 c.second = second;
                 out.push_back(c);
+                late.push_back(edgeTex || zone == 1);
                 px[taken] = gx;
                 py[taken] = gy;
                 ++taken;
@@ -1628,8 +1631,26 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             }
         }
     if (out.size() - first > (size_t)cfg_.max_cands) {   // слишком много — самые контрастные
-        std::stable_sort(out.begin() + first, out.end(),
-                         [](const Candidate& a, const Candidate& b) { return a.contrast > b.contrast; });
+        if (!cfg_.cands_sky) {
+            std::stable_sort(out.begin() + first, out.end(),
+                             [](const Candidate& a, const Candidate& b) { return a.contrast > b.contrast; });
+            out.resize(first + cfg_.max_cands);
+            return;
+        }
+        // На широком кадре (12 Мп) кандидатов с кромки леса и облаков больше max_cands, и самые
+        // контрастные вытесняли тусклого дрона в чистом небе. Сначала берём кандидатов из тайлов неба
+        // (и у самой земли, если тайл не текстура), потом из текстуры у кромки, облаков и смешанных
+        // зон — внутри по контрасту
+        std::vector<uint32_t> idx(out.size() - first);
+        for (uint32_t k = 0; k < idx.size(); ++k) idx[k] = k;
+        std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
+            if (late[a] != late[b]) return late[a] < late[b];
+            return out[first + a].contrast > out[first + b].contrast;
+        });
+        std::vector<Candidate> keep;
+        keep.reserve((size_t)cfg_.max_cands);
+        for (int k = 0; k < cfg_.max_cands; ++k) keep.push_back(out[first + idx[k]]);
+        std::copy(keep.begin(), keep.end(), out.begin() + first);
         out.resize(first + cfg_.max_cands);
     }
 }
