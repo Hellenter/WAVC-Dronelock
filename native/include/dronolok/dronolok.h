@@ -113,6 +113,59 @@ DL_API int dl_tracker_static_save(dl_tracker* t, const char* path);
 DL_API int dl_tracker_static_load(dl_tracker* t, const char* path);
 DL_API void dl_tracker_static_clear(dl_tracker* t);
 
+/* ---- Геометрия камер и передача цели (dronolok/geometry.hpp) ----
+   Мир: азимут от севера по часовой, угол места от горизонта, градусы. Положение камеры — куда смотрит
+   оптическая ось и поворот кадра вокруг неё. lens: 0 обычный объектив, 1 рыбий глаз (r = f·θ). */
+typedef struct {
+    int w, h;
+    float hfov_deg;
+    int lens;
+    float cx, cy; /* центр кадра; < 0 — середина */
+    float k1;     /* радиальная дисторсия, 0 — без неё */
+} dl_camera;
+
+typedef struct {
+    float az, el, roll;
+} dl_pose;
+
+/* Сообщение о цели для другой камеры или поворотки. t — время кадра по общим часам, с. */
+typedef struct {
+    int id;
+    double t;
+    float az, el;     /* градусы */
+    float vaz, vel;   /* град/с */
+    float sigma;      /* СКО направления, градусы */
+    float sigma_v;    /* СКО скорости, град/с */
+    int cls;          /* как у dl_track */
+    float confidence; /* 0..1 */
+    int hard;         /* 1 — жёсткий захват */
+    float size_deg;   /* видимый размер, 0 — не измерен */
+} dl_target;
+
+typedef struct {
+    float u, v, radius;
+    int visible;
+} dl_window;
+
+DL_API int dl_project(const dl_camera* c, const dl_pose* p, float az, float el, float* u, float* v);
+DL_API void dl_unproject(const dl_camera* c, const dl_pose* p, float u, float v, float* az, float* el);
+DL_API float dl_pixel_deg(const dl_camera* c, const dl_pose* p, float u, float v);
+/* Цель из трека: направление, угловая скорость по vx, vy (пикс./кадр) и fps, неопределённость по sigma.
+   hard — состояние захвата трекера (dl_tracker_hard). */
+DL_API void dl_target_from_track(const dl_camera* c, const dl_pose* p, double t, float fps, const dl_track* tr,
+                                 int hard, dl_target* out);
+/* Прогноз направления на момент t (az, el, sigma в градусах). */
+DL_API void dl_target_predict(const dl_target* tg, double t, float* az, float* el, float* sigma);
+/* Окно поиска цели в кадре другой камеры на момент t: k_sigma — сколько СКО брать. */
+DL_API dl_window dl_target_window(const dl_target* tg, double t, const dl_camera* c, const dl_pose* p, float k_sigma);
+/* Куда повернуть ось, чтобы цель была в центре через lead секунд после t. */
+DL_API dl_pose dl_target_aim(const dl_target* tg, double t, double lead);
+/* Сдвиг картинки при повороте камеры from -> to в точке (u, v) — для dl_tracker_set_motion по энкодерам. */
+DL_API void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose* to, float u, float v, float* dx,
+                          float* dy);
+/* Состояние захвата: 0 нет, 1 захват, 2 жёсткий (подтверждён дрон). */
+DL_API int dl_tracker_hard(dl_tracker* t);
+
 #ifdef __cplusplus
 }
 #endif
