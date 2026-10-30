@@ -295,8 +295,8 @@ void Pipeline::decodeLoop() {
         f = allocFrame(W, H);
         const double t = now_ms();
         wrapped = false;
-        if (!src.read(f->px.data(), W, H, W)) {
-            if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W)) return false;
+        if (!src.read(f->px.data(), W, H, W, &f->color)) {
+            if (!s.loop || !src.rewind() || !src.read(f->px.data(), W, H, W, &f->color)) return false;
             ++loop;
             wrapped = true;
         }
@@ -442,7 +442,7 @@ void Pipeline::processLoop() {
     LoadGovernor gov;
     SceneAnalyzer scene;
     std::string sceneWhy;
-    std::vector<FocusArea> focus, roi, keepGrow;
+    std::vector<FocusArea> focus, roi, keepGrow, tintAt;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
@@ -783,6 +783,14 @@ void Pipeline::processLoop() {
                 }
                 det.setLockArea(on, lx, ly, lr, lp, lc);
             }
+            // цвет кадра — для облаков по цвету при обучении маски и цвета целей у треков, которые можно
+            // захватить (окно поворотки — без цвета)
+            if (view == p.frame && f.color.w > 0) {
+                det.setColor(f.color.u.data(), f.color.v.data(), f.color.w, f.color.h, f.color.w, f.color.step, 1,
+                             f.color.off);
+                trk->roi(me.dx, me.dy, tintAt, true);
+                det.setTintAreas(tintAt);
+            }
             det.detect(f.px.data(), f.w, f.h, f.w, cands);
             trk->setPartial(det.timing().partial);
             // силуэт захваченной цели: прицел в центре крупного БПЛА, а не на крыле или хвосте
@@ -835,7 +843,8 @@ void Pipeline::processLoop() {
             const bool learning = det.learningMask();
             if (maskChecking && !det.verifyingMask()) {   // сверка маски из файла закончилась
                 maskChecking = false;
-                if (det.maskReplaced() && s.useMaskFile()) det.saveMask(maskPath());
+                // и подтверждённую: после сверки маска новая (из файла — только доращенное)
+                if (s.useMaskFile()) det.saveMask(maskPath());
                 std::lock_guard<std::mutex> lr(rm_);
                 staticMsg_ = det.maskReplaced() ? "сцена изменилась: маска неба выучена заново и сохранена"
                                                 : "маска неба из файла подтверждена";
@@ -873,6 +882,7 @@ void Pipeline::processLoop() {
             r->latencyMs = t3 - p.readyAt;
             r->mask = det.tileMask();
             r->maskDark = det.polarityOpen(0);
+            r->maskBright = det.polarityOpen(1);
             r->fineSky = det.fineSky();
             r->cellsPerTile = det.cellsPerTile();
             r->tilesX = det.tilesX();

@@ -157,7 +157,68 @@ void VideoSource::convert(uint8_t* dst, int outW, int outH, int dstStride) {
     sws_scale(sws_, frame_->data, frame_->linesize, 0, frame_->height, planes, strides);
 }
 
-bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride) {
+// Цвет: отсчёт U и V в точке (off, off) каждого блока step x step выходного кадра (уменьшение и
+// увеличение — пересчётом координат). Плоскости 8-16 бит, планарные и NV12/P010; RGB и палитра — без
+// цвета. Смещения в строке и перевод диапазона — таблицами: 2560x1440 с шагом 4 (640x360 отсчётов)
+// ~0.7 мс, половина — чтение строк цвета из памяти (с шагом 8 — 0.25 мс)
+void VideoSource::sampleColor(ColorPlanes& c, int outW, int outH) {
+    c.w = c.h = 0;
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((AVPixelFormat)frame_->format);
+    if (!d || d->nb_components < 3 || (d->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BE)) ||
+        (d->flags & AV_PIX_FMT_FLAG_HWACCEL) || c.step <= 0 || outW < c.step || outH < c.step)
+        return;
+    const AVComponentDescriptor& cu = d->comp[1];
+    const AVComponentDescriptor& cv = d->comp[2];
+    if (cu.depth < 8 || cu.depth > 16 || cv.depth != cu.depth || !frame_->data[cu.plane] || !frame_->data[cv.plane]) return;
+    const AVPixelFormat f = (AVPixelFormat)frame_->format;
+    const bool full = frame_->color_range == AVCOL_RANGE_JPEG || f == AV_PIX_FMT_YUVJ420P || f == AV_PIX_FMT_YUVJ422P ||
+                      f == AV_PIX_FMT_YUVJ444P;
+    c.w = outW / c.step;
+    c.h = outH / c.step;
+    c.u.resize((size_t)c.w * c.h);
+    c.v.resize((size_t)c.w * c.h);
+    const double sx = (double)frame_->width / outW, sy = (double)frame_->height / outH;
+    const int cwMax = -((-frame_->width) >> d->log2_chroma_w) - 1;
+    const int chMax = -((-frame_->height) >> d->log2_chroma_h) - 1;
+    colOffU_.resize(c.w);
+    colOffV_.resize(c.w);
+    for (int bx = 0; bx < c.w; ++bx) {   // байт отсчёта в строке (шаг и смещение — из описания формата)
+        const int x = std::min(frame_->width - 1, (int)((bx * c.step + c.off) * sx));
+        const int cx = std::min(cwMax, x >> d->log2_chroma_w);
+        colOffU_[bx] = cx * cu.step + cu.offset;
+        colOffV_[bx] = cx * cv.step + cv.offset;
+    }
+    uint8_t lut[256];   // ТВ-диапазон цвета 16..240 -> полный 0..255 (как яркость в convert)
+    for (int i = 0; i < 256; ++i) {
+        const int val = full ? i : 128 + ((i - 128) * 255 + (i >= 128 ? 112 : -112)) / 224;
+        lut[i] = (uint8_t)std::min(255, std::max(0, val));
+    }
+    const bool wide = cu.depth > 8;   // отсчёт в 16 битах: старшие 8 бит значения
+    const int su = cu.shift + cu.depth - 8, sv = cv.shift + cv.depth - 8;
+    for (int by = 0; by < c.h; ++by) {
+        const int y = std::min(frame_->height - 1, (int)((by * c.step + c.off) * sy));
+        const int cy = std::min(chMax, y >> d->log2_chroma_h);
+        const uint8_t* ru = frame_->data[cu.plane] + (size_t)cy * frame_->linesize[cu.plane];
+        const uint8_t* rv = frame_->data[cv.plane] + (size_t)cy * frame_->linesize[cv.plane];
+        uint8_t* ou = &c.u[(size_t)by * c.w];
+        uint8_t* ov = &c.v[(size_t)by * c.w];
+        if (wide) {
+            for (int bx = 0; bx < c.w; ++bx) {
+                const uint8_t* qu = ru + colOffU_[bx];
+                const uint8_t* qv = rv + colOffV_[bx];
+                ou[bx] = lut[((qu[0] | (qu[1] << 8)) >> su) & 255];
+                ov[bx] = lut[((qv[0] | (qv[1] << 8)) >> sv) & 255];
+            }
+        } else {
+            for (int bx = 0; bx < c.w; ++bx) {
+                ou[bx] = lut[ru[colOffU_[bx]]];
+                ov[bx] = lut[rv[colOffV_[bx]]];
+            }
+        }
+    }
+}
+
+bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride, ColorPlanes* color) {
     if (!fmt_) return false;
     for (;;) {
         if (!decodeNext()) return false;
@@ -169,6 +230,7 @@ bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride) {
     }
     skipTo_ = 0;
     convert(dst, outW, outH, dstStride);
+    if (color) sampleColor(*color, outW, outH);
     av_frame_unref(frame_);
     return true;
 }

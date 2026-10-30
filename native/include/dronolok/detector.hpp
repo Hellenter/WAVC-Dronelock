@@ -140,6 +140,44 @@ struct DetectorConfig {
     // открыт для светлых целей), 0 — выкл. Помехи копятся — тайл закрывается (grow_mask)
     int pol_mask = 1;
     float pol_tex = 0.05f;
+    // Облака по цвету (нужен цвет кадра, setColor). Облака, освещённые солнцем, текстурны в обеих
+    // полярностях: яркие клочья и тёмные просветы голубого неба между ними, — и маска закрывала их,
+    // как кроны. По цвету и яркости это небо: не зелёное (у листвы и травы зелёный выше красного и
+    // выше синего больше чем на sky_green яркости), не темнее sky_y яркости открытого неба этой
+    // сцены, и 10% самых тёмных точек тайла не темнее sky_dark неба (у крон и домов глубокие тени);
+    // и не стоит на земле: под ним в столбце открытое небо, а не сплошь закрытое до низа кадра (верх
+    // крон, лес в дымке у горизонта). Такой тайл при обучении маски — облако: закрыт только для
+    // светлых целей, тёмные ищутся по фону ячеек (как pol_mask), но не ниже медианы ячейки + bg_k
+    // уровней отклика (у кромки облака разброс фона почти нулевой, и без этого её блик — цель).
+    // Доращивание облако не закрывает и землёй не считает, mask_recheck может открыть целиком.
+    // Цвета нет (серая камера, gray-видео) — как раньше. Нужен фон по ячейкам (bg_map)
+    bool sky_color = true;
+    float sky_green = 0.08f, sky_y = 0.7f, sky_dark = 0.6f;
+    // ...мягкое облако — и у самой кромки леса (sky_soft): облако, касающееся крон, стоит на земле,
+    // и правило "висит в небе" его не открывало. У облака яркость меняется плавно: перепад на 1
+    // пикс. меньше sky_s14 перепада на 4 пикс. (у листвы, веток и дальнего леса — около половины), а
+    // перепад на 4 пикс. (по x и по y) меньше sky_d4 яркости тайла. Такой тайл цвета неба — облако,
+    // что бы ни было под ним, и линия горизонта через него не идёт. Кроме полосы в один тайл между
+    // гладким небом и немягкой текстурой: так лежит гребень дальнего холма в дымке, он мягок так же
+    bool sky_soft = true;
+    float sky_d4 = 0.08f, sky_s14 = 0.32f;
+    // ...но над тёмной верхушкой ближнего дерева облако линию горизонта поднимает, как раньше: первый
+    // немягкий текстурный тайл под ним (через 1-2 гладких) — с долей точек темнее sky_dark неба не
+    // меньше sky_tree, и гладкий просвет между ними закрыт. Камера чуть сдвинулась — ветки уже в
+    // просвете, и на 14 к/с их кончики захватывались. Лес в дымке светлее (на wt23 до 27% таких
+    // точек, ель на wt20 — 42-54%); 0 — выкл.
+    float sky_tree = 0.35f;
+    // ...облако по цвету открыто и для светлых целей — по фону ячеек и не ниже медианы + bg_k, как
+    // для тёмных; false — только для тёмных
+    bool sky_bright = true;
+    // Лист у самой камеры (нужен цвет кадра, setColor): пролетает мимо объектива тёмным пятном и летит,
+    // как дрон. По цвету это листва — зелёное, жёлтое, оранжевое, красное или бурое: синего меньше
+    // яркости или зелёный выше красного и синего (phi = max(Y - B, G - max(R, B)), уровни RGB). Серая
+    // цель на фоне неба — смесь серого с цветом фона (дымка, размытый цвет yuv420), её phi не больше
+    // max(0, phi фона). Кандидат, у которого тело окрашено так сильнее фона на leaf_color уровней, —
+    // с цветом листвы (Candidate::leaf); трек с такими попаданиями — лист (TrackerConfig::leaf_hits).
+    // 0 — не смотреть
+    float leaf_color = 8.f;
     // Цель в захвате, залетевшая под маску (облако, кромка): в круге прогноза её трека
     // (setLockArea) ячейки под маской смотрятся с порогом x lock_through_k. Кандидат — той же
     // полярности, контраст в пределах x2 от контраста трека, слабый (только продолжает трек,
@@ -208,6 +246,10 @@ struct Candidate {
     float margin = 0;  // во сколько раз отклик выше действующего порога (0 — неизвестно: не из Detector)
     bool tbd = false;  // найдена накоплением по кадрам (DetectorConfig::tbd), отклик ниже порога
     bool second = false;   // второй кандидат в тайле (DetectorConfig::per_tile)
+    // Цвет (DetectorConfig::leaf_color): colored — измерен (тело попало в отсчёты цвета, вокруг ровный
+    // фон), leaf — насколько тело зеленее или желтее фона, уровни; leafy — не меньше leaf_color
+    bool colored = false, leafy = false;
+    float leaf = 0;
 };
 
 // Область, где ждём цель (прогноз трека): там порог ниже, см. DetectorConfig::focus_k
@@ -250,9 +292,12 @@ public:
     void resetBackground();
     // Маска неба в файле: неподвижной камере не нужно учить её заново при каждом запуске
     // (в эти кадры захват ложный). loadMask сразу включает сохранённую маску и первые verify
-    // кадров параллельно учит маску заново; если новая отличается больше чем на 10% тайлов
-    // (камеру сдвинули, повернули), берётся новая (maskReplaced). Файл привязан к размеру
-    // кадра, пулингу и тайлу — чужой не загрузится.
+    // кадров параллельно учит маску заново. Дальше маска — новая, а из файла берутся только
+    // тайлы, закрытые доращиванием по помехам (их перепроверка может открыть снова): закрытое
+    // по текстуре прошлым запуском или прошлой версией программы не держится. Новая отличается
+    // от файла больше чем на 10% тайлов (камеру сдвинули, повернули) — из файла не берётся
+    // ничего (maskReplaced). Файл привязан к размеру кадра, пулингу и тайлу — чужой не загрузится;
+    // файл первой версии (без слоя доращивания) — только до конца сверки.
     bool saveMask(const std::string& path) const;
     bool loadMask(const std::string& path, int verify = 25);
     bool verifyingMask() const { return verifyLeft_ > 0; }
@@ -268,9 +313,26 @@ public:
     // тайлы, закрытые маской, где ищутся цели одной полярности (DetectorConfig::pol_mask):
     // pol 0 — тёмные, 1 — светлые (tilesY x tilesX, 1 — ищутся); пусто — нет таких
     const std::vector<uint8_t>& polarityOpen(int pol) const { return polOpen_[pol ? 1 : 0]; }
+    // Цвет кадра для DetectorConfig::sky_color (необязательно): плоскости U и V (Cb, Cr; полный
+    // диапазон, 128 — серый) cw x ch, stride байт между строками и pix между отсчётами строки,
+    // отсчёт — на блок step x step пикс. кадра (yuv420p как есть — step 2, pix 1; NV12 — u = uv,
+    // v = uv + 1, pix 2), в его точке (off, off) от угла (-1 — в центре). Действует на следующий
+    // detect(); не задан — цвет этого кадра не учитывается. Маска неба читает 8x8 отсчётов на тайл
+    // и только в кадры обучения, цвет целей (leaf_color) — отсчёты вокруг каждого кандидата
+    void setColor(const uint8_t* u, const uint8_t* v, int cw, int ch, int stride, int step, int pix = 1, int off = -1) {
+        colU_ = u, colV_ = v, colW_ = cw, colH_ = ch, colStride_ = stride, colStep_ = step, colPix_ = pix;
+        colOff_ = off < 0 ? step / 2 : std::min(off, step - 1);
+    }
+    // тайлы, закрытые при обучении текстурой, но по цвету и яркости — небо (облака у солнца,
+    // sky_color; tilesY x tilesX); пусто — нет таких или цвета не было
+    const std::vector<uint8_t>& skyColored() const { return skyCol_; }
 
     // Прогнозы треков на этот кадр. Действует до следующего вызова.
     void setFocus(const std::vector<FocusArea>& areas) { focus_ = areas; }
+    // Где мерить цвет целей (leaf_color): прогнозы треков, которые можно захватить (Tracker::roi с
+    // targets). Цвет нужен только им, а кандидатов на облаках и в кронах бывает за сотню. Не задано —
+    // у всех кандидатов. Действует до следующего вызова
+    void setTintAreas(const std::vector<FocusArea>& areas) { tint_ = areas, tintSet_ = true; }
     // Цель в захвате на этот кадр: прогноз (x, y), радиус поиска, полярность и контраст трека
     // (DetectorConfig::lock_through); on = false — захвата нет. Действует до следующего вызова
     void setLockArea(bool on, float x = 0, float y = 0, float r = 0, int polarity = -1, float contrast = 0) {
@@ -321,6 +383,7 @@ private:
     int texN_ = 0;
     int verifyLeft_ = 0;
     bool maskReplaced_ = false;
+    std::vector<uint8_t> fileGrown_;   // маска из файла на сверке: тайлы, закрытые доращиванием
     bool bgIdle_ = false;   // фон ячеек не учился (не было маски): при появлении маски — заново
     long maskVer_ = 0, bandVer_ = -1;
     std::vector<uint8_t> band_, nearGround_;   // тайлы полосы у горизонта; тайлы рядом с маской
@@ -350,7 +413,25 @@ private:
         const auto& v = polOpen_[pol ? 1 : 0];
         return v.size() == mask_.size() && v[i];
     }
+    // облака по цвету (sky_color): цвет этого кадра; по тайлам за кадры обучения — суммы яркости
+    // и цвета (U, V от серого), гистограмма яркости по 8 уровней, отсчётов; итог — тайлы-облака
+    const uint8_t *colU_ = nullptr, *colV_ = nullptr;
+    int colW_ = 0, colH_ = 0, colStride_ = 0, colStep_ = 0, colPix_ = 1, colOff_ = 0;
+    std::vector<float> colY_, colU0_, colV0_, colD1_, colD4_;   // ...и перепады на 1 и 4 пикс.
+    std::vector<uint32_t> colHist_, colN_;
+    std::vector<uint8_t> skyCol_, softCol_;   // ...из них мягкие (sky_soft, до маски)
+    float skyRef_ = 0;                        // яркость открытого неба сцены
+    void sampleColor(const uint8_t* gray, int stride);
+    void measureTint(const uint8_t* gray, int stride, Candidate& c);   // цвет цели против фона (leaf_color)
+    std::vector<uint8_t> tintY_, tintU_, tintV_;   // measureTint: отсчёты кольца фона
+    bool skyColorTile(size_t i, float frac) const;   // цвет и яркость неба (без правила "висит в небе")
+    float darkShare(size_t i) const;                 // доля отсчётов цвета темнее sky_dark неба
+    void markSoftCloud(float frac);
+    void markSkyColor(float frac);
+    void resetColor();
+    bool skyColAt(size_t i) const { return skyCol_.size() == mask_.size() && skyCol_[i]; }
     void markTexBad(float frac);
+    void applyGrown();
     void updateRecheck();
     bool lockOn_ = false;
     float lockX_ = 0, lockY_ = 0, lockR_ = 0, lockC_ = 0;
@@ -373,7 +454,8 @@ public:
     const std::vector<uint8_t>& nearGroundTiles() const { return nearGround_; }
 private:
     void buildMask(float frac, std::vector<uint8_t>& out) const;
-    std::vector<FocusArea> focus_, roi_;
+    std::vector<FocusArea> focus_, roi_, tint_;
+    bool tintSet_ = false;
     std::vector<uint8_t> focusTiles_, roiMask_, zones_, zoneHist_, zoneAll_;
     std::vector<int> fill_;
     void computeZones();
@@ -540,6 +622,11 @@ struct TrackerConfig {
     bool anchor_check = true;
     float overlay_px = 1.f;
     float overlay_cam = 24.f;
+    // Лист у самой камеры: трек, у которого среди последних 32 замеров цвета набралось leaf_hits
+    // попаданий с цветом листвы (Candidate::leafy, DetectorConfig::leaf_color), — лист: не
+    // захватывается, захват с него сразу снимается, листом остаётся до конца. Окно — чтобы редкие
+    // случайные попадания за минуты ведения дрона не складывались. 0 — выкл.
+    int leaf_hits = 2;
 };
 
 // Время в секундах. Числа выше подобраны для камеры 25 кадр/с: счётчики кадров — это время
@@ -609,6 +696,9 @@ struct Track {
     bool followed = false;   // камера поворачивается за ним: по кадру почти стоит, по сцене летит
     bool everFollowed = false;   // камера его вела: зависнув потом, помехой не становится
     bool anchored = false;   // на мачте или столбе (см. Silhouette::attached): не дрон
+    uint16_t colorN = 0, leafN = 0;   // попаданий с измеренным цветом и из них с цветом листвы
+    uint32_t leafBits = 0;   // последние 32 замера цвета: бит 1 — с цветом листвы
+    bool leaf = false;       // лист у камеры (TrackerConfig::leaf_hits): не захватывается
     // ожидание размера (захват): логарифм видимого размера и его изменение за кадр
     float ls = 0, dls = 0;
     uint8_t lsN = 0;         // замеров размера, 0 — размер не ведётся
@@ -643,8 +733,9 @@ public:
     // Где ждать подтверждённые цели на следующем кадре (до update): для Detector::setFocus
     void focus(float camDx, float camDy, std::vector<FocusArea>& out) const;
     // Где ждать все живые треки (и новые, и на прогнозе) на следующем кадре: для
-    // Detector::setRoi — между полными просмотрами кадра ищем только там
-    void roi(float camDx, float camDy, std::vector<FocusArea>& out) const;
+    // Detector::setRoi — между полными просмотрами кадра ищем только там. targets — только треки,
+    // которые ещё могут стать целью (не помехи и не признанные листом): для Detector::setTintAreas
+    void roi(float camDx, float camDy, std::vector<FocusArea>& out, bool targets = false) const;
     // Следующий кадр детектор смотрел только вокруг треков (DetectTiming::partial):
     // карта клаттера в этот кадр не остывает, иначе помехи вне треков "забываются"
     void setPartial(bool p) { partial_ = p; }

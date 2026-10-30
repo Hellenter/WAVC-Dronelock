@@ -56,6 +56,8 @@ static void usage() {
         "  --coarse-every N        грубые масштабы целиком раз в N кадров\n"
         "  --per-tile N            до стольких кандидатов в тайле (2; второй — из ячеек 16x16)\n"
         "  --no-bg-map             без фона по ячейкам у кромки леса (маска неба с тайлом запаса, как раньше)\n"
+        "  --no-sky-color          маска без облаков по цвету (цвет берётся из y4m и --yuv420)\n"
+        "  --no-leaf-color         лист у камеры не отсеивается по цвету\n"
         "  --bg-map [--bg-k 3 --bg-frames 250]  фон по ячейкам у кромки: порог ячейки = медиана + K*СКО\n"
         "  --tbd [--tbd-thr 7 --tbd-z0 1.5 --tbd-decay 0.7 --tbd-min 0.5]   накопление по кадрам (включает --bg-map)\n"
         "  --band PX [--band-k 1 --upper-every N]   полоса у горизонта каждый кадр, небо выше — раз в N\n"
@@ -75,6 +77,37 @@ static void usage() {
         "  --sweep                 таблица скоростей: наборы инструкций x потоки\n"
         "  --json out.jsonl        дописать итог строкой JSON\n"
         "  --dump-tracks out.csv   признаки треков по кадрам (для настройки классификатора)\n");
+}
+
+// Цвет загруженного кадра, как в приложении: по отсчёту U и V в углу блока 4x4 (в памяти 1/8 кадра).
+// Каждый второй — в центре блока 8x8, по ним учится маска неба (sky_color), а все — цвет целей (leaf_color)
+struct Color4 {
+    std::vector<uint8_t> u, v;
+};
+static bool sample_color4(const FrameReader& rd, int W, int H, Color4& c) {
+    const uint8_t *u, *v;
+    int cw, ch, stride, step;
+    if (!rd.color(u, v, cw, ch, stride, step)) return false;
+    const int bw = W / 4, bh = H / 4;
+    c.u.resize((size_t)bw * bh);
+    c.v.resize(c.u.size());
+    for (int by = 0; by < bh; ++by) {
+        const size_t row = (size_t)std::min(ch - 1, by * 4 / step) * stride;
+        for (int bx = 0; bx < bw; ++bx) {
+            const int cx = std::min(cw - 1, bx * 4 / step);
+            c.u[(size_t)by * bw + bx] = u[row + cx];
+            c.v[(size_t)by * bw + bx] = v[row + cx];
+        }
+    }
+    return true;
+}
+
+static void print_sky_color(const Detector& det) {
+    size_t n = 0;
+    for (auto m : det.skyColored()) n += m;
+    if (n)
+        std::printf("облака по цвету: %zu тайлов открыты для %s\n", n,
+                    det.config().sky_bright ? "тёмных и светлых целей" : "тёмных целей");
 }
 
 static Isa parse_isa(const std::string& s) {
@@ -114,7 +147,7 @@ int main(int argc, char** argv) {
     std::string sceneLog;
     bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false, fpsScale = false;
     GlobalMotion gm;
-    std::vector<FocusArea> focusAreas, roiAreas;
+    std::vector<FocusArea> focusAreas, roiAreas, tintAreas;
     DetectorConfig cfg;
     TrackerConfig tcfg;
     for (int i = 1; i < argc; ++i) {
@@ -178,6 +211,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-bg-map") cfg.bg_map = false;
         else if (a == "--no-skyline") cfg.skyline = false;
         else if (a == "--no-fine-mask") cfg.fine_mask = false;
+        else if (a == "--no-sky-color") cfg.sky_color = false;
+        else if (a == "--no-leaf-color") cfg.leaf_color = 0;
         else if (a == "--lock-slow") tcfg.lock_slow = (float)std::atof(val().c_str());
         else if (a == "--lock-dwell") tcfg.lock_dwell = std::atoi(val().c_str());
         else if (a == "--follow-k") tcfg.follow_k = (float)std::atof(val().c_str());
@@ -232,10 +267,17 @@ int main(int argc, char** argv) {
     const float gsx = haveGt && gt.w ? (float)W / gt.w : 1, gsy = haveGt && gt.h ? (float)H / gt.h : 1;
 
     std::vector<std::vector<uint8_t>> frames;
+    std::vector<Color4> colors;   // цвет загруженных кадров (пусто — его нет)
     std::vector<uint8_t> buf;
     if (!stream) {
         const double t0 = now_ms();
-        while ((int)frames.size() < maxFrames && rd.next(buf)) frames.push_back(buf);
+        Color4 c4;
+        while ((int)frames.size() < maxFrames && rd.next(buf)) {
+            frames.push_back(buf);
+            if ((cfg.sky_color || cfg.leaf_color > 0) && colors.size() + 1 == frames.size() && sample_color4(rd, W, H, c4))
+                colors.push_back(c4);
+        }
+        if (colors.size() != frames.size()) colors.clear();
         std::printf("загружено %zu кадров %dx%d за %.1f c\n", frames.size(), W, H, (now_ms() - t0) / 1000);
         if (frames.empty()) return 1;
     }
@@ -287,12 +329,16 @@ int main(int argc, char** argv) {
     if (learn > 0 && !stream) {
         det.beginMaskLearning();
         std::vector<Candidate> c;
-        for (int i = 0; i < std::min(learn, (int)frames.size()); ++i) det.detect(frames[i].data(), W, H, W, c);
+        for (int i = 0; i < std::min(learn, (int)frames.size()); ++i) {
+            if (!colors.empty()) det.setColor(colors[i].u.data(), colors[i].v.data(), W / 4, H / 4, W / 4, 4, 1, 0);
+            det.detect(frames[i].data(), W, H, W, c);
+        }
         det.endMaskLearning();
         long on = 0;
         for (auto m : det.tileMask()) on += m;
         std::printf("авто-маска: исключено %.1f%% тайлов (лес/земля)\n",
                     100.0 * (1 - (double)on / std::max<size_t>(1, det.tileMask().size())));
+        print_sky_color(det);
     }
     std::printf("бэкенд %s, потоков %d\n", det.backendName().c_str(), det.threads());
 
@@ -319,6 +365,7 @@ int main(int argc, char** argv) {
         if (learnLive > 0 && i == learnLive) {
             det.endMaskLearning();
             trk.resetTracks();
+            print_sky_color(det);
         }
         const double t0 = now_ms();
         MotionEstimate me;
@@ -363,6 +410,14 @@ int main(int argc, char** argv) {
                              ss.skyFrac, ss.hv, ss.skylineFlat, ss.skylineSd, light_name(ss.light), terrain_name(ss.terrain),
                              ss.lightJump || ss.moved ? ss.lastEvent.c_str() : "", det.threshold(), why.c_str());
         }
+        // цвет кадра: маска неба читает его в кадры обучения, цвет целей (leaf_color) — у треков, которые
+        // можно захватить
+        const uint8_t *cu, *cv;
+        int cw, ch, cs, cst;
+        if (stream && rd.color(cu, cv, cw, ch, cs, cst)) det.setColor(cu, cv, cw, ch, cs, cst);
+        else if (!stream && !colors.empty()) det.setColor(colors[fi].u.data(), colors[fi].v.data(), W / 4, H / 4, W / 4, 4, 1, 0);
+        trk.roi(me.dx, me.dy, tintAreas, true);
+        det.setTintAreas(tintAreas);
         det.detect(g, W, H, W, cands);
         trk.setPartial(det.timing().partial);
         const double t1 = now_ms();
