@@ -3487,7 +3487,7 @@ int run_stress(int argc, char** argv) {
                 break;
             case 36:   // трекер: захват на летавший трек, переход жёсткого, птица, скорости в секундах
                 s.trk.lock_mover = R(2);
-                s.trk.lock_mover_fps = R(3) ? 20.f : F(0, 120);
+                s.trk.lock_mover_fps = R(3) ? 31.f : F(0, 120);
                 s.trk.hard_switch_drone = R(3) != 0;
                 s.trk.hover_first = R(3) != 0;
                 s.trk.reupdate = R(2) ? 0.f : F(0, 1);
