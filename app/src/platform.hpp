@@ -37,4 +37,10 @@ bool open_in_browser(const std::string& path);   // файл (отчёт) или
 std::vector<std::string> ui_fonts();   // системные шрифты с кириллицей, по убыванию предпочтения
 void attach_console();                 // Windows: вывод --bench в консоль, из которой запустили
 
+// Отдельный процесс (отрисовка 3D-сцены): без окна консоли, вне ограничения CPU этого процесса
+// (Job Object), на своих ядрах affinity (0 — любые). nullptr — не запустился (err — почему).
+void* proc_start(const std::vector<std::string>& args, uint64_t affinity, std::string& err);
+bool proc_alive(void* p);
+void proc_stop(void* p);   // завершить, если ещё работает, и освободить
+
 }  // namespace plat

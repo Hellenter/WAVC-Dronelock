@@ -85,7 +85,7 @@ const char* state_name(NState s) {
 Vec3 Body::at(double t) const {
     const double dt = t - t0;
     Vec3 p{p0.x + v.x * dt, p0.y + v.y * dt, p0.z + v.z * dt};
-    if (bird) {   // птица летит неровно: покачивание по высоте и в сторону
+    if (bird && wobble) {   // птица летит неровно: покачивание по высоте и в сторону
         p.z += 1.2 * std::sin(0.9 * dt + phase);
         p.x += 0.8 * std::sin(0.6 * dt + 2 * phase);
     }
@@ -187,10 +187,60 @@ void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t
     }
 }
 
+// Кадр из 3D-сцены: Godot рисует камеру при повороте p на момент t; шум датчика добавляем здесь,
+// цели (правда) — из ответа сцены.
+bool Emulator::sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out) {
+    int w = 0, h = 0;
+    std::string err;
+    if (!link_->render(t, cam, p.az, p.el, out, w, h, sbodies_, err) || w != W || h != H) {
+        if (err.empty()) err = "сцена прислала кадр не того размера";
+        std::lock_guard<std::mutex> lk(vm_);
+        view_.status = "3D-сцена: " + err;
+        stop_ = true;
+        out.assign((size_t)W * H, 0);
+        return false;
+    }
+    if (c_.noise > 0) {
+        const uint32_t seed = noiseSeed_ += 0x7f4a7c15u;
+        parallel_rows(H, [&](int ya, int yb) {
+            for (int y = ya; y < yb; ++y) {
+                uint32_t r = (seed ^ (uint32_t)(y * 2654435761u) ^ 0x51ed27u) | 1u;
+                uint8_t* o = &out[(size_t)y * W];
+                for (int x = 0; x < W; ++x) {
+                    r ^= r << 13;
+                    r ^= r >> 17;
+                    r ^= r << 5;
+                    const int v = o[x] + ((noiseTab_[r >> 16] + 4) >> 3);
+                    o[x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+            }
+        });
+    }
+    bodies_.clear();
+    for (const scene::Body& sb : sbodies_) {
+        Body b;
+        b.id = sb.id;
+        b.bird = sb.bird;
+        b.shape = (Shape)std::max(0, std::min(3, sb.shape));
+        b.size = sb.size;
+        b.p0 = {sb.x, sb.y, sb.z};
+        b.v = {sb.vx, sb.vy, sb.vz};
+        b.t0 = t;
+        b.wobble = false;
+        b.hidden = sb.hidden;
+        bodies_.push_back(b);
+    }
+    return true;
+}
+
 void Emulator::renderWide(double t, std::vector<uint8_t>& out) {
     const int W = wideCam_.w, H = wideCam_.h;
     const size_t N = (size_t)W * H;
     out.resize(N);
+    if (sceneMode_) {
+        sceneRender(t, 0, widePose_, W, H, out);
+        return;
+    }
     // облака плывут медленно (0.04 °/с — меньше пикселя за 0.5 с): фон с облаками считаем раз в
     // полсекунды, на сетке CLOUD_STEP, между узлами — линейно
     if (wideSky_.size() != N || t - wideSkyT_ >= 0.5) {
@@ -253,6 +303,10 @@ void Emulator::renderWide(double t, std::vector<uint8_t>& out) {
 void Emulator::renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out) {
     const int W = narrowCam_.w, H = narrowCam_.h;
     out.resize((size_t)W * H);
+    if (sceneMode_) {
+        sceneRender(t, 1, p, W, H, out);
+        return;
+    }
     const int gw = W / NARROW_STEP + 2, gh = H / NARROW_STEP + 2;
     std::vector<float> bg((size_t)gw * gh), gaz(bg.size()), gel(bg.size());
     std::vector<uint8_t> ground(bg.size());
@@ -307,6 +361,7 @@ int Emulator::nearestBody(double t, double az, double el, double maxDeg) const {
     double bd = maxDeg;
     const Vec3 d = dir_from_azel(az, el);
     for (const Body& b : bodies_) {
+        if (b.hidden) continue;
         // крупная цель — не точка: попадание в её силуэт (крыло, хвост) — тоже она
         const Vec3 q = b.at(t);
         const double R = std::max(1.0, std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z));
@@ -321,6 +376,10 @@ int Emulator::nearestBody(double t, double az, double el, double maxDeg) const {
 
 void Emulator::start(const Config& c) {
     stop();
+    {
+        std::lock_guard<std::mutex> lk(vm_);
+        view_ = View();
+    }
     c_ = c;
     switchMode_ = (int)c.switchMode;
     speed_ = c.simSpeed;
@@ -337,36 +396,10 @@ void Emulator::start(const Config& c) {
     narrowCam_.w = c.narrowW;
     narrowCam_.h = c.narrowH;
     narrowCam_.hfov_deg = c.narrowFov;
-    // фон широкой без облаков — один раз
-    const int W = c.wideW, H = c.wideH;
-    wideBase_.assign((size_t)W * H, 0);
-    wideGround_.assign((size_t)W * H, 0);
-    parallel_rows(H, [&](int ya, int yb) {
-        for (int y = ya; y < yb; ++y)
-            for (int x = 0; x < W; ++x) {
-                double az, el;
-                azel_from_dir(unproject(wideCam_, widePose_, x + 0.5, y + 0.5), az, el);
-                const bool g = el < treeline(az);
-                const size_t k = (size_t)y * W + x;
-                wideGround_[k] = g;
-                wideBase_[k] = g ? background(az, el, 0, true) : sky_base(el);
-            }
-    });
-    cgW_ = W / CLOUD_STEP + 2;
-    cgH_ = H / CLOUD_STEP + 2;
-    wideAz_.assign((size_t)cgW_ * cgH_, 0);
-    wideEl_.assign(wideAz_.size(), 0);
-    for (int j = 0; j < cgH_; ++j)
-        for (int i = 0; i < cgW_; ++i) {
-            double az, el;
-            azel_from_dir(unproject(wideCam_, widePose_, i * CLOUD_STEP, j * CLOUD_STEP), az, el);
-            wideAz_[(size_t)j * cgW_ + i] = (float)az;
-            wideEl_[(size_t)j * cgW_ + i] = (float)el;
-        }
+    sceneMode_ = !c.scene.empty();
+    poseSeen_ = poseReq_;
+    if (!sceneMode_) prepareWide();
     ngm_.reset();
-    wideSky_.clear();
-    wideNoise_.clear();
-    wideSkyT_ = -1;
     noiseTab_.resize(65536);
     {
         std::mt19937 g(c.seed + 99);
@@ -374,12 +407,14 @@ void Emulator::start(const Config& c) {
         for (auto& v : noiseTab_) v = (int16_t)std::max(-32000.f, std::min(32000.f, N(g)));
     }
     bodies_.clear();
-    for (int i = 0; i < c.drones + c.birds; ++i) {
-        Body b;
-        b.bird = i >= c.drones;
-        spawn(b, 0, true);
-        bodies_.push_back(b);
-    }
+    if (!sceneMode_)
+        for (int i = 0; i < c.drones + c.birds; ++i) {
+            Body b;
+            b.bird = i >= c.drones;
+            spawn(b, 0, true);
+            bodies_.push_back(b);
+        }
+    wideNoise_.clear();
     // точная
     DetectorConfig dc;
     dc.scales = c.narrowScales;   // цель в узком поле крупнее: несколько масштабов
@@ -432,8 +467,8 @@ void Emulator::start(const Config& c) {
         wcv_.notify_all();
     });
     VideoInfo vi;
-    vi.w = W;
-    vi.h = H;
+    vi.w = c.wideW;
+    vi.h = c.wideH;
     vi.fps = c.wideFps;
     vi.codec = "эмулятор";
     stop_ = false;
@@ -448,9 +483,41 @@ void Emulator::start(const Config& c) {
                             return true;
                         },
                         "эмулятор");
-    event(0, "старт: целей " + std::to_string(c.drones) + " дронов и " + std::to_string(c.birds) + " птиц");
+    event(0, "старт: целей " + std::to_string(c.drones) + " дронов и " + std::to_string(c.birds) + " птиц" +
+                 (sceneMode_ ? ", 3D-сцена " + c.scene : std::string()));
     running_ = true;
     th_ = std::thread([this] { loop(); });
+}
+
+// фон широкой без облаков — при запуске и после поворота широкой
+void Emulator::prepareWide() {
+    const int W = wideCam_.w, H = wideCam_.h;
+    wideBase_.assign((size_t)W * H, 0);
+    wideGround_.assign((size_t)W * H, 0);
+    parallel_rows(H, [&](int ya, int yb) {
+        for (int y = ya; y < yb; ++y)
+            for (int x = 0; x < W; ++x) {
+                double az, el;
+                azel_from_dir(unproject(wideCam_, widePose_, x + 0.5, y + 0.5), az, el);
+                const bool g = el < treeline(az);
+                const size_t k = (size_t)y * W + x;
+                wideGround_[k] = g;
+                wideBase_[k] = g ? background(az, el, 0, true) : sky_base(el);
+            }
+    });
+    cgW_ = W / CLOUD_STEP + 2;
+    cgH_ = H / CLOUD_STEP + 2;
+    wideAz_.assign((size_t)cgW_ * cgH_, 0);
+    wideEl_.assign(wideAz_.size(), 0);
+    for (int j = 0; j < cgH_; ++j)
+        for (int i = 0; i < cgW_; ++i) {
+            double az, el;
+            azel_from_dir(unproject(wideCam_, widePose_, i * CLOUD_STEP, j * CLOUD_STEP), az, el);
+            wideAz_[(size_t)j * cgW_ + i] = (float)az;
+            wideEl_[(size_t)j * cgW_ + i] = (float)el;
+        }
+    wideSky_.clear();
+    wideSkyT_ = -1;
 }
 
 void Emulator::stop() {
@@ -458,6 +525,7 @@ void Emulator::stop() {
     wcv_.notify_all();
     if (th_.joinable()) th_.join();
     pipe_.close();
+    if (link_) link_->stop();
     running_ = false;
 }
 
@@ -1022,8 +1090,10 @@ ui:
     view_.rateEl = (float)mount_.vel;
     view_.win = win_;
     view_.winOn = winOn_;
+    view_.widePose = widePose_;
     view_.truth.clear();
     for (const Body& b : bodies_) {
+        if (b.hidden) continue;
         View::TruthPt p{};
         const Vec3 d = b.at(t);
         double u, v;
@@ -1053,6 +1123,37 @@ ui:
 }
 
 void Emulator::loop() {
+    if (sceneMode_) {   // Godot — отдельный процесс на своих ядрах; сцена строится несколько секунд
+        {
+            std::lock_guard<std::mutex> lk(vm_);
+            view_.status = "запуск 3D-сцены...";
+        }
+        if (!link_) link_.reset(new scene::Link());
+        scene::Options o;
+        o.godot = c_.godot;
+        o.project = c_.simProject;
+        o.scene = c_.scene;
+        o.sector = c_.sector;
+        o.affinity = c_.renderAffinity;
+        char hello[600];
+        snprintf(hello, sizeof(hello),
+                 "{\"wide\": [%d, %d, %.3f, %.3f], \"fine\": [%d, %d, %.3f, %.3f], \"seed\": %u, \"drones\": %d, "
+                 "\"birds\": %d, \"range\": [%.1f, %.1f], \"types\": {\"quad\": %.3f, \"delta\": %.3f, \"plane\": %.3f}, "
+                 "\"az\": %.3f, \"el\": %.3f, \"sector\": %s}",
+                 c_.wideW, c_.wideH, c_.wideFov, c_.wideFps, c_.narrowW, c_.narrowH, c_.narrowFov, c_.narrowFps, c_.seed,
+                 c_.drones, c_.birds, c_.rangeMin, c_.rangeMax, c_.quadShare, c_.deltaShare, c_.planeShare, widePose_.az,
+                 widePose_.el, c_.sector.empty() ? "false" : "true");
+        std::string err;
+        if (!link_->start(o, hello, err)) {
+            std::lock_guard<std::mutex> lk(vm_);
+            view_.status = "3D-сцена: " + err;
+            view_.running = false;
+            running_ = false;
+            return;
+        }
+        std::lock_guard<std::mutex> lk(vm_);
+        view_.status.clear();
+    }
     double t = 0, nextWide = 0;
     const double dtN = 1.0 / std::max(1.f, c_.narrowFps);
     const double wall0 = now_s();
@@ -1068,8 +1169,17 @@ void Emulator::loop() {
             continue;
         }
         if (t >= nextWide - 1e-9) {
-            // тела, вылетевшие из поля зрения широкой или ушедшие далеко, — заново
+            if (poseReq_ != poseSeen_) {   // широкую повернули кнопками
+                poseSeen_ = poseReq_;
+                widePose_ = {wantAz_, std::max(-10.f, std::min(80.f, (float)wantEl_)), 0};
+                if (!sceneMode_) prepareWide();
+                char b[96];
+                snprintf(b, sizeof(b), "широкая повёрнута: азимут %.0f°, угол места %.0f°", widePose_.az, widePose_.el);
+                event(t, b);
+            }
+            // тела, вылетевшие из поля зрения широкой или ушедшие далеко, — заново (в 3D-сцене их ведёт сцена)
             for (Body& b : bodies_) {
+                if (sceneMode_) break;
                 const Vec3 d = b.at(t);
                 const double R = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
                 double u, v, az, el;
@@ -1275,6 +1385,11 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-veto") c.narrowVeto = false;
         else if (a == "--no-cue") c.wideCue = false;
         else if (a == "--legacy") c.narrowSilhouette = c.narrowHold = c.narrowVeto = c.wideCue = false;
+        else if (a == "--scene") c.scene = val();
+        else if (a == "--sector") c.sector = val();
+        else if (a == "--godot") c.godot = val();
+        else if (a == "--az") c.wideAz = (float)atof(val().c_str());
+        else if (a == "--el") c.wideEl = (float)atof(val().c_str());
         else {
             printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 250,1200]\n"
                    "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--types 0.5,0.25,0.25] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
@@ -1282,11 +1397,33 @@ int run_cli(int argc, char** argv) {
                    "  [--switch queue|nearest|manual] [--json out.json] [--quiet]\n"
                    "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window] [--no-lock-focus]\n"
                    "  [--min-hold 0.08] [--give-up 3] [--cool-down 10]\n"
-                   "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--legacy — всё выключено]\n");
+                   "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--legacy — всё выключено]\n"
+                   "  3D-сцена Godot вместо синтетического неба: [--scene sim/scenes/city_sectors.json] [--sector highrise]\n"
+                   "  [--godot путь] [--az 0] [--el 32]\n");
             return a == "--help" ? 0 : 2;
         }
     }
+    if (!c.scene.empty()) {
+        std::string sim, godot = c.godot;
+        if (c.simProject.empty() && scene::find_sim(".", sim, godot)) c.simProject = sim + "/godot";
+        if (c.simProject.empty()) {   // путь к сцене sim/scenes/x.json — проект рядом
+            const std::string d = c.scene.substr(0, c.scene.find_last_of("/\\"));
+            c.simProject = d + "/../godot";
+        }
+        if (c.godot.empty()) c.godot = godot;
+        if (c.godot.empty()) {
+            printf("не найден Godot 4.3: --godot путь или переменная GODOT\n");
+            return 2;
+        }
+        if (!c.sector.empty())   // ось широкой — на середину сектора
+            for (const auto& sc : scene::scene_sectors(c.scene))
+                if (sc.name == c.sector) c.wideAz = sc.mid;
+    }
     const Stats s = e.runBlocking(c, seconds, verbose);
+    if (!c.scene.empty() && s.wideFrames == 0) {
+        printf("%s\n", e.view().status.c_str());
+        return 1;
+    }
     float lm, l9, am, a9, wm, w9;
     pct(s.errLock, lm, l9);
     pct(s.errAxis, am, a9);

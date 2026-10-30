@@ -24,6 +24,9 @@ env:
   FFMPEG_SHA256: '733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1'
   SDL2_VERSION: '2.30.11'
   SDL2_SHA256: '0590db0a47b564aab92499ed03eaa75db9aee17c371080caa3b05df9d49d9ff9'
+  # Godot 4.3 для 3D-сцен эмулятора (sim/): сумма архива снята при первой загрузке 2026-10-30
+  GODOT_VERSION: '4.3-stable'
+  GODOT_WIN_SHA256: '8f2c75b734bd956027ae3ca92c41f78b5d5a255dacc0f20e4e3c523c545ad410'
 
 jobs:
   # Ядро + тесты + приложение под Linux x64, синтетическое видео для проверки
@@ -125,6 +128,15 @@ jobs:
           cp build-win/Dronolok.exe build-win/native/dronolok_bench.exe build-win/native/dronolok.dll $d/
           cp app/README.md $d/README.md
           cp native/include/dronolok/dronolok.h native/python/dronolok_native.py $d/
+          # 3D-сцены для эмулятора двух камер: проект Godot, сцены и сам Godot (sim/Godot.exe)
+          mkdir -p $d/sim
+          cp -r sim/godot sim/scenes sim/README.md $d/sim/
+          rm -rf $d/sim/godot/.godot
+          f="$RUNNER_TEMP/godot-win.zip"
+          curl -fsSL -o "$f" "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_win64.exe.zip"
+          echo "$GODOT_WIN_SHA256  $f" | sha256sum -c -
+          unzip -q -j "$f" "Godot_v${GODOT_VERSION}_win64.exe" -d "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/Godot_v${GODOT_VERSION}_win64.exe" $d/sim/Godot.exe
           x86_64-w64-mingw32-objdump -p $d/Dronolok.exe | grep -i "DLL Name" | sort -u
           mkdir -p win-tests && cp build-win/native/test_kernels.exe win-tests/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -22,7 +22,9 @@
 #include <dirent.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <signal.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -86,6 +88,11 @@ bool set_cpu_cap(int percent) {
         if (percent >= 100) return true;
         g_job = CreateJobObjectW(nullptr, nullptr);
         if (!g_job || !AssignProcessToJobObject(g_job, GetCurrentProcess())) return false;
+        // дочерние процессы (отрисовка сцены) могут выйти из-под потолка: он только для алгоритма
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+        memset(&li, 0, sizeof(li));
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &li, sizeof(li));
     }
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION info;
     memset(&info, 0, sizeof(info));
@@ -178,6 +185,47 @@ void attach_console() {
         freopen("CONOUT$", "w", stderr);
         SetConsoleOutputCP(CP_UTF8);
     }
+}
+
+static std::wstring widen(const std::string& s) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? n : 1, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    w.resize(n > 0 ? n - 1 : 0);
+    return w;
+}
+
+void* proc_start(const std::vector<std::string>& args, uint64_t affinity, std::string& err) {
+    std::wstring cmd;
+    for (const auto& a : args) {
+        if (!cmd.empty()) cmd += L' ';
+        cmd += L'"' + widen(a) + L'"';
+    }
+    STARTUPINFOW si;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+    DWORD fl = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+    BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, fl | CREATE_BREAKAWAY_FROM_JOB, nullptr,
+                             nullptr, &si, &pi);
+    if (!ok) ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, fl, nullptr, nullptr, &si, &pi);
+    if (!ok) {
+        err = "не запустился " + (args.empty() ? std::string() : args[0]) + " (ошибка " + std::to_string(GetLastError()) + ")";
+        return nullptr;
+    }
+    if (affinity) SetProcessAffinityMask(pi.hProcess, (DWORD_PTR)affinity);
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
+
+bool proc_alive(void* p) { return p && WaitForSingleObject((HANDLE)p, 0) == WAIT_TIMEOUT; }
+
+void proc_stop(void* p) {
+    if (!p) return;
+    if (proc_alive(p) && WaitForSingleObject((HANDLE)p, 1500) == WAIT_TIMEOUT) TerminateProcess((HANDLE)p, 1);
+    CloseHandle((HANDLE)p);
 }
 
 #else  // Linux и прочие unix
@@ -288,6 +336,52 @@ std::vector<std::string> ui_fonts() {
 }
 
 void attach_console() {}
+
+void* proc_start(const std::vector<std::string>& args, uint64_t affinity, std::string& err) {
+    if (args.empty()) return nullptr;
+    const pid_t pid = fork();
+    if (pid < 0) {
+        err = "fork не удался";
+        return nullptr;
+    }
+    if (pid == 0) {
+        if (affinity) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            for (int i = 0; i < 64; ++i)
+                if (affinity >> i & 1) CPU_SET(i, &set);
+            sched_setaffinity(0, sizeof(set), &set);
+        }
+        std::vector<char*> av;
+        for (const auto& a : args) av.push_back(const_cast<char*>(a.c_str()));
+        av.push_back(nullptr);
+        execvp(av[0], av.data());
+        _exit(127);
+    }
+    return new pid_t(pid);
+}
+
+bool proc_alive(void* p) {
+    if (!p) return false;
+    pid_t* pid = (pid_t*)p;
+    if (*pid <= 0) return false;
+    int st = 0;
+    if (waitpid(*pid, &st, WNOHANG) == 0) return true;
+    *pid = 0;
+    return false;
+}
+
+void proc_stop(void* p) {
+    if (!p) return;
+    pid_t* pid = (pid_t*)p;
+    if (proc_alive(p)) {
+        kill(*pid, SIGTERM);
+        for (int i = 0; i < 150 && proc_alive(p); ++i) usleep(10000);
+        if (proc_alive(p)) kill(*pid, SIGKILL);
+        if (*pid > 0) waitpid(*pid, nullptr, 0);
+    }
+    delete pid;
+}
 
 #endif
 
