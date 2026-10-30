@@ -195,11 +195,29 @@ static std::wstring widen(const std::string& s) {
     return w;
 }
 
+// аргумент в кавычках по правилам CommandLineToArgvW: обратные косые перед кавычкой удваиваются,
+// кавычка внутри экранируется («D:\Godot\» или имя сектора с кавычкой не склеивают аргументы)
+static void quote_arg(const std::wstring& a, std::wstring& cmd) {
+    cmd += L'"';
+    size_t bs = 0;
+    for (wchar_t c : a) {
+        if (c == L'\\') {
+            ++bs;
+            continue;
+        }
+        cmd.append(c == L'"' ? bs * 2 + 1 : bs, L'\\');
+        bs = 0;
+        cmd += c;
+    }
+    cmd.append(bs * 2, L'\\');
+    cmd += L'"';
+}
+
 void* proc_start(const std::vector<std::string>& args, uint64_t affinity, std::string& err) {
     std::wstring cmd;
     for (const auto& a : args) {
         if (!cmd.empty()) cmd += L' ';
-        cmd += L'"' + widen(a) + L'"';
+        quote_arg(widen(a), cmd);
     }
     STARTUPINFOW si;
     memset(&si, 0, sizeof(si));

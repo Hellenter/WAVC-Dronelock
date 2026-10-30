@@ -94,6 +94,10 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
         f_ = 1;
         while (w / f_ > MAX_SIDE || h / f_ > MAX_SIDE) f_ *= 2;
     }
+    if (!gray || w < f_ || h < f_) {   // полоса уже блока уменьшения (4000x3): строки блока вне кадра
+        ms_ = now_ms() - t0;
+        return res;
+    }
     // уменьшенная копия: среднее 4 точек блока f x f (для f <= 2 — всех)
     std::vector<Img> pyr(1);
     Img& b = pyr[0];
@@ -142,6 +146,7 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
     // от кадра 1/15 с назад — в K раз больше, его хватает уменьшенной копии; за кадр — его K-я доля
     const int K = long_ && fps_ >= 22.5f ? std::min(8, (int)std::lround(fps_ / 15.f)) : 1;
     bool found = false;
+    while ((int)hist_.size() > K) hist_.pop_front();   // частоту сменили (setFps): база — ровно K кадров назад
     if (K > 1 && (int)hist_.size() >= K && hist_.front().size() == pyr.size()) {
         res = match(pyr, hist_.front(), K);
         found = res.valid;

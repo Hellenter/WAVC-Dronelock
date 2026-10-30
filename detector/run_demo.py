@@ -7,7 +7,7 @@
 h264 не должно входить в замер). Время детекции и трекинга меряется отдельно
 от отрисовки и записи демо.
 """
-import argparse, json, os, sys, time
+import argparse, json, os, subprocess, sys, time
 import numpy as np, cv2
 from detector import PointDetector, Tracker
 
@@ -150,8 +150,10 @@ def main():
                     break
     if writer is not None:
         writer.release()
-        os.system(f'ffmpeg -loglevel error -y -i "{a.out}.tmp.avi" -c:v libx264 -crf 23 -pix_fmt yuv420p "{a.out}" '
-                  f'&& rm "{a.out}.tmp.avi"')
+        # список аргументов, без оболочки: имя файла с кавычкой или ; не выполняется как команда
+        if subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", a.out + ".tmp.avi", "-c:v", "libx264", "-crf", "23",
+                           "-pix_fmt", "yuv420p", a.out]).returncode == 0:
+            os.remove(a.out + ".tmp.avi")
     ms = np.array(times) * 1000
     res = dict(mask=bool(a.learn_mask), resolution=f"{frames[0].shape[1]}x{frames[0].shape[0]}", pool=a.pool, k=a.k,
                threads=cv2.getNumThreads(), frames=len(ms),

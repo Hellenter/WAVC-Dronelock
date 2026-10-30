@@ -201,6 +201,7 @@ static DetectorConfig sanitize(DetectorConfig c) {
     c.tile = std::max(8, std::min(128, c.tile));
     c.max_cands = std::max(1, c.max_cands);
     c.scales = std::max(1, std::min(4, c.scales));
+    c.threads = std::max(0, std::min(256, c.threads));   // 0 — по числу ядер
     c.focus_k = std::max(0.2f, std::min(1.f, c.focus_k));
     c.full_every = std::max(1, std::min(16, c.full_every));
     c.coarse_every = std::max(1, std::min(16, c.coarse_every));
@@ -457,7 +458,7 @@ void Detector::markSoftCloud(float frac) {
     softCol_.clear();
     const size_t n = (size_t)tw_ * th_;
     const int nt = texN_ * ((int)cfg_.dark + (int)cfg_.bright);
-    if (!cfg_.sky_color || nt == 0 || texSum_.size() != n || colN_.size() != n) return;
+    if (!cfg_.sky_color || n == 0 || nt == 0 || texSum_.size() != n || colN_.size() != n) return;
     // цвет вообще есть: у серой (ИК) камеры U и V около 128 по всему кадру
     size_t colored = 0, all = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -647,16 +648,14 @@ bool Detector::saveMask(const std::string& path) const {
     if (verifyLeft_ && fileGrown_.size() == n) grown = fileGrown_;   // ещё сверяется: слой из файла
     else if (grownT_.size() == n)
         for (size_t i = 0; i < n; ++i) grown[i] = grownT_[i] && !mask_[i] ? (polOpenAt(0, i) ? 2 : 1) : 0;
-    FILE* f = open_file(path, "wb");
-    if (!f) return false;
     const int32_t hdr[6] = {w_, h_, cfg_.pool, cfg_.tile, tw_, th_};
-    bool ok = std::fwrite(kMaskMagic, 1, 8, f) == 8 && std::fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
-              std::fwrite(mask_.data(), 1, n, f) == n && std::fwrite(grown.data(), 1, n, f) == n;
-    ok = std::fclose(f) == 0 && ok;
-    return ok;
+    return write_file_replace(path, "wb", [&](FILE* f) {
+        return std::fwrite(kMaskMagic, 1, 8, f) == 8 && std::fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
+               std::fwrite(mask_.data(), 1, n, f) == n && std::fwrite(grown.data(), 1, n, f) == n;
+    });
 }
 
-bool Detector::loadMask(const std::string& path, int verify) {
+bool Detector::loadMask(const std::string& path, int verify, int w, int h) {
     FILE* f = open_file(path, "rb");
     if (!f) return false;
     char magic[8];
@@ -668,7 +667,13 @@ bool Detector::loadMask(const std::string& path, int verify) {
          hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 && hdr[5] > 0 &&
          hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
          // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
-         hdr[0] <= kMaxSide && hdr[1] <= kMaxSide;
+         hdr[0] <= kMaxSide && hdr[1] <= kMaxSide && (w <= 0 || h <= 0 || (hdr[0] == w && hdr[1] == h));
+    if (ok) {   // испорченный заголовок в пределах kMaxSide: не выделять десятки МБ под короткий файл
+        const long here = std::ftell(f);
+        const size_t need = (size_t)hdr[4] * hdr[5] * ((v3 || v2) ? 2 : 1);
+        ok = here >= 0 && std::fseek(f, 0, SEEK_END) == 0 && std::ftell(f) - here >= (long)need &&
+             std::fseek(f, here, SEEK_SET) == 0;
+    }
     std::vector<uint8_t> m, g;
     if (ok) {
         m.resize((size_t)hdr[4] * hdr[5]);
@@ -1032,9 +1037,12 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
         mask_.clear();
         verifyLeft_ = 0;
         fileGrown_.clear();
-        if (learning_) {
+        if (learning_) {   // обучение — с нуля: кадры прежнего размера в счёте texN_ давали маску «всё небо»
             texSum_.assign((size_t)tw_ * th_, 0.f);
             for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
+            texN_ = 0;
+            resetColor();
+            resetGrow();
         }
     }
     // как cv2.threshold(R, thr*0.6) на u8: горячий, если R > floor(thr*0.6)
@@ -1187,6 +1195,9 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     markFocus(tw_, th_, T * s);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
+    // полярность выключили по ходу (ночь, снег, профиль Pi): её текстура с последнего кадра не держится
+    if (!cfg_.dark) stats_->tex[0].clear();
+    if (!cfg_.bright) stats_->tex[1].clear();
     if (cfg_.lock_through && lockOn_ && !learning_ && !mask_.empty() && (lockPol_ > 0 ? cfg_.bright : cfg_.dark))
         selectThrough(lockPol_ > 0 ? stats_->bright : stats_->dark, lockPol_ > 0 ? 1 : 0, out);
     // фон ячеек читают кромка маски неба и накопление (tbd). Без маски и без накопления (камера

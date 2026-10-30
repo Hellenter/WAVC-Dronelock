@@ -207,6 +207,8 @@ class NativeTracker:
     def __init__(self, shape, fps=None):
         h, w = shape
         self._h = lib().dl_tracker_create(w, h)
+        if not self._h:
+            raise ValueError(f"трекер не создан для кадра {w}x{h}")
         if fps:
             self.set_fps(fps)
         self._dets = (_Cand * 4096)()

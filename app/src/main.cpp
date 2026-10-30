@@ -269,13 +269,17 @@ void set_resolution(App& a) {
     if (r.scale > 0) {
         a.s.procW = r.scale == 1.f ? 0 : std::max(64, (int)(vi.w * r.scale) & ~1);
         a.s.procH = r.scale == 1.f ? 0 : std::max(64, (int)(vi.h * r.scale) & ~1);
-    } else {
-        a.s.procW = r.w;
-        a.s.procH = r.h;
+    } else {   // размер камеры — в ориентации видео: портретное с телефона иначе растягивалось втрое
+        const bool portrait = vi.h > vi.w;
+        a.s.procW = portrait ? r.h : r.w;
+        a.s.procH = portrait ? r.w : r.h;
     }
 }
 
+void ann_flush(App& a);
+
 void open_video(App& a, const std::string& path) {
+    ann_flush(a);   // разметка прошлого видео: точки «за целью» и ещё не записанные
     a.err.clear();
     a.shown.reset();
     a.texSeq = -1;
@@ -470,6 +474,14 @@ void ann_follow_stop(App& a, const char* why) {
     if (a.annDirty) ann_changed(a);
     a.annDirty = false;
     if (why) a.annMsg = why;
+}
+
+// перед сменой видео и выходом: последняя точка «за целью» и точки, ждущие автосохранения (раз в секунду)
+void ann_flush(App& a) {
+    if (!a.pipe.isOpen()) return;
+    ann_follow_stop(a, nullptr);
+    if (a.annDirty) ann_changed(a);
+    a.annDirty = false;
 }
 
 // Трек алгоритма рядом с местом, где цель видели: трекер сбросил треки (маска неба выучена
@@ -4134,6 +4146,7 @@ int main(int argc, char** argv) {
         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), a.ren);
         SDL_RenderPresent(a.ren);
     }
+    ann_flush(a);
     a.emu.stop();
     a.emuView = twocam::View();
     a.pipe.close();
