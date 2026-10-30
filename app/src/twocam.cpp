@@ -506,7 +506,7 @@ void Emulator::assign(double t, int wideId, const char* why) {
     state_ = wideId ? NState::Slew : NState::Idle;
     nlock_ = 0;
     haveNrep_ = false;
-    tAssign_ = tState_ = t;
+    tAssign_ = tState_ = tWideSeen_ = t;
     tInView_ = -1;
     tSearch_ = -1;
     gotThis_ = false;
@@ -538,7 +538,7 @@ bool Emulator::vetoed(double t, const TargetReport& r) const {
 
 // Цель есть только у точной: широкая снова видит её — свой трек широкой у неё теперь этот
 void Emulator::rebind(double t) {
-    if (!nOnly_ || !haveNrep_ || state_ != NState::Track) return;
+    if (!nOnly_ || !haveNrep_ || (state_ != NState::Track && t - tLastSeen_ > c_.narrowLostHold)) return;
     double naz, nel, nsg;
     predict(nrep_, t, naz, nel, nsg);
     const double half = 0.5 * nrep_.size_deg;
@@ -562,6 +562,7 @@ void Emulator::rebind(double t) {
     assigned_ = best;
     nOnly_ = false;
     ++st_.rebinds;
+    tWideSeen_ = t;
     for (const auto& w : targets_)
         if (w.id == best && w.truth) assignedBody_ = w.truth;
     char b[160];
@@ -618,7 +619,9 @@ void Emulator::choose(double t) {
     }
     // назначенную широкая потеряла: точная, уверенная в дроне, держит её сама (и ищет по своему
     // прогнозу); иначе — если точная её ведёт, ведём дальше, а нет — отпускаем
-    if (assigned_ && !nOnly_ && !find(assigned_) && c_.narrowHold && nConf_ &&
+    // (трек широкой выпадает из её сообщения на кадр-другой, когда цель слабая: это ещё не потеря)
+    if (assigned_ && find(assigned_)) tWideSeen_ = t;
+    if (assigned_ && !nOnly_ && !find(assigned_) && t - tWideSeen_ > 0.5 && c_.narrowHold && nConf_ &&
         (state_ == NState::Track || t - tLastSeen_ < c_.narrowLostHold)) {
         nOnly_ = true;
         ++st_.kept;
@@ -733,9 +736,13 @@ void Emulator::stepNarrow(double t, double dt) {
     if (c_.narrowSilhouette) {
         float lx, ly, lr;
         int lp;
-        if (ntrk_->lockSearch((float)dx, (float)dy, lx, ly, lr, lp))
-            ntrk_->setLockSilhouette(measure_silhouette(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, lx, ly, lr, lp,
-                                                        std::max(6.f, 0.8f * ndet_->threshold()), ntrk_->config().silh_max));
+        if (ntrk_->lockSearch((float)dx, (float)dy, lx, ly, lr, lp)) {
+            // только крупной цели: у дальней в 2–4 пикс. силуэт по шуму дёргает трек на пиксель-другой, его
+            // скорость сбивается, и поворотка по ней уводит цель из центра (сцена 5: крыло за 1 км потеряно за 0.4 с)
+            const Silhouette sh = measure_silhouette(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, lx, ly, lr, lp,
+                                                     std::max(6.f, 0.8f * ndet_->threshold()), ntrk_->config().silh_max);
+            if (sh.valid && std::max(sh.w, sh.h) >= c_.silhMinPx) ntrk_->setLockSilhouette(sh);
+        }
     }
     const std::vector<Track>& tr = ntrk_->update(ncands_, (float)dx, (float)dy);
     const double npd = pixel_deg(narrowCam_, enc, narrowCam_.w * 0.5, narrowCam_.h * 0.5);   // град на пиксель точной
@@ -797,15 +804,11 @@ void Emulator::stepNarrow(double t, double dt) {
         double bd = 1e18;
         for (const Track& x : tr) {
             if (!winOn_) break;   // ни широкая, ни своя память не говорят, где цель: любой трек в кадре — не она
+            // цель только у точной, и та её потеряла: сама заново не берёт — широкая не подтвердит, что
+            // найденное — она, а это обычно кромка леса или облако, куда цель ушла (на сценах: 1–2 с на
+            // чужом треке). Поворотка идёт по прогнозу, пока широкая не увидит цель снова (rebind)
+            if (nOnly_) break;
             if (x.clutter || x.miss > 0 || x.hits < minHits) continue;
-            // цель только у точной, и та её потеряла: широкая не подтвердит, что найденное — она. Берём
-            // только то, что держится дольше и летит по сцене не меньше половины её прежнего хода, — не
-            // кромку леса и не облако, в которое она ушла
-            if (nOnly_) {
-                if (x.hits < std::max(minHits, (int)std::lround(0.3 * c_.narrowFps)) || x.cls == TargetClass::Bird) continue;
-                const double vpx = std::hypot(nrep_.vaz * std::cos(nrep_.el * PI / 180), nrep_.vel) / npd / c_.narrowFps;
-                if (x.travel < std::max(3.0, 0.5 * vpx * x.age)) continue;
-            }
             const double d = std::hypot(x.x - win_.u, x.y - win_.v);
             if (c_.windowFocus && winOn_ && d > win_.radius) continue;
             if (wt && c_.wideCheck) {
@@ -817,7 +820,7 @@ void Emulator::stepNarrow(double t, double dt) {
                     if (!c_.narrowSilhouette || a > tol + 3) continue;
                     const Silhouette sh = measure_silhouette(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, x.x, x.y, 6.f,
                                                              x.polarity, std::max(6.f, 0.8f * ndet_->threshold()), 200.f);
-                    if (!sh.valid) continue;
+                    if (!sh.valid || std::max(sh.w, sh.h) < c_.silhMinPx) continue;
                     double saz, sel;
                     azel_from_dir(unproject(narrowCam_, enc, sh.x, sh.y), saz, sel);
                     if (ang(saz, sel, waz, wel) > tol + 0.5 * npd * std::max(sh.w, sh.h)) continue;
@@ -1267,6 +1270,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--give-up") c.giveUp = (float)atof(val().c_str());
         else if (a == "--cool-down") c.coolDown = (float)atof(val().c_str());
         else if (a == "--no-silhouette") c.narrowSilhouette = false;
+        else if (a == "--silh-min") c.silhMinPx = (float)atof(val().c_str());
         else if (a == "--no-hold") c.narrowHold = false;
         else if (a == "--no-veto") c.narrowVeto = false;
         else if (a == "--no-cue") c.wideCue = false;
