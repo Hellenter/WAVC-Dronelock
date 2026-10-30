@@ -91,6 +91,9 @@ struct VideoMeta {
     long frames = 0;
     bool gt = false;
     bool noDrones = false;   // по разметке в ролике нет ни одной цели
+    std::string codec;
+    std::string fpsNote;     // частота не из контейнера (fps_note): «голый» поток, файл меток
+    bool fpsAssumed = false; // частота в файле не записана — нужна video_fps или файл меток
 };
 
 // Итог одного прогона «видео x вариант». Отрицательное значение — нет данных

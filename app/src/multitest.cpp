@@ -564,6 +564,9 @@ static VideoMeta probe(const std::string& path) {
         m.h = vi.h;
         m.fps = vi.fps;
         m.frames = (long)vi.frames;
+        m.codec = vi.codec;
+        m.fpsNote = fps_note(vi);
+        m.fpsAssumed = vi.fpsFrom == FpsFrom::Assumed;
     }
     GroundTruth g;
     m.gt = g.load(path + ".gt.json");
@@ -1128,6 +1131,9 @@ int run_cli(int argc, char** argv) {
                st.outDir.c_str());
         if (!st.error.empty()) printf("  %s\n", st.error.c_str());
         for (const auto& x : var) printf("  вариант: %s\n", x.name.c_str());
+        for (const auto& x : v)   // частота не из контейнера: от неё зависят скорости трекера
+            if (!x.fpsNote.empty() && !(x.fpsAssumed && c.base.s.videoFps > 0))
+                printf("  %s: %s\n", x.file.c_str(), x.fpsNote.c_str());
     }
     int shown = 0;
     while (r.running()) {
