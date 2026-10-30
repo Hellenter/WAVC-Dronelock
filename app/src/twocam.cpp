@@ -375,6 +375,7 @@ void Emulator::start(const Config& c) {
     // точная
     DetectorConfig dc;
     dc.scales = c.narrowScales;   // цель в узком поле крупнее: несколько масштабов
+    dc.auto_thr = c.narrowAutoThr;
     dc.threads = 2;
     ndet_.reset(new Detector(dc));
     ntrk_.reset(new Tracker(c.narrowW, c.narrowH, tracker_for_fps(TrackerConfig(), c.narrowFps)));
@@ -1036,6 +1037,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-window") c.windowFocus = false;
         else if (a == "--no-lock-focus") c.lockFocus = false;
         else if (a == "--nscales") c.narrowScales = atoi(val().c_str());
+        else if (a == "--nauto") c.narrowAutoThr = atoi(val().c_str()) != 0;
         else if (a == "--dump") sscanf(val().c_str(), "%lf,%lf", &e.dumpAt_, &e.dumpLen_);
         else if (a == "--no-wide-check") c.wideCheck = false;
         else if (a == "--min-hold") c.minHold = (float)atof(val().c_str());

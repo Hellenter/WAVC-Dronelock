@@ -51,6 +51,7 @@ struct Config {
     float narrowFov = 20, narrowFps = 60;
     float maxRate = 30, maxAccel = 150;   // град/с, град/с²
     int narrowScales = 2;                 // масштабов детектора точной
+    bool narrowAutoThr = false;           // порог детектора точной по шуму кадра (CFAR)
     float encoderDeg = 0.01f;             // дискретность датчиков угла
     float handoffLatency = 0.06f;         // от кадра широкой до команды поворотке, с
     // наведение
