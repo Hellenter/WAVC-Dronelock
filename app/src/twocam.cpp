@@ -307,7 +307,10 @@ int Emulator::nearestBody(double t, double az, double el, double maxDeg) const {
     double bd = maxDeg;
     const Vec3 d = dir_from_azel(az, el);
     for (const Body& b : bodies_) {
-        const double a = angle_between(d, b.at(t));
+        // крупная цель — не точка: попадание в её силуэт (крыло, хвост) — тоже она
+        const Vec3 q = b.at(t);
+        const double R = std::max(1.0, std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z));
+        const double a = angle_between(d, q) - 0.5 * b.size / R * 180 / PI;
         if (a < bd) {
             bd = a;
             best = b.id;
