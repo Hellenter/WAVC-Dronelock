@@ -106,6 +106,7 @@ const std::vector<Param>& params() {
         {"step", "Камера реже видео: каждый N-й кадр", "Видео", false, "1, 4, 6", S(frameStep)},
         {"phase", "Камера реже видео: с какого кадра файла считать шаг (сдвиг)", "Видео", false, "0, 1, 2, 3", S(framePhase)},
         {"cam_fps", "Частота камеры, к/с (0 — как в видео)", "Видео", false, "0, 15, 30", S(targetFps)},
+        {"video_fps", "Настоящая частота кадров файла, к/с (0 — из файла; для .h264/.mjpeg без времени кадров)", "Видео", false, "0, 10, 14", S(videoFps)},
         // Тонко: порог
         {"auto_thr", "Порог по шуму", "Тонко", true, "0, 1", D(auto_thr)},
         {"noise_k", "Порог: во сколько раз выше шума", "Тонко", false, "8, 12, 16", D(noise_k)},
@@ -378,7 +379,10 @@ void apply_algo(Settings& dst, const Settings& src) {
 // ------------------------------------------------------------ видео в папке
 
 bool is_video_file(const std::string& name) {
-    static const char* ext[] = {".mp4", ".mkv", ".avi", ".mov", ".ts", ".y4m", ".webm", ".m4v", ".mts"};
+    // .h264/.h265/.mjpeg — «голые» потоки rpicam-vid (камера установки)
+    static const char* ext[] = {".mp4",  ".mkv",  ".avi", ".mov",   ".ts",   ".y4m",   ".webm",
+                                ".m4v",  ".mts",  ".h264", ".264",  ".h265", ".hevc", ".265",
+                                ".mjpeg", ".mjpg"};
     std::string n = name;
     for (char& c : n) c = (char)tolower((unsigned char)c);
     for (const char* e : ext) {
@@ -575,8 +579,9 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, int varIdx, in
     Settings s = var.setup.s;
     if (phase >= 0) s.framePhase = phase;
     s.pace = c.realtime ? Pace::Realtime : Pace::MaxSpeed;
+    const double vfps = s.videoFps > 0 ? s.videoFps : vm.fps;   // частота файла, заданная вручную
     // частота камеры — только медленнее видео (пропуск кадров); быстрее — темп подачи, здесь не нужен
-    if (!(s.targetFps > 0 && vm.fps > 0 && s.targetFps < 0.99 * vm.fps)) s.targetFps = 0;
+    if (!(s.targetFps > 0 && vfps > 0 && s.targetFps < 0.99 * vfps)) s.targetFps = 0;
     s.speed = 1;
     s.source = Source::Stream;
     s.loop = false;
@@ -603,7 +608,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, int varIdx, in
     Collector col;
     col.maxFrames = c.maxFrames;
     // номера кадров — файла, маска учится по обработанным
-    const double fstep = std::max(1, s.frameStep) * (s.targetFps > 0 ? vm.fps / s.targetFps : 1.0);
+    const double fstep = std::max(1, s.frameStep) * (s.targetFps > 0 ? vfps / s.targetFps : 1.0);
     col.warmup = (int)std::lround(c.warmup * fstep) + (fstep > 1.0001 ? std::max(0, s.framePhase) : 0);
     // радиус задан в пикселях исходного кадра; при уменьшенной обработке — меньше
     col.radius = c.radius * (s.procW && vm.w ? (float)s.procW / vm.w : 1.f);
@@ -680,7 +685,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, int varIdx, in
         rr.lockOnDrone = col.dFrames ? 100.0 * col.lockOnD / col.dFrames : -1;
         rr.hardOnDrone = col.dFrames ? 100.0 * col.hardOnD / col.dFrames : -1;
         rr.falseLock = col.lockEv ? 100.0 * col.falseLockF / col.lockEv : 0;
-        const double fps = vm.fps > 0 ? vm.fps : 25;
+        const double fps = vfps > 0 ? vfps : 25;
         if (col.firstGt >= 0 && col.firstDet >= 0) rr.firstDetectS = std::max(0.0, (col.firstDet - col.firstGt) / fps);
         if (col.firstGt >= 0 && col.firstLock >= 0) rr.firstLockS = std::max(0.0, (col.firstLock - col.firstGt) / fps);
         // оценка 0..100: обнаружение и захват на дроне, минус ложные захваты и ложные цели
@@ -885,7 +890,8 @@ bool Runner::start(const Config& c, std::string& err) {
         res_.clear();
         for (int v = 0; v < (int)videos_.size(); ++v)
             for (int k = 0; k < (int)variants_.size(); ++k) {
-                const int np = cfg_.allPhases ? phase_count(variants_[k].setup.s, videos_[v].fps) : 1;
+                const Settings& vs = variants_[k].setup.s;
+                const int np = cfg_.allPhases ? phase_count(vs, vs.videoFps > 0 ? vs.videoFps : videos_[v].fps) : 1;
                 for (int ph = 0; ph < np; ++ph) {
                     RunResult r;
                     r.video = v;

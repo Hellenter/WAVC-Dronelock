@@ -2,7 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#include "dronolok/fileutil.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -60,7 +64,122 @@ static void plane_orient(const uint8_t* s, int sw, int sh, size_t ss, uint8_t* d
         }
 }
 
+// «Голый» поток кадров без контейнера (rpicam-vid пишет .h264 и .mjpeg так): времени кадров в нём нет,
+// FFmpeg нумерует их сам по частоте из параметров потока или по 25 к/с
+static bool is_raw_stream(const std::string& f) {
+    static const char* raw[] = {"h264",     "hevc",      "vvc",       "mjpeg",      "mjpeg_2000", "jpeg_pipe",
+                                "image2pipe", "m4v",      "mpegvideo", "h263",       "rawvideo"};
+    for (const char* r : raw)
+        if (f == r) return true;
+    return false;
+}
+
+std::string fps_note(const VideoInfo& vi) {
+    char b[512];
+    switch (vi.fpsFrom) {
+        case FpsFrom::Assumed:
+            snprintf(b, sizeof(b),
+                     "в файле (%s) нет времени кадров: частота %.4g к/с взята из потока или по умолчанию — если камера "
+                     "снимала с другой частотой, укажите её (Видео → частота кадров файла) или положите рядом файл меток "
+                     "rpicam-vid --save-pts",
+                     vi.format.c_str(), vi.fps);
+            return b;
+        case FpsFrom::Timecodes: {
+            std::string f = vi.timecodes;
+            const size_t sl = f.find_last_of("/\\");
+            if (sl != std::string::npos) f = f.substr(sl + 1);
+            snprintf(b, sizeof(b), "частота по меткам времени %s, пропущено кадров: %lld", f.c_str(), (long long)vi.dropped);
+            return b;
+        }
+        case FpsFrom::User:
+            snprintf(b, sizeof(b), "частота задана вручную (в файле %.4g к/с)", vi.fileFps);
+            return b;
+        default:
+            return "";
+    }
+}
+
 VideoSource::~VideoSource() { close(); }
+
+// Шаг меток, которые FFmpeg проставил «голому» потоку: по нему метки переводятся в номера кадров
+// (частота из параметров потока может с ним не совпадать). По первым пакетам, затем чтение с начала
+void VideoSource::measureRawRate() {
+    std::vector<int64_t> ts;
+    AVPacket* p = av_packet_alloc();
+    if (!p) return;
+    for (int n = 0; ts.size() < 48 && n < 4096 && av_read_frame(fmt_, p) >= 0; ++n) {
+        if (p->stream_index == stream_) {
+            const int64_t t = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
+            if (t != AV_NOPTS_VALUE) ts.push_back(t);
+        }
+        av_packet_unref(p);
+    }
+    av_packet_free(&p);
+    std::sort(ts.begin(), ts.end());
+    std::vector<int64_t> d;
+    for (size_t i = 1; i < ts.size(); ++i)
+        if (ts[i] > ts[i - 1]) d.push_back(ts[i] - ts[i - 1]);
+    if (d.size() >= 3 && tb_ > 0) {
+        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+        const double r = 1.0 / ((double)d[d.size() / 2] * tb_);
+        if (r > 0.1 && r < 10000) idxFps_ = r;
+    }
+    if (!ts.empty() && ts.front() < start_) start_ = ts.front();
+    rewind();
+}
+
+// Метки времени кадров рядом с «голым» потоком — rpicam-vid --save-pts <файл>, mkvmerge timecode v2:
+// первая строка "# timecode format v2", дальше по строке на кадр, миллисекунды. Частота — по
+// обычному интервалу, кадр, которого камера не успела снять, — пропуск номера
+void VideoSource::loadTimecodes(const std::string& path) {
+    std::string stem = path;
+    const size_t dot = stem.find_last_of('.'), sl = stem.find_last_of("/\\");
+    if (dot != std::string::npos && (sl == std::string::npos || dot > sl)) stem.resize(dot);
+    const std::string cand[] = {path + ".pts",     stem + ".pts",        stem + ".txt",           stem + "_pts.txt",
+                                stem + ".timestamps", stem + "_timestamps.txt", path + ".txt"};
+    for (const auto& c : cand) {
+        FILE* f = dronolok::open_file(c, "rb");
+        if (!f) continue;
+        std::vector<double> t;
+        char line[256];
+        bool v2 = false;
+        for (int n = 0; fgets(line, sizeof(line), f); ++n) {
+            if (n == 0) {
+                v2 = strstr(line, "timecode format v2") != nullptr;
+                if (!v2) break;
+                continue;
+            }
+            if (line[0] == '#') continue;
+            char* e = nullptr;
+            const double ms = strtod(line, &e);
+            if (e == line || !std::isfinite(ms)) continue;
+            t.push_back(ms / 1000.0);
+            if (t.size() >= 100000000) break;
+        }
+        fclose(f);
+        if (!v2 || t.size() < 3) continue;
+        std::vector<double> d;
+        for (size_t i = 1; i < t.size(); ++i)
+            if (t[i] > t[i - 1]) d.push_back(t[i] - t[i - 1]);
+        if (d.size() < 2) continue;
+        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+        const double dt = d[d.size() / 2];
+        if (!(dt > 1e-4 && dt < 100)) continue;
+        tcIdx_.resize(t.size());
+        int64_t drop = 0;
+        for (size_t i = 0; i < t.size(); ++i) {
+            int64_t k = std::llround((t[i] - t[0]) / dt);
+            if (i && k <= tcIdx_[i - 1]) k = tcIdx_[i - 1] + 1;   // метки не по порядку — подряд
+            if (i) drop += k - tcIdx_[i - 1] - 1;
+            tcIdx_[i] = k;
+        }
+        info_.fps = 1.0 / dt;
+        info_.fpsFrom = FpsFrom::Timecodes;
+        info_.timecodes = c;
+        info_.dropped = drop;
+        return;
+    }
+}
 
 void VideoSource::close() {
     if (sws_) sws_freeContext(sws_);
@@ -73,6 +192,8 @@ void VideoSource::close() {
     eof_ = false;
     info_ = VideoInfo();
     orient_ = Orient();
+    tcIdx_.clear();
+    idxFps_ = 25;
 }
 
 bool VideoSource::open(const std::string& path, int threads, std::string& err) {
@@ -163,12 +284,21 @@ bool VideoSource::open(const std::string& path, int threads, std::string& err) {
     }
     AVRational fr = av_guess_frame_rate(fmt_, st, nullptr);
     info_.fps = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 25.0;
+    idxFps_ = info_.fps;
     tb_ = av_q2d(st->time_base);
     start_ = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
     index_ = -1;
     skipTo_ = 0;
-    if (st->nb_frames > 0) info_.frames = st->nb_frames;
-    else if (fmt_->duration > 0) info_.frames = (int64_t)(fmt_->duration / 1e6 * info_.fps);
+    tcIdx_.clear();
+    info_.format = fmt_->iformat && fmt_->iformat->name ? fmt_->iformat->name : "";
+    if (is_raw_stream(info_.format)) {
+        info_.fpsFrom = FpsFrom::Assumed;
+        measureRawRate();
+        loadTimecodes(path);
+    }
+    if (!tcIdx_.empty()) info_.frames = tcIdx_.back() + 1;
+    else if (st->nb_frames > 0) info_.frames = st->nb_frames;
+    else if (fmt_->duration > 0) info_.frames = (int64_t)(fmt_->duration / 1e6 * idxFps_);
     info_.codec = codec->name;
     const char* pf = av_get_pix_fmt_name(ctx_->pix_fmt);
     info_.pixfmt = pf ? pf : "?";
@@ -288,7 +418,14 @@ bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride, ColorPla
         if (!decodeNext()) return false;
         // номер кадра — по времени показа: после перемотки счёт кадров с начала неизвестен
         const int64_t pts = frame_->best_effort_timestamp;
-        index_ = pts != AV_NOPTS_VALUE && tb_ > 0 ? (int64_t)std::llround((pts - start_) * tb_ * info_.fps) : index_ + 1;
+        if (pts != AV_NOPTS_VALUE && tb_ > 0) {
+            const int64_t k = (int64_t)std::llround((pts - start_) * tb_ * idxFps_);
+            if (tcIdx_.empty() || k < 0) index_ = k;
+            else if (k < (int64_t)tcIdx_.size()) index_ = tcIdx_[(size_t)k];   // по меткам времени камеры
+            else index_ = tcIdx_.back() + (k - ((int64_t)tcIdx_.size() - 1));
+        } else {
+            ++index_;
+        }
         if (index_ >= skipTo_) break;
         av_frame_unref(frame_);   // до нужного кадра после перемотки — без преобразования
     }
@@ -323,7 +460,11 @@ bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride, ColorPla
 bool VideoSource::seek(int64_t frame) {
     if (!fmt_) return false;
     frame = std::max<int64_t>(0, frame);
-    const int64_t ts = start_ + (tb_ > 0 ? (int64_t)(frame / info_.fps / tb_) : 0);
+    int64_t k = frame;   // кадр потока, с которого начинается нужный номер
+    if (!tcIdx_.empty())
+        k = std::min<int64_t>(std::lower_bound(tcIdx_.begin(), tcIdx_.end(), frame) - tcIdx_.begin(),
+                              (int64_t)tcIdx_.size() - 1);
+    const int64_t ts = start_ + (tb_ > 0 ? (int64_t)(k / idxFps_ / tb_) : 0);
     if (av_seek_frame(fmt_, stream_, ts, AVSEEK_FLAG_BACKWARD) < 0 && !rewind()) return false;
     avcodec_flush_buffers(ctx_);
     eof_ = false;

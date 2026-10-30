@@ -67,6 +67,14 @@ jobs:
         run: |
           ffmpeg -loglevel error -i sample/sky16mp.mp4 -frames:v 20 -pix_fmt gray -f yuv4mpegpipe - | ./build-native/dronolok_bench - --frames 20 --sweep
           ./build-app/dronolok_app --bench sample/sky16mp.mp4 --preload 60 --frames 240 --json bench-linux.json
+      - name: Голый поток .mjpeg с метками времени rpicam-vid (частота и пропуски кадров)
+        run: |
+          mkdir -p sample-raw
+          ffmpeg -loglevel error -i sample/sky16mp.mp4 -frames:v 11 -vf "select=not(eq(n\,5))" -fps_mode passthrough -c:v mjpeg -q:v 4 -f mjpeg sample-raw/cam.mjpeg
+          python -c "open('sample-raw/cam.pts','w').write('# timecode format v2\n' + ''.join('%.3f\n' % (k * 1000 / 14) for k in range(12) if k != 5))"
+          ./build-app/dronolok_app --bench sample-raw/cam.mjpeg --frames 8 | tee raw.log
+          grep -q "14.00 к/с" raw.log && grep -q "пропущено кадров: 1" raw.log
+          ./build-app/dronolok_app --bench sample-raw/cam.mjpeg --frames 8 --video-fps 10 | grep -q "10.00 к/с"
       - name: Стресс-проверка приложения (случайные настройки, перемотка, пауза)
         run: timeout 120 ./build-app/dronolok_app --stress sample/sky16mp.mp4 --seconds 30
       - name: Мультитест (без окна, синтетика с разметкой)

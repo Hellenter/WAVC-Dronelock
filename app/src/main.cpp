@@ -1064,6 +1064,12 @@ void panel_main(App& a, bool& changed) {
         ImGui::TextDisabled("%dx%d, %.2f к/с, %s%s%s", vi.w, vi.h, vi.fps, vi.codec.c_str(),
                             vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "",
                             vi.rotation ? (", повёрнуто на " + std::to_string(vi.rotation) + "°").c_str() : "");
+        const std::string fn = fps_note(vi);
+        if (!fn.empty()) {   // частота не из контейнера: от неё зависят скорости и выдержки трекера
+            ImGui::PushStyleColor(ImGuiCol_Text, vi.fpsFrom == FpsFrom::Assumed ? TXT_WARN : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("%s", fn.c_str());
+            ImGui::PopStyleColor();
+        }
     } else {
         ImGui::TextDisabled("или перетащите файл в окно");
     }
@@ -1129,6 +1135,18 @@ void panel_main(App& a, bool& changed) {
 void tab_video(App& a, bool& changed) {
     const VideoInfo vi = a.pipe.info();
     if (heading("Подача кадров", true)) {
+        {   // применяется, когда ползунок отпущен: смена частоты перезапускает чтение файла
+            float vf = (float)a.s.videoFps;
+            label("частота кадров файла, к/с");
+            if (ImGui::SliderFloat("##vfps", &vf, 0, 120, vf <= 0 ? "из файла" : "%.2f")) a.s.videoFps = vf < 0.5f ? 0 : vf;
+            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+            help_marker("С какой частотой камера на самом деле снимала. Нужна, если в файле её нет или она неверна: "
+                        "«голые» .h264 и .mjpeg с rpicam-vid FFmpeg читает как 25 к/с, OpenCV VideoWriter пишет ту частоту, "
+                        "что ему задали. Трекер и маска неба считают скорости и выдержки в секундах, поэтому неверная "
+                        "частота сдвигает их все. Номера кадров и разметка не меняются. Файл меток rpicam-vid --save-pts "
+                        "рядом с видео (<имя>.pts или <имя>.txt) подхватывается сам — с ним учитываются и пропуски кадров. "
+                        "Ctrl+щелчок — ввести число. Остаётся для следующих открытых файлов.");
+        }
         static const char* paces[] = {"Как камера", "Максимально быстро"};
         static const char* paceTips[] = {
             "Кадры приходят с частотой видео (или заданной). Если обработка не успевает, лишние кадры "
@@ -3561,6 +3579,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--step") s.frameStep = std::max(1, atoi(val().c_str()));
         else if (a == "--phase") s.framePhase = std::max(0, atoi(val().c_str()));
         else if (a == "--cam-fps") s.targetFps = atof(val().c_str());
+        else if (a == "--video-fps") s.videoFps = atof(val().c_str());
         else if (a == "--no-fps-scale") s.fpsScale = false;
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
@@ -3598,6 +3617,7 @@ int run_bench(int argc, char** argv) {
     }
     printf("видео %dx%d, %.2f к/с, %s, поворот %d°\n", p.info().w, p.info().h, p.info().fps, p.info().codec.c_str(),
            p.info().rotation);
+    if (!fps_note(p.info()).empty()) printf("  %s\n", fps_note(p.info()).c_str());
     bool counting = preload == 0;
     for (;;) {
         SDL_Delay(50);
