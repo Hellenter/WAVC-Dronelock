@@ -52,6 +52,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     c.still_speed *= vu;
     c.flock_speed *= vu;
     c.lost_grow *= vu;
+    if (c.creep_frames > 0) c.creep_frames = std::max(4, (int)std::lround((float)c.creep_frames / vu));
     if (std::fabs(fps - ref) < 0.01f * ref) return c;
     const float t = fps / ref, v = ref / fps;   // t — кадров в той же секунде, v — пикс. за кадр
     auto frames = [&](int n, int lo) { return n > 0 ? std::max(lo, (int)std::lround(n * t)) : n; };
@@ -412,7 +413,8 @@ void Tracker::classify(Track& t) const {
     const bool held = (hard_ && t.id == lockId_) || t.everFollowed;
     const bool qh = quietHold(t);
     if (t.overlay || t.anchored ||
-        (!held && (t.clutter || (!qh && n >= cfg_.cls_min_hits && t.travel < std::max(3.f, cfg_.still_speed * (float)t.age))))) {
+        (!held && (t.clutter || (!qh && !creeper(t) && n >= cfg_.cls_min_hits &&
+                                 t.travel < std::max(3.f, cfg_.still_speed * (float)t.age))))) {
         t.cls = TargetClass::Clutter;
         return;
     }
@@ -464,6 +466,30 @@ bool Tracker::edgeJitter(const Track& t) const {
 // Трек спокойного неба (см. quiet_frames) ещё не простоял quiet_max кадров
 bool Tracker::quietHold(const Track& t) const {
     return t.quiet && t.age < cfg_.quiet_max && !t.overlay && !t.anchored;
+}
+
+// Ползёт при неподвижной камере: ушёл по сцене дальше creep_px (и дальше пути камеры за то же
+// время) — медленно летящий дрон, а не помеха, хоть и медленнее still_speed. Пятно на земле,
+// плывущее от неточной оценки поворота (из-за него still_speed), уходит на 10-20% пути камеры
+bool Tracker::creeper(const Track& t) const {
+    return cfg_.creep_frames > 0 && t.travel >= cfg_.creep_px && t.travel >= t.camPath && !t.overlay && !t.anchored &&
+           !edgeJitter(t);
+}
+
+// Медленная цель в горячей ячейке: трек, начатый до того, как ячейка стала помехой, ведёт её
+// отклики дальше (класс — помеха, захвата нет), пока не станет ясно, ползёт она или стоит.
+// Иначе почти зависший дрон греет карту, трек на нём умирает и пробег не копится никогда:
+// карта и долгая память ползут за ним следом (wt12, дрон 4: 0.2 пикс./кадр, 7 с без трека).
+// Только при неподвижной камере: при повороте в горячих ячейках — земля, и её трек, оставленный
+// жить, "летит" от ошибки оценки сдвига. Отклик — рядом с прошлой отметкой (ползёт, а не прыгает):
+// иначе трек помехи перескакивает на соседнее пятно и за пару скачков "пролетает" mover_px (n1)
+bool Tracker::creepKeep(const Track& t, const Candidate& d) const {
+    if (cfg_.creep_frames <= 0 || !t.confirmed || t.overlay || t.anchored || t.edgeBorn || t.camPath >= cfg_.mover_px ||
+        t.obs.empty() || (t.age >= cfg_.creep_frames && t.travel < cfg_.creep_px))
+        return false;
+    const auto& o = t.obs.back();
+    const float gap = (float)std::max(1, frame_ - o.t);
+    return std::hypot(d.x - o.fx, d.y - o.fy) <= cfg_.creep_step * gap;
 }
 
 // вклад попадания в уверенность: ~ логарифм отношения правдоподобия "цель / шум" для
@@ -765,7 +791,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // клаттер: всё, что не продолжает движущуюся цель, греет карту; в горячих ячейках —
     // помеха (её не отдаём ни трекам, ни в новые треки)
     auto mover = [&](const Track& t) {
-        return t.confirmed && t.travel >= cfg_.mover_px * (t.edgeBorn ? cfg_.edge_mover_k : 1.f) &&
+        // трек, переживший горячую ячейку, — помеха, пока не уполз дальше creep_px: скачок отклика
+        // в первые кадры даёт пробег ~mover_px, и неподвижная точка становилась целью (wt22)
+        return t.confirmed && t.travel >= (t.crept ? std::max(cfg_.mover_px, cfg_.creep_px) : cfg_.mover_px) * (t.edgeBorn ? cfg_.edge_mover_k : 1.f) &&
                t.travel >= cfg_.mover_cam_k * t.camPath && !t.overlay && !t.anchored &&
                !edgeJitter(t);
     };
@@ -803,7 +831,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         // отклик захватывавшейся цели (камера ведёт дрон, и он стоит в кадре) в память не идёт
         const bool target = owner[di] >= 0 && tracks_[owner[di]].everLocked;
         if (learn && !shadow[di] && !dets[di].weak && !target) staticAdd(cellOf(dets[di]));
-        if (owner[di] >= 0) {
+        if (owner[di] >= 0 && creepKeep(tracks_[owner[di]], dets[di])) {
+            tracks_[owner[di]].crept = true;
+        } else if (owner[di] >= 0) {
             match[owner[di]] = -1;
             owner[di] = -1;
         }
