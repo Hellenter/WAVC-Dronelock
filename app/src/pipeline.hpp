@@ -291,6 +291,11 @@ public:
         std::lock_guard<std::mutex> lk(cueM_);
         cue_ = a;
     }
+    // Другая камера рассмотрела трек id вблизи и видит птицу (Tracker::markBird) — со следующего кадра
+    void markBird(int id) {
+        std::lock_guard<std::mutex> lk(cueM_);
+        birds_.push_back(id);
+    }
     void selectTarget(int id) { lockCmd_ = id; }
     // забыть накопленное в этом запуске (память помех, маску неба), файлы не трогать
     void forget() {
@@ -345,6 +350,7 @@ private:
     Settings settings_;
     std::mutex cueM_;
     std::vector<dronolok::FocusArea> cue_;
+    std::vector<int> birds_;
     int settingsVer_ = 0;
 
     std::thread dec_, proc_;

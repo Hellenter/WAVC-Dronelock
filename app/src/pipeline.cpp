@@ -923,6 +923,11 @@ void Pipeline::processLoop() {
                                                               std::max(6.f, 0.8f * det.threshold()), trk->config().silh_max));
             }
             const double t1 = now_ms();
+            {
+                std::lock_guard<std::mutex> lk(cueM_);
+                for (int id : birds_) trk->markBird(id);
+                birds_.clear();
+            }
             const auto& tracks = trk->update(cands, me.dx, me.dy);
             // маска дорастает там, где копятся помехи (неподвижная камера); у цели в захвате — нет
             if (!camMoves && maskOn && !det.learningMask()) {

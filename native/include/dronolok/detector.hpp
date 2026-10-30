@@ -903,6 +903,7 @@ struct Track {
     bool followed = false;   // камера поворачивается за ним: по кадру почти стоит, по сцене летит
     bool everFollowed = false;   // камера его вела: зависнув потом, помехой не становится
     bool anchored = false;   // на мачте или столбе (см. Silhouette::attached): не дрон
+    bool extBird = false;    // другая камера рассмотрела цель и видит птицу (Tracker::markBird)
     uint16_t colorN = 0, leafN = 0;   // попаданий с измеренным цветом и из них с цветом листвы
     uint32_t leafBits = 0;   // последние 32 замера цвета: бит 1 — с цветом листвы
     bool leaf = false;       // лист у камеры (TrackerConfig::leaf_hits): не захватывается
@@ -968,6 +969,9 @@ public:
     bool selectLock(int id);
     // Следующая цель очереди после захваченной (по кругу); возвращает её id, 0 — очередь пуста
     int nextLock();
+    // Другая камера (точная на поворотке) рассмотрела цель id и видит птицу: трек — птица до конца
+    // жизни, жёсткий захват на нём снимается. false — такого трека нет
+    bool markBird(int id);
     // захват выбран вручную (selectLock/nextLock) и держится, пока цель жива
     bool manualLock() const { return lockId_ && manual_; }
     // сколько кадров подряд захваченная цель — дрон (до verify_frames — проверка)
