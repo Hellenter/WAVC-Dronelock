@@ -4,3 +4,6 @@ data/
 *.tmp.avi
 build*/
 *.y4m
+sim/godot/.godot/
+sim/godot/**/*.import
+/out/

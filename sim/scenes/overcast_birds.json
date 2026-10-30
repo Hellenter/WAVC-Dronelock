@@ -1,0 +1,168 @@
+{
+ "name": "overcast_birds",
+ "seed": 3,
+ "seconds": 10,
+ "rig": {
+  "height": 4.0
+ },
+ "wide": {
+  "w": 4608,
+  "h": 3456,
+  "hfov": 120,
+  "fps": 14,
+  "az": 0,
+  "el": 15,
+  "msaa": 4
+ },
+ "fine": {
+  "enabled": true,
+  "w": 640,
+  "h": 480,
+  "hfov": 20,
+  "fps": 60,
+  "max_dps": 30,
+  "accel": 150,
+  "latency": 0.06,
+  "target": "auto"
+ },
+ "world": {
+  "trees": 2500,
+  "trees_from": 90,
+  "trees_to": 1200,
+  "forest_threshold": 0.45,
+  "tree_lines": [
+   {
+    "dist": 140,
+    "depth": 35,
+    "az_from": -70,
+    "az_to": 45,
+    "count": 500
+   }
+  ],
+  "villages": [
+   {
+    "az": 70,
+    "dist": 230,
+    "radius": 70,
+    "houses": 14
+   }
+  ],
+  "poles": [
+   {
+    "pos": [
+     -60,
+     180,
+     0
+    ],
+    "height": 28,
+    "radius": 0.25
+   },
+   {
+    "pos": [
+     30,
+     260,
+     0
+    ],
+    "height": 18,
+    "radius": 0.15
+   }
+  ],
+  "hills": 140,
+  "hills_from": 1500,
+  "cloud_cover": 0.85,
+  "sun_az": 150,
+  "sun_el": 12,
+  "fog": 0.0006,
+  "wind": 1.0,
+  "shadows": false,
+  "cloud_soft": 0.3,
+  "sun": 0.7,
+  "ambient": 0.8
+ },
+ "targets": [
+  {
+   "kind": "bird",
+   "size": 0.9,
+   "flap_hz": 3.5,
+   "flap_deg": 45,
+   "flap_period": 2.5,
+   "flap_on": 1.2,
+   "speed": 10,
+   "path": {
+    "type": "wander",
+    "center": [
+     20,
+     120,
+     35
+    ],
+    "radius": 50
+   }
+  },
+  {
+   "kind": "bird",
+   "size": 0.6,
+   "flap_hz": 6,
+   "flap_deg": 50,
+   "speed": 12,
+   "path": {
+    "type": "line",
+    "from": [
+     150,
+     90,
+     25
+    ],
+    "to": [
+     -150,
+     140,
+     40
+    ]
+   }
+  },
+  {
+   "kind": "bird",
+   "size": 1.2,
+   "flap_hz": 2.5,
+   "flap_deg": 35,
+   "flap_period": 4,
+   "flap_on": 1.5,
+   "speed": 8,
+   "path": {
+    "type": "orbit",
+    "center": [
+     -80,
+     250,
+     60
+    ],
+    "radius": 50
+   }
+  },
+  {
+   "kind": "bird",
+   "size": 0.35,
+   "flap_hz": 9,
+   "flap_deg": 55,
+   "speed": 14,
+   "path": {
+    "type": "waypoints",
+    "points": [
+     [
+      100,
+      100,
+      20
+     ],
+     [
+      0,
+      200,
+      35
+     ],
+     [
+      -120,
+      160,
+      28
+     ]
+    ],
+    "mode": "pingpong"
+   }
+  }
+ ]
+}
