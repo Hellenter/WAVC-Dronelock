@@ -51,7 +51,7 @@ struct Config {
     float narrowFov = 20, narrowFps = 60;
     float maxRate = 30, maxAccel = 150;   // град/с, град/с²
     int narrowScales = 2;                 // масштабов детектора точной
-    float narrowThrMin = 5;               // порог по шуму не ниже этого
+    float narrowThrMin = 8;               // порог по шуму не ниже этого: в облаках оценка шума мала, и порог 5 даёт ложные треки
     bool narrowAutoThr = true;            // порог детектора точной по шуму кадра (CFAR): при шуме 3 зум x4 ведёт 84% времени вместо 18%
     float encoderDeg = 0.01f;             // дискретность датчиков угла
     float handoffLatency = 0.06f;         // от кадра широкой до команды поворотке, с
