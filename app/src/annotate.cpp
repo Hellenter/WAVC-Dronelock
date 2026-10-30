@@ -94,32 +94,34 @@ bool Annotation::save(const std::string& path, int64_t frames) const {
         return true;
     }
     const GroundTruth g = toGroundTruth(frames);
-    FILE* f = open_file(path, "w");
-    if (!f) return false;
-    fprintf(f, "{\"w\": %d, \"h\": %d, \"fps\": %g, \"source\": \"dronolok_app\",%s\n \"objects\": [", w, h, fps,
-            noDrones ? " \"no_drones\": true," : "");
-    for (size_t i = 0; i < objs.size(); ++i) {
-        fprintf(f, "%s\n  {\"id\": %d, \"kind\": \"%s\", \"keys\": [", i ? "," : "", objs[i].id,
-                objs[i].bird ? "bird" : "drone");
-        bool first = true;
-        for (const auto& k : objs[i].keys) {
-            fprintf(f, "%s[%lld, %.1f, %.1f]", first ? "" : ", ", (long long)k.first, k.second.first, k.second.second);
-            first = false;
+    // через временный файл: автосохранение раз в секунду, и закрытие программы посреди записи
+    // не должно оставить обрезанную разметку
+    return write_file_replace(path, "w", [&](FILE* f) {
+        fprintf(f, "{\"w\": %d, \"h\": %d, \"fps\": %g, \"source\": \"dronolok_app\",%s\n \"objects\": [", w, h, fps,
+                noDrones ? " \"no_drones\": true," : "");
+        for (size_t i = 0; i < objs.size(); ++i) {
+            fprintf(f, "%s\n  {\"id\": %d, \"kind\": \"%s\", \"keys\": [", i ? "," : "", objs[i].id,
+                    objs[i].bird ? "bird" : "drone");
+            bool first = true;
+            for (const auto& k : objs[i].keys) {
+                fprintf(f, "%s[%lld, %.1f, %.1f]", first ? "" : ", ", (long long)k.first, k.second.first, k.second.second);
+                first = false;
+            }
+            fprintf(f, "]}");
         }
-        fprintf(f, "]}");
-    }
-    fprintf(f, "],\n \"frames\": [");
-    for (size_t i = 0; i < g.frames.size(); ++i) {
-        fprintf(f, "%s\n  [", i ? "," : "");
-        for (size_t j = 0; j < g.frames[i].size(); ++j) {
-            const GtObj& o = g.frames[i][j];
-            fprintf(f, "%s{\"kind\": \"%s\", \"bright\": false, \"x\": %.1f, \"y\": %.1f}", j ? ", " : "",
-                    o.bird ? "bird" : "drone", o.x, o.y);
+        fprintf(f, "],\n \"frames\": [");
+        for (size_t i = 0; i < g.frames.size(); ++i) {
+            fprintf(f, "%s\n  [", i ? "," : "");
+            for (size_t j = 0; j < g.frames[i].size(); ++j) {
+                const GtObj& o = g.frames[i][j];
+                fprintf(f, "%s{\"kind\": \"%s\", \"bright\": false, \"x\": %.1f, \"y\": %.1f}", j ? ", " : "",
+                        o.bird ? "bird" : "drone", o.x, o.y);
+            }
+            fprintf(f, "]");
         }
-        fprintf(f, "]");
-    }
-    fprintf(f, "]}\n");
-    return fclose(f) == 0;
+        fprintf(f, "]}\n");
+        return !ferror(f);
+    });
 }
 
 AnnObject* Annotation::find(int id) {
