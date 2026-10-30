@@ -116,6 +116,7 @@ bool Link::start(const Options& o, const std::string& hello, std::string& err) {
         stop();
         return false;
     }
+    fprintf(stderr, "сцена: Godot подключился (порт %d)\n", port);
     const std::string h = hello + "\n";
     if (!sendAll(h.data(), h.size())) {
         err = "связь со сценой оборвалась";
@@ -135,6 +136,20 @@ bool Link::sendAll(const char* p, size_t n) {
     return true;
 }
 
+// данные от сцены: ждём не дольше 2 минут на кадр и бросаем, если Godot закрылся
+bool Link::waitReadable() {
+    const auto s = (decltype(socket(0, 0, 0)))sock_;
+    for (int i = 0; i < 1200; ++i) {
+        fd_set fs_;
+        FD_ZERO(&fs_);
+        FD_SET(s, &fs_);
+        timeval tv{0, 100000};
+        if (select((int)s + 1, &fs_, nullptr, nullptr, &tv) > 0) return true;
+        if (!plat::proc_alive(proc_)) return false;
+    }
+    return false;
+}
+
 bool Link::recvLine(std::string& line) {
     for (;;) {
         const size_t e = buf_.find('\n');
@@ -144,6 +159,7 @@ bool Link::recvLine(std::string& line) {
             return true;
         }
         char tmp[4096];
+        if (!waitReadable()) return false;
         const int k = recv((decltype(socket(0, 0, 0)))sock_, tmp, sizeof(tmp), 0);
         if (k <= 0) return false;
         buf_.append(tmp, k);
@@ -157,6 +173,7 @@ bool Link::recvAll(uint8_t* p, size_t n) {
     p += from;
     n -= from;
     while (n > 0) {
+        if (!waitReadable()) return false;
         const int k = recv((decltype(socket(0, 0, 0)))sock_, (char*)p, (int)std::min<size_t>(n, 1 << 22), 0);
         if (k <= 0) return false;
         p += k;
@@ -196,6 +213,7 @@ bool Link::render(double t, int cam, double az, double el, std::vector<uint8_t>&
             bodies.push_back(b);
         }
     }
+    if (!frames_++) fprintf(stderr, "сцена: первый кадр %dx%d, целей %d\n", w, h, k);
     px.resize((size_t)n);
     if (!recvAll(px.data(), (size_t)n)) {
         err = "связь со сценой оборвалась";

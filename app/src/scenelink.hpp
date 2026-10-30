@@ -45,12 +45,14 @@ public:
 
 private:
     bool sendAll(const char* p, size_t n);
+    bool waitReadable();
     bool recvLine(std::string& line);
     bool recvAll(uint8_t* p, size_t n);
 
     void* proc_ = nullptr;
     intptr_t lsock_ = -1, sock_ = -1;
     std::string buf_;   // принятое сверх прочитанной строки
+    int64_t frames_ = 0;
 };
 
 // Где лежит симулятор: папка sim рядом с программой (сборка) или в репозитории (../sim от build-*)

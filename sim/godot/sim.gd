@@ -1707,6 +1707,7 @@ func live_connect(port: int) -> bool:
 		"seed": int(h.get("seed", 1)) + 100,
 		"range": h.get("range", [250, 1200]), "types": h.get("types", {"quad": 0.5, "delta": 0.25, "plane": 0.25})}
 	get_window().title = "Дронолок: 3D-сцена для эмулятора (не закрывать)"
+	printerr("live: связь с приложением, порт %d" % port)
 	return true
 
 
@@ -1765,6 +1766,8 @@ func live_loop() -> void:
 		fine_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
 		await RenderingServer.frame_post_draw
 	var shapes = {"bird": 0, "quad": 1, "delta": 2, "wing": 3, "plane": 3}
+	printerr("live: сцена готова, целей %d" % targets.size())
+	var served = 0
 	while true:
 		var line = live_read_line()
 		if line == null:
@@ -1803,7 +1806,12 @@ func live_loop() -> void:
 		if rows.size() > 0:
 			head += "\n".join(rows) + "\n"
 		if live_peer.put_data(head.to_utf8_buffer()) != OK or live_peer.put_data(data) != OK:
+			printerr("live: связь оборвалась")
 			break
+		served += 1
+		if served <= 2 or served % 500 == 0:
+			printerr("live: кадров %d (t %.2f)" % [served, t])
+	printerr("live: конец, кадров %d" % served)
 
 
 func save_json(path: String, obj) -> void:

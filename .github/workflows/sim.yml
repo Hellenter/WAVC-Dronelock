@@ -85,7 +85,7 @@ jobs:
           set -o pipefail
           for sec in forest highrise; do
             echo "== эмулятор: city_sectors, сектор $sec" | tee -a report.txt
-            timeout 1200 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
+            timeout 600 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
               --sector $sec --godot "$GODOT" --seconds 6 --wide 2304x1728 --drones 4 --birds 2 --json twocam-$sec.json | tee -a report.txt
           done
       - name: Мультитест по роликам сцены
