@@ -658,6 +658,14 @@ struct TrackerConfig {
     // скорость трека для дрейфа — по стольким последним попаданиям при 25 к/с (не меньше 8; во времени:
     // на 60 к/с 8 попаданий — 0.13 с, шум положения отклика того же порядка, что и сам дрейф)
     int drift_obs = 13;
+    // Медленная цель в горячей ячейке (см. Tracker::creepKeep): трек не бросается ещё creep_frames
+    // кадров (при 25 к/с), а ушедший по сцене дальше creep_px при неподвижной камере — и дальше: он
+    // не помеха, хоть и медленнее still_speed. Почти зависший дрон wt12 (0.2 пикс./кадр) иначе грел
+    // карту помех, трек на нём умирал, и 7 с трека не было вовсе (найден 63 -> 91%). 0 — выключено.
+    int creep_frames = 100;
+    float creep_px = 24.f;
+    float creep_lag = 8.f;      // ...и ползёт сейчас: за последние creep_frames ушёл на столько пикс.
+    float creep_step = 4.f;     // ...и только отклик не дальше стольких пикс. за кадр от прошлой отметки
     int clutter_cell = 8;       // ячейка карты статичного клаттера
     float clutter_decay = 0.97f;
     float clutter_level = 0.35f;
@@ -668,6 +676,9 @@ struct TrackerConfig {
     // мимо такой точки, не теряется. static_frames = 0 — выключено.
     int static_frames = 3000;
     float static_hits = 8.f;
+    // ...умерший на месте трек добавляет в ячейку не больше static_death откликов (0 — все). Опция: 3 —
+    // wt9 найден 1 -> 3%, но wt3/wt7 захват на дроне -2/-4 (30.10)
+    int static_death = 0;
     // классификатор по движению
     int cls_window = 16;        // сколько последних попаданий смотреть
     int cls_min_hits = 8;       // меньше — класс Unknown
@@ -871,8 +882,11 @@ struct Track {
     float vsx = 0, vsy = 0;  // скорость относительно сцены
     float p00 = 0, p01 = 0, p11 = 0;   // ковариация Калмана (одинакова для x и y)
     float bx = 0, by = 0;    // точка рождения в координатах сцены
+    std::deque<TrackPoint> cps;   // позиция по сцене раз в creep_frames/8 кадров (см. Tracker::creeper)
+    int cpT = -1000000;
     int level = 0;
     bool everMover = false;
+    bool crept = false;      // жил в горячей ячейке (см. TrackerConfig::creep_frames): летит — только дальше creep_px
     bool edgeBorn = false;   // родился в смешанной зоне: выдаётся, только когда полетит
     int flapT = -1000000;    // кадр, когда последний раз были видны взмахи
     std::vector<uint32_t> pend;   // ячейки, где был, пока не полетел: в память, если так и не полетит
@@ -984,6 +998,8 @@ private:
         return cfg_.gate + (smooth ? cfg_.gate_speed_k * std::hypot(t.vsx, t.vsy) * dt_ : 0.f);
     }
     bool quietHold(const Track& t) const;
+    bool creepKeep(const Track& t, const Candidate& d) const;
+    bool creeper(const Track& t) const;
     bool edgeJitter(const Track& t) const;
 
     TrackerConfig cfg_;

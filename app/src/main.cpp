@@ -3529,6 +3529,8 @@ int run_stress(int argc, char** argv) {
                 s.trk.reupdate = R(2) ? 0.f : F(0, 1);
                 s.trk.mover_cam_k = F(0, 1);
                 s.trk.still_speed = F(0, 3);
+                s.trk.creep_frames = R(3) ? 100 : R(400);
+                s.trk.creep_px = F(0, 64);
                 s.trk.flap_max_period = F(2, 48);
                 s.trk.lock_slow = R(2) ? 1.f : F(0, 3);
                 s.trk.hard_switch = F(0, 4);
