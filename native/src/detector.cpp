@@ -750,7 +750,11 @@ void Detector::updateRecheck() {
             const size_t i = (size_t)y * tw_ + x;
             if (!mask_[i] && (!texBad_[i] || recheckN_[i] < need || recheckTex_[i] >= cfg_.recheck_tex)) top = y;
         }
-        for (int y = 0; y < top; ++y) {
+        // тайл прямо над сильной землёй со своей текстурой (recheck_edge = false) не открываем: в
+        // дымке кромка леса слаба, как облако, а верхушки над ней вспыхивают (wt24: захват уходил на
+        // верхушку ели). Под облаком гладкое, закрытое линией горизонта, — не в счёт
+        const int lim = cfg_.recheck_edge || top >= th_ || !texBad_[(size_t)top * tw_ + x] ? top : top - 1;
+        for (int y = 0; y < lim; ++y) {
             const size_t i = (size_t)y * tw_ + x;
             if (mask_[i] || !texBad_[i]) continue;
             mask_[i] = 1;
