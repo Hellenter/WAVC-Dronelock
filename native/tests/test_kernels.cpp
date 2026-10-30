@@ -599,6 +599,13 @@ static void test_stationary() {
     for (int i = 0; i < 25; ++i) a.detect(ground_frame(w, h, 0.6f, i).data(), w, h, w, c);
     a.endMaskLearning();
     CHECK(a.saveMask(path), "saveMask");
+    {   // файл другого размера кадра (сменили разрешение обработки, повёрнутое видео) не грузится:
+        // иначе первый detect сбросил бы маску, и она не училась бы заново
+        Detector o(cfg);
+        CHECK(!o.loadMask(path, 10, w / 2, h / 2) && !o.loadMask(path, 10, h, w) && o.tileMask().empty(),
+              "loadMask: файл другого размера кадра загрузился");
+        CHECK(o.loadMask(path, 10, w, h), "loadMask: файл того же размера не загрузился");
+    }
     Detector b(cfg);
     CHECK(b.loadMask(path, 10) && b.tileMask() == a.tileMask(), "loadMask");
     for (int i = 0; i < 10; ++i) b.detect(ground_frame(w, h, 0.6f, 100 + i).data(), w, h, w, c);

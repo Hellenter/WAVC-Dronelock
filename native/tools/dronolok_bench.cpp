@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
     std::FILE* dump = dumpPath.empty() ? nullptr : std::fopen(dumpPath.c_str(), "w");
     if (dump) std::fprintf(dump, "loop,frame,id,x,y,hits,speed,resid,contrast,contrast_cv,flap_r2,flap_period,flap_depth,hover,flock,energy,level,cls,gt\n");
     bool maskLoaded = false;
-    if (!maskPath.empty() && det.loadMask(maskPath)) {
+    if (!maskPath.empty() && det.loadMask(maskPath, 25, W, H)) {
         maskLoaded = true;
         learn = learnLive = 0;
         std::printf("маска неба загружена из %s, сверка 25 кадров\n", maskPath.c_str());
