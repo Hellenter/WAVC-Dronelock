@@ -432,8 +432,14 @@ int Emulator::nearestBody(double t, double az, double el, double maxDeg) const {
     return best;
 }
 
-void Emulator::start(const Config& c) {
+void Emulator::start(const Config& cfg) {
     stop();
+    // кадр меньше шага облаков, частота 0 или угол 0 дают деление на ноль и NaN в повороте
+    Config c = cfg;
+    c.wideW = std::max(c.wideW, 64), c.wideH = std::max(c.wideH, 64);
+    c.narrowW = std::max(c.narrowW, 64), c.narrowH = std::max(c.narrowH, 64);
+    c.wideFps = std::max(c.wideFps, 1.f), c.narrowFps = std::max(c.narrowFps, 1.f);
+    c.wideFov = std::min(std::max(c.wideFov, 0.5f), 179.f), c.narrowFov = std::min(std::max(c.narrowFov, 0.5f), 179.f);
     {
         std::lock_guard<std::mutex> lk(vm_);
         view_ = View();
@@ -1330,7 +1336,16 @@ ui:
             view_.footprint.push_back({(float)u, (float)v});
     }
     view_.events = events_;
-    view_.st = st_;
+    {
+        // окну хватает хвоста ошибок (медиана по 3000): полные векторы за час — мегабайты на каждый кадр точной
+        auto tail = [](const std::vector<float>& v, std::vector<float>& o) {
+            o.assign(v.end() - std::min<size_t>(v.size(), 3000), v.end());
+        };
+        std::vector<float> l = std::move(st_.errLock), a = std::move(st_.errAxis), w = std::move(st_.errWide);
+        view_.st = st_;   // без векторов ошибок
+        st_.errLock = std::move(l), st_.errAxis = std::move(a), st_.errWide = std::move(w);
+        tail(st_.errLock, view_.st.errLock), tail(st_.errAxis, view_.st.errAxis), tail(st_.errWide, view_.st.errWide);
+    }
     view_.st.simT = t + dt;   // шаг [t, t+dt] уже учтён в долях времени
 }
 
@@ -1341,6 +1356,7 @@ void Emulator::loop() {
             view_.status = "запуск 3D-сцены...";
         }
         if (!link_) link_.reset(new scene::Link());
+        link_->setCancel(&stop_);
         scene::Options o;
         o.godot = c_.godot;
         o.project = c_.simProject;
@@ -1603,7 +1619,9 @@ Stats Emulator::runBlocking(const Config& c, double seconds, bool verbose) {
     if (verbose)
         for (const auto& e : v.events) printf("  [%6.2f] %s\n", e.t, e.text.c_str());
     stop();
-    return v.st;
+    Stats s = v.st;   // ошибки — полностью (в окне только хвост), поток уже остановлен
+    s.errLock = st_.errLock, s.errAxis = st_.errAxis, s.errWide = st_.errWide;
+    return s;
 }
 
 int run_cli(int argc, char** argv) {

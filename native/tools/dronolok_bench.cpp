@@ -290,6 +290,10 @@ int main(int argc, char** argv) {
         if (frames.empty()) return 1;
     }
 
+    if (sweep && stream) {
+        std::fprintf(stderr, "--sweep меряет загруженные кадры: без --stream\n");
+        return 1;
+    }
     if (sweep) {
         const int hw = hardware_threads();
         std::vector<int> ths{1, 2, 4};
