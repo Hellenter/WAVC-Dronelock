@@ -644,7 +644,15 @@ static void test_stationary() {
     TrackerConfig t;
     const TrackerConfig t25 = tracker_for_fps(t, 25.f), t10 = tracker_for_fps(t, 10.f);
     CHECK(t25.gate == t.gate && t25.max_miss == t.max_miss, "tracker_for_fps 25");
-    CHECK(t10.gate > t.gate && t10.max_miss < t.max_miss && t10.confirm == t.confirm, "tracker_for_fps 10");
+    // предел ворот — в пикселях кадра на любой частоте, растёт манёвренность (ворота по ошибке прогноза)
+    CHECK(t10.gate == t.gate && t10.q_accel > t.q_accel && t10.max_miss < t.max_miss && t10.confirm == t.confirm,
+          "tracker_for_fps 10");
+    // окно ведомой цели: заданное от 30 к/с, ниже — во времени, не меньше 9; окно дрейфа — во времени, не меньше 8
+    const TrackerConfig t30 = tracker_for_fps(t, 30.f), t14 = tracker_for_fps(t, 14.f), t60f = tracker_for_fps(t, 60.f);
+    CHECK(t60f.follow_min_obs == t.follow_min_obs && t30.follow_min_obs == t.follow_min_obs && t14.follow_min_obs == 9 &&
+              t14.drift_obs == 8 && t60f.drift_obs > t.drift_obs,
+          "tracker_for_fps: follow_min_obs %d %d %d, drift_obs %d %d", t60f.follow_min_obs, t30.follow_min_obs,
+          t14.follow_min_obs, t14.drift_obs, t60f.drift_obs);
     // правила в пикс./с: на 60 к/с — прежние числа за кадр
     const TrackerConfig t60 = tracker_for_fps(t, 60.f);
     CHECK(std::fabs(t60.still_speed - 0.25f) < 1e-3f && std::fabs(t60.lost_grow - 4.f) < 1e-3f &&
