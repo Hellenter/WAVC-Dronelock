@@ -19,6 +19,7 @@ struct dl_tracker {
     std::vector<Candidate> dets;
     std::vector<FocusArea> focus;
     float dx = 0, dy = 0;
+    bool staticSet = false;   // память помех выставлена dl_tracker_set_static
     dl_tracker(int w, int h) : trk(w, h) {}
 };
 
@@ -169,9 +170,20 @@ int dl_tracker_clutter(dl_tracker* t, dl_candidate* out, int cap) {
     return (int)c.size();
 }
 
+void dl_tracker_set_fps(dl_tracker* t, float fps) {
+    // от умолчаний (они для 25 к/с): повторный вызов не пересчитывает уже пересчитанное
+    TrackerConfig c = tracker_for_fps(TrackerConfig(), fps);
+    if (t->staticSet) {   // выставлено dl_tracker_set_static — не трогаем
+        c.static_frames = t->trk.config().static_frames;
+        c.static_hits = t->trk.config().static_hits;
+    }
+    t->trk.config() = c;
+}
+
 void dl_tracker_set_static(dl_tracker* t, int frames, float hits) {
     t->trk.config().static_frames = frames;
     t->trk.config().static_hits = hits;
+    t->staticSet = true;
 }
 int dl_tracker_static_save(dl_tracker* t, const char* path) { return t->trk.saveStatic(path) ? 1 : 0; }
 int dl_tracker_static_load(dl_tracker* t, const char* path) { return t->trk.loadStatic(path) ? 1 : 0; }

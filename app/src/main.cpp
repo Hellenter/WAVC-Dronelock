@@ -1112,6 +1112,14 @@ void tab_video(App& a, bool& changed) {
             a.s.targetFps = fps;
             changed = true;
         }
+        label("камера реже видео: каждый N-й кадр");
+        if (ImGui::SliderInt("##fstep", &a.s.frameStep, 1, 8, a.s.frameStep <= 1 ? "все кадры" : "каждый %d-й")) {
+            a.s.frameStep = std::max(1, a.s.frameStep);
+            changed = true;
+        }
+        help_marker("Эмуляция медленной камеры: из видео 60 к/с с шагом 4 алгоритм видит 15 к/с (камера 16 Мп — "
+                    "10-15 к/с), и цель за кадр смещается вчетверо дальше. Разметка видео подходит без пересчёта. "
+                    "Не то же, что \"частота камеры\": та подаёт все кадры реже, как замедленное видео.");
         float sp = (float)a.s.speed;
         label("скорость видео", "Замедление: кадры подаются реже, каждый обрабатывается. Кнопки x0.1-x1 есть и "
                                 "под видео. Клавиши + и -.");
@@ -2253,7 +2261,7 @@ void lock_queue(App& a, const Result* r) {
 
 void panel_metrics(App& a, const Metrics& m, const Result* r) {
     const Settings s = a.pipe.settings();
-    const double fpsSrc = s.targetFps > 0 ? s.targetFps : m.sourceFps;
+    const double fpsSrc = (s.targetFps > 0 ? s.targetFps : m.sourceFps) / std::max(1, s.frameStep);
     const bool rt = s.pace == Pace::Realtime;
     const double dropPct = m.processed + m.dropped ? 100.0 * m.dropped / (m.processed + m.dropped) : 0;
     const double detFps = m.detect.mean > 0 ? 1000.0 / m.detect.mean : 0;
@@ -2839,6 +2847,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--csv") csv = val();
         else if (a == "--tracks") s.trackLog = val();
         else if (a == "--dedup") s.skipDuplicates = true;
+        else if (a == "--step") s.frameStep = std::max(1, atoi(val().c_str()));
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
         else if (a == "--no-skyline") s.det.skyline = false;

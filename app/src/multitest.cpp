@@ -63,6 +63,7 @@ const std::vector<Param>& params() {
         {"skyline", "Всё ниже горизонта — земля", "Алгоритм", true, "1, 0", D(skyline)},
         {"adapt", "Подстраиваться под сцену и погоду", "Алгоритм", true, "1, 0", S(adapt)},
         {"bg_map", "Фон по ячейкам у кромки леса", "Алгоритм", true, "1, 0", D(bg_map)},
+        {"bg_near", "Фон по ячейкам и в небе у кромки (кончики веток)", "Алгоритм", true, "1, 0", D(bg_near)},
         {"grow_mask", "Маска дорастает, где копятся помехи", "Алгоритм", true, "1, 0", D(grow_mask)},
         {"mask_recheck", "Маска перепроверяется (облака открываются)", "Алгоритм", true, "1, 0", D(mask_recheck)},
         {"pol_mask", "Облака закрыты только для светлых целей (0 нет, 1 тёмные ищутся, 2 и наоборот)", "Алгоритм", true, "1, 0, 2", D(pol_mask)},
@@ -93,6 +94,7 @@ const std::vector<Param>& params() {
         {"full_every", "Весь кадр раз в, кадров", "Алгоритм", false, "1, 2, 3", D(full_every)},
         {"coarse_every", "Крупные масштабы раз в, кадров", "Алгоритм", false, "1, 2, 4", D(coarse_every)},
         {"dedup", "Пропускать повторы кадра", "Видео", true, "0, 1", S(skipDuplicates)},
+        {"step", "Камера реже видео: каждый N-й кадр", "Видео", false, "1, 4, 6", S(frameStep)},
         // Тонко: порог
         {"auto_thr", "Порог по шуму", "Тонко", true, "0, 1", D(auto_thr)},
         {"noise_k", "Порог: во сколько раз выше шума", "Тонко", false, "8, 12, 16", D(noise_k)},
@@ -113,6 +115,12 @@ const std::vector<Param>& params() {
         {"confirm", "Подтверждение, кадров", "Тонко", false, "2, 3, 4", T(confirm)},
         {"quiet", "Новая точка в спокойном небе, кадров (0 выкл.)", "Тонко", false, "0, 50", T(quiet_frames)},
         {"edge_straight", "У кромки — только прямой полёт", "Тонко", false, "0, 0.5", T(edge_straight)},
+        {"lock_mover", "Новый захват — только на летавший трек", "Тонко", true, "0, 1", T(lock_mover)},
+        {"hard_switch_drone", "Жёсткий захват переходит только на «дрон» или ведомую камерой цель", "Тонко", true, "1, 0", T(hard_switch_drone)},
+        {"hover_first", "Птица: зависание важнее взмахов", "Тонко", true, "1, 0", T(hover_first)},
+        {"reupdate", "Нашлась после пропуска: скорость по прямой от последней отметки, доля", "Тонко", false, "0, 0.5, 1", T(reupdate)},
+        {"lock_mover_fps", "Захват только на летавший трек при камере не быстрее, к/с", "Тонко", false, "0, 20, 30", T(lock_mover_fps)},
+        {"mover_cam_k", "Летит: по сцене дальше доли пути камеры", "Тонко", false, "0, 0.25, 0.35, 0.5", T(mover_cam_k)},
         {"silhouette", "Крупная цель целиком (силуэт)", "Тонко", true, "1, 0", T(silhouette)},
         {"size_predict", "Ожидание размера", "Тонко", true, "1, 0", T(size_predict)},
         {"anchor_check", "На мачте или столбе — не дрон", "Тонко", true, "1, 0", T(anchor_check)},
@@ -129,6 +137,7 @@ const std::vector<Param>& params() {
         // Тонко: птица или дрон
         {"bird_resid", "Птица: отклонение от траектории, пикс.", "Тонко", false, "1.6, 2.2, 3", T(bird_resid)},
         {"bird_cv", "Птица: мигание контраста", "Тонко", false, "0.35, 0.5, 0.65", T(bird_contrast_cv)},
+        {"flap_max_period", "Птица: самый медленный взмах, кадров при 25 к/с", "Тонко", false, "16, 24", T(flap_max_period)},
         {"cls_min_hits", "Птица: попаданий до решения", "Тонко", false, "6, 8, 12", T(cls_min_hits)},
         // Главное
         {"governor", "Держать темп камеры", "Главное", true, "0, 1", S(governor)},
@@ -301,6 +310,7 @@ void apply_algo(Settings& dst, const Settings& src) {
     dst.trkSeconds = src.trkSeconds;
     dst.governor = src.governor;
     dst.skipDuplicates = src.skipDuplicates;
+    dst.frameStep = src.frameStep;
     dst.follow = src.follow;
     dst.followFrac = src.followFrac;
     dst.followGain = src.followGain;
@@ -530,7 +540,7 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, const Config& 
 
     Collector col;
     col.maxFrames = c.maxFrames;
-    col.warmup = c.warmup;
+    col.warmup = c.warmup * std::max(1, s.frameStep);   // номера кадров — файла, маска учится по обработанным
     // радиус задан в пикселях исходного кадра; при уменьшенной обработке — меньше
     col.radius = c.radius * (s.procW && vm.w ? (float)s.procW / vm.w : 1.f);
     if (vm.gt) {
