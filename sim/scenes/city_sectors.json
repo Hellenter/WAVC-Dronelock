@@ -9,9 +9,11 @@
  "world": {
   "sectors": [
    {"name": "forest", "type": "forest", "az_from": 0, "az_to": 120},
-   {"name": "lowrise", "type": "lowrise", "az_from": 120, "az_to": 240, "from": 110, "to": 900, "houses": 450},
+   {"name": "lowrise", "type": "lowrise", "az_from": 120, "az_to": 240, "from": 110, "to": 900,
+    "villages": 4, "streets": 5, "plots": 16},
    {"name": "highrise", "type": "highrise", "az_from": 240, "az_to": 360, "from": 260, "to": 1600,
-    "buildings": 110, "floors": [9, 25], "towers": 0.4, "masts": 0.35}
+    "districts": 3, "blocks": [3, 2], "block": [150, 120], "street": 30, "floors": [9, 25], "towers": 0.25,
+    "masts": 0.35}
   ],
   "trees": 1400,
   "trees_from": 90,

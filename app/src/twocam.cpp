@@ -192,7 +192,22 @@ void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t
 bool Emulator::sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out) {
     int w = 0, h = 0;
     std::string err;
-    if (!link_->render(t, cam, p.az, p.el, out, w, h, sbodies_, err) || w != W || h != H) {
+    bool ok = link_->render(t, cam, p.az, p.el, out, w, h, sbodies_, err);
+    // Godot закрыли или он упал: поднимаем заново (до 3 раз), мир тот же по seed, кадр просим повторно
+    while (!ok && !stop_ && linkRestarts_ < 3) {
+        ++linkRestarts_;
+        fprintf(stderr, "сцена: %s, перезапуск %d\n", err.c_str(), linkRestarts_);
+        event(t, "3D-сцена: " + err + ", перезапуск");
+        {
+            std::lock_guard<std::mutex> lk(vm_);
+            view_.status = "перезапуск 3D-сцены...";
+        }
+        err.clear();
+        ok = link_->start(linkOpt_, linkHello_, err) && link_->render(t, cam, p.az, p.el, out, w, h, sbodies_, err);
+        std::lock_guard<std::mutex> lk(vm_);
+        view_.status.clear();
+    }
+    if (!ok || w != W || h != H) {
         if (err.empty()) err = "сцена прислала кадр не того размера";
         std::lock_guard<std::mutex> lk(vm_);
         view_.status = "3D-сцена: " + err;
@@ -398,6 +413,12 @@ void Emulator::start(const Config& c) {
     narrowCam_.hfov_deg = c.narrowFov;
     sceneMode_ = !c.scene.empty();
     poseSeen_ = poseReq_;
+    scanReq_ = false;
+    scan_ = false;
+    pano_.clear();   // панорама — своя у каждой сцены
+    panoTw_ = panoTh_ = panoTile_ = 0;
+    sincePose_ = 0;
+    lastLearning_ = true;
     if (!sceneMode_) prepareWide();
     ngm_.reset();
     noiseTab_.resize(65536);
@@ -518,6 +539,47 @@ void Emulator::prepareWide() {
         }
     wideSky_.clear();
     wideSkyT_ = -1;
+}
+
+// маска широкой (по тайлам) -> ячейки панорамы, видимые сейчас
+void Emulator::panoLearn(const Result& r) {
+    if ((int)pano_.size() != PANO_W * PANO_H) pano_.assign((size_t)PANO_W * PANO_H, 0);
+    const int tw = r.tilesX, th = r.tilesY, tp = r.tilePx;
+    if (tw <= 0 || th <= 0 || tp <= 0 || r.mask.size() != (size_t)tw * th) return;
+    const double half = c_.wideFov * 0.5 + 5;
+    const int n = (int)std::ceil(half / PANO_STEP);
+    const int i0 = (int)std::floor(widePose_.az / PANO_STEP);
+    for (int j = 0; j < PANO_H; ++j) {
+        const double el = PANO_EL0 + (j + 0.5) * PANO_STEP;
+        for (int di = -n; di <= n; ++di) {
+            const int i = ((i0 + di) % PANO_W + PANO_W) % PANO_W;
+            double u, v;
+            if (!project(wideCam_, widePose_, dir_from_azel((i + 0.5) * PANO_STEP, el), u, v)) continue;
+            const int tx = (int)(u / tp), ty = (int)(v / tp);
+            if (u < 0 || v < 0 || tx >= tw || ty >= th) continue;
+            pano_[(size_t)j * PANO_W + i] = r.mask[(size_t)ty * tw + tx] ? 1 : 2;
+        }
+    }
+}
+
+// маска широкой для текущего поворота из панорамы; возвращает долю тайлов, которые панорама покрывает
+float Emulator::panoMaskFor(std::vector<uint8_t>& m) const {
+    m.assign((size_t)panoTw_ * panoTh_, 1);
+    if ((int)pano_.size() != PANO_W * PANO_H) return 0.f;
+    int known = 0;
+    for (int ty = 0; ty < panoTh_; ++ty)
+        for (int tx = 0; tx < panoTw_; ++tx) {
+            double az, el;
+            azel_from_dir(unproject(wideCam_, widePose_, (tx + 0.5) * panoTile_, (ty + 0.5) * panoTile_), az, el);
+            const int j = (int)std::floor((el - PANO_EL0) / PANO_STEP);
+            uint8_t v = 0;
+            if (j >= PANO_H) v = 1;        // выше панорамы — небо
+            else if (j < 0) v = 2;         // ниже — земля
+            else v = pano_[(size_t)j * PANO_W + ((int)std::floor(az / PANO_STEP) % PANO_W + PANO_W) % PANO_W];
+            if (v) ++known;
+            m[(size_t)ty * panoTw_ + tx] = v != 2;
+        }
+    return (float)known / std::max(1, panoTw_ * panoTh_);
 }
 
 void Emulator::stop() {
@@ -1144,6 +1206,9 @@ void Emulator::loop() {
                  c_.drones, c_.birds, c_.rangeMin, c_.rangeMax, c_.quadShare, c_.deltaShare, c_.planeShare, widePose_.az,
                  widePose_.el, c_.sector.empty() ? "false" : "true");
         std::string err;
+        linkOpt_ = o;
+        linkHello_ = hello;
+        linkRestarts_ = 0;
         if (!link_->start(o, hello, err)) {
             std::lock_guard<std::mutex> lk(vm_);
             view_.status = "3D-сцена: " + err;
@@ -1169,12 +1234,51 @@ void Emulator::loop() {
             continue;
         }
         if (t >= nextWide - 1e-9) {
+            if (scanReq_.exchange(false) && !scan_) {
+                scan_ = true;
+                scanStep_ = 0;
+                scanAz0_ = widePose_.az;
+                scanEl0_ = widePose_.el;
+                event(t, "обзор 360°: маска неба по кругу");
+            }
+            if (scan_ && (!lastLearning_ && sincePose_ >= 3)) {   // этот вид выучен — дальше
+                const float step = std::max(20.f, c_.wideFov * 0.5f);
+                const int n = (int)std::ceil(360.f / step - 1e-3f);
+                if (scanStep_ + 1 >= n) {
+                    scan_ = false;
+                    wantAz_ = scanAz0_;
+                    wantEl_ = scanEl0_;
+                    event(t, "обзор 360° закончен");
+                } else {
+                    ++scanStep_;
+                    wantAz_ = std::fmod(scanAz0_ + scanStep_ * step, 360.f);
+                    wantEl_ = scanEl0_;
+                }
+                ++poseReq_;
+            }
             if (poseReq_ != poseSeen_) {   // широкую повернули кнопками
                 poseSeen_ = poseReq_;
                 widePose_ = {wantAz_, std::max(-10.f, std::min(80.f, (float)wantEl_)), 0};
                 if (!sceneMode_) prepareWide();
-                char b[96];
-                snprintf(b, sizeof(b), "широкая повёрнута: азимут %.0f°, угол места %.0f°", widePose_.az, widePose_.el);
+                sincePose_ = 0;
+                lastLearning_ = true;
+                char b[160];
+                // маска неба для нового вида: из панорамы, если она его покрывает, иначе — учить заново
+                std::vector<uint8_t> m;
+                const float known = c_.panoMask && !scan_ && panoTw_ > 0 ? panoMaskFor(m) : 0.f;
+                if (known >= 0.85f) {
+                    pipe_.setExternalMask(std::move(m), panoTw_, panoTh_, (int)std::lround(c_.wideFps));
+                    snprintf(b, sizeof(b), "широкая повёрнута: азимут %.0f°, угол места %.0f°; маска из панорамы (%.0f%% вида)",
+                             widePose_.az, widePose_.el, known * 100);
+                } else {
+                    pipe_.relearnMask();
+                    snprintf(b, sizeof(b), "широкая повёрнута: азимут %.0f°, угол места %.0f°; маска учится%s", widePose_.az,
+                             widePose_.el, c_.panoMask && !scan_ ? " (панорама покрывает мало)" : "");
+                }
+                {
+                    std::lock_guard<std::mutex> lk(vm_);
+                    view_.panoKnown = known;
+                }
                 event(t, b);
             }
             // тела, вылетевшие из поля зрения широкой или ушедшие далеко, — заново (в 3D-сцене их ведёт сцена)
@@ -1222,6 +1326,25 @@ void Emulator::loop() {
             }
             if (res && wideDone_ >= idx) {
                 onWide(t, *res);
+                // панорамная маска: маска этого вида — в панораму (после обучения и раз в полсекунды)
+                const bool learned = lastLearning_ && !res->learning;
+                lastLearning_ = res->learning;
+                ++sincePose_;
+                if (res->tilesX > 0) {
+                    panoTw_ = res->tilesX;
+                    panoTh_ = res->tilesY;
+                    panoTile_ = res->tilePx;
+                }
+                if (c_.panoMask && !res->learning && !res->mask.empty() &&
+                    (learned || st_.wideFrames % std::max(1, (int)(c_.wideFps / 2)) == 0)) {
+                    panoLearn(*res);
+                    std::lock_guard<std::mutex> lk(vm_);
+                    view_.pano = pano_;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(vm_);
+                    view_.scanning = scan_;
+                }
                 std::lock_guard<std::mutex> lk(vm_);
                 view_.wide = res;
                 view_.status.clear();
@@ -1391,10 +1514,10 @@ int run_cli(int argc, char** argv) {
         else if (a == "--az") c.wideAz = (float)atof(val().c_str());
         else if (a == "--el") c.wideEl = (float)atof(val().c_str());
         else {
-            printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 250,1200]\n"
+            printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 100,750]\n"
                    "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--types 0.5,0.25,0.25] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
                    "  [--fps 60] [--rate 30] [--accel 150] [--latency 0.06] [--dwell 6]\n"
-                   "  [--switch queue|nearest|manual] [--json out.json] [--quiet]\n"
+                   "  [--switch manual|queue|nearest] [--json out.json] [--quiet]\n"
                    "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window] [--no-lock-focus]\n"
                    "  [--min-hold 0.08] [--give-up 3] [--cool-down 10]\n"
                    "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--legacy — всё выключено]\n"

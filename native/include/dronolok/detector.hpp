@@ -329,6 +329,9 @@ public:
     // файл первой версии (без слоя доращивания) — только до конца сверки.
     bool saveMask(const std::string& path) const;
     bool loadMask(const std::string& path, int verify = 25);
+    // Готовая маска по тайлам (tilesY x tilesX, 1 = искать) — например, из панорамной маски 360°
+    // при известном повороте камеры: включается сразу, без обучения и сверки. false — размер не тот.
+    bool setMask(const std::vector<uint8_t>& m, int tw, int th);
     bool verifyingMask() const { return verifyLeft_ > 0; }
     bool maskReplaced() const { return maskReplaced_; }
     // Помехи этого кадра (Tracker::clutterDets, пиксели кадра) для доращивания маски

@@ -124,6 +124,8 @@ struct App {
     int64_t emuWSeq = -1;
     int emuRes = 0, emuSpeed = 2;
     bool emuTruth = true;
+    bool emuShowMask = false;          // маска неба поверх кадра широкой
+    SDL_Texture* emuPanoTex = nullptr; // панорамная маска 360°, PANO_W/4 x PANO_H/4
     // мир эмулятора: 0 — синтетическое небо, 1 — 3D-сцена Godot (sim/)
     int emuWorld = 0;
     std::string simDir, simBase;
@@ -2398,6 +2400,64 @@ void emu_start(App& a) {
     a.emuWSeq = -1;
 }
 
+// Панорамная маска полосой: 360° по азимуту, угол места снизу вверх; рамка — текущий вид широкой.
+void draw_pano(App& a) {
+    const twocam::View& v = a.emuView;
+    constexpr int K = 4, PW = twocam::PANO_W / K, PH = twocam::PANO_H / K;
+    if (v.pano.size() != (size_t)twocam::PANO_W * twocam::PANO_H) {
+        ImGui::TextDisabled("Панорама пуста: маска ещё учится.");
+        return;
+    }
+    if (!a.emuPanoTex) {
+        a.emuPanoTex = SDL_CreateTexture(a.ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, PW, PH);
+        if (!a.emuPanoTex) return;
+    }
+    void* px;
+    int pitch;
+    int known = 0;
+    if (SDL_LockTexture(a.emuPanoTex, nullptr, &px, &pitch) == 0) {
+        for (int y = 0; y < PH; ++y) {
+            uint32_t* o = (uint32_t*)((uint8_t*)px + (size_t)y * pitch);
+            const int j0 = (PH - 1 - y) * K;   // строка 0 панорамы — внизу (угол места -20°)
+            for (int x = 0; x < PW; ++x) {
+                int sky = 0, closed = 0;
+                for (int j = j0; j < j0 + K; ++j)
+                    for (int i = x * K; i < x * K + K; ++i) {
+                        const uint8_t c = v.pano[(size_t)j * twocam::PANO_W + i];
+                        sky += c == 1;
+                        closed += c == 2;
+                    }
+                known += sky + closed > 0;
+                // не видели — тёмная, небо — голубая, закрыто — серо-коричневая (ABGR)
+                o[x] = sky + closed == 0 ? 0xff2a2624u : closed > sky ? 0xff3c4a5au : 0xffe8c8a0u;
+            }
+        }
+        SDL_UnlockTexture(a.emuPanoTex);
+    }
+    ImGui::Text("Панорама: известно %.0f%% круга, вида — %.0f%%", 100.f * known / (PW * PH), 100.f * v.panoKnown);
+    const float w = ImGui::GetContentRegionAvail().x, h = w * PH / PW;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::Image((ImTextureID)(intptr_t)a.emuPanoTex, ImVec2(w, h));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float hf = a.emuCfg.wideFov, vf = hf * a.emuCfg.wideH / std::max(1, a.emuCfg.wideW);
+    const float span = twocam::PANO_H * twocam::PANO_STEP;
+    auto X = [&](float az) { return p0.x + w * std::fmod(az + 720.f, 360.f) / 360.f; };
+    auto Y = [&](float el) { return p0.y + h * (1.f - std::clamp((el - twocam::PANO_EL0) / span, 0.f, 1.f)); };
+    const float az0 = v.widePose.az - hf / 2, az1 = v.widePose.az + hf / 2;
+    const float y0 = Y(v.widePose.el + vf / 2), y1 = Y(v.widePose.el - vf / 2);
+    const ImU32 col = IM_COL32(90, 220, 255, 230);
+    dl->PushClipRect(p0, ImVec2(p0.x + w, p0.y + h), true);
+    for (float sh : {-360.f, 0.f, 360.f}) {   // вид через 0°/360° — двумя кусками
+        const float xa = p0.x + w * (az0 + sh) / 360.f, xb = p0.x + w * (az1 + sh) / 360.f;
+        dl->AddRect(ImVec2(xa, y0), ImVec2(xb, y1), col, 0, 0, 2.f);
+    }
+    for (const auto& sc : a.emuWorld == 1 ? a.simSectors : std::vector<scene::Sector>()) {
+        dl->AddLine(ImVec2(X(sc.from), p0.y), ImVec2(X(sc.from), p0.y + h), IM_COL32(255, 255, 255, 90));
+    }
+    dl->PopClipRect();
+    ImGui::TextDisabled("Азимут 0–360° слева направо: голубое — небо, бурое — закрыто, тёмное — не видели.");
+}
+
 void panel_twocam(App& a) {
     twocam::Config& c = a.emuCfg;
     const float bigH = ImGui::GetFrameHeight() * 1.6f;
@@ -2504,6 +2564,22 @@ void panel_twocam(App& a) {
             }
         }
         if (turn && a.emu.running()) a.emu.setWidePose(cc.wideAz, cc.wideEl);
+    }
+
+    heading("Маска неба");
+    ImGui::Checkbox("Панорамная маска 360°", &c.panoMask);
+    ImGui::SetItemTooltip("Маска неба копится по кругу: после поворота широкая берёт маску из панорамы, если та "
+                          "покрывает от 85%% вида, и не учится заново. Применяется при перезапуске.");
+    ImGui::Checkbox("Показывать маску на широкой", &a.emuShowMask);
+    ImGui::SetItemTooltip("Закрытые маской тайлы (земля, дома, деревья) — затемнены красным, пока маска учится — "
+                          "рамка жёлтая.");
+    if (a.emu.running() && c.panoMask) {
+        const twocam::View& v = a.emuView;
+        ImGui::BeginDisabled(v.scanning);
+        if (ImGui::Button(v.scanning ? "Идёт обзор 360°..." : "Обзор 360°", ImVec2(-FLT_MIN, 0))) a.emu.startScan();
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Широкая проходит круг шагами в полкадра и учит маску на каждом, потом возвращается.");
+        draw_pano(a);
     }
 
     heading("Переключение целей");
@@ -2679,6 +2755,20 @@ void draw_twocam(App& a) {
     auto W = [&](float x, float y) { return ImVec2(wPos.x + x * ks, wPos.y + y * ks); };
     dl->AddImage((ImTextureID)(intptr_t)a.emuWTex, wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y));
     dl->PushClipRect(wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y), true);
+    if (a.emuShowMask) {   // маска неба: закрытые тайлы — красным, пока учится — жёлтая рамка
+        const Result& r = *v.wide;
+        const float tp = r.tilePx * ks;
+        if (r.mask.size() == (size_t)r.tilesX * r.tilesY && tp > 0)
+            for (int ty = 0; ty < r.tilesY; ++ty)
+                for (int tx = 0; tx < r.tilesX; ++tx)
+                    if (!r.mask[(size_t)ty * r.tilesX + tx])
+                        dl->AddRectFilled(ImVec2(wPos.x + tx * tp, wPos.y + ty * tp),
+                                          ImVec2(wPos.x + (tx + 1) * tp, wPos.y + (ty + 1) * tp), IM_COL32(150, 30, 20, 95));
+        if (r.learning) {
+            dl->AddRect(wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y), IM_COL32(255, 210, 0, 200), 0, 0, 3.f);
+            dl->AddText(ImVec2(wPos.x + 8, wPos.y + 6), IM_COL32(255, 210, 0, 255), "маска учится");
+        }
+    }
     if (v.footprint.size() >= 3) {   // куда смотрит точная
         std::vector<ImVec2> poly;
         for (const auto& p : v.footprint) poly.push_back(W(p.first, p.second));
@@ -4000,6 +4090,7 @@ int main(int argc, char** argv) {
     if (a.tex) SDL_DestroyTexture(a.tex);
     if (a.cropTex) SDL_DestroyTexture(a.cropTex);
     if (a.emuWTex) SDL_DestroyTexture(a.emuWTex);
+    if (a.emuPanoTex) SDL_DestroyTexture(a.emuPanoTex);
     if (a.emuNTex) SDL_DestroyTexture(a.emuNTex);
     SDL_DestroyRenderer(a.ren);
     SDL_DestroyWindow(win);

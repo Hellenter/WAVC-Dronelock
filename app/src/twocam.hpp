@@ -31,6 +31,9 @@ using dronolok::Pose;
 using dronolok::TargetReport;
 using dronolok::Vec3;
 
+constexpr int PANO_W = 1440, PANO_H = 360;   // 0.25° на ячейку: азимут 0..360, угол места -20..70
+constexpr float PANO_STEP = 0.25f, PANO_EL0 = -20.f;
+
 enum class SwitchMode : int { Manual = 0, Queue = 1, Nearest = 2 };
 
 struct Config {
@@ -38,9 +41,12 @@ struct Config {
     // Цели тогда летают в сцене (числа, дальность и доли типов — ниже), облака и видимость — из сцены.
     std::string scene, sector, godot, simProject;
     uint64_t renderAffinity = 0;   // ядра для отрисовки сцены, 0 — любые
+    // Панорамная маска 360°: маска неба широкой копится по азимуту и углу места; после поворота
+    // широкой маска берётся из панорамы (если она покрывает новый вид), а не учится заново
+    bool panoMask = true;
     // сцена
     int drones = 3, birds = 1;
-    float rangeMin = 250, rangeMax = 1200;   // м
+    float rangeMin = 100, rangeMax = 750;    // м
     float speedMin = 6, speedMax = 22;       // м/с
     float droneSize = 0.5f, birdSize = 0.35f;   // м: размах квадрокоптера (средний) и птицы (не используется)
     // доли типов дронов: квадрокоптер (0.3–0.8 м при размере 0.5), летающее крыло (1.8–3.5 м, 25–45 м/с),
@@ -66,7 +72,7 @@ struct Config {
     float encoderDeg = 0.01f;             // дискретность датчиков угла
     float handoffLatency = 0.06f;         // от кадра широкой до команды поворотке, с
     // наведение
-    SwitchMode switchMode = SwitchMode::Queue;
+    SwitchMode switchMode = SwitchMode::Manual;
     float dwell = 6;          // сколько вести цель, прежде чем перейти к следующей (авто), с
     bool dronesOnly = true;   // не наводиться на цели, которые широкая считает птицами
     float simSpeed = 1;       // во сколько раз быстрее реального времени; 0 — как успевает ПК
@@ -177,6 +183,11 @@ struct View {
     std::vector<std::pair<float, float>> footprint;   // контур кадра точной на широкой
     std::deque<Event> events;
     Stats st;
+    // панорамная маска: PANO_W x PANO_H ячеек по PANO_STEP°, угол места от PANO_EL0; 0 — не видели,
+    // 1 — небо (искать), 2 — закрыто маской
+    std::vector<uint8_t> pano;
+    float panoKnown = 0;                  // доля тайлов текущего вида, покрытых панорамой
+    bool scanning = false;                // идёт обзор 360°
     bool running = false, paused = false;
     std::string status;
 };
@@ -196,6 +207,9 @@ public:
     void setSwitchMode(SwitchMode m) { switchMode_ = (int)m; }
     void setSpeed(float s) { speed_ = s; }
     // повернуть широкую камеру (вступает с ближайшего её кадра); поворотка точной не трогается
+    // обзор 360°: широкая поворачивается шагами по полкадра, на каждом шаге маска учится и
+    // ложится в панораму, в конце — обратно
+    void startScan() { scanReq_ = true; }
     void setWidePose(float az, float el) {
         wantAz_ = az;
         wantEl_ = el;
@@ -231,10 +245,24 @@ private:
     std::atomic<float> speed_{1};
     std::atomic<float> wantAz_{0}, wantEl_{0};
     std::atomic<int> poseReq_{0};
+    std::atomic<bool> scanReq_{false};
+    // панорамная маска
+    std::vector<uint8_t> pano_;
+    int panoTw_ = 0, panoTh_ = 0, panoTile_ = 0;   // тайлы маски широкой (из её результата)
+    int sincePose_ = 0;          // кадров широкой с последнего поворота
+    bool lastLearning_ = true;
+    bool scan_ = false;
+    int scanStep_ = 0;
+    float scanAz0_ = 0, scanEl0_ = 0;
+    void panoLearn(const Result& r);
+    float panoMaskFor(std::vector<uint8_t>& m) const;
     int poseSeen_ = 0;
     // 3D-сцена: отдельный процесс Godot
     bool sceneMode_ = false;
     std::unique_ptr<scene::Link> link_;
+    scene::Options linkOpt_;
+    std::string linkHello_;
+    int linkRestarts_ = 0;
     std::vector<scene::Body> sbodies_;
     mutable std::mutex vm_;
     View view_;

@@ -265,6 +265,16 @@ public:
     void marks(std::vector<uint8_t>& out) const;
     int findInHistory(int64_t frame) const;   // seq последнего обработанного кадра frame или -1
     void relearnMask();
+    // Маска неба снаружи (панорамная маска 360° эмулятора при известном повороте камеры): ставится
+    // со следующего кадра без обучения; треки — заново (вид сменился), смену сцены hold кадров не ловим
+    void setExternalMask(std::vector<uint8_t> m, int tw, int th, int hold) {
+        std::lock_guard<std::mutex> lk(extM_);
+        extMask_ = std::move(m);
+        extTw_ = tw;
+        extTh_ = th;
+        extHold_ = hold;
+        extNew_ = true;
+    }
     // Память статичных помех лежит рядом с видео (<видео>.static.bin): загружается при
     // открытии и сохраняется при закрытии, если включена
     std::string staticPath() const { return path_ + ".static.bin"; }
@@ -343,6 +353,10 @@ private:
     std::atomic<int> steps_{0};
     std::atomic<bool> relearn_{true};
     std::atomic<bool> maskForce_{false};   // "заново": учить, даже если есть файл
+    std::mutex extM_;
+    std::vector<uint8_t> extMask_;
+    int extTw_ = 0, extTh_ = 0, extHold_ = 0;
+    bool extNew_ = false;
     std::atomic<int> staticCmd_{0};
     std::atomic<int> lockCmd_{0};   // -1 — следующая цель очереди, > 0 — id выбранного трека
     std::atomic<int64_t> seekReq_{-1};

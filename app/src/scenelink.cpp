@@ -80,7 +80,7 @@ bool Link::start(const Options& o, const std::string& hello, std::string& err) {
     std::error_code ec;
     const std::string project = s8(fs::absolute(u8(o.project), ec)), scn = s8(fs::absolute(u8(o.scene), ec));
     std::vector<std::string> args = {o.godot, "--path", project, "--rendering-driver", "opengl3", "--audio-driver",
-                                     "Dummy", "--", "--config", scn, "--live", std::to_string(port)};
+                                     "Dummy", "--resolution", "64x48", "--position", "-30000,-30000", "--", "--config", scn, "--live", std::to_string(port)};
     if (!o.sector.empty()) {
         args.push_back("--sector");
         args.push_back(o.sector);
@@ -281,7 +281,16 @@ std::vector<Sector> scene_sectors(const std::string& path) {
     size_t p = s.find("\"sectors\"");
     if (p == std::string::npos) return out;
     p = s.find('[', p);
-    const size_t e = p == std::string::npos ? p : s.find(']', p);
+    if (p == std::string::npos) return out;
+    // конец массива по глубине скобок: внутри секторов бывают свои массивы ("floors": [9, 25])
+    size_t e = std::string::npos;
+    for (size_t i = p, depth = 0; i < s.size(); ++i) {
+        if (s[i] == '[') ++depth;
+        else if (s[i] == ']' && --depth == 0) {
+            e = i;
+            break;
+        }
+    }
     if (e == std::string::npos) return out;
     const std::string arr = s.substr(p, e - p);
     static const std::regex obj("\\{[^{}]*\\}"), nm("\"name\"\\s*:\\s*\"([^\"]*)\""), ty("\"type\"\\s*:\\s*\"([^\"]*)\""),

@@ -506,6 +506,7 @@ void Pipeline::processLoop() {
     int learnLeft = 0;
     int grownSaved = 0;   // тайлов маски, доросших и открытых, на момент сохранения в файл
     bool maskOn = false, motionWas = false, maskChecking = false;
+    int extLeft = 0;   // кадров после маски снаружи, когда смена вида не переучивает маску
     bool relearnMoved = false;   // маска учится заново после плавного поворота камеры (панорамы)
     // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
     float uniqShare = 1.f, trkFps = 0.f;
@@ -715,6 +716,30 @@ void Pipeline::processLoop() {
         // камера, ведущая цель, тоже поворачивается: маска неба не годится
         const bool camMoves = ef.motion || s.follow || panning;
         if (sceneLight) det.resetBackground();   // облако закрыло солнце: старый фон ячеек только мешает
+        {   // маска снаружи (панорама эмулятора): вместо обучения, смену вида в эти кадры не ловим
+            std::lock_guard<std::mutex> lk(extM_);
+            if (extNew_) {
+                extNew_ = false;
+                if (det.setMask(extMask_, extTw_, extTh_)) {
+                    maskOn = true;
+                    maskChecking = false;
+                    learnLeft = 0;
+                    relearn_ = false;
+                    maskForce_ = false;
+                    trkIdx = -1;
+                    trk->resetTracks();
+                    gm.reset();
+                    extLeft = extHold_;
+                } else {
+                    maskForce_ = true;
+                    relearn_ = true;
+                }
+            }
+        }
+        if (extLeft > 0) {
+            --extLeft;
+            sceneMoved = false;
+        }
         if (sceneMoved && !camMoves && maskOn) {   // камеру повернули: маска неба — заново, не из файла
             maskForce_ = true;
             relearn_ = true;

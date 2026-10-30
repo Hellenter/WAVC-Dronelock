@@ -700,6 +700,23 @@ bool Detector::loadMask(const std::string& path, int verify) {
     return true;
 }
 
+bool Detector::setMask(const std::vector<uint8_t>& m, int tw, int th) {
+    if (tw <= 0 || th <= 0 || m.size() != (size_t)tw * th || (tw_ > 0 && (tw != tw_ || th != th_))) return false;
+    tw_ = tw;
+    th_ = th;
+    mask_ = m;
+    fileGrown_.clear();
+    learning_ = false;
+    maskReplaced_ = false;
+    verifyLeft_ = 0;
+    texSum_.assign((size_t)tw_ * th_, 0.f);
+    for (auto& t : texSumP_) t.assign((size_t)tw_ * th_, 0.f);
+    texN_ = 0;
+    resetGrow();
+    resetColor();
+    return true;
+}
+
 // тайлы, закрытые доращиванием в прошлый раз (слой файла маски), — снова закрыты доращиванием
 void Detector::applyGrown() {
     const size_t n = mask_.size();

@@ -699,6 +699,7 @@ const ROOFS := [Color(0.45, 0.18, 0.14), Color(0.30, 0.32, 0.35), Color(0.20, 0.
 
 var house_models: Array = []
 var house_items: Array = []    # процедурные дома: [Transform3D основания, ширина, глубина, высота стен, высота крыши]
+var roads: Array = []          # улицы: [Transform3D середины, длина вдоль x, ширина]
 
 
 func load_house_models() -> void:
@@ -875,7 +876,8 @@ func grid_put(grid: Dictionary, p: Vector2, rad: float, cell: float) -> void:
 	grid[k].append([p.x, p.y, rad])
 
 
-# Частный сектор: дома вдоль улиц (фасадом к установке), кварталы и пустыри по шуму.
+# Частный сектор: посёлки из параллельных улиц, дома по обе стороны на участках ~22 м, фасадом к
+# улице; между посёлками — поля и лес (world.sectors[].villages, streets, plots).
 func build_lowrise() -> void:
 	var any = false
 	for sc in sectors():
@@ -885,24 +887,60 @@ func build_lowrise() -> void:
 		load_house_models()
 		var r0 = maxf(float(sc.get("from", 120.0)), float(cfg["world"].get("clear_radius", 35.0)))
 		var r1 = float(sc.get("to", 800.0))
-		var n = int(sc.get("houses", 350))
 		var grid = {}
-		var placed = 0
+		var made = 0
 		var tries = 0
-		while placed < n and tries < n * 20:
+		while made < int(sc.get("villages", 4)) and tries < 200:
 			tries += 1
-			var sp = sector_point(sc, r0, r1)
-			var p: Vector2 = sp[0]
-			if noise.get_noise_2d(p.x * 0.6 + 900.0, p.y * 0.6) < -0.25:
-				continue   # пустыри и огороды
-			if not grid_free(grid, p, 8.0, 24.0):
+			var ns = rng.randi_range(3, int(sc.get("streets", 6)))
+			var np = rng.randi_range(8, int(sc.get("plots", 16)))
+			var sx = np * 22.0
+			var sz = ns * 64.0
+			var rad = 0.5 * sqrt(sx * sx + sz * sz)
+			var sp = sector_point(sc, r0 + rad * 0.5, maxf(r0 + rad * 0.5 + 1.0, r1 - rad * 0.5))
+			var c: Vector2 = sp[0]
+			if not grid_free(grid, c, rad, 400.0):
 				continue
-			grid_put(grid, p, 8.0, 24.0)
-			var rot = -float(sp[1]) * DEG + (PI * 0.5 if rng.randf() < 0.3 else 0.0) + rng.randf_range(-0.12, 0.12)
-			place_house(p, rot)
-			placed += 1
+			grid_put(grid, c, rad, 400.0)
+			made += 1
+			# улицы — поперёк направления на установку или вдоль, как легла дорога
+			var rot = -float(sp[1]) * DEG + (PI * 0.5 if rng.randf() < 0.5 else 0.0) + rng.randf_range(-0.2, 0.2)
+			var xfv = Transform3D(Basis(Vector3.UP, rot), Vector3(c.x, 0, c.y))
+			for si in ns:
+				var z = (si - (ns - 1) * 0.5) * 64.0
+				for side in [-1.0, 1.0]:
+					for k in np:
+						if rng.randf() < 0.12:
+							continue   # пустой участок
+						var x = (k - (np - 1) * 0.5) * 22.0 + rng.randf_range(-2.0, 2.0)
+						var q = xfv * Vector3(x, 0, z + side * rng.randf_range(13.0, 17.0))
+						place_house(Vector2(q.x, q.z), rot + (PI if side > 0 else 0.0) + rng.randf_range(-0.06, 0.06))
+				roads.append([xfv * Transform3D(Basis(), Vector3(0, 0, z)), np * 22.0 + 20.0, 7.0])
+			roads.append([xfv * Transform3D(Basis(Vector3.UP, PI * 0.5), Vector3(-np * 11.0 - 10.0, 0, 0)), ns * 64.0, 8.0])
 	if any:
 		flush_houses()
+		flush_roads()
+
+
+# Улицы одним MultiMesh тёмных полос на земле.
+func flush_roads() -> void:
+	if roads.is_empty():
+		return
+	var pm = PlaneMesh.new()
+	pm.size = Vector2(1, 1)
+	pm.material = mat_color(Color(0.22, 0.22, 0.23), 0.95)
+	var mm = MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = pm
+	mm.instance_count = roads.size()
+	for i in roads.size():
+		var it: Array = roads[i]
+		var xf: Transform3D = it[0]
+		mm.set_instance_transform(i, xf * Transform3D(Basis().scaled(Vector3(it[1], 1, it[2])), Vector3(0, 0.06, 0)))
+	var mi = MultiMeshInstance3D.new()
+	mi.multimesh = mm
+	world.add_child(mi)
+	roads.clear()
 
 
 const BUILDING_SHADER := """
@@ -953,45 +991,51 @@ void fragment() {
 func build_highrise() -> void:
 	var slabs = []     # [Transform3D основания, ширина, глубина, высота, цвет]
 	var masts = []     # [x, z, y0, h]
+	var colors = [Color(0.82, 0.80, 0.76), Color(0.74, 0.74, 0.72), Color(0.86, 0.78, 0.66), Color(0.68, 0.72, 0.78), Color(0.78, 0.66, 0.58), Color(0.90, 0.90, 0.88)]
 	for sc in sectors():
 		if str(sc.get("type", "")) != "highrise":
 			continue
 		var r0 = maxf(float(sc.get("from", 250.0)), float(cfg["world"].get("clear_radius", 35.0)))
 		var r1 = float(sc.get("to", 1500.0))
-		var n = int(sc.get("buildings", 90))
 		var fl = sc.get("floors", [9, 25])
+		var bl = sc.get("block", [150, 120])
+		var nb = sc.get("blocks", [3, 2])
+		var street = float(sc.get("street", 30.0))
+		var L = float(bl[0])
+		var W = float(bl[1])
 		var grid = {}
+		var made = 0
 		var tries = 0
-		var placed = 0
-		var colors = [Color(0.82, 0.80, 0.76), Color(0.74, 0.74, 0.72), Color(0.86, 0.78, 0.66), Color(0.68, 0.72, 0.78), Color(0.78, 0.66, 0.58), Color(0.90, 0.90, 0.88)]
-		while placed < n and tries < n * 30:
+		while made < int(sc.get("districts", 3)) and tries < 200:
 			tries += 1
-			var sp = sector_point(sc, r0, r1)
-			var p: Vector2 = sp[0]
-			var tower = rng.randf() < float(sc.get("towers", 0.4))
-			var bw = rng.randf_range(18.0, 28.0) if tower else rng.randf_range(40.0, 100.0)
-			var bd = bw * rng.randf_range(0.8, 1.0) if tower else rng.randf_range(12.0, 15.0)
-			var floors = rng.randi_range(maxi(int(fl[0]), 16) if tower else int(fl[0]), int(fl[1]) if tower else mini(int(fl[1]), 17))
-			var bh = floors * 2.9 + 1.0
-			var rad = 0.5 * sqrt(bw * bw + bd * bd) + 12.0
-			if not grid_free(grid, p, rad, 60.0):
+			var nx = int(nb[0])
+			var nz = int(nb[1])
+			var sx = nx * (L + street)
+			var sz = nz * (W + street)
+			var rad = 0.5 * sqrt(sx * sx + sz * sz)
+			var sp = sector_point(sc, r0 + rad * 0.6, maxf(r0 + rad * 0.6 + 1.0, r1 - rad * 0.5))
+			var c: Vector2 = sp[0]
+			if not grid_free(grid, c, rad + 40.0, 500.0):
 				continue
-			grid_put(grid, p, rad, 60.0)
-			# кварталы: оси домов по сетке района (шум даёт поворот на куски района)
-			var rot = -float(sp[1]) * DEG + (PI * 0.5 if rng.randf() < 0.45 else 0.0) + noise.get_noise_2d(p.x * 0.05, p.y * 0.05) * 0.6
-			var xf = Transform3D(Basis(Vector3.UP, rot), Vector3(p.x, 0, p.y))
-			var c: Color = colors[rng.randi() % colors.size()]
-			slabs.append([xf, bw, bd, bh, c])
-			add_box(xf, AABB(Vector3(-bw / 2, 0, -bd / 2), Vector3(bw, bh, bd)))
-			# машинное отделение лифта на крыше
-			var nb = 1 if tower else maxi(1, int(bw / 30.0))
-			for k in nb:
-				var ox = (k - (nb - 1) * 0.5) * (bw / nb)
-				slabs.append([xf * Transform3D(Basis(), Vector3(ox, bh, 0)), 5.0, 6.0, 3.2, c * 0.85])
-			if rng.randf() < float(sc.get("masts", 0.35)):
-				var mp = xf * Vector3(rng.randf_range(-bw * 0.4, bw * 0.4), 0, rng.randf_range(-bd * 0.3, bd * 0.3))
-				masts.append([mp.x, mp.z, bh, rng.randf_range(3.0, 9.0)])
-			placed += 1
+			grid_put(grid, c, rad + 40.0, 500.0)
+			made += 1
+			# микрорайон: сетка кварталов, улицы между ними; ось — примерно на установку
+			var rot = -float(sp[1]) * DEG + rng.randf_range(-0.3, 0.3)
+			var xfd = Transform3D(Basis(Vector3.UP, rot), Vector3(c.x, 0, c.y))
+			var dom = rng.randi() % (nx * nz)   # квартал с доминантой (самые высокие башни)
+			for bi in nx + 1:   # улицы между кварталами и по краю микрорайона
+				roads.append([xfd * Transform3D(Basis(Vector3.UP, PI * 0.5), Vector3((bi - nx * 0.5) * (L + street), 0, 0)), sz + street, street * 0.6])
+			for bj in nz + 1:
+				roads.append([xfd * Transform3D(Basis(), Vector3(0, 0, (bj - nz * 0.5) * (W + street))), sx + street, street * 0.6])
+			for bi in nx:
+				for bj in nz:
+					var xfb = xfd * Transform3D(Basis(), Vector3((bi - (nx - 1) * 0.5) * (L + street), 0, (bj - (nz - 1) * 0.5) * (W + street)))
+					var col: Color = colors[rng.randi() % colors.size()]
+					if bi * nz + bj != dom and rng.randf() < float(sc.get("towers", 0.25)):
+						hr_towers(slabs, masts, sc, xfb, L, W, fl, col)
+					else:
+						hr_perimeter(slabs, masts, sc, xfb, L, W, fl, col, bi * nz + bj == dom)
+	flush_roads()
 	if slabs.is_empty():
 		return
 	var m = ShaderMaterial.new()
@@ -1029,6 +1073,74 @@ func build_highrise() -> void:
 	var mi2 = MultiMeshInstance3D.new()
 	mi2.multimesh = m2
 	world.add_child(mi2)
+
+
+# Секция дома в осях квартала: центр (x, z), длина span вдоль оси x квартала (along) или z, глубина d.
+func hr_section(slabs: Array, masts: Array, sc: Dictionary, xfb: Transform3D, x: float, z: float, span: float, d: float,
+		along_x: bool, floors: int, col: Color) -> void:
+	var bw = span if along_x else d
+	var bd = d if along_x else span
+	var bh = floors * 2.9 + 1.0
+	var xf = xfb * Transform3D(Basis(), Vector3(x, 0, z))
+	slabs.append([xf, bw, bd, bh, col])
+	add_box(xf, AABB(Vector3(-bw / 2, 0, -bd / 2), Vector3(bw, bh, bd)))
+	var n = maxi(1, int(span / 28.0))   # машинные отделения лифтов — по одному на подъезд
+	for k in n:
+		var o = (k - (n - 1) * 0.5) * (span / n)
+		slabs.append([xf * Transform3D(Basis(), Vector3(o if along_x else 0.0, bh, 0.0 if along_x else o)), 5.0, 6.0, 3.2, col * 0.85])
+	if rng.randf() < float(sc.get("masts", 0.35)) * 0.5:
+		var mp = xf * Vector3(rng.randf_range(-bw * 0.4, bw * 0.4), 0, rng.randf_range(-bd * 0.3, bd * 0.3))
+		masts.append([mp.x, mp.z, bh, rng.randf_range(3.0, 9.0)])
+
+
+# Квартал по периметру, как в новых микрорайонах: секции 9–17 эт. по сторонам, двор внутри, въезды
+# в разрывах, на углу — башня-доминанта; во дворе иногда детский сад.
+func hr_perimeter(slabs: Array, masts: Array, sc: Dictionary, xfb: Transform3D, L: float, W: float, fl: Array,
+		col: Color, dominant: bool) -> void:
+	var d = 15.0
+	var f0 = int(fl[0])
+	var fmid = mini(int(fl[1]), 17)
+	var base = rng.randi_range(f0, fmid)
+	var tower_corner = rng.randi() % 4
+	var corners = [Vector2(-L / 2 + 11, -W / 2 + 11), Vector2(L / 2 - 11, -W / 2 + 11), Vector2(L / 2 - 11, W / 2 - 11), Vector2(-L / 2 + 11, W / 2 - 11)]
+	# стороны: [центр x, z, длина, вдоль x]; секции ~30 м, высота ступенями
+	var sides = [[0.0, -W / 2 + d / 2, L, true], [0.0, W / 2 - d / 2, L, true], [-L / 2 + d / 2, 0.0, W - 2 * d, false], [L / 2 - d / 2, 0.0, W - 2 * d, false]]
+	for si in sides.size():
+		var sd: Array = sides[si]
+		var span: float = sd[2]
+		var nsec = maxi(1, int(round(span / 30.0)))
+		var sl = span / nsec
+		var gap = rng.randi() % nsec if (si == 1 or rng.randf() < 0.3) else -1   # въезд во двор
+		for k in nsec:
+			if k == gap:
+				continue
+			var o = -span / 2 + (k + 0.5) * sl
+			var cx: float = sd[0] + (o if sd[3] else 0.0)
+			var cz: float = sd[1] + (0.0 if sd[3] else o)
+			var skip = false
+			var tc: Vector2 = corners[tower_corner]
+			if absf(cx - tc.x) < 18.0 and absf(cz - tc.y) < 18.0:
+				skip = true   # тут башня
+			if not skip:
+				hr_section(slabs, masts, sc, xfb, cx, cz, sl - 0.5, d, sd[3], clampi(base + rng.randi_range(-2, 2), f0, fmid), col)
+	var tc2: Vector2 = corners[tower_corner]
+	var tf = rng.randi_range(maxi(f0, 18), int(fl[1]))
+	if dominant:
+		tf = int(fl[1]) + rng.randi_range(0, 5)
+	hr_section(slabs, masts, sc, xfb, tc2.x, tc2.y, 22.0, 22.0, true, tf, col.lightened(0.05))
+	if rng.randf() < 0.5:   # детский сад во дворе
+		hr_section(slabs, masts, sc, xfb, rng.randf_range(-10.0, 10.0), rng.randf_range(-6.0, 6.0), 40.0, 22.0, true, 2,
+			Color(0.85, 0.75, 0.55))
+
+
+# Квартал точечных башен 17–25 эт. на общем стилобате (2 эт.).
+func hr_towers(slabs: Array, masts: Array, sc: Dictionary, xfb: Transform3D, L: float, W: float, fl: Array, col: Color) -> void:
+	var n = rng.randi_range(2, 4)
+	for k in n:
+		var x = (k - (n - 1) * 0.5) * (L / n)
+		var z = rng.randf_range(-W * 0.2, W * 0.2)
+		hr_section(slabs, masts, sc, xfb, x, z, 22.0, 22.0, true, rng.randi_range(maxi(int(fl[0]), 17), int(fl[1])), col)
+	hr_section(slabs, masts, sc, xfb, 0.0, W / 2 - 12.0, L * 0.8, 18.0, true, 2, col.darkened(0.15))
 
 
 # Препятствие для разметки: коробка ab в осях xf (дома повёрнуты — AABB в мировых осях раздувался бы).
@@ -1706,7 +1818,15 @@ func live_connect(port: int) -> bool:
 	cfg["random_targets"] = {"drones": int(h.get("drones", 3)), "birds": int(h.get("birds", 1)),
 		"seed": int(h.get("seed", 1)) + 100,
 		"range": h.get("range", [250, 1200]), "types": h.get("types", {"quad": 0.5, "delta": 0.25, "plane": 0.25})}
-	get_window().title = "Дронолок: 3D-сцена для эмулятора (не закрывать)"
+	# окно не нужно: кадры идут из SubViewport в приложение. Свернуть нельзя (свёрнутое окно Godot не
+	# рисует), поэтому крошечное, без рамки и за краем экрана; закрыть его нельзя — сцену закрывает приложение.
+	var win = get_window()
+	win.title = "Дронолок: 3D-сцена для эмулятора"
+	get_tree().auto_accept_quit = false
+	win.borderless = true
+	win.unfocusable = true
+	win.size = Vector2i(64, 48)
+	win.position = Vector2i(-30000, -30000)
 	printerr("live: связь с приложением, порт %d" % port)
 	return true
 
