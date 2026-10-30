@@ -1195,7 +1195,7 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     else zones_.clear(), zoneHist_.clear();
     markFocus(tw_, th_, T * s);
     for (auto& v : stats_->mtex) v.clear();
-    if ((learning_ || verifyLeft_) && !timing_.partial && maskScale() >= 1.4f) learnCoarse(gray, w, h, stride, p);
+    if ((learning_ || verifyLeft_) && !timing_.partial && maskScale() >= 1.25f) learnCoarse(gray, w, h, stride, p);
     if (cfg_.dark) selectTiles(stats_->dark, tw_, th_, T, s, 0, 0, true, out);
     if (cfg_.bright) selectTiles(stats_->bright, tw_, th_, T, s, 1, 0, true, out);
     if (cfg_.lock_through && lockOn_ && !learning_ && !mask_.empty() && (lockPol_ > 0 ? cfg_.bright : cfg_.dark))
@@ -1942,7 +1942,7 @@ void Detector::updateBand() {
     }
 }
 
-// Обучение маски на крупной сцене (scene_scale от 1.4): листва, трава и дальний лес там крупнее в пикселях,
+// Обучение маски на крупной сцене (scene_scale от 1.25): листва, трава и дальний лес там крупнее в пикселях,
 // чем отклик точечной цели, и тайл земли выходил гладким. Текстура тайла — и на кадре вдвое меньше (min/max
 // 2x2, как грубые масштабы), тайлом вдвое меньше: тот же тайл кадра, порог плотности — как у основного
 void Detector::learnCoarse(const uint8_t* gray, int w, int h, int stride, const ResponseParams& p) {
