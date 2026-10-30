@@ -479,7 +479,8 @@ const char* class_name(TargetClass c);
 
 struct TrackerConfig {
     // ассоциация: прогноз фильтра Калмана (постоянная скорость) и ворота по его ошибке
-    float gate = 40.f;          // макс. радиус ассоциации, пиксели кадра
+    float gate = 26.f;          // макс. радиус ассоциации, пиксели кадра (на любой частоте, см. tracker_for_fps)
+    float gate_speed_k = 0.f;   // ...плюс столько скоростей трека по сцене, пикс./кадр: быстрая цель манёвром уходит дальше
     float gate_sigma = 4.f;     // ворота = столько СКО ошибки прогноза...
     float gate_min = 4.f;       // ...но не меньше, пикс.
     float q_accel = 4.f;        // манёвренность цели: СКО ускорения, пикс./кадр^2 (птицы рвут до 4)
@@ -880,6 +881,7 @@ private:
     float measVar(int level) const;
     float evidenceOf(const Candidate& d) const;
     int coastLimit(const Track& t) const;
+    float gateCap(const Track& t) const { return cfg_.gate + cfg_.gate_speed_k * std::hypot(t.vsx, t.vsy); }
     bool quietHold(const Track& t) const;
     bool edgeJitter(const Track& t) const;
 

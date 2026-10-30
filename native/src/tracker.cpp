@@ -55,8 +55,10 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     // по физике ворота растут как v, а СКО ускорения в пикс./кадр^2 как v^2. Замер на 10 к/с
     // (30 с синтетики): так птиц находится больше всех (88%), но 12% попаданий по дронам
     // уходят в "птицу" — трек слишком вольно гнётся. С v^0.5 и v^1.5 птиц 77% (без пересчёта
-    // 51%), дронов-"птиц" 0, ложных тревог столько же
-    c.gate *= std::sqrt(v);
+    // 51%), дронов-"птиц" 0, ложных тревог столько же.
+    // Предел ворот gate — в пикселях кадра без пересчёта (ночной тест 30.10): ворота по ошибке прогноза
+    // растут и так (q_accel), а предел 40·√v на 14 к/с (53 пикс.) цеплял чужие отклики — без дронов
+    // кадров с захватом 19 -> 3%, на 60 к/с 20·√v (13 пикс.) рвал ведомую цель (wt17, wt16)
     c.q_accel *= v * std::sqrt(v);
     c.bird_speed *= v;
     c.hover_speed *= v;
@@ -523,7 +525,7 @@ void Tracker::focus(float camDx, float camDy, std::vector<FocusArea>& out) const
         if (t.id != lockId_ && (t.hits < cfg_.cls_min_hits || (t.travel < cfg_.mover_px && !quietHold(t)))) continue;
         const KfPeek k = kf_peek(t, camDx, camDy, q);
         const float S = k.p00 + measVar(t.level);
-        const float r = std::min(cfg_.gate, std::max(cfg_.gate_min, cfg_.gate_sigma * std::sqrt(S)));
+        const float r = std::min(gateCap(t), std::max(cfg_.gate_min, cfg_.gate_sigma * std::sqrt(S)));
         out.push_back({k.x, k.y, r});
     }
 }
@@ -548,7 +550,7 @@ void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
         }
         // запас на размер цели: на грубом масштабе её отклик гуляет по корпусу
         out.push_back({k.x, k.y,
-                       std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << lv) +
+                       std::min(gateCap(t), std::max(gmin, cfg_.gate_sigma * std::sqrt(S))) + 4.f * (1 << lv) +
                            0.5f * std::max(e, std::max(t.bw, t.bh)),
                        lv});
     }
@@ -741,7 +743,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             const float S = t.p00 + measVar(dets[di].level);
             // крупная цель (грубый масштаб) — протяжённая, её отклик гуляет по корпусу
             const float gmin = cfg_.gate_min * (float)(1 << std::min(4, std::max(dets[di].level, t.level)));
-            const float r = std::min(cfg_.gate, std::max(gmin, cfg_.gate_sigma * std::sqrt(S)));
+            const float r = std::min(gateCap(t), std::max(gmin, cfg_.gate_sigma * std::sqrt(S)));
             const float ex = dets[di].x - t.x, ey = dets[di].y - t.y, d2 = ex * ex + ey * ey;
             if (d2 < r * r) pairs.push_back({d2 / S, ti, di});
         }
