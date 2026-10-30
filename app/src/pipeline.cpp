@@ -128,7 +128,8 @@ FramePtr Pipeline::allocFrame(int w, int h) {
 
 bool Pipeline::openGenerator(const VideoInfo& info, std::function<bool(Frame&)> gen, const std::string& name) {
     close();
-    info_ = info;
+    fileInfo_ = info;
+    applyVideoFps(settings());
     path_ = name;
     gen_ = std::move(gen);
     {
@@ -148,8 +149,9 @@ bool Pipeline::open(const std::string& path, std::string& err) {
     gen_ = nullptr;
     VideoSource probe;
     if (!probe.open(path, 1, err)) return false;
-    info_ = probe.info();
+    fileInfo_ = probe.info();
     probe.close();
+    applyVideoFps(settings());
     path_ = path;
     {
         auto g = std::make_shared<GroundTruth>();
@@ -175,6 +177,15 @@ void Pipeline::close() {
 }
 
 VideoInfo Pipeline::info() const { return info_; }
+
+void Pipeline::applyVideoFps(const Settings& s) {
+    info_ = fileInfo_;
+    if (s.videoFps > 0) {
+        info_.fileFps = info_.fps;
+        info_.fps = s.videoFps;
+        info_.fpsFrom = FpsFrom::User;
+    }
+}
 
 void Pipeline::startThreads() {
     stop_ = false;
@@ -233,12 +244,14 @@ void Pipeline::setSettings(const Settings& s) {
         restart = open_ && (o.source != s.source || o.preloadFrames != s.preloadFrames || o.procW != s.procW ||
                             o.procH != s.procH || o.decoderThreads != s.decoderThreads || o.loop != s.loop ||
                             (s.source == Source::Preload &&
-                             (fileStep(o) != fileStep(s) || o.framePhase != s.framePhase)));
+                             (fileStep(o) != fileStep(s) || o.framePhase != s.framePhase)) ||
+                            o.videoFps != s.videoFps);
         settings_ = s;
         ++settingsVer_;
     }
     if (restart) {   // источник кадров поменялся — перезапуск чтения с начала файла
         stopThreads();
+        applyVideoFps(s);
         relearn_ = true;
         startThreads();
     }

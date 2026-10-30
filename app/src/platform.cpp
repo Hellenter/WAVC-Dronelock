@@ -121,7 +121,8 @@ static std::string dialog_blocking(void* owner) {
     // с владельцем диалог модальный для окна приложения: всегда поверх него, сворачивается вместе
     // с ним, а щелчки по окну приложения не копятся, пока диалог открыт
     ofn.hwndOwner = (HWND)owner;
-    ofn.lpstrFilter = L"Видео (*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm)\0*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm\0"
+    ofn.lpstrFilter = L"Видео (*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm;*.h264;*.h265;*.mjpeg)\0"
+                      L"*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm;*.m4v;*.mts;*.h264;*.264;*.h265;*.hevc;*.265;*.mjpeg;*.mjpg\0"
                       L"Все файлы (*.*)\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH * 4;
