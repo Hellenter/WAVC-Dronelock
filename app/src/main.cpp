@@ -3576,6 +3576,7 @@ int run_stress(int argc, char** argv) {
                 s.trk.lock_speed_max = R(3) ? 0.f : F(0, 60);
                 s.trk.lock_established = R(2);
                 s.trk.lost_r_max = R(3) ? 0.f : F(0, 10);
+                s.trk.lost_r_max_slow = R(3) ? 4.f : F(0, 10);
                 s.frameDt = R(3) != 0;
                 break;
             default:   // частота камеры и шаг: ниже частоты видео кадры файла пропускаются

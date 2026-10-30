@@ -664,6 +664,14 @@ static void test_stationary() {
               t14.drift_obs == 8 && t60f.drift_obs > t.drift_obs,
           "tracker_for_fps: follow_min_obs %d %d %d, drift_obs %d %d", t60f.follow_min_obs, t30.follow_min_obs,
           t14.follow_min_obs, t14.drift_obs, t60f.drift_obs);
+    // круг передачи захвата: на медленной камере — lost_r_max_slow, если lost_r_max не задан; на 60 к/с — без предела
+    TrackerConfig tl = t;
+    tl.lost_r_max = 2.f;
+    TrackerConfig t0 = t;
+    t0.lost_r_max_slow = 0.f;
+    CHECK(t14.lost_r_max == t.lost_r_max_slow && t30.lost_r_max == t.lost_r_max_slow && t60f.lost_r_max == t.lost_r_max &&
+              tracker_for_fps(tl, 14.f).lost_r_max == 2.f && tracker_for_fps(t0, 14.f).lost_r_max == 0.f,
+          "tracker_for_fps: lost_r_max %.1f %.1f %.1f", t14.lost_r_max, t30.lost_r_max, t60f.lost_r_max);
     // правила в пикс./с: на 60 к/с — прежние числа за кадр
     const TrackerConfig t60 = tracker_for_fps(t, 60.f);
     CHECK(std::fabs(t60.still_speed - 0.25f) < 1e-3f && std::fabs(t60.lost_grow - 4.f) < 1e-3f &&

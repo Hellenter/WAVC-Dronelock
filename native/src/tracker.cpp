@@ -42,6 +42,8 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     TrackerConfig c = c0;
     // медленная камера: новый захват — только на летавший трек (см. lock_mover_fps)
     if (fps > 0 && fps <= c.lock_mover_fps) c.lock_mover = true;
+    // ...и круг передачи захвата «той же цели» не шире lost_r_max_slow ворот (см. lost_r_max)
+    if (fps > 0 && fps <= c.lock_mover_fps && !(c.lost_r_max > 0)) c.lost_r_max = c.lost_r_max_slow;
     if (!(fps > 0) || !(ref > 0)) return c;
     // предел ворот — не меньше пути цели за кадр при gate_pps пикс./с (на 10 к/с — 36 пикс.)
     if (c.gate_pps > 0) c.gate = std::max(c.gate, c.gate_pps / fps);
