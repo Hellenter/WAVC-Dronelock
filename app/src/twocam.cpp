@@ -376,6 +376,7 @@ void Emulator::start(const Config& c) {
     DetectorConfig dc;
     dc.scales = c.narrowScales;   // цель в узком поле крупнее: несколько масштабов
     dc.auto_thr = c.narrowAutoThr;
+    dc.thr_min = c.narrowThrMin;
     dc.threads = 2;
     ndet_.reset(new Detector(dc));
     ntrk_.reset(new Tracker(c.narrowW, c.narrowH, tracker_for_fps(TrackerConfig(), c.narrowFps)));
@@ -659,8 +660,8 @@ void Emulator::stepNarrow(double t, double dt) {
             fwrite(nframe_.data(), 1, nframe_.size(), f);
             fclose(f);
         }
-        printf("t=%.3f state=%s lock=%d win=(%.0f,%.0f r%.0f vis%d) cands=%zu\n", t, state_name(state_), nlock_, win_.u,
-               win_.v, win_.radius, win_.visible, ncands_.size());
+        printf("t=%.3f state=%s lock=%d win=(%.0f,%.0f r%.0f vis%d) cands=%zu thr=%.1f noise=%.2f\n", t, state_name(state_), nlock_, win_.u,
+               win_.v, win_.radius, win_.visible, ncands_.size(), ndet_->threshold(), ndet_->noiseLevel());
         for (const Track& x : tr)
             printf("  трек %d (%.1f,%.1f) hits %d miss %d clutter %d cls %d\n", x.id, x.x, x.y, x.hits, x.miss, (int)x.clutter,
                    (int)x.cls);
@@ -1038,6 +1039,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-lock-focus") c.lockFocus = false;
         else if (a == "--nscales") c.narrowScales = atoi(val().c_str());
         else if (a == "--nauto") c.narrowAutoThr = atoi(val().c_str()) != 0;
+        else if (a == "--nthr-min") c.narrowThrMin = (float)atof(val().c_str());
         else if (a == "--dump") sscanf(val().c_str(), "%lf,%lf", &e.dumpAt_, &e.dumpLen_);
         else if (a == "--no-wide-check") c.wideCheck = false;
         else if (a == "--min-hold") c.minHold = (float)atof(val().c_str());
