@@ -76,8 +76,11 @@ bool Link::start(const Options& o, const std::string& hello, std::string& err) {
     }
     lsock_ = (intptr_t)ls;
     const int port = ntohs(a.sin_port);
-    std::vector<std::string> args = {o.godot, "--path", o.project, "--rendering-driver", "opengl3", "--audio-driver",
-                                     "Dummy", "--", "--config", o.scene, "--live", std::to_string(port)};
+    // Godot с --path работает из папки проекта: пути — полные
+    std::error_code ec;
+    const std::string project = s8(fs::absolute(u8(o.project), ec)), scn = s8(fs::absolute(u8(o.scene), ec));
+    std::vector<std::string> args = {o.godot, "--path", project, "--rendering-driver", "opengl3", "--audio-driver",
+                                     "Dummy", "--", "--config", scn, "--live", std::to_string(port)};
     if (!o.sector.empty()) {
         args.push_back("--sector");
         args.push_back(o.sector);

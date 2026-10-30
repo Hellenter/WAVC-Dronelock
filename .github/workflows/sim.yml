@@ -82,6 +82,7 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
+          set -o pipefail
           for sec in forest highrise; do
             echo "== эмулятор: city_sectors, сектор $sec" | tee -a report.txt
             timeout 1200 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
