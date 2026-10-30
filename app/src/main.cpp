@@ -3193,6 +3193,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-scene-shift") s.sceneShift = false;
         else if (a == "--no-pan") s.panDetect = false;
         else if (a == "--pan-motion") s.panMotion = true;
+        else if (a == "--no-motion-long") s.motionLong = false;
         else if (a == "--focus") s.focus = true;
         else if (a == "--static") s.trk.static_frames = atoi(val().c_str());
         else if (a == "--static-file") s.staticFile = true;
