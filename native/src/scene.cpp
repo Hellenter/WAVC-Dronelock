@@ -48,6 +48,7 @@ void SceneAnalyzer::reset() {
     last_ = -1000000;
     ref_.clear();
     refLine_.clear();
+    lastLine_.clear();
     movedRun_ = 0;
 }
 
@@ -68,6 +69,7 @@ bool SceneAnalyzer::update(const uint8_t* gray, int w, int h, int stride, float 
         havePrev_ = false;
         ref_.clear();
         refLine_.clear();
+        lastLine_.clear();
     }
     if (bw_ < 4 || bh_ < 4) return false;
     const int step = step_;
@@ -363,7 +365,19 @@ bool SceneAnalyzer::update(const uint8_t* gray, int w, int h, int stride, float 
                 const double floor = n * std::max(4.0, (double)sigma * sigma);
                 ncc = saa > floor && sbb > floor ? sab / std::sqrt(saa * sbb) : 1;
             }
-            const bool off = (nl && sl / nl > 2.0) || ncc < 0.5;
+            // кромка, которая дрожит от анализа к анализу (густой туман: земля по яркости на пороге
+            // "темнее неба", столбцы то находят кромку, то нет), сдвигом не считается: камеру
+            // повернули — кромка встаёт на новое место и там стоит
+            double jl = 0;
+            int nj = 0;
+            if (lastLine_.size() == line.size())
+                for (int bx = 0; bx < bw_; ++bx)
+                    if (line[bx] < bh_ || lastLine_[bx] < bh_) {
+                        jl += std::abs(line[bx] - lastLine_[bx]);
+                        ++nj;
+                    }
+            const bool steady = !nj || jl / nj <= 1.0;
+            const bool off = (nl && sl / nl > 2.0 && steady) || ncc < 0.5;
             movedRun_ = off ? movedRun_ + 1 : 0;
             if (movedRun_ >= 3) {
                 s.moved = true;
@@ -376,6 +390,7 @@ bool SceneAnalyzer::update(const uint8_t* gray, int w, int h, int stride, float 
             }
         }
     }
+    lastLine_ = line;
     s.ready = true;
     ++s.analyses;
     return true;

@@ -1465,6 +1465,11 @@ void tab_algorithm(App& a, bool& changed) {
         help_marker("Выкл.: облако по цвету открыто только для тёмных целей (дрон на фоне облака тёмный), на экране "
                     "такие тайлы закрашены едва заметно.");
     }
+    blk |= ImGui::Checkbox("Цель у самой земли — только когда полетела", &d.near_edge);
+    help_marker("Кончики веток и верхушки елей заходят в открытый тайл неба над кромкой и на фоне тёмных облаков "
+                "или в дымке дают 60-75% ложных захватов неподвижной камеры. Цель, родившаяся в тайле неба рядом с "
+                "землёй (не дальше 16 пикс. от закрытого тайла, а на камере до 20 к/с — во всём тайле), "
+                "подтверждается, только когда полетела, как у кромки. 14 к/с: захват на дроне 76 -> 84%.");
     blk |= ImGui::Checkbox("Фон по ячейкам у кромки леса", &d.bg_map);
     help_marker("Маска неба не расширяется на тайл запаса: тайлы у самой кромки леса смотрятся по ячейкам 16x16, "
                 "и у каждой ячейки там свой порог по её шуму за ~10 с (листва, марево). Дальние дроны низко над "
@@ -3229,6 +3234,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--no-sky-color") s.det.sky_color = false;
         else if (a == "--no-sky-soft") s.det.sky_soft = false;
         else if (a == "--no-sky-bright") s.det.sky_bright = false;
+        else if (a == "--no-near-edge") s.det.near_edge = false;
         else if (a == "--no-adapt") s.adapt = false;
         else if (a == "--lock-cmax") s.trk.lock_cmax = (float)atof(val().c_str());
         else if (a == "--lock-slow") s.trk.lock_slow = (float)atof(val().c_str());
