@@ -650,6 +650,27 @@ void Emulator::stepNarrow(double t, double dt) {
     ndet_->setFocus(fa);
     ndet_->detect(nframe_.data(), narrowCam_.w, narrowCam_.h, narrowCam_.w, ncands_);
     const std::vector<Track>& tr = ntrk_->update(ncands_, (float)dx, (float)dy);
+    if (dumpAt_ > 0 && t >= dumpAt_ && t < dumpAt_ + dumpLen_) {   // отладка: кадры точной в PGM и её треки
+        char fn[64];
+        snprintf(fn, sizeof(fn), "narrow_%07.3f.pgm", t);
+        if (FILE* f = fopen(fn, "wb")) {
+            fprintf(f, "P5 %d %d 255\n", narrowCam_.w, narrowCam_.h);
+            fwrite(nframe_.data(), 1, nframe_.size(), f);
+            fclose(f);
+        }
+        printf("t=%.3f state=%s lock=%d win=(%.0f,%.0f r%.0f vis%d) cands=%zu\n", t, state_name(state_), nlock_, win_.u,
+               win_.v, win_.radius, win_.visible, ncands_.size());
+        for (const Track& x : tr)
+            printf("  трек %d (%.1f,%.1f) hits %d miss %d clutter %d cls %d\n", x.id, x.x, x.y, x.hits, x.miss, (int)x.clutter,
+                   (int)x.cls);
+        for (const Body& b : bodies_) {
+            double u, v;
+            const Vec3 q = b.at(t);
+            const double R = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+            if (project(narrowCam_, truth, {q.x / R, q.y / R, q.z / R}, u, v) && in_frame(narrowCam_, u, v))
+                printf("  тело %d%s в (%.1f,%.1f), %.0f м\n", b.id, b.bird ? " птица" : "", u, v, R);
+        }
+    }
     st_.narrowMs += (now_s() - t1) * 1000;
     ++st_.narrowFrames;
     auto truthOf = [&](double az, double el) { return nearestBody(t, az, el, 0.2); };
@@ -979,6 +1000,7 @@ Stats Emulator::runBlocking(const Config& c, double seconds, bool verbose) {
 
 int run_cli(int argc, char** argv) {
     Config c;
+    Emulator e;
     double seconds = 60;
     std::string json;
     bool verbose = true;
@@ -1013,6 +1035,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-ff") c.feedForward = false;
         else if (a == "--no-window") c.windowFocus = false;
         else if (a == "--no-lock-focus") c.lockFocus = false;
+        else if (a == "--dump") sscanf(val().c_str(), "%lf,%lf", &e.dumpAt_, &e.dumpLen_);
         else if (a == "--no-wide-check") c.wideCheck = false;
         else if (a == "--min-hold") c.minHold = (float)atof(val().c_str());
         else if (a == "--give-up") c.giveUp = (float)atof(val().c_str());
@@ -1027,7 +1050,6 @@ int run_cli(int argc, char** argv) {
             return a == "--help" ? 0 : 2;
         }
     }
-    Emulator e;
     const Stats s = e.runBlocking(c, seconds, verbose);
     float lm, l9, am, a9, wm, w9;
     pct(s.errLock, lm, l9);

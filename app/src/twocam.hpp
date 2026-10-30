@@ -157,6 +157,7 @@ public:
     View view() const;
     // без интерфейса: прогнать seconds модельного времени как можно быстрее
     Stats runBlocking(const Config& c, double seconds, bool verbose);
+    double dumpAt_ = 0, dumpLen_ = 0;   // отладка (--dump t,len): кадры точной в PGM
 
 private:
     void loop();
