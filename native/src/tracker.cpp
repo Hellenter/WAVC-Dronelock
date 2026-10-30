@@ -91,6 +91,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     c.hard_full_every = frames(c.hard_full_every, 1);
     c.relock_frames = frames(c.relock_frames, 5);
     c.stuck_obs = frames(c.stuck_obs, 3);
+    c.stuck_base = frames(c.stuck_base, 6);
     c.stuck_hold = frames(c.stuck_hold, 10);
     return c;
 }
@@ -1070,26 +1071,34 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         // снова на прогнозе с прежней скоростью, отклик его не продолжает, место — «предмет». Только при
         // неподвижной камере: на повороте (wt12 после к. 480) сцена по оценке сдвига плывёт, и медленный
         // дрон «вставал» по ней
-        if (cfg_.stuck_obs > 0 && settled(tr) && !movingCam_ && (int)tr.obs.size() >= 2 * cfg_.stuck_obs + 1) {
-            const int K = cfg_.stuck_obs, n = (int)tr.obs.size();
+        if (cfg_.stuck_obs > 0 && settled(tr) && !movingCam_ &&
+            (int)tr.obs.size() >= cfg_.stuck_obs + std::max(cfg_.stuck_obs, cfg_.stuck_base) + 1) {
+            const int K = cfg_.stuck_obs, L = std::max(K, cfg_.stuck_base), n = (int)tr.obs.size();
             const auto& e = tr.obs[n - 1];
             // стоит: попадания с s по последнее — не дальше stuck_px от последнего (dev — дальнее из них)
             int s = n - 1;
             float dev = 0;
             for (float d; s > 0 && (d = std::hypot(tr.obs[s - 1].x - e.x, tr.obs[s - 1].y - e.y)) <= cfg_.stuck_px; --s)
                 dev = std::max(dev, d);
-            if (n - s >= K && s >= K + 1) {
+            if (n - s >= K && s >= L + 1) {
                 const auto& q = tr.obs[s - 1];       // последнее попадание до остановки
                 const auto& a = tr.obs[s - 1 - K];
-                const float dq = (float)(q.ts - a.ts);
+                const auto& b = tr.obs[s - 1 - L];
+                const float dq = (float)(q.ts - a.ts), db = (float)(q.ts - b.ts);
                 const float vx = dq > 0 ? (q.x - a.x) / dq : 0.f, vy = dq > 0 ? (q.y - a.y) / dq : 0.f;
+                // и до того летел ровно (stuck_base): за L попаданий до остановки сдвинулся вдоль этой скорости
+                // не меньше чем на stuck_steady пути, что прошёл бы с ней. Трек, скачущий по откликам листвы,
+                // получает «скорость» прыжка, а за L попаданий почти не сдвинулся (wt7 14 к/с: 0.5 пути) — на
+                // прогнозе с ней он держал жёсткий захват не на дроне. У дрона за деревом 0.9–1.0
+                const bool steady =
+                    db > 0 && (q.x - b.x) * vx + (q.y - b.y) * vy >= cfg_.stuck_steady * db * (vx * vx + vy * vy);
                 // с прежней скоростью за первые K попаданий стоянки ушёл бы дальше stuck_travel и вчетверо
                 // дальше её разброса: встал как вкопанный (дрон тормозит плавно — его скорость перед стоянкой
                 // уже мала; медленный дрон, 0.2 пикс./кадр в wt12, «стоит» в пределах stuck_px не хуже
                 // предмета). И место откликалось само, до стоянки (карта клаттера, долгая память помех) —
                 // отклики зависшего дрона идут его треку и карту не греют
                 const float go = std::hypot(vx, vy) * (float)(tr.obs[s + K - 1].ts - q.ts);
-                if (dq > 0 && go > cfg_.stuck_travel && go > 4.f * dev && occluderHere(e.x + gx_, e.y + gy_)) {
+                if (dq > 0 && steady && go > cfg_.stuck_travel && go > 4.f * dev && occluderHere(e.x + gx_, e.y + gy_)) {
                     occ_.push_back({e.x, e.y, cfg_.stuck_r * (float)(1 << std::min(4, e.level)), frame_});
                     if (occ_.size() > 16) occ_.erase(occ_.begin());
                     const float el = (float)(time_ - q.ts);

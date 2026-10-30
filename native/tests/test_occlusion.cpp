@@ -99,6 +99,23 @@ static void hover(float fps, float brake, float hover) {
     CHECK(off == 0, "%.0f к/с, торможение %.1f с: захват не на дроне %d кадров", fps, brake, off);
 }
 
+// Отклик листвы: трек ползёт по кроне (0.8 пикс./кадр при 14 к/с), за 3 кадра перескакивает на 12 пикс. и стоит.
+// «Скорость» прыжка — 4 пикс./кадр, но перед ним трек не летел (stuck_base, stuck_steady): это не дрон за
+// предметом, и прогноз с такой скоростью не нужен — иначе трек листвы держал бы захват на прогнозе
+static int foliage(const TrackerConfig& base) {
+    const float fps = 14;
+    Tracker t(1280, 720, tracker_for_fps(base, fps));
+    float x = 560;
+    for (int f = 0; f < 60; ++f) {
+        if (f >= 20 && f < 23) x += 4.f;
+        else if (f < 20) x += 0.8f;
+        std::vector<Candidate> d{mk(x, 300, 30)};
+        if (f % 2 == 0) d.push_back(mk(592, 290, 15));   // крона рядом мерцает (карта клаттера)
+        t.update(d);
+    }
+    return t.stuckEvents();
+}
+
 int main() {
     for (float fps : {14.f, 25.f, 60.f})
         for (float brake : {0.5f, 1.f}) hover(fps, brake, 3.f);
@@ -118,6 +135,13 @@ int main() {
                 CHECK(a.back >= 0 && a.back <= (int)std::lround(0.5f * fps), "%.0f к/с %s %.1f с: на дрон через %d кадров", fps,
                       edge ? "кромка" : "пятно", hide, a.back);
             }
+    {
+        TrackerConfig loose;
+        loose.stuck_steady = 0;
+        const int a = foliage(TrackerConfig()), b = foliage(loose);
+        std::printf("листва: снят с «предмета» %d раз (без проверки ровного полёта %d)\n", a, b);
+        CHECK(a == 0, "трек листвы, перескочивший и вставший, принят за дрон за предметом (%d)", a);
+    }
     if (failures) std::printf("%d ошибок\n", failures);
     else std::printf("заслон: всё в порядке\n");
     return failures ? 1 : 0;

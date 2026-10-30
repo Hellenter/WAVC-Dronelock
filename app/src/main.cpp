@@ -3872,6 +3872,8 @@ int run_stress(int argc, char** argv) {
                 s.trk.relock_edge = R(2);
                 // 30.10 ночь: дрон за предметом — трек не залипает на нём, захват не переходит на стоящий трек
                 s.trk.stuck_obs = R(3) ? 4 : R(12);
+                s.trk.stuck_base = R(3) ? 12 : R(40);
+                s.trk.stuck_steady = R(3) ? 0.7f : F(0, 1.5f);
                 s.trk.stuck_px = R(3) ? 3.f : F(0, 6);
                 s.trk.stuck_travel = R(3) ? 8.f : F(0, 20);
                 s.trk.stuck_r = R(3) ? 6.f : F(0, 20);
