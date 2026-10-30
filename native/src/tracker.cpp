@@ -1335,7 +1335,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 // с самолёта на медленный дрон, не на яркую; на ведомую камерой — и без этого
                 // (её скорость по сцене — скорость камеры, hard_switch_follow)
                 return hard_ ? cfg_.hard_switch > 0 && t.lockW > cfg_.hard_switch * cur->lockW &&
-                                   ((cfg_.hard_switch_follow && t.followed) || relSpeed(t) < 0.5f * relSpeed(*cur)) &&
+                                   ((cfg_.hard_switch_follow && t.followed) ||
+                                    (cfg_.hard_switch_slow && relSpeed(t) < 0.5f * relSpeed(*cur))) &&
                                    (!cfg_.hard_switch_drone || t.followed ||   // камера ведёт её — это и есть цель (wt17)
                                     (t.cls == TargetClass::Drone && t.birdScore < 0.5f))
                              : t.lockW > cfg_.lock_switch * cur->lockW;
