@@ -42,8 +42,9 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     // медленная камера: новый захват — только на летавший трек (см. lock_mover_fps)
     if (fps > 0 && fps <= c.lock_mover_fps) c.lock_mover = true;
     if (!(fps > 0) || !(ref > 0)) return c;
-    // окно ведомой цели задано при 60 к/с
-    if (c.follow_min_obs > 0) c.follow_min_obs = std::max(9, (int)std::lround(c.follow_min_obs * fps / 60.f));
+    // окно ведомой цели: заданное — от 30 к/с и выше, ниже — во времени, но не меньше 9
+    if (c.follow_min_obs > 0)
+        c.follow_min_obs = std::min(c.follow_min_obs, std::max(9, (int)std::lround(c.follow_min_obs * fps / 30.f)));
     // правила на кадр жизни трека — по частоте вызовов update
     const float vu = ref / (ufps > 0 ? ufps : fps);
     c.still_speed *= vu;
