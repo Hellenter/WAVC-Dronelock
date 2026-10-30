@@ -14,6 +14,7 @@ extern "C" {
 #include <libavutil/display.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/time.h>
 #include <libswscale/swscale.h>
 }
 
@@ -101,33 +102,6 @@ std::string fps_note(const VideoInfo& vi) {
 
 VideoSource::~VideoSource() { close(); }
 
-// Шаг меток, которые FFmpeg проставил «голому» потоку: по нему метки переводятся в номера кадров
-// (частота из параметров потока может с ним не совпадать). По первым пакетам, затем чтение с начала
-void VideoSource::measureRawRate() {
-    std::vector<int64_t> ts;
-    AVPacket* p = av_packet_alloc();
-    if (!p) return;
-    for (int n = 0; ts.size() < 48 && n < 4096 && av_read_frame(fmt_, p) >= 0; ++n) {
-        if (p->stream_index == stream_) {
-            const int64_t t = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
-            if (t != AV_NOPTS_VALUE) ts.push_back(t);
-        }
-        av_packet_unref(p);
-    }
-    av_packet_free(&p);
-    std::sort(ts.begin(), ts.end());
-    std::vector<int64_t> d;
-    for (size_t i = 1; i < ts.size(); ++i)
-        if (ts[i] > ts[i - 1]) d.push_back(ts[i] - ts[i - 1]);
-    if (d.size() >= 3 && tb_ > 0) {
-        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
-        const double r = 1.0 / ((double)d[d.size() / 2] * tb_);
-        if (r > 0.1 && r < 10000) idxFps_ = r;
-    }
-    if (!ts.empty() && ts.front() < start_) start_ = ts.front();
-    rewind();
-}
-
 // Метки времени кадров рядом с «голым» потоком — rpicam-vid --save-pts <файл>, mkvmerge timecode v2:
 // первая строка "# timecode format v2", дальше по строке на кадр, миллисекунды. Частота — по
 // обычному интервалу, кадр, которого камера не успела снять, — пропуск номера
@@ -194,6 +168,8 @@ void VideoSource::close() {
     orient_ = Orient();
     tcIdx_.clear();
     idxFps_ = 25;
+    seq_ = false;
+    keys_.clear();
 }
 
 bool VideoSource::open(const std::string& path, int threads, std::string& err) {
@@ -293,10 +269,12 @@ bool VideoSource::open(const std::string& path, int threads, std::string& err) {
     info_.format = fmt_->iformat && fmt_->iformat->name ? fmt_->iformat->name : "";
     if (is_raw_stream(info_.format)) {
         info_.fpsFrom = FpsFrom::Assumed;
-        measureRawRate();
+        seq_ = true;
+        scanRaw();
         loadTimecodes(path);
     }
-    if (!tcIdx_.empty()) info_.frames = tcIdx_.back() + 1;
+    if (!tcIdx_.empty()) info_.frames = tcIdx_.back() + 1 + std::max<int64_t>(0, rawFrames_ - (int64_t)tcIdx_.size());
+    else if (seq_ && rawFrames_ > 0) info_.frames = rawFrames_;
     else if (st->nb_frames > 0) info_.frames = st->nb_frames;
     else if (fmt_->duration > 0) info_.frames = (int64_t)(fmt_->duration / 1e6 * idxFps_);
     info_.codec = codec->name;
@@ -318,7 +296,10 @@ bool VideoSource::decodeNext() {
             avcodec_send_packet(ctx_, nullptr);
             continue;
         }
-        if (pkt_->stream_index == stream_) avcodec_send_packet(ctx_, pkt_);
+        if (pkt_->stream_index == stream_) {
+            if (seq_) notePacket();
+            avcodec_send_packet(ctx_, pkt_);
+        }
         av_packet_unref(pkt_);
     }
 }
@@ -418,13 +399,13 @@ bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride, ColorPla
         if (!decodeNext()) return false;
         // номер кадра — по времени показа: после перемотки счёт кадров с начала неизвестен
         const int64_t pts = frame_->best_effort_timestamp;
-        if (pts != AV_NOPTS_VALUE && tb_ > 0) {
-            const int64_t k = (int64_t)std::llround((pts - start_) * tb_ * idxFps_);
-            if (tcIdx_.empty() || k < 0) index_ = k;
+        if (seq_) {   // «голый» поток: кадры по счёту от ключевого, с которого читали
+            const int64_t k = ++seqN_;
+            if (tcIdx_.empty()) index_ = k;
             else if (k < (int64_t)tcIdx_.size()) index_ = tcIdx_[(size_t)k];   // по меткам времени камеры
             else index_ = tcIdx_.back() + (k - ((int64_t)tcIdx_.size() - 1));
         } else {
-            ++index_;
+            index_ = pts != AV_NOPTS_VALUE && tb_ > 0 ? (int64_t)std::llround((pts - start_) * tb_ * idxFps_) : index_ + 1;
         }
         if (index_ >= skipTo_) break;
         av_frame_unref(frame_);   // до нужного кадра после перемотки — без преобразования
@@ -460,11 +441,8 @@ bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride, ColorPla
 bool VideoSource::seek(int64_t frame) {
     if (!fmt_) return false;
     frame = std::max<int64_t>(0, frame);
-    int64_t k = frame;   // кадр потока, с которого начинается нужный номер
-    if (!tcIdx_.empty())
-        k = std::min<int64_t>(std::lower_bound(tcIdx_.begin(), tcIdx_.end(), frame) - tcIdx_.begin(),
-                              (int64_t)tcIdx_.size() - 1);
-    const int64_t ts = start_ + (tb_ > 0 ? (int64_t)(k / idxFps_ / tb_) : 0);
+    if (seq_) return seekSeq(frame);
+    const int64_t ts = start_ + (tb_ > 0 ? (int64_t)(frame / idxFps_ / tb_) : 0);
     if (av_seek_frame(fmt_, stream_, ts, AVSEEK_FLAG_BACKWARD) < 0 && !rewind()) return false;
     avcodec_flush_buffers(ctx_);
     eof_ = false;
@@ -473,8 +451,101 @@ bool VideoSource::seek(int64_t frame) {
     return true;
 }
 
+// ---- «голый» поток: меток времени у пакетов нет, перемотка — по байтам до ключевого кадра.
+// Номер ключевого кадра = число пакетов до него (у IDR кадры до него в порядке показа идут и в
+// порядке декодирования раньше), позиции ключевых — из просмотра файла при открытии и по ходу чтения
+
+// Ключевой кадр, с которого номер по счёту пакетов верен: IDR у H.264/H.265 (у I-кадра «открытой»
+// группы кадры, показанные до него, в порядке декодирования идут после и при перемотке выпадают —
+// счёт сбился бы), любой кадр у MJPEG; у прочих — если в потоке нет B-кадров
+static bool seek_key(const AVPacket* p, AVCodecID id, bool reorder) {
+    if (!(p->flags & AV_PKT_FLAG_KEY) || p->pos < 0) return false;
+    if (id != AV_CODEC_ID_H264 && id != AV_CODEC_ID_HEVC) return id == AV_CODEC_ID_MJPEG || !reorder;
+    for (int i = 0; i + 3 < p->size; ++i) {
+        if (p->data[i] || p->data[i + 1] || p->data[i + 2] != 1) continue;
+        const uint8_t b = p->data[i + 3];
+        if (id == AV_CODEC_ID_H264 ? (b & 0x1f) == 5 : ((b >> 1) & 0x3f) == 19 || ((b >> 1) & 0x3f) == 20) return true;
+        i += 2;
+    }
+    return false;
+}
+
+void VideoSource::notePacket() {
+    if (seek_key(pkt_, ctx_->codec_id, reorder_)) keys_.emplace(pktN_, pkt_->pos);
+    ++pktN_;
+}
+
+// Просмотр пакетов без декодирования: число кадров и позиции ключевых. Не дольше ~2 с — у очень
+// длинного файла остальное доберётся по ходу чтения
+void VideoSource::scanRaw() {
+    keys_.clear();
+    rawFrames_ = 0;
+    reorder_ = fmt_->streams[stream_]->codecpar->video_delay > 0 || ctx_->has_b_frames > 0;
+    const double t0 = (double)av_gettime_relative() / 1000.0;
+    AVPacket* p = av_packet_alloc();
+    if (!p) return;
+    int64_t n = 0;
+    bool full = true;
+    for (int r; (r = av_read_frame(fmt_, p)) >= 0;) {
+        if (p->stream_index == stream_) {
+            if (seek_key(p, ctx_->codec_id, reorder_)) keys_.emplace(n, p->pos);
+            ++n;
+        }
+        av_packet_unref(p);
+        if ((n & 63) == 0 && (double)av_gettime_relative() / 1000.0 - t0 > 2000) {
+            full = false;
+            break;
+        }
+    }
+    av_packet_free(&p);
+    if (full) rawFrames_ = n;
+    rewindSeq();
+}
+
+bool VideoSource::byteSeek(int64_t pos) {
+    if (av_seek_frame(fmt_, -1, pos, AVSEEK_FLAG_BYTE) < 0 &&
+        avformat_seek_file(fmt_, -1, pos, pos, pos, AVSEEK_FLAG_BYTE) < 0)
+        return false;
+    avcodec_flush_buffers(ctx_);
+    eof_ = false;
+    return true;
+}
+
+bool VideoSource::rewindSeq() {
+    const int64_t pos = keys_.empty() ? 0 : keys_.begin()->second;
+    if (!byteSeek(keys_.empty() || keys_.begin()->first != 0 ? 0 : pos)) return false;
+    pktN_ = 0;
+    seqN_ = -1;
+    index_ = -1;
+    skipTo_ = 0;
+    return true;
+}
+
+bool VideoSource::seekSeq(int64_t frame) {
+    int64_t k = frame;   // кадр потока, с которого начинается нужный номер
+    if (!tcIdx_.empty())
+        k = std::min<int64_t>(std::lower_bound(tcIdx_.begin(), tcIdx_.end(), frame) - tcIdx_.begin(),
+                              (int64_t)tcIdx_.size() - 1);
+    auto it = keys_.upper_bound(k);
+    const bool ahead = seqN_ + 1 <= k && (it == keys_.begin() || std::prev(it)->first <= seqN_ + 1);
+    if (!ahead) {   // назад или вперёд за ключевой кадр: с ближайшего ключевого до него
+        if (it == keys_.begin()) {
+            if (!rewindSeq()) return false;
+        } else {
+            --it;
+            if (!byteSeek(it->second)) return false;
+            pktN_ = it->first;
+            seqN_ = it->first - 1;
+        }
+    }
+    index_ = -1;
+    skipTo_ = frame;
+    return true;
+}
+
 bool VideoSource::rewind() {
     if (!fmt_) return false;
+    if (seq_) return rewindSeq();
     if (av_seek_frame(fmt_, stream_, 0, AVSEEK_FLAG_BACKWARD) < 0 &&
         avformat_seek_file(fmt_, -1, INT64_MIN, 0, INT64_MAX, 0) < 0)
         return false;

@@ -1,6 +1,7 @@
 // Чтение видео через FFmpeg (libavformat + libavcodec + swscale) в серые кадры u8.
 #pragma once
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -67,8 +68,12 @@ public:
 
 private:
     bool decodeNext();
-    void measureRawRate();
     void loadTimecodes(const std::string& path);
+    void scanRaw();
+    void notePacket();
+    bool byteSeek(int64_t pos);
+    bool rewindSeq();
+    bool seekSeq(int64_t frame);
     void convert(uint8_t* dst, int outW, int outH, int dstStride);
     void sampleColor(ColorPlanes& c, int outW, int outH);
 
@@ -92,6 +97,12 @@ private:
     // частота, по которой метки времени переводятся в номера кадров: у контейнера — его частота, у
     // «голого» потока — шаг меток, которые проставил FFmpeg (не обязательно настоящая частота камеры)
     double idxFps_ = 25;
+    // «голый» поток (seq_): номер кадра — по счёту от ключевого кадра, с которого читали; перемотка — по
+    // байтовым позициям ключевых кадров (номер кадра потока -> позиция в файле)
+    bool seq_ = false;
+    bool reorder_ = false;   // в потоке есть B-кадры (порядок показа не совпадает с порядком декодирования)
+    int64_t seqN_ = -1, pktN_ = 0, rawFrames_ = 0;
+    std::map<int64_t, int64_t> keys_;
     // по файлу меток времени: номер кадра (по настоящему времени) k-го кадра потока; пропуск кадра
     // камерой — скачок номера, как у записи с потерями
     std::vector<int64_t> tcIdx_;
