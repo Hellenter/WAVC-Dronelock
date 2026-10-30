@@ -500,6 +500,7 @@ void Pipeline::processLoop() {
     SceneAnalyzer scene;
     std::string sceneWhy;
     std::vector<FocusArea> focus, roi, keepGrow, tintAt;
+    size_t cueN = 0;
     std::unique_ptr<Tracker> trk;
     int trkW = 0, trkH = 0, trkCell = 0;
     int learnLeft = 0;
@@ -852,10 +853,18 @@ void Pipeline::processLoop() {
             const double tm = now_ms();
             focus.clear();
             if (s.focus) trk->focus(me.dx, me.dy, focus);
+            {   // подсказка от другой камеры
+                std::lock_guard<std::mutex> lk(cueM_);
+                focus.insert(focus.end(), cue_.begin(), cue_.end());
+                cueN = cue_.size();
+            }
             det.setFocus(focus);
             // экономия: между полными просмотрами кадра детектор смотрит только вокруг треков
             roi.clear();
-            if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) trk->roi(me.dx, me.dy, roi);
+            if (dc.full_every > 1 || (dc.coarse_every > 1 && dc.scales > 1)) {
+                trk->roi(me.dx, me.dy, roi);
+                roi.insert(roi.end(), focus.end() - cueN, focus.end());
+            }
             det.setRoi(roi);
             {   // цель в захвате может залететь под маску (облако, кромка): там ищется её продолжение
                 float lx = 0, ly = 0, lr = 0, lc = 0;

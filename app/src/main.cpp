@@ -2446,6 +2446,22 @@ void panel_twocam(App& a) {
                               "К этой цели — не раньше чем через 10 с.");
     ImGui::SliderFloat("##giveup", &c.giveUp, 1, 15, "%.1f с");
 
+    heading("Обмен между камерами");
+    ImGui::Checkbox("Крупная цель — по силуэту", &c.narrowSilhouette);
+    help_marker("Крупный дрон на точной — десятки пикселей, детектор находит на нём несколько точек (концы "
+                "крыльев, нос, хвост). Точная ведёт центр силуэта и не перескакивает с одной части на другую.");
+    ImGui::Checkbox("Точная держит цель без широкой", &c.narrowHold);
+    help_marker("Точная ведёт цель и сама видит, что это дрон: если широкая потеряла цель или её трек ушёл на "
+                "другую цель (соседа, облако), точная не бросает свою, а ведёт её дальше. Как только широкая снова "
+                "видит цель, точная передаёт ей номер её трека.");
+    ImGui::Checkbox("Точная отсеивает птиц", &c.narrowVeto);
+    help_marker("На точной цель крупнее и кадров вчетверо больше — взмахи крыльев видны. Цель, которую точная "
+                "видит птицей, отсеивается, и к ней (и к новым трекам широкой на её пути) точная 30 с не "
+                "возвращается. Цель, выбранную вручную, не отсеивает.");
+    ImGui::Checkbox("Точная подсказывает широкой", &c.wideCue);
+    help_marker("Где точная видит подтверждённый дрон, у широкой порог ниже: потерянную цель она находит "
+                "снова быстрее, а слабую не теряет.");
+
     heading("Широкая камера");
     static const char* rs[] = {"4608x3456", "2304x1728"};
     label("Разрешение", "16 Мп — как настоящая. Половина — если ПК не успевает в реальном времени.");
@@ -2534,7 +2550,8 @@ void draw_twocam(App& a) {
     snprintf(cap, sizeof(cap), "Широкая %dx%d, %.0f°, %.0f к/с — щелчок по цели: навести точную", f.w, f.h,
              a.emuCfg.wideFov, a.emuCfg.wideFps);
     dl->AddText(ImVec2(wPos.x, wPos.y - capH), txt, cap);
-    snprintf(cap, sizeof(cap), "Точная %dx%d, %.1f°: %s", v.nw, v.nh, a.emuCfg.narrowFov, twocam::state_name(v.state));
+    snprintf(cap, sizeof(cap), "Точная %dx%d, %.1f°: %s%s", v.nw, v.nh, a.emuCfg.narrowFov, twocam::state_name(v.state),
+             v.nOnly ? " — сама, широкая цель не видит" : v.nConf ? " — дрон подтверждён" : "");
     dl->AddText(ImVec2(nPos.x, nPos.y - capH), txt, cap);
 
     // --- широкая
@@ -2576,6 +2593,18 @@ void draw_twocam(App& a) {
         }
     }
     if (pickId) a.emu.selectTarget(pickId);
+    for (const auto& p : v.vetoW) {   // отсеянные точной (птицы) — там, где они по прогнозу
+        const ImVec2 q = W(p.first, p.second);
+        dl->AddLine(ImVec2(q.x - 7, q.y - 7), ImVec2(q.x + 7, q.y + 7), COL_BIRD, 2.f);
+        dl->AddLine(ImVec2(q.x - 7, q.y + 7), ImVec2(q.x + 7, q.y - 7), COL_BIRD, 2.f);
+    }
+    if (v.nWu >= 0 && (v.nOnly || v.nConf)) {   // где цель видит точная
+        const ImVec2 q = W(v.nWu, v.nWv);
+        const ImU32 col = IM_COL32(90, 220, 255, 255);
+        const ImVec2 d[] = {ImVec2(q.x, q.y - 16), ImVec2(q.x + 16, q.y), ImVec2(q.x, q.y + 16), ImVec2(q.x - 16, q.y)};
+        dl->AddPolyline(d, 4, col, ImDrawFlags_Closed, 2.f);
+        if (v.nOnly) dl->AddText(ImVec2(q.x + 18, q.y + 2), col, "по точной");
+    }
     dl->PopClipRect();
 
     // --- точная
@@ -2612,7 +2641,8 @@ void panel_twocam_metrics(App& a) {
     char val[48], sub[96];
     const bool track = v.state == twocam::NState::Track;
     snprintf(val, sizeof(val), "%s", twocam::state_name(v.state));
-    if (v.assigned) snprintf(sub, sizeof(sub), "цель %d широкой", v.assigned);
+    if (v.assigned && v.nOnly) snprintf(sub, sizeof(sub), "цель %d — только у точной", v.assigned);
+    else if (v.assigned) snprintf(sub, sizeof(sub), "цель %d широкой%s", v.assigned, v.nConf ? ", дрон" : "");
     else snprintf(sub, sizeof(sub), "целей у широкой: %d", (int)v.targets.size());
     kpi("Точная", val, track ? TXT_OK : v.assigned ? TXT_WARN : TXT_DIM, sub, tw);
     ImGui::SameLine();
@@ -2636,6 +2666,8 @@ void panel_twocam_metrics(App& a) {
     ImGui::Text("ось: аз %.2f°, угол места %.2f°", v.axis.az, v.axis.el);
     ImGui::Text("скорость поворота: %.1f / %.1f °/с (предел %.0f)", v.rateAz, v.rateEl, a.emuCfg.maxRate);
     ImGui::Text("назначений %d, взяла %d, не ту %d, потерь %d", s.assignments, s.acquired, s.wrongLocks, s.losses);
+    ImGui::Text("точная подтвердила дронов %d, отсеяла птиц %d", s.confirmed, s.vetoBird + s.vetoDrone + s.vetoNone);
+    ImGui::Text("держала цель без широкой %.1f с (%d раз), вернула широкой %d", s.narrowOnly, s.kept, s.rebinds);
     if (s.simT > 0)
         ImGui::Text("нечего вести %.0f%% времени, ложная цель широкой %.0f%%", 100 * s.idleTime / s.simT,
                     100 * s.falseTarget / s.simT);
@@ -2655,8 +2687,9 @@ void panel_twocam_metrics(App& a) {
             ImGui::TableSetColumnIndex(0);
             ImGui::Text(t.id == v.assigned ? "%d  <" : "%d", t.id);
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cls_col(t.cls)), "%s%s",
-                               t.cls == 1 ? "дрон" : t.cls == 2 ? "птица" : "?", t.hard ? ", жёсткий" : "");
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cls_col(t.cls)), "%s%s%s",
+                               t.cls == 1 ? "дрон" : t.cls == 2 ? "птица" : "?", t.hard ? ", жёсткий" : "",
+                               t.verdict == 1 ? ", точная: дрон" : t.verdict == 2 ? ", точная: птица" : "");
             ImGui::TableSetColumnIndex(2);
             ImGui::Text("%.1f° / %.1f°", t.rep.az, t.rep.el);
             ImGui::TableSetColumnIndex(3);

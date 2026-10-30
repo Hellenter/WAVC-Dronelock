@@ -76,6 +76,16 @@ struct Config {
     float minHold = 0.08f;       // трек в окне берётся, если держится столько секунд (не шум на один-два кадра)
     float giveUp = 3;            // столько секунд точная ищет и не может удержать цель — цель «не подтверждена»
     float coolDown = 10;         // столько секунд к неподтверждённой цели не возвращаться (авто-режимы)
+    // обмен между камерами: точная видит цель крупнее, чаще и без лишних пикселей
+    bool narrowSilhouette = true;   // точная ведёт крупную цель по силуэту (центр), а не по частям: не скачет с крыла на хвост
+    bool narrowHold = true;    // точная, уверенная, что это дрон, держит цель сама, когда широкая её теряет или
+                               // её трек уходит на другое; как только широкая снова видит цель — передаёт ей её трек
+    bool narrowVeto = true;    // точная отсеивает цель, которую сама видит птицей (взмахи крыльев)
+    bool wideCue = true;       // точная сообщает широкой, где цель: там у широкой порог ниже
+    float confirmT = 0.5f;     // точная уверена в дроне: ведёт цель столько секунд и её классификатор — «дрон»
+    float vetoT = 0.6f;        // столько секунд подряд птица у точной — цель отсеивается
+    float vetoCool = 30;       // к отсеянной цели и к целям широкой на её прогнозе не возвращаться, с
+    float narrowLostHold = 2;  // цель есть только у точной: столько секунд искать её по своему прогнозу
 };
 
 // Тело в мире: прямолинейное движение (у птиц — с покачиванием и взмахами)
@@ -100,6 +110,7 @@ struct WideTarget {
     int cls = 0;
     bool hard = false;
     int truth = 0;   // ближайшее тело по правде (для оценки), 0 — ни одного рядом
+    int verdict = 0; // что сказала точная: 1 — дрон (подтвердила), 2 — птица (отсеяна)
 };
 
 struct Event {
@@ -118,6 +129,15 @@ struct Stats {
     double slewSum = 0, acqSum = 0;           // с: до цели в кадре точной и до захвата, сумма по назначениям
     int slewN = 0, acqN = 0;
     std::vector<float> errLock, errAxis, errWide;   // град: захват точной, ось точной, сообщение широкой — от правды
+    // обмен между камерами
+    double narrowOnly = 0, narrowOnlyCorrect = 0;   // с: цель есть только у точной (широкая потеряла или ушла с неё)
+    double trackDrone = 0;                    // с: точная ведёт настоящий дрон (любой, не птицу и не пустое место)
+    int kept = 0;                             // точная не бросила цель, когда широкая её потеряла или ушла с неё
+    int rebinds = 0;                          // широкая снова видит цель, которую держала точная, — трек передан
+    int confirmed = 0;                        // точная подтвердила дрон
+    int vetoBird = 0, vetoDrone = 0;          // точная отсеяла как птицу: по правде птица / дрон (ошибка)
+    int vetoNone = 0;                         // ...и там по правде ничего нет (помеха)
+    int partJumps = 0;                        // захват точной перешёл на соседний трек той же цели (часть крупной)
     double wideMs = 0, narrowMs = 0;          // среднее время обработки кадра
     double renderWideMs = 0, renderNarrowMs = 0;   // отрисовка кадров, сумма, мс
 };
@@ -131,6 +151,9 @@ struct View {
     int nlock = 0;
     NState state = NState::Idle;
     int assigned = 0;                     // id трека широкой
+    bool nConf = false, nOnly = false;    // точная подтвердила дрон; цель только у точной
+    float nWu = -1, nWv = -1;             // где точная видит цель, на кадре широкой
+    std::vector<std::pair<float, float>> vetoW;   // отсеянные точной (прогноз), на кадре широкой
     std::vector<WideTarget> targets;
     Pose axis, cmd;
     float rateAz = 0, rateEl = 0;
@@ -179,6 +202,8 @@ private:
     void stepNarrow(double t, double dt);
     void choose(double t);
     void assign(double t, int wideId, const char* why);
+    void rebind(double t);
+    bool vetoed(double t, const TargetReport& r) const;
     void event(double t, const std::string& s);
     int nearestBody(double t, double az, double el, double maxDeg) const;
 
@@ -217,6 +242,7 @@ private:
     std::vector<WideTarget> targets_;   // последнее дошедшее сообщение
     std::vector<int> visited_;          // уже обслуженные цели (авто: по очереди)
     std::vector<std::pair<int, double>> cool_;   // не подтверждённые точной цели широкой и до какого времени
+    std::vector<std::pair<TargetReport, double>> veto_;   // отсеянные точной (где были) и до какого времени
 
     // точная
     struct Mount {
@@ -238,6 +264,13 @@ private:
     double tAssign_ = 0, tInView_ = -1, tState_ = 0, tLastSeen_ = 0, tTrackStart_ = 0;
     double tSearch_ = -1;    // с какого момента точная ищет цель и не может удержать; -1 — держит
     bool gotThis_ = false;   // назначенную цель точная уже брала (захват считаем раз на назначение)
+    bool manualPick_ = false;   // цель выбрал оператор: точная её не отсеивает
+    bool nConf_ = false;     // точная уверена, что ведёт дрон
+    bool nOnly_ = false;     // цель есть только у точной: трек широкой assigned_ уже не она (или пропал)
+    double tBird_ = -1;      // с какого момента точная видит в цели птицу
+    int detachId_ = 0;       // трек широкой, от которого точная только что отказалась (ушёл с цели)
+    double tDetach_ = -10;
+    float lastU_ = 0, lastV_ = 0, lastSz_ = 0;   // захват точной на прошлом кадре: где и какого размера, пикс.
     TargetReport nrep_;      // последнее положение по точной
     bool haveNrep_ = false;
     dronolok::SearchWindow win_;

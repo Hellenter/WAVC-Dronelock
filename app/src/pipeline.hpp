@@ -274,6 +274,13 @@ public:
     // Очередь целей: захват на следующую по весомости (по кругу) или на выбранный трек.
     // Ручной выбор держится, пока цель жива (Tracker::selectLock)
     void nextTarget() { lockCmd_ = -1; }
+    // Подсказка извне (точная камера видит цель, а широкая её потеряла или ведёт слабо): здесь
+    // детектор ищет с пониженным порогом, как вокруг прогноза своих треков, и не пропускает это
+    // место между полными просмотрами кадра. Действует на кадры, обработанные после вызова; пусто — нет
+    void setCue(const std::vector<dronolok::FocusArea>& a) {
+        std::lock_guard<std::mutex> lk(cueM_);
+        cue_ = a;
+    }
     void selectTarget(int id) { lockCmd_ = id; }
     // забыть накопленное в этом запуске (память помех, маску неба), файлы не трогать
     void forget() {
@@ -326,6 +333,8 @@ private:
 
     mutable std::mutex sm_;
     Settings settings_;
+    std::mutex cueM_;
+    std::vector<dronolok::FocusArea> cue_;
     int settingsVer_ = 0;
 
     std::thread dec_, proc_;
