@@ -1,6 +1,7 @@
 #include "dronolok/dronolok.h"
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 
 #include "dronolok/detector.hpp"
@@ -142,12 +143,14 @@ int dl_tracker_next(dl_tracker* t) { return t->trk.nextLock(); }
 
 int dl_tracker_update(dl_tracker* t, const dl_candidate* dets, int n, dl_track* out, int cap) {
     if (!dets || n < 0) n = 0;   // resize(-1) — это 4 миллиарда элементов
-    t->dets.resize((size_t)n);
+    t->dets.clear();
     for (int i = 0; i < n; ++i) {
         const dl_candidate& c = dets[i];
-        t->dets[i] = {c.x, c.y, c.contrast, c.snr, c.polarity, c.level};
-        t->dets[i].energy = c.energy;
-        t->dets[i].margin = c.margin;
+        // nan/inf в координатах от вызывающего: приведение к int в сетке помех — неопределённое поведение
+        if (!std::isfinite(c.x) || !std::isfinite(c.y)) continue;
+        t->dets.push_back({c.x, c.y, c.contrast, c.snr, c.polarity, c.level});
+        t->dets.back().energy = c.energy;
+        t->dets.back().margin = c.margin;
     }
     const std::vector<Track>* trp;
     try {

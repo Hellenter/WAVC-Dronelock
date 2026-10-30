@@ -16,6 +16,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
 #include "dronolok/detector.hpp"
 #include "dronolok/scene.hpp"
 #include "dronolok/tuning.hpp"
@@ -23,6 +27,27 @@
 #include "y4m_reader.hpp"
 
 using namespace dronolok;
+
+// Сколько байт можно занять под загруженные кадры: половина свободной памяти (Linux), на 32-битной
+// системе не больше 1 ГБ адресного пространства; 0 — не знаем
+static size_t preload_budget() {
+    size_t cap = 0;
+#if defined(__linux__)
+    // MemAvailable учитывает кэш файлов, который ядро отдаст; без него — свободные страницы
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[128];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof(line), f))
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+        std::fclose(f);
+        if (kb > 0) cap = (size_t)std::min<unsigned long long>(kb / 2 * 1024ULL, (size_t)-1);
+    }
+    const long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (!cap && pages > 0 && page > 0) cap = (size_t)pages / 2 * (size_t)page;
+#endif
+    if (sizeof(void*) == 4) cap = cap ? std::min(cap, (size_t)1 << 30) : (size_t)1 << 30;
+    return cap;
+}
 
 static double now_ms() {
     using namespace std::chrono;
@@ -278,6 +303,13 @@ int main(int argc, char** argv) {
     std::vector<Color4> colors;   // цвет загруженных кадров (пусто — его нет)
     std::vector<uint8_t> buf;
     if (!stream) {
+        // кадры в памяти — не больше половины свободной (Pi 3: 1 ГБ, а 100 кадров 16 Мп — 1.6 ГБ)
+        const size_t frameBytes = (size_t)W * H + (size_t)W * H / 8, cap = preload_budget();
+        if (cap > 0 && (size_t)maxFrames * frameBytes > cap) {
+            const int fit = std::max(2, (int)(cap / frameBytes));
+            std::printf("памяти хватит на %d кадров из %d (--frames или --stream)\n", fit, maxFrames);
+            maxFrames = fit;
+        }
         const double t0 = now_ms();
         Color4 c4;
         while ((int)frames.size() < maxFrames && rd.next(buf)) {
