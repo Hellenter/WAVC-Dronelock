@@ -3,7 +3,8 @@
 //  - «пятно»: пока дрон скрыт, рядом с его путём (сбоку, выше) мерцает неподвижный отклик
 //    (heir_still: захват на прогнозе не передаётся стоящему треку);
 //  - «кромка»: на пути дрона всё время стоит неподвижный отклик предмета, дрон в нём «тонет»
-//    и выходит с другой стороны (stuck_obs: трек дрона не залипает на предмете).
+//    и выходит с другой стороны (stuck_obs: трек дрона не залипает на предмете);
+//  - «зависание»: дрон плавно тормозит и висит — это не предмет, захват на нём.
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -74,7 +75,33 @@ static Result run(float fps, float hide, bool edge, const TrackerConfig& base) {
     return r;
 }
 
+// Дрон плавно тормозит и зависает (за brake с), потом стоит hover с: «залипанием» это не считается,
+// захват всё время на дроне
+static void hover(float fps, float brake, float hover) {
+    std::mt19937 rng(11);
+    auto U = [&](float a, float b) { return a + (b - a) * (float)(rng() % 100000) / 100000.f; };
+    Tracker t(1280, 720, tracker_for_fps(TrackerConfig(), fps));
+    const float v0 = 90.f / fps;
+    const int t0 = (int)(6 * fps), nb = (int)std::lround(brake * fps), nh = (int)std::lround(hover * fps);
+    float x = 100, y = 300;
+    int off = 0;
+    for (int f = 0; f < t0 + nb + nh; ++f) {
+        x += f < t0 ? v0 : f < t0 + nb ? v0 * (1.f - (float)(f - t0) / (float)nb) : 0.f;
+        t.update({mk(x + U(-.5f, .5f), y + U(-.5f, .5f), 30)});
+        if (f < t0) continue;
+        bool on = false;
+        for (const Track& tr : t.confirmed())
+            on |= tr.id == t.lockedId() && std::hypot(tr.x - x, tr.y - y) < 12;
+        off += !on;
+    }
+    std::printf("%2.0f к/с, торможение %.1f с: снят с «предмета» %d раз, кадров не на дроне %d\n", fps, brake, t.stuckEvents(), off);
+    CHECK(t.stuckEvents() == 0, "%.0f к/с, торможение %.1f с: зависший дрон принят за предмет", fps, brake);
+    CHECK(off == 0, "%.0f к/с, торможение %.1f с: захват не на дроне %d кадров", fps, brake, off);
+}
+
 int main() {
+    for (float fps : {14.f, 25.f, 60.f})
+        for (float brake : {0.5f, 1.f}) hover(fps, brake, 3.f);
     const TrackerConfig on;
     TrackerConfig off = on;
     off.stuck_obs = 0;
