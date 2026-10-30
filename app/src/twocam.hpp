@@ -50,6 +50,8 @@ struct Config {
     int narrowW = 640, narrowH = 480;
     float narrowFov = 20, narrowFps = 60;
     float maxRate = 30, maxAccel = 150;   // град/с, град/с²
+    int narrowScales = 2;                 // масштабов детектора точной
+    bool narrowAutoThr = true;            // порог детектора точной по шуму кадра (CFAR): при шуме 3 зум x4 ведёт 84% времени вместо 18%
     float encoderDeg = 0.01f;             // дискретность датчиков угла
     float handoffLatency = 0.06f;         // от кадра широкой до команды поворотке, с
     // наведение
@@ -57,10 +59,17 @@ struct Config {
     float dwell = 6;          // сколько вести цель, прежде чем перейти к следующей (авто), с
     bool dronesOnly = true;   // не наводиться на цели, которые широкая считает птицами
     float simSpeed = 1;       // во сколько раз быстрее реального времени; 0 — как успевает ПК
+    double stopAt = 0;        // остановиться на этом модельном времени, с (замеры); 0 — не останавливаться
     // алгоритм точной (для сравнения: что даёт каждая доработка)
     bool encoderMotion = true;   // сдвиг картинки — по датчикам угла поворотки, иначе оценка по кадру
     bool feedForward = true;     // поворотка ведёт со скоростью цели, иначе только по ошибке
     bool windowFocus = true;     // в окне поиска порог ниже и берётся ближайший к прогнозу трек
+    bool wideCheck = true;       // трек точной сверяется с прогнозом широкой на этот момент (0.4–0.5°), а не с её
+                                 // последним сообщением с допуском 1.5°: соседний дрон в окне не берётся
+    bool lockFocus = true;       // и вокруг своей цели при ведении порог ниже: слабая цель не рвётся на куски
+    float minHold = 0.08f;       // трек в окне берётся, если держится столько секунд (не шум на один-два кадра)
+    float giveUp = 3;            // столько секунд точная ищет и не может удержать цель — цель «не подтверждена»
+    float coolDown = 10;         // столько секунд к неподтверждённой цели не возвращаться (авто-режимы)
 };
 
 // Тело в мире: прямолинейное движение (у птиц — с покачиванием и взмахами)
@@ -95,6 +104,8 @@ struct Stats {
     double simT = 0;
     int wideFrames = 0, narrowFrames = 0;
     int assignments = 0, acquired = 0, wrongLocks = 0, losses = 0;
+    int wideSwaps = 0;                        // трек широкой, указанный точной, перескочил на другое тело
+    int unconfirmed = 0;                      // точная не смогла удержать цель за giveUp и отказалась от неё
     double trackTime = 0, trackCorrect = 0;   // с: точная ведёт цель, и это назначенное тело
     double idleTime = 0, falseTarget = 0;     // с: нечего вести; назначена цель широкой, которой нет (шум, облако)
     double slewSum = 0, acqSum = 0;           // с: до цели в кадре точной и до захвата, сумма по назначениям
@@ -148,6 +159,7 @@ public:
     View view() const;
     // без интерфейса: прогнать seconds модельного времени как можно быстрее
     Stats runBlocking(const Config& c, double seconds, bool verbose);
+    double dumpAt_ = 0, dumpLen_ = 0;   // отладка (--dump t,len): кадры точной в PGM
 
 private:
     void loop();
@@ -197,6 +209,7 @@ private:
     std::deque<std::pair<double, std::vector<WideTarget>>> inbox_;   // сообщения в пути
     std::vector<WideTarget> targets_;   // последнее дошедшее сообщение
     std::vector<int> visited_;          // уже обслуженные цели (авто: по очереди)
+    std::vector<std::pair<int, double>> cool_;   // не подтверждённые точной цели широкой и до какого времени
 
     // точная
     struct Mount {
@@ -216,6 +229,8 @@ private:
     int assignedBody_ = 0;   // тело по правде (оценка)
     int nlock_ = 0;          // трек точной
     double tAssign_ = 0, tInView_ = -1, tState_ = 0, tLastSeen_ = 0, tTrackStart_ = 0;
+    double tSearch_ = -1;    // с какого момента точная ищет цель и не может удержать; -1 — держит
+    bool gotThis_ = false;   // назначенную цель точная уже брала (захват считаем раз на назначение)
     TargetReport nrep_;      // последнее положение по точной
     bool haveNrep_ = false;
     dronolok::SearchWindow win_;
