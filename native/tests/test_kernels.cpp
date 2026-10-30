@@ -594,6 +594,15 @@ static void test_stationary() {
     CHECK(b.loadMask(path, 10) && b.tileMask() == a.tileMask(), "loadMask");
     for (int i = 0; i < 10; ++i) b.detect(ground_frame(w, h, 0.6f, 100 + i).data(), w, h, w, c);
     CHECK(!b.verifyingMask() && !b.maskReplaced() && b.tileMask() == a.tileMask(), "mask verify, same scene");
+    {   // сверка при жёстком захвате (детектор смотрит весь кадр раз в hard_full_every): землю
+        // сверка видит каждый кадр, иначе она выходит гладкой и открывается (wt6, 30.10)
+        DetectorConfig k = cfg;
+        k.full_every = 6;
+        Detector v(k);
+        CHECK(v.loadMask(path, 10), "loadMask full_every 6");
+        for (int i = 0; i < 10; ++i) v.detect(ground_frame(w, h, 0.6f, 100 + i).data(), w, h, w, c);
+        CHECK(!v.verifyingMask() && !v.maskReplaced() && v.tileMask() == a.tileMask(), "mask verify, full_every 6");
+    }
     Detector m(cfg);   // камеру повернули: земли стало больше — маска учится заново
     m.loadMask(path, 10);
     for (int i = 0; i < 10; ++i) m.detect(ground_frame(w, h, 0.3f, 200 + i).data(), w, h, w, c);

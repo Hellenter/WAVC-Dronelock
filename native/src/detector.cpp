@@ -973,7 +973,9 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
     // между полными просмотрами — только тайлы вокруг треков (маска неба тоже действует);
     // полоса у горизонта — всегда, небо выше неё — раз в upper_every кадров
     const long fn = frameNo_++;
-    timing_.partial = !learning_ && cfg_.full_every > 1 && fn % cfg_.full_every != 0;
+    // сверка маски из файла, как обучение, смотрит весь кадр: иначе при жёстком захвате (full_every)
+    // земля вне окна вокруг цели выходит гладкой, и сверка её открывает (wt6, 30.10)
+    timing_.partial = !learning_ && !verifyLeft_ && cfg_.full_every > 1 && fn % cfg_.full_every != 0;
     timing_.upperSkipped = !band_.empty() && m && cfg_.upper_every > 1 && fn % cfg_.upper_every != 0;
     timing_.coarsePartial = cfg_.coarse_every > 1 && fn % cfg_.coarse_every != 0;
     if (timing_.partial || timing_.upperSkipped) {
