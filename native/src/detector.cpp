@@ -229,6 +229,8 @@ DetectorConfig detector_for_fps(const DetectorConfig& c0, float fps, float ref) 
     // перепроверка: и замер реже-чаще, и окно — замеров в окне столько же
     c.recheck_every = frames(c.recheck_every, 1);
     c.recheck_frames = frames(c.recheck_frames, 30);
+    // цель у земли (near_edge): на медленной камере — весь тайл у кромки
+    if (c.near_edge_fps > 0 && fps <= c.near_edge_fps) c.near_edge_px = 0;
     // фон ячеек (bg_frames) остаётся в кадрах: квантили мерцания копятся по числу замеров, и окно
     // в секундах на 15 к/с давало больше ложных захватов без дронов (6.6% -> 8%, на дронах так же).
     // Экономия "раз в N кадров" (full_every, coarse_every, upper_every) — не окна, а бюджет кадра
@@ -748,7 +750,11 @@ void Detector::updateRecheck() {
             const size_t i = (size_t)y * tw_ + x;
             if (!mask_[i] && (!texBad_[i] || recheckN_[i] < need || recheckTex_[i] >= cfg_.recheck_tex)) top = y;
         }
-        for (int y = 0; y < top; ++y) {
+        // тайл прямо над сильной землёй со своей текстурой (recheck_edge = false) не открываем: в
+        // дымке кромка леса слаба, как облако, а верхушки над ней вспыхивают (wt24: захват уходил на
+        // верхушку ели). Под облаком гладкое, закрытое линией горизонта, — не в счёт
+        const int lim = cfg_.recheck_edge || top >= th_ || !texBad_[(size_t)top * tw_ + x] ? top : top - 1;
+        for (int y = 0; y < lim; ++y) {
             const size_t i = (size_t)y * tw_ + x;
             if (mask_[i] || !texBad_[i]) continue;
             mask_[i] = 1;
@@ -1432,6 +1438,21 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
             const float thrB = thr0 * bk;   // порог тайла без фокуса
             const float thr = (focusTiles_[i] ? thrF : thr0) * zk * bk;
             int taken = 0, px[4], py[4];
+            // тайл неба у самой земли (near_edge): цель отсюда подтверждается, только когда полетела
+            const bool nearEdge = cfg_.near_edge && nearOn && nearGround_[i];
+            // ...и не дальше near_edge_px от закрытого тайла (0 — весь тайл)
+            auto nearClosed = [&](float x, float y) {
+                if (cfg_.near_edge_px <= 0) return true;
+                const float tp = (float)(T * f);
+                for (int yy = std::max(0, ty - 1); yy <= std::min(th - 1, ty + 1); ++yy)
+                    for (int xx = std::max(0, tx - 1); xx <= std::min(tw - 1, tx + 1); ++xx) {
+                        if (mask_[(size_t)yy * tw + xx]) continue;
+                        const float dx = std::max({(float)xx * tp - x, 0.f, x - (float)(xx + 1) * tp});
+                        const float dy = std::max({(float)yy * tp - y, 0.f, y - (float)(yy + 1) * tp});
+                        if (dx * dx + dy * dy <= cfg_.near_edge_px * cfg_.near_edge_px) return true;
+                    }
+                return false;
+            };
             auto push = [&](int gx, int gy, float mx, bool second) {   // gx, gy — пикс. после пулинга
                 Candidate c;
                 c.x = (float)(gx * f) + (f - 1) * 0.5f;
@@ -1443,7 +1464,8 @@ void Detector::selectTiles(const TileStats& ts, int tw, int th, int T, int f, in
                 c.level = lvl;
                 c.weak = focusTiles_[i] && !(mx >= thrB * zk && (edgeTex || mx >= cfg_.clutter_k * level + thrB * zk * 0.5f));
                 // открытое перепроверкой облако: цель там подтверждается, только когда полетела
-                c.edge = zone == 1 || edgeTex || polTile || (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
+                c.edge = zone == 1 || edgeTex || polTile || (nearEdge && nearClosed(c.x, c.y)) ||
+                         (fineGrid && !cloud_.empty() && cloud_.size() == mask_.size() && cloud_[i]);
                 c.second = second;
                 out.push_back(c);
                 px[taken] = gx;

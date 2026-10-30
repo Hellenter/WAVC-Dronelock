@@ -266,7 +266,9 @@ def main():
         out.write(b"FRAME\n")
         out.write(np.clip(img + 0.5, 0, 255).astype(np.uint8).tobytes())
     out.close()
-    json.dump(dict(w=W, h=H, fps=fps, frames=gt), open(a.out + ".gt.json", "w"))
+    # ground_top: верх земли по столбцам без качания (оценка маски неба по тайлам)
+    json.dump(dict(w=W, h=H, fps=fps, frames=gt, ground_top=[int(round(v)) for v in tree_top]),
+              open(a.out + ".gt.json", "w"))
 
 
 if __name__ == "__main__":

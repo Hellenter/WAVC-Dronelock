@@ -1230,6 +1230,23 @@ static void test_scene() {
         moved |= sa.update(f.data(), w, h, w, 25.f) && sa.state().moved;
     }
     CHECK(moved, "сдвиг камеры не замечен");
+    // густой туман: земля лишь чуть темнее неба, по яркости на пороге "темнее неба"; облака плывут,
+    // яркость неба над кромкой меняется, и столбцы то находят кромку, то нет. Камера стоит —
+    // сдвигом сцены это не считается
+    SceneAnalyzer fog;
+    bool fogMoved = false;
+    for (int i = 0; i < 80; ++i) {
+        f.resize((size_t)w * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const int top = 300 + (int)(20 * std::sin(x * 0.05f));
+                const float sky = 175.f + 12.f * std::sin(x * 0.03f - i * 0.4f);
+                const float v = (y < top ? sky : 147.f) + n(g);
+                f[(size_t)y * w + x] = (uint8_t)std::min(255.f, std::max(0.f, v));
+            }
+        fogMoved |= fog.update(f.data(), w, h, w, 25.f) && fog.state().moved;
+    }
+    CHECK(!fogMoved, "дрожащая кромка (туман) принята за сдвиг камеры");
     SceneAnalyzer night;
     for (int i = 0; i < 40; ++i) {
         frame(25, 0.4f, 0, f);
