@@ -6,7 +6,7 @@
 //
 // Протокол (sim/godot/sim.gd, --live <порт>): от нас строка JSON — сначала hello с камерами и
 // целями, затем {"t", "cam", "az", "el"} на каждый кадр, {"quit": 1} в конце. От сцены — строка
-// "FRAME w h n k", k строк целей "id bird shape size x y z vx vy vz hidden" (восток, север, верх; м и м/с)
+// "FRAME w h n k", k строк целей "id bird shape size x y z vx vy vz hidden" (от камер: восток, север, верх; м и м/с)
 // и n байт кадра (серый, w x h).
 #pragma once
 #include <cstdint>

@@ -1799,8 +1799,10 @@ func live_loop() -> void:
 			var p2 = target_pos(tg, t + 0.05)
 			var v = (p2 - p) / 0.05 if p2 != null else Vector3.ZERO
 			var c: Dictionary = tg["cfg"]
+			# от камер установки (на высоте rig.height): эмулятор считает направления из начала координат
 			rows.append("%d %d %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %d" % [tg["id"], 1 if tg["kind"] == "bird" else 0,
-				shapes.get(str(c.get("model", "quad")), 1), float(tg["size"]), p.x, -p.z, p.y, v.x, -v.z, v.y,
+				shapes.get(str(c.get("model", "quad")), 1), float(tg["size"]), p.x - rig_pos.x, -(p.z - rig_pos.z),
+				p.y - rig_pos.y, v.x, -v.z, v.y,
 				1 if occluded(rig_pos, p) else 0])
 		var head = "FRAME %d %d %d %d\n" % [img.get_width(), img.get_height(), data.size(), rows.size()]
 		if rows.size() > 0:
