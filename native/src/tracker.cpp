@@ -371,6 +371,19 @@ bool Tracker::selectLock(int id) {
     return false;
 }
 
+bool Tracker::markBird(int id) {
+    bool found = false;
+    for (auto* v : {&tracks_, &out_})
+        for (Track& t : *v)
+            if (t.id == id) {
+                t.extBird = true;
+                t.cls = TargetClass::Bird;
+                t.birdScore = 1.f;
+                found = true;
+            }
+    return found;
+}
+
 int Tracker::nextLock() {
     std::vector<int> q;
     lockQueue(q);
@@ -425,6 +438,11 @@ void Tracker::classify(Track& t) const {
         (!held && (t.clutter || (!qh && !creeper(t) && n >= cfg_.cls_min_hits &&
                                  t.travel < std::max(3.f, cfg_.still_speed * (float)t.age))))) {
         t.cls = TargetClass::Clutter;
+        return;
+    }
+    if (t.extBird) {   // другая камера рассмотрела её вблизи
+        t.cls = TargetClass::Bird;
+        t.birdScore = 1.f;
         return;
     }
     if (n < cfg_.cls_min_hits) {
