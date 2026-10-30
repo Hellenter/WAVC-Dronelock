@@ -1217,7 +1217,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 // птица рядом весомее (lock_slow), и на 15 к/с захват уходил с дрона на неё (wt16, wt18)
                 // с самолёта на медленный дрон, не на яркую; на ведомую камерой — и без этого
                 // (её скорость по сцене — скорость камеры, hard_switch_follow)
-                return hard_ ? cfg_.hard_switch > 0 && t.lockW > cfg_.hard_switch * cur->lockW &&
+                // жёсткий захват не уходит на трек, пережитый в горячей ячейке (crept): ползущая точка —
+                // скорее всего дрон, но уже подтверждённый жёстко дрон надёжнее (wt5: жёсткий 87 -> 54)
+                return hard_ ? cfg_.hard_switch > 0 && !t.crept && t.lockW > cfg_.hard_switch * cur->lockW &&
                                    ((cfg_.hard_switch_follow && t.followed) || relSpeed(t) < 0.5f * relSpeed(*cur)) &&
                                    (!cfg_.hard_switch_drone || t.followed ||   // камера ведёт её — это и есть цель (wt17)
                                     (t.cls == TargetClass::Drone && t.birdScore < 0.5f))
