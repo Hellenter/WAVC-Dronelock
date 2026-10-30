@@ -1166,6 +1166,10 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 // счёт с утечкой: кадр перевеса +1, кадр без него -1 — претендент, весомый
                 // большую часть времени, своё набирает, хоть вес и скачет
                 const bool w = wins(t);
+                // мягкий захват на «птице» уступает «дрону» сразу (lock_bird_yield)
+                if (w && cfg_.lock_bird_yield && !hard_ && cur->cls == TargetClass::Bird && t.cls == TargetClass::Drone &&
+                    t.birdScore < 0.5f)
+                    n = std::max(n, cfg_.lock_dwell - 1);
                 n += w ? 1 : -1;
                 if (n <= 0) continue;
                 nb.emplace_back(t.id, n);
