@@ -591,7 +591,10 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, int varIdx, in
         s.slowdown = 1;
         s.emulateMs = 0;
     }
-    if (threads > 0) s.det.threads = threads;
+    if (threads > 0) {
+        s.det.threads = threads;
+        s.decoderThreads = threads;   // декодер тоже по своей доле ядер: у каждого 4K HEVC ~ядра+1 кадров в памяти
+    }
     const float sc = var.setup.scale;
     if (sc > 0 && std::fabs(sc - 1.f) > 1e-3f && vm.w > 0) {
         s.procW = std::max(64, (int)(vm.w * sc) & ~1);

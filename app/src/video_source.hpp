@@ -69,6 +69,9 @@ private:
     double tb_ = 0;                 // единица времени потока, с
     int64_t start_ = 0;             // pts первого кадра
     int64_t index_ = -1, skipTo_ = 0;
+    int badFrames_ = 0;             // кадров подряд, которые декодер не смог собрать
+    std::vector<uint8_t> lutY_;     // яркость 9-16 бит -> 8 бит (HDR/10-бит с телефона)
+    int lutKey_ = -1;
     VideoInfo info_;
     Orient orient_;
     std::vector<uint8_t> raw_;             // кадр до поворота

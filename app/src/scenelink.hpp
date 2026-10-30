@@ -9,6 +9,7 @@
 // "FRAME w h n k", k строк целей "id bird shape size x y z vx vy vz hidden" (от камер: восток, север, верх; м и м/с)
 // и n байт кадра (серый, w x h).
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -42,13 +43,17 @@ public:
                 std::vector<Body>& bodies, std::string& err);
     void stop();
     bool running() const { return proc_ != nullptr; }
+    // флаг остановки эмулятора: ожидание Godot и кадра прерывается сразу, а не через 2 минуты
+    void setCancel(const std::atomic<bool>* c) { cancel_ = c; }
 
 private:
+    bool cancelled() const { return cancel_ && cancel_->load(); }
     bool sendAll(const char* p, size_t n);
     bool waitReadable();
     bool recvLine(std::string& line);
     bool recvAll(uint8_t* p, size_t n);
 
+    const std::atomic<bool>* cancel_ = nullptr;
     void* proc_ = nullptr;
     intptr_t lsock_ = -1, sock_ = -1;
     std::string buf_;   // принятое сверх прочитанной строки

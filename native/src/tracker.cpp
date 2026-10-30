@@ -208,13 +208,12 @@ void Tracker::staticCells(std::vector<TrackPoint>& out) const {
 // камеру, ложился в память по всему пути, и при каждом запуске его отклики на этом пути были
 // помехой (wt1, Maxim 30.10: с «чистым стартом» — дрон) — не грузятся
 bool Tracker::saveStatic(const std::string& path) const {
-    FILE* f = open_file(path, "wb");
-    if (!f) return false;
     const int32_t hdr[5] = {0x4D534C44, 4, gw_, gh_, cfg_.clutter_cell};
     std::vector<float> v(stat_.size());
     for (size_t i = 0; i < v.size(); ++i) v[i] = staticAt(i);
-    const bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(v.data(), sizeof(float), v.size(), f) == v.size();
-    return fclose(f) == 0 && ok;
+    return write_file_replace(path, "wb", [&](FILE* f) {
+        return fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(v.data(), sizeof(float), v.size(), f) == v.size();
+    });
 }
 
 bool Tracker::loadStatic(const std::string& path) {

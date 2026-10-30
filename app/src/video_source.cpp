@@ -14,15 +14,17 @@ extern "C" {
 }
 
 void expand_tv_range(const uint8_t* src, uint8_t* dst, int n) {
-    static uint8_t lut[256];
-    static bool init = false;
-    if (!init) {
-        for (int i = 0; i < 256; ++i) {
-            int v = ((i - 16) * 255 + 109) / 219;
-            lut[i] = (uint8_t)(i <= 16 ? 0 : v > 255 ? 255 : v);
+    // таблица заполняется один раз и потокобезопасно: декодеры мультитеста работают параллельно
+    static const struct Lut {
+        uint8_t v[256];
+        Lut() {
+            for (int i = 0; i < 256; ++i) {
+                int x = ((i - 16) * 255 + 109) / 219;
+                v[i] = (uint8_t)(i <= 16 ? 0 : x > 255 ? 255 : x);
+            }
         }
-        init = true;
-    }
+    } tab;
+    const uint8_t* lut = tab.v;
     int i = 0;
     for (; i + 4 <= n; i += 4) {
         dst[i] = lut[src[i]];
@@ -178,9 +180,18 @@ bool VideoSource::open(const std::string& path, int threads, std::string& err) {
 bool VideoSource::decodeNext() {
     for (;;) {
         int r = avcodec_receive_frame(ctx_, frame_);
-        if (r == 0) return true;
+        if (r == 0) {
+            badFrames_ = 0;
+            return true;
+        }
         if (r == AVERROR_EOF) return false;
-        if (r != AVERROR(EAGAIN)) return false;
+        // кадр не собрался (битый пакет в записи с телефона, HEVC сразу после перемотки) — это не конец
+        // файла: просим следующий (пакет — только когда декодер скажет EAGAIN), сдаёмся после 50 подряд.
+        // Раньше видео здесь обрывалось или шло по кругу с начала
+        if (r != AVERROR(EAGAIN)) {
+            if (++badFrames_ > 50) return false;
+            continue;
+        }
         if (eof_) return false;
         r = av_read_frame(fmt_, pkt_);
         if (r < 0) {   // конец файла: досливаем буферы декодера
@@ -207,6 +218,32 @@ void VideoSource::convert(uint8_t* dst, int outW, int outH, int dstStride) {
             uint8_t* o = dst + (size_t)y * dstStride;
             if (full) memcpy(o, s, outW);
             else expand_tv_range(s, o, outW);
+        }
+        return;
+    }
+    // 10 бит (HEVC/HDR с телефона, P010): яркость таблицей из плоскости Y — swscale в один поток
+    // тратил на кадр 4K больше, чем детектор
+    const int dep = d ? d->comp[0].depth : 0;
+    const bool wideY = d && !(d->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BE |
+                                          AV_PIX_FMT_FLAG_HWACCEL)) &&
+                       dep > 8 && dep <= 12 && d->comp[0].plane == 0 && d->comp[0].step == 2 && d->comp[0].offset == 0;
+    if (wideY && outW == frame_->width && outH == frame_->height) {
+        const int sh = d->comp[0].shift, key = dep * 64 + sh * 2 + (full ? 1 : 0);
+        if (lutKey_ != key) {   // значение 0..2^dep-1 -> 0..255 (ТВ-диапазон 16..235 << (dep-8) — в полный)
+            const int maxv = (1 << dep) - 1, lo = 16 << (dep - 8), span = 219 << (dep - 8);
+            lutY_.resize((size_t)maxv + 1);
+            for (int v = 0; v <= maxv; ++v) {
+                const int x = full ? (v * 255 + maxv / 2) / maxv : ((v - lo) * 255 + span / 2) / span;
+                lutY_[v] = (uint8_t)(full ? x : v <= lo ? 0 : x > 255 ? 255 : x);
+            }
+            lutKey_ = key;
+        }
+        const uint8_t* lut = lutY_.data();
+        const int mask = (1 << dep) - 1;
+        for (int y = 0; y < outH; ++y) {
+            const uint8_t* s = frame_->data[0] + (size_t)y * frame_->linesize[0];
+            uint8_t* o = dst + (size_t)y * dstStride;
+            for (int x = 0; x < outW; ++x) o[x] = lut[((s[2 * x] | (s[2 * x + 1] << 8)) >> sh) & mask];
         }
         return;
     }
@@ -288,7 +325,11 @@ bool VideoSource::read(uint8_t* dst, int outW, int outH, int dstStride, ColorPla
         if (!decodeNext()) return false;
         // номер кадра — по времени показа: после перемотки счёт кадров с начала неизвестен
         const int64_t pts = frame_->best_effort_timestamp;
-        index_ = pts != AV_NOPTS_VALUE && tb_ > 0 ? (int64_t)std::llround((pts - start_) * tb_ * info_.fps) : index_ + 1;
+        int64_t idx = pts != AV_NOPTS_VALUE && tb_ > 0 ? (int64_t)std::llround((pts - start_) * tb_ * info_.fps) : index_ + 1;
+        // переменная частота (телефон): интервал короче 1/fps давал два кадра с одним номером —
+        // разметка «за целью» вставала («видео перемотали»), кадр разметки считался дважды
+        if (index_ >= 0 && idx <= index_) idx = index_ + 1;
+        index_ = idx;
         if (index_ >= skipTo_) break;
         av_frame_unref(frame_);   // до нужного кадра после перемотки — без преобразования
     }

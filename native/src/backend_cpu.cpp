@@ -82,12 +82,13 @@ public:
         const int T = p.tile, k = std::min(p.k | 1, MAX_K), a = k / 2;
         const int Wp = f.w / p.pool, Hp = f.h / p.pool, tw = Wp / T, th = Hp / T;
         const size_t nt = (size_t)tw * th;
-        if (p.dark) dk.resize(nt);
-        if (p.bright) br.resize(nt);
+        // выключенная полярность — пустая статистика, а не прошлая (её читают перепроверка маски и доращивание)
+        dk.resize(p.dark ? nt : 0);
+        br.resize(p.bright ? nt : 0);
         const bool cells = p.cells && T % CELL == 0;
         const size_t nc = cells ? (size_t)(tw * T / CELL) * (th * T / CELL) : 0;
-        if (p.dark) cells ? dk.resizeCells(nc) : dk.resizeCells(0);
-        if (p.bright) cells ? br.resizeCells(nc) : br.resizeCells(0);
+        dk.resizeCells(p.dark ? nc : 0);
+        br.resizeCells(p.bright ? nc : 0);
         jobs = skipped = 0;
         if (!tw || !th || (!p.dark && !p.bright)) return;
         const int jr = std::max(1, p.job_rows);

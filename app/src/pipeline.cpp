@@ -764,7 +764,7 @@ void Pipeline::processLoop() {
             // столько, чтобы по времени как на 60 к/с, но не меньше 10: на 14 к/с 25 кадров — 1.8 с
             // без маски (захват в это время садится на кромку крон и землю) при каждом переучивании
             const int learnN = perSec(s, s.learnMaskFrames, 10);
-            if (s.learnMaskFrames > 0 && s.useMaskFile() && !force && det.loadMask(maskPath(), learnN)) {
+            if (s.learnMaskFrames > 0 && s.useMaskFile() && !force && det.loadMask(maskPath(), learnN, f.w, f.h)) {
                 learnLeft = 0;
                 maskOn = true;
                 maskChecking = true;
@@ -1153,7 +1153,9 @@ void Pipeline::processLoop() {
         latest_ = r;
         hist_.push_back(r);
         histBytes_ += r->frame->px.size();
-        while (hist_.size() > 1 && (hist_.size() > HIST_MAX || histBytes_ > HIST_BYTES)) {
+        // мультитест (наблюдатель) историю не смотрит: 4 прогона 4K держали бы по 1 ГБ кадров
+        const size_t histMax = observer_ ? 1 : HIST_MAX;
+        while (hist_.size() > 1 && (hist_.size() > histMax || histBytes_ > HIST_BYTES)) {
             histBytes_ -= hist_.front()->frame->px.size();
             hist_.pop_front();
         }
