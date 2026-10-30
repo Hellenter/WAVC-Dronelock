@@ -631,8 +631,11 @@ void Detector::buildMask(float frac, std::vector<uint8_t>& out) const {
 }
 
 namespace {
-// вторая версия — со слоем доращивания: 1 — тайл закрыт по помехам, 2 — закрыт так только для светлых
-const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '2', 0};
+// вторая версия — со слоем доращивания: 1 — тайл закрыт по помехам, 2 — закрыт так только для светлых.
+// Третья — тот же формат; тайлы, доращенные второй, снова небо: до creep_frames и static_drone (30.10)
+// отклики медленного дрона, летящего на камеру, были помехами, и маска дорастала по его пути
+const char kMaskMagic[8] = {'D', 'L', 'M', 'A', 'S', 'K', '3', 0};
+const char kMaskMagic2[8] = {'D', 'L', 'M', 'A', 'S', 'K', '2', 0};
 const char kMaskMagic1[8] = {'D', 'L', 'M', 'A', 'S', 'K', '1', 0};
 const int32_t kMaxSide = 1 << 16;   // сторона кадра в файле маски, пикс.
 }
@@ -659,8 +662,9 @@ bool Detector::loadMask(const std::string& path, int verify) {
     char magic[8];
     int32_t hdr[6];
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    const bool v2 = ok && std::memcmp(magic, kMaskMagic, 8) == 0;
-    ok = ok && (v2 || std::memcmp(magic, kMaskMagic1, 8) == 0) && std::fread(hdr, sizeof(hdr), 1, f) == 1 &&
+    const bool v3 = ok && std::memcmp(magic, kMaskMagic, 8) == 0;
+    const bool v2 = ok && std::memcmp(magic, kMaskMagic2, 8) == 0;
+    ok = ok && (v3 || v2 || std::memcmp(magic, kMaskMagic1, 8) == 0) && std::fread(hdr, sizeof(hdr), 1, f) == 1 &&
          hdr[2] == cfg_.pool && hdr[3] == cfg_.tile && hdr[4] > 0 && hdr[5] > 0 &&
          hdr[4] == (hdr[0] / cfg_.pool) / cfg_.tile && hdr[5] == (hdr[1] / cfg_.pool) / cfg_.tile &&
          // размер кадра из файла ограничен: испорченный заголовок не выделяет гигабайты под маску
@@ -669,9 +673,15 @@ bool Detector::loadMask(const std::string& path, int verify) {
     if (ok) {
         m.resize((size_t)hdr[4] * hdr[5]);
         ok = std::fread(m.data(), 1, m.size(), f) == m.size();
-        if (ok && v2) {
+        if (ok && (v3 || v2)) {
             g.resize(m.size());
             ok = std::fread(g.data(), 1, g.size(), f) == g.size();
+        }
+        // доращенное второй версией — снова небо (закрыто оно по помехам, которыми был и дрон)
+        if (ok && v2) {
+            for (size_t i = 0; i < g.size(); ++i)
+                if (g[i]) m[i] = 1;
+            g.clear();
         }
     }
     std::fclose(f);

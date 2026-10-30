@@ -203,11 +203,14 @@ void Tracker::staticCells(std::vector<TrackPoint>& out) const {
 }
 
 // Файл: "DLSM", версия, ширина и высота сетки, ячейка, затем значения по ячейкам. Версия 3:
-// файлы версии 2 могли запомнить сам дрон (камера вела его, и он стоял в кадре) — не грузятся
+// файлы версии 2 могли запомнить сам дрон (камера вела его, и он стоял в кадре) — не грузятся.
+// Версия 4: в файлах версии 3 (до creep_frames и static_drone, 30.10) медленный дрон, летящий на
+// камеру, ложился в память по всему пути, и при каждом запуске его отклики на этом пути были
+// помехой (wt1, Maxim 30.10: с «чистым стартом» — дрон) — не грузятся
 bool Tracker::saveStatic(const std::string& path) const {
     FILE* f = open_file(path, "wb");
     if (!f) return false;
-    const int32_t hdr[5] = {0x4D534C44, 3, gw_, gh_, cfg_.clutter_cell};
+    const int32_t hdr[5] = {0x4D534C44, 4, gw_, gh_, cfg_.clutter_cell};
     std::vector<float> v(stat_.size());
     for (size_t i = 0; i < v.size(); ++i) v[i] = staticAt(i);
     const bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(v.data(), sizeof(float), v.size(), f) == v.size();
@@ -219,7 +222,7 @@ bool Tracker::loadStatic(const std::string& path) {
     if (!f) return false;
     int32_t hdr[5];
     std::vector<float> v(stat_.size());
-    const bool ok = fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == 0x4D534C44 && hdr[1] == 3 && hdr[2] == gw_ &&
+    const bool ok = fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == 0x4D534C44 && hdr[1] == 4 && hdr[2] == gw_ &&
                     hdr[3] == gh_ && hdr[4] == cfg_.clutter_cell && fread(v.data(), sizeof(float), v.size(), f) == v.size();
     fclose(f);
     if (!ok) return false;

@@ -293,6 +293,15 @@ static void test_static_map() {
     CHECK(t2.clutterDets().size() == 1, "после загрузки статичная точка не помеха");
     Tracker t3(320, 240, tc);
     CHECK(!t3.loadStatic(path), "память загрузилась для другого размера кадра");
+    // файл версии 3 (до creep_frames и static_drone: в нём путь медленного дрона) не грузится
+    if (FILE* f = std::fopen(path.c_str(), "r+b")) {
+        const int32_t v3 = 3;
+        std::fseek(f, 4, SEEK_SET);
+        std::fwrite(&v3, sizeof(v3), 1, f);
+        std::fclose(f);
+    }
+    Tracker t4(640, 480, tc);
+    CHECK(!t4.loadStatic(path), "загрузилась память версии 3");
     std::remove(path.c_str());
     std::printf("static map: ok\n");
 }
@@ -607,6 +616,39 @@ static void test_stationary() {
     m.loadMask(path, 10);
     for (int i = 0; i < 10; ++i) m.detect(ground_frame(w, h, 0.3f, 200 + i).data(), w, h, w, c);
     CHECK(m.maskReplaced() && m.tileMask() != a.tileMask(), "mask verify, moved camera");
+    {   // файл второй версии: доращенные им тайлы — снова небо (дорастала и по пути дрона, 30.10)
+        std::vector<uint8_t> b;
+        if (FILE* f = std::fopen(path.c_str(), "rb")) {
+            int ch;
+            while ((ch = std::fgetc(f)) != EOF) b.push_back((uint8_t)ch);
+            std::fclose(f);
+        }
+        const size_t n = a.tileMask().size(), mo = 8 + 6 * 4;
+        size_t sky = n;
+        for (size_t i = 0; i < n; ++i)
+            if (a.tileMask()[i]) { sky = i; break; }
+        CHECK(b.size() == mo + 2 * n && sky < n, "mask v2: файл %zu, небо %zu", b.size(), sky);
+        if (b.size() == mo + 2 * n && sky < n) {
+            b[6] = '2';
+            b[mo + sky] = 0;       // тайл неба закрыт...
+            b[mo + n + sky] = 1;   // ...доращиванием
+            const std::string p2 = "test_mask_v2.bin";
+            if (FILE* f = std::fopen(p2.c_str(), "wb")) {
+                std::fwrite(b.data(), 1, b.size(), f);
+                std::fclose(f);
+            }
+            Detector o(cfg);
+            CHECK(o.loadMask(p2, 0) && o.tileMask() == a.tileMask(), "mask v2: доращенный тайл не открылся");
+            b[6] = '3';
+            if (FILE* f = std::fopen(p2.c_str(), "wb")) {
+                std::fwrite(b.data(), 1, b.size(), f);
+                std::fclose(f);
+            }
+            Detector o3(cfg);
+            CHECK(o3.loadMask(p2, 0) && o3.tileMask()[sky] == 0, "mask v3: доращенный тайл открылся");
+            std::remove(p2.c_str());
+        }
+    }
     // с маской неба задание сужается до своих тайлов маски: кандидаты при любом размере
     // заданий те же (на полном кадре и между полными просмотрами, full_every 2)
     for (int fe : {1, 2}) {
@@ -1231,7 +1273,7 @@ static void test_bad_files() {
 }
 
 // Файл маски: после сверки маска — новая. Закрытое в файле по текстуре (прошлый запуск, прошлая
-// версия программы) не держится; доращенное по помехам (слой второй версии файла) снова закрыто, и
+// версия программы) не держится; доращенное по помехам (слой третьей версии файла) снова закрыто, и
 // перепроверка открывает его, когда там тихо; другая сцена — из файла ничего
 static void test_mask_file_layers() {
     const int w = 640, h = 640;   // тайлы 10 x 10, земля — ряды 6..9
@@ -1247,9 +1289,9 @@ static void test_mask_file_layers() {
     const int tw = a.tilesX(), th = a.tilesY();
     const size_t stale = 2 * tw + 3, gt = 3 * tw + 5;   // небо: закрыто по текстуре прошлым запуском; доращено
     CHECK(m.size() == (size_t)tw * th && m[stale] && m[gt], "mask layers: sky tiles open");
-    for (int variant = 0; variant < 3; ++variant) {   // первая версия; вторая; вторая, а камеру повернули
+    for (int variant = 0; variant < 3; ++variant) {   // первая версия; третья; третья, а камеру повернули
         {
-            const char magic[8] = {'D', 'L', 'M', 'A', 'S', 'K', variant ? '2' : '1', 0};
+            const char magic[8] = {'D', 'L', 'M', 'A', 'S', 'K', variant ? '3' : '1', 0};
             const int32_t hdr[6] = {w, h, cfg.pool, cfg.tile, tw, th};
             std::vector<uint8_t> mm = m, grown(m.size(), 0);
             mm[stale] = 0;
