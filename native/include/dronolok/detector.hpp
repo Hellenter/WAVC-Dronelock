@@ -632,8 +632,9 @@ struct TrackerConfig {
     // мимо такой точки, не теряется. static_frames = 0 — выключено.
     int static_frames = 3000;
     float static_hits = 8.f;
-    // ...умерший на месте трек добавляет в ячейку не больше static_death откликов (0 — все)
-    int static_death = 3;
+    // ...умерший на месте трек добавляет в ячейку не больше static_death откликов (0 — все). Опция: 3 —
+    // wt9 найден 1 -> 3%, но wt3/wt7 захват на дроне -2/-4 (30.10)
+    int static_death = 0;
     // классификатор по движению
     int cls_window = 16;        // сколько последних попаданий смотреть
     int cls_min_hits = 8;       // меньше — класс Unknown
