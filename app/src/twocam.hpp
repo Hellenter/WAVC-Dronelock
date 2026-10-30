@@ -21,6 +21,7 @@
 #include "dronolok/detector.hpp"
 #include "dronolok/geometry.hpp"
 #include "pipeline.hpp"
+#include "silhouette.hpp"
 
 namespace twocam {
 
@@ -36,7 +37,11 @@ struct Config {
     int drones = 3, birds = 1;
     float rangeMin = 250, rangeMax = 1200;   // м
     float speedMin = 6, speedMax = 22;       // м/с
-    float droneSize = 0.5f, birdSize = 0.35f;   // м
+    float droneSize = 0.5f, birdSize = 0.35f;   // м: размах квадрокоптера (средний) и птицы (не используется)
+    // доли типов дронов: квадрокоптер (0.3–0.8 м при размере 0.5), летающее крыло (1.8–3.5 м, 25–45 м/с),
+    // самолёт (1.5–4 м, 15–30 м/с)
+    float quadShare = 0.5f, deltaShare = 0.25f, planeShare = 0.25f;
+    float psf = 0.6f;   // пятно объектива, СКО в пикселях
     float clouds = 0.35f;                    // 0..1
     float noise = 2.0f;                      // СКО шума датчика, уровни яркости
     float visibility = 6000;                 // м: контраст падает как exp(-R/visibility)
@@ -77,6 +82,7 @@ struct Config {
 struct Body {
     int id = 0;
     bool bird = false;
+    Shape shape = Shape::Quad;
     Vec3 p0, v;          // м, м/с; камеры в начале координат
     double t0 = 0;       // когда появилось
     float size = 0.5f;   // м

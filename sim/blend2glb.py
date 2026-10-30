@@ -1,11 +1,16 @@
 """Перегнать модель Poly Haven (.blend) в лёгкие .glb для сцены, по одному на каждое дерево в файле:
     blender -b model.blend --python sim/blend2glb.py -- <папка> [--tris 30000] [--tex 512]
-Прореживает каждую сетку до --tris треугольников, уменьшает текстуры до --tex и заменяет сложные
-материалы Poly Haven простыми (цвет + прозрачность листвы срезом): экспортёр glTF и Godot понимают
-только такие."""
+Уменьшает каждое дерево до --tris треугольников: листву (карточки с прозрачностью) прореживает
+целыми карточками, а оставшиеся немного увеличивает, чтобы крона не стала прозрачной; ствол и ветки
+упрощает. Текстуры уменьшает до --tex, сложные материалы Poly Haven заменяет простыми (цвет +
+прозрачность листвы срезом): экспортёр glTF и Godot понимают только такие."""
 import os
+import random
 import sys
+
+import bmesh
 import bpy
+from mathutils import Vector
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 out_dir = argv[0]
@@ -51,13 +56,85 @@ for img in bpy.data.images:
     if img.size[0] > tex:
         img.scale(tex, max(1, int(img.size[1] * tex / img.size[0])))
 
+def uv_from_attributes(o):
+    """UV, сохранённые как простой атрибут (FLOAT2 или вектор), — в слой UV (иначе экспортёр их не видит)"""
+    me = o.data
+    for a in list(me.attributes):
+        if (a.data_type in ("FLOAT2", "FLOAT_VECTOR") and a.domain == "CORNER" and a.name not in me.uv_layers
+                and not a.name.startswith(".") and "uv" in a.name.lower()):
+            data = [tuple(x.vector)[:2] for x in a.data]
+            name = a.name
+            for aux in (".vs." + name, ".es." + name, ".pn." + name):
+                if aux in me.attributes:
+                    me.attributes.remove(me.attributes[aux])
+            me.attributes.remove(me.attributes[name])
+            uv = me.uv_layers.new(name=name)
+            for i, v in enumerate(data):
+                uv.data[i].uv = v
+    if len(me.uv_layers):
+        me.uv_layers.active_index = 0
+        me.uv_layers[0].active_render = True
+
+
+def thin(o, tris):
+    """листву — целыми карточками, остальное — схлопыванием рёбер"""
+    me = o.data
+    leaf = {i for i, m in enumerate(me.materials) if m is not None and m.blend_method == "CLIP"}
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.faces.ensure_lookup_table()
+    leaf_faces = [f for f in bm.faces if f.material_index in leaf]
+    n_leaf = sum(len(f.verts) - 2 for f in leaf_faces)
+    n_all = sum(len(f.verts) - 2 for f in bm.faces)
+    leaf_budget = 0.75 * tris
+    if leaf and n_leaf > leaf_budget:
+        seen, islands = set(), []
+        for f in leaf_faces:
+            if f.index in seen:
+                continue
+            seen.add(f.index)
+            stack, isl = [f], []
+            while stack:
+                g = stack.pop()
+                isl.append(g)
+                for e in g.edges:
+                    for h in e.link_faces:
+                        if h.index not in seen and h.material_index in leaf:
+                            seen.add(h.index)
+                            stack.append(h)
+            islands.append(isl)
+        keep = leaf_budget / n_leaf
+        grow = min(2.0, keep ** -0.5)
+        rnd = random.Random(1)
+        kill = []
+        for isl in islands:
+            if rnd.random() < keep:
+                vs = list({v for f in isl for v in f.verts})
+                c = sum((v.co for v in vs), Vector()) / len(vs)
+                for v in vs:
+                    v.co = c + (v.co - c) * grow
+            else:
+                kill.extend(isl)
+        bmesh.ops.delete(bm, geom=kill, context="FACES")
+        print("  листва:", len(islands), "карточек, оставлено", round(keep * 100, 1), "%, увеличены в", round(grow, 2))
+    bm.to_mesh(me)
+    bm.free()
+    rest = sum(len(p.vertices) - 2 for p in me.polygons if p.material_index not in leaf)
+    rest_budget = tris - min(n_leaf, leaf_budget)
+    if rest > rest_budget > 0:
+        vg = o.vertex_groups.new(name="bark")
+        vg.add([v for p in me.polygons if p.material_index not in leaf for v in p.vertices], 1.0, "REPLACE")
+        m = o.modifiers.new("dec", "DECIMATE")
+        m.ratio = max(0.05, rest_budget / rest)
+        m.vertex_group = "bark"
+        m.use_collapse_triangulate = True
+    return n_all
+
+
 meshes = [o for o in bpy.context.scene.objects if o.type == "MESH" and o.visible_get()]
 for o in meshes:
-    n = sum(len(p.vertices) - 2 for p in o.data.polygons)
-    if n > tris:
-        m = o.modifiers.new("dec", "DECIMATE")
-        m.ratio = tris / n
-        m.use_collapse_triangulate = True
+    uv_from_attributes(o)
+    n = thin(o, tris)
     # каждое дерево отдельно и в начале координат (в файле Poly Haven варианты стоят рядом)
     loc = o.location.copy()
     o.location = (0, 0, 0)
@@ -67,4 +144,4 @@ for o in meshes:
     bpy.ops.export_scene.gltf(filepath=path, export_format="GLB", use_selection=True, export_apply=True,
                               export_image_format="AUTO", export_yup=True)
     o.location = loc
-    print("записан", path, "треугольников было", n, "стало ~", min(n, tris), os.path.getsize(path) // 1024, "КБ")
+    print("записан", path, "треугольников было", n, "стало", sum(len(p.vertices) - 2 for p in o.evaluated_get(bpy.context.evaluated_depsgraph_get()).data.polygons), os.path.getsize(path) // 1024, "КБ")

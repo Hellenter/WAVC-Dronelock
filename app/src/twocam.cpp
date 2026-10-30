@@ -141,44 +141,49 @@ void Emulator::spawn(Body& b, double t, bool first) {
         b.p0 = {d.x * R, d.y * R, d.z * R};
         break;
     }
-    const double sp = b.bird ? 8 + U(rng_) * 6 : c_.speedMin + U(rng_) * (c_.speedMax - c_.speedMin);
+    // тип дрона по долям из настроек; у каждого свой размах и скорость
+    if (b.bird) {
+        b.shape = Shape::Bird;
+    } else {
+        const double tot = std::max(1e-6f, c_.quadShare + c_.deltaShare + c_.planeShare), r = U(rng_) * tot;
+        b.shape = r < c_.quadShare ? Shape::Quad : r < c_.quadShare + c_.deltaShare ? Shape::Delta : Shape::Plane;
+    }
+    double sp = c_.speedMin + U(rng_) * (c_.speedMax - c_.speedMin);
+    switch (b.shape) {
+    case Shape::Bird: sp = 8 + U(rng_) * 6; b.size = (float)(0.3 + U(rng_) * 0.9); break;   // от воробья до вороны
+    case Shape::Quad: b.size = c_.droneSize * (float)(0.6 + U(rng_)); break;
+    case Shape::Delta: sp = 25 + U(rng_) * 20; b.size = (float)(1.8 + U(rng_) * 1.7); break;
+    case Shape::Plane: sp = 15 + U(rng_) * 15; b.size = (float)(1.5 + U(rng_) * 2.5); break;
+    }
     const double hd = U(rng_) * 2 * PI;
     b.v = {sp * std::cos(hd), sp * std::sin(hd), (U(rng_) * 2 - 1) * (b.bird ? 0.5 : 1.5)};
-    b.size = b.bird ? c_.birdSize : c_.droneSize * (float)(0.8 + 0.4 * U(rng_));
     b.flapHz = b.bird ? (float)(4 + U(rng_) * 4) : 0;
     b.phase = (float)(U(rng_) * 6.28);
     (void)first;
 }
 
 void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h) {
+    std::vector<Tri> tris;
     for (const Body& b : bodies_) {
         const Vec3 q = b.at(t);
         const double R = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
-        const Vec3 d{q.x / R, q.y / R, q.z / R};
         double u, v;
-        if (!project(m, p, d, u, v) || !in_frame(m, u, v, 20)) continue;
-        const double pd = pixel_deg(m, p, u, v);
-        double sizePx = rad2deg(b.size / R) / pd;
+        if (!project(m, p, q, u, v) || !in_frame(m, u, v, 20)) continue;
         double c = (b.bird ? -55.0 : -70.0) * std::exp(-R / c_.visibility);
-        if (b.bird) {   // взмахи: силуэт и контраст пульсируют
-            const double fl = std::sin(2 * PI * b.flapHz * t + b.phase);
-            sizePx *= 0.75 + 0.25 * fl;
-            c *= 0.8 + 0.2 * fl;
+        double flap = 0, pitch = 0, bank = 0;
+        const double sp = std::sqrt(b.v.x * b.v.x + b.v.y * b.v.y);
+        if (b.bird) {   // взмахи: крылья ходят вверх-вниз, силуэт меняется
+            flap = 0.7 * std::sin(2 * PI * b.flapHz * (t - b.t0) + b.phase);
+            bank = 0.15 * std::sin(0.7 * t + b.phase);
+        } else if (b.shape == Shape::Quad) {
+            pitch = -std::min(0.45, 0.02 * sp);   // квадрокоптер летит с наклоном носом вниз
+            bank = 0.05 * std::sin(1.3 * t + b.phase);
+        } else {
+            bank = 0.12 * std::sin(0.4 * t + b.phase);
         }
-        const double sx = std::max(0.5, 0.42 * sizePx), sy = std::max(0.5, (b.bird ? 0.3 : 0.55) * sizePx);
-        // точка меньше пикселя: та же сумма контраста, размазанная по пятну датчика
-        const double area = 0.785 * sizePx * sizePx * (b.bird ? 0.6 : 1.0);
-        const double A = c * std::min(1.0, area / (2 * PI * sx * sy));
-        const int rx = (int)std::ceil(3 * sx), ry = (int)std::ceil(3 * sy);
-        const int x0 = std::max(0, (int)u - rx), x1 = std::min(w - 1, (int)u + rx);
-        const int y0 = std::max(0, (int)v - ry), y1 = std::min(h - 1, (int)v + ry);
-        for (int y = y0; y <= y1; ++y)
-            for (int x = x0; x <= x1; ++x) {
-                const double dx = (x + 0.5 - u) / sx, dy = (y + 0.5 - v) / sy;
-                const double g = std::exp(-0.5 * (dx * dx + dy * dy));
-                uint8_t& o = px[(size_t)y * w + x];
-                o = (uint8_t)std::max(0.0, std::min(255.0, o + A * g));
-            }
+        build_silhouette(b.shape, b.size, flap, tris);
+        draw_silhouette(tris, q, body_frame(b.v, pitch, bank), c, c_.psf,
+                        [&](const Vec3& d, double& uu, double& vv) { return project(m, p, d, uu, vv); }, px, w, h);
     }
 }
 
@@ -670,7 +675,7 @@ void Emulator::stepNarrow(double t, double dt) {
             const Vec3 q = b.at(t);
             const double R = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
             if (project(narrowCam_, truth, {q.x / R, q.y / R, q.z / R}, u, v) && in_frame(narrowCam_, u, v))
-                printf("  тело %d%s в (%.1f,%.1f), %.0f м\n", b.id, b.bird ? " птица" : "", u, v, R);
+                printf("  тело %d %s %.1f м в (%.1f,%.1f), %.0f м\n", b.id, shape_name(b.shape), b.size, u, v, R);
         }
     }
     st_.narrowMs += (now_s() - t1) * 1000;
@@ -1019,6 +1024,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--noise") c.noise = (float)atof(val().c_str());
         else if (a == "--visibility") c.visibility = (float)atof(val().c_str());
         else if (a == "--size") c.droneSize = (float)atof(val().c_str());
+        else if (a == "--types") sscanf(val().c_str(), "%f,%f,%f", &c.quadShare, &c.deltaShare, &c.planeShare);
         else if (a == "--wide") sscanf(val().c_str(), "%dx%d", &c.wideW, &c.wideH);
         else if (a == "--wide-fps") c.wideFps = (float)atof(val().c_str());
         else if (a == "--fisheye") c.wideFisheye = true;
@@ -1047,7 +1053,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--cool-down") c.coolDown = (float)atof(val().c_str());
         else {
             printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 250,1200]\n"
-                   "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
+                   "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--types 0.5,0.25,0.25] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 20]\n"
                    "  [--fps 60] [--rate 30] [--accel 150] [--latency 0.06] [--dwell 6]\n"
                    "  [--switch queue|nearest|manual] [--json out.json] [--quiet]\n"
                    "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window] [--no-lock-focus]\n"

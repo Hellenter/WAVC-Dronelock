@@ -2425,8 +2425,14 @@ void panel_twocam(App& a) {
     ImGui::DragFloatRange2("##rng", &c.rangeMin, &c.rangeMax, 10, 50, 5000, "от %.0f", "до %.0f");
     label("Скорость целей, м/с");
     ImGui::DragFloatRange2("##spd", &c.speedMin, &c.speedMax, 0.5f, 0, 80, "от %.0f", "до %.0f");
-    label("Размер дрона, м");
+    label("Размер квадрокоптера, м", "Средний размах; у каждого дрона свой, от 0.6 до 1.6 этого значения.");
     ImGui::SliderFloat("##dsz", &c.droneSize, 0.1f, 3, "%.2f");
+    label("Типы дронов", "Доли: квадрокоптеры, летающие крылья (треугольник 1.8–3.5 м, 25–45 м/с) и самолёты (1.5–4 м, 15–30 м/с).");
+    ImGui::SliderFloat("##tq", &c.quadShare, 0, 1, "квадро %.2f");
+    ImGui::SliderFloat("##td", &c.deltaShare, 0, 1, "крыло %.2f");
+    ImGui::SliderFloat("##tp", &c.planeShare, 0, 1, "самолёт %.2f");
+    label("Размытие объектива, пикс.");
+    ImGui::SliderFloat("##psf", &c.psf, 0, 2, "%.2f");
     label("Облачность");
     ImGui::SliderFloat("##cl", &c.clouds, 0, 1, "%.2f");
     label("Шум датчика");

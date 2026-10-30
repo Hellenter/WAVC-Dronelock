@@ -43,13 +43,16 @@
   `dist`, `depth`, `az_from`, `az_to`, `count`), `villages` (`az`, `dist`, `radius`, `houses`), `poles`
   (`pos`, `height`, `radius`), `hills`, `cloud_cover`, `cloud_soft`, `cloud_wind`, `sun_az`, `sun_el`, `sun`,
   `ambient`, `fog`, `wind` (качание крон), `shadows`.
-- `targets`: `kind` (`drone`/`bird`), `model` (`quad`, `wing`, птица — по умолчанию), `size` (м: размах
+- `targets`: `kind` (`drone`/`bird`), `model` (`quad`, `delta` — летающее крыло-треугольник, `wing`/`plane` — самолёт, птица — по умолчанию), `size` (м: размах
   дрона или крыльев птицы), `speed`, `start`/`end` (с), `path`:
   `line` (`from`, `to`), `waypoints` (`points`, `mode`: `once`/`loop`/`pingpong`), `orbit` (`center`,
   `radius`, `dir`, `phase`), `hover` (`pos`, `jitter`), `wander` (`center`, `radius`). Птицы: `flap_hz`,
   `flap_deg`, `flap_period` и `flap_on` (взмахи пачками, между ними планирование).
 
-Готовые сцены: `forest_village` (4 дрона, 2 птицы), `forest_polyhaven` (то же с деревьями Poly Haven из
+- `random_targets`: `drones`, `birds`, `range` [м, м], `types` (`quad`/`delta`/`plane` и доли), `seed` — случайные
+  цели разных типов: квадрокоптер 0.3–0.8 м, крыло 1.8–3.5 м и 25–45 м/с, самолёт 1.5–4 м и 15–30 м/с, птицы 0.3–1.2 м.
+
+Готовые сцены: `drone_types` (8 дронов трёх типов и 4 птицы на 150–1500 м), `forest_village` (4 дрона, 2 птицы), `forest_polyhaven` (то же с деревьями Poly Haven из
 `assets/polyhaven`), `pan_sweep` (камера качается ±25° на 10°/с),
 `overcast_birds` (пасмурно, только птицы — проверка ложных тревог), `quick` (3 с, полразрешения).
 

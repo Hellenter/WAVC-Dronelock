@@ -731,9 +731,71 @@ func box(sz: Vector3) -> BoxMesh:
 	return b
 
 
+# Случайные цели: "random_targets": {"drones": 6, "birds": 3, "range": [150, 1500], "seed": 5,
+#   "types": {"quad": 0.5, "delta": 0.25, "plane": 0.25}} — разные типы, размеры и скорости,
+#   пролёт по прямой через поле зрения широкой камеры.
+func random_targets() -> Array:
+	var rc: Dictionary = cfg.get("random_targets", {})
+	var out = []
+	if rc.is_empty():
+		return out
+	var r = RandomNumberGenerator.new()
+	r.seed = int(rc.get("seed", int(cfg.get("seed", 1)) + 100))
+	var rng_r = rc.get("range", [150, 1500])
+	var types: Dictionary = rc.get("types", {"quad": 0.5, "delta": 0.25, "plane": 0.25})
+	var tot = 0.0
+	for k in types:
+		tot += float(types[k])
+	var half = float(wcfg.get("hfov", 120.0)) * 0.4
+	var az0 = float(wcfg.get("az", 0.0))
+	var n_dr = int(rc.get("drones", 6))
+	for i in n_dr + int(rc.get("birds", 3)):
+		var t = {}
+		var model = "bird"
+		var size = r.randf_range(0.3, 1.2)
+		var speed = r.randf_range(8, 14)
+		if i < n_dr:
+			var x = r.randf() * tot
+			for k in types:
+				model = k
+				x -= float(types[k])
+				if x <= 0:
+					break
+			if model == "quad":
+				size = r.randf_range(0.3, 0.8)
+				speed = r.randf_range(5, 20)
+			elif model == "delta":
+				size = r.randf_range(1.8, 3.5)
+				speed = r.randf_range(25, 45)
+			else:
+				size = r.randf_range(1.5, 4.0)
+				speed = r.randf_range(15, 30)
+			t["kind"] = "drone"
+		else:
+			t["kind"] = "bird"
+			t["flap_hz"] = r.randf_range(3, 8)
+			t["flap_period"] = r.randf_range(2, 5)
+			t["flap_on"] = r.randf_range(0.8, 2)
+		t["model"] = model
+		t["size"] = size
+		t["speed"] = speed
+		var dist = r.randf_range(float(rng_r[0]), float(rng_r[1]))
+		var az = (az0 + r.randf_range(-half, half)) * DEG
+		var el = r.randf_range(3, 25) * DEG
+		var c = Vector3(sin(az) * cos(el), cos(az) * cos(el), sin(el)) * dist   # восток, север, верх
+		var hd = r.randf() * TAU
+		var dirv = Vector3(cos(hd), sin(hd), r.randf_range(-0.05, 0.05))
+		var secs = float(cfg.get("seconds", 10.0))
+		var a = c - dirv * speed * secs * 0.5
+		var b = c + dirv * speed * secs * 0.5
+		t["path"] = {"type": "line", "from": [a.x, a.y, maxf(a.z, 15.0)], "to": [b.x, b.y, maxf(b.z, 15.0)]}
+		out.append(t)
+	return out
+
+
 func build_targets() -> void:
 	var id = 1
-	for t in cfg.get("targets", []):
+	for t in cfg.get("targets", []) + random_targets():
 		var kind = str(t.get("kind", "drone"))
 		var model = str(t.get("model", "quad" if kind == "drone" else "bird"))
 		var s = float(t.get("size", 0.35 if kind == "drone" else 0.8))
@@ -757,7 +819,25 @@ func build_targets() -> void:
 				part(root, box(Vector3(0.04 * s, 0.03 * s, 0.36 * s)), dirv * 0.18 * s, m, Basis(Vector3.UP, a))
 				part(root, box(Vector3(0.06 * s, 0.07 * s, 0.06 * s)), dirv * 0.35 * s + Vector3(0, 0.03 * s, 0), m)
 				part(root, prop, dirv * 0.35 * s + Vector3(0, 0.07 * s, 0), pm)
-		elif model == "wing":
+		elif model == "delta":
+			# летающее крыло: треугольник с вырезом сзади (размах s), кили на концах
+			var L = 0.62 * s
+			var st = SurfaceTool.new()
+			st.begin(Mesh.PRIMITIVE_TRIANGLES)
+			var nose = Vector3(0, 0, -0.55 * L)
+			var lt = Vector3(-0.5 * s, 0, 0.45 * L)
+			var rt = Vector3(0.5 * s, 0, 0.45 * L)
+			var notch = Vector3(0, 0, 0.25 * L)
+			for v in [nose, lt, notch, nose, notch, rt]:
+				st.add_vertex(v)
+			st.generate_normals()
+			var dm = m.duplicate()
+			dm.cull_mode = BaseMaterial3D.CULL_DISABLED
+			part(root, st.commit(), Vector3.ZERO, dm)
+			part(root, box(Vector3(0.06 * s, 0.07 * s, 0.8 * L)), Vector3(0, 0, 0.05 * L), m)
+			for x in [-0.47 * s, 0.47 * s]:
+				part(root, box(Vector3(0.01 * s, 0.1 * s, 0.2 * L)), Vector3(x, 0.05 * s, 0.35 * L), m)
+		elif model == "wing" or model == "plane":
 			part(root, box(Vector3(0.12 * s, 0.12 * s, 0.75 * s)), Vector3.ZERO, m)
 			part(root, box(Vector3(s, 0.02 * s, 0.16 * s)), Vector3(0, 0.03 * s, -0.05 * s), m)
 			part(root, box(Vector3(0.35 * s, 0.02 * s, 0.1 * s)), Vector3(0, 0.03 * s, 0.33 * s), m)
