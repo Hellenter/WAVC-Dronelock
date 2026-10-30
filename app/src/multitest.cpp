@@ -442,6 +442,8 @@ struct Collector {
     long firstGt = -1, firstDet = -1, firstLock = -1;
     double skySum = 0, skyDarkSum = 0;
     long skyN = 0;
+    long autoF = 0, autoN = 0, sceneN = 0;
+    double hazeSum = 0, noiseSum = 0;
 
     static bool live(const Track& t) { return !t.clutter && t.cls != TargetClass::Clutter; }
 
@@ -470,6 +472,15 @@ struct Collector {
         lastLock = r.lockId;
 
         const int64_t idx = r.frame->index;
+        if (idx >= warmup) {   // подстройка под сцену: включала ли порог по шуму и почему
+            ++autoN;
+            autoF += r.autoThr;
+            if (r.adapt && r.scene.ready) {
+                hazeSum += r.scene.haze;
+                noiseSum += r.scene.noise;
+                ++sceneN;
+            }
+        }
         if (!r.mask.empty() && idx >= warmup) {   // маска неба после обучения: сколько неба осталось в поиске
             long on = 0, dark = 0;
             const bool md = r.maskDark.size() == r.mask.size(), mb = r.maskBright.size() == r.mask.size();
@@ -676,6 +687,9 @@ static RunResult run_one(const VideoMeta& vm, const Variant& var, int varIdx, in
     rr.lockAcq = col.acq;
     rr.skyPct = col.skyN ? 100.0 * col.skySum / col.skyN : -1;
     rr.skyDarkPct = col.skyN ? 100.0 * col.skyDarkSum / col.skyN : -1;
+    rr.autoThrPct = col.autoN ? 100.0 * col.autoF / col.autoN : -1;
+    rr.hazePct = col.sceneN ? 100.0 * col.hazeSum / col.sceneN : -1;
+    rr.skyNoise = col.sceneN ? col.noiseSum / col.sceneN : -1;
     rr.gt = col.gtN > 0 && col.evF > 0;
     if (rr.gt) {
         rr.evalFrames = col.evF;
@@ -742,6 +756,13 @@ const std::vector<Metric>& metrics() {
         {"sky_dark_pct", "Небо в поиске тёмных", "%", 0, false, 1, [](const RunResult& r) { return r.skyDarkPct; },
          "Как «небо в поиске», но для тёмных целей: с тайлами, которые маска закрыла только из-за светлой текстуры "
          "(облака), — там тёмный дрон ищется."},
+        {"auto_thr_pct", "Порог по шуму", "%", 0, false, 1, [](const RunResult& r) { return r.autoThrPct; },
+         "Доля кадров, где порог шёл по шуму неба (auto_thr): выставлен или включён подстройкой под сцену (дымка, "
+         "шум, мало света) — сразу на весь кадр. На чистом небе такой порог отсекает тусклых дронов."},
+        {"haze_pct", "Дымка", "%", 0, false, 0, [](const RunResult& r) { return r.hazePct; },
+         "Дымка по оценке подстройки под сцену, в среднем. Выше 58% подстройка включает порог по шуму."},
+        {"sky_noise", "Шум неба", "", 0, false, 2, [](const RunResult& r) { return r.skyNoise; },
+         "Шум матрицы на небе (СКО, уровни яркости), в среднем. Выше 2.6 подстройка включает порог по шуму."},
         {"lock_pct", "Кадров с захватом", "%", 0, false, 1, [](const RunResult& r) { return r.lockPct; },
          "Доля всех кадров, где есть захват (любой цели)."},
         {"hard_pct", "Кадров с жёстким", "%", 0, false, 1, [](const RunResult& r) { return r.hardPct; },
@@ -801,7 +822,8 @@ std::vector<RunResult> merge_phases(const std::vector<RunResult>& runs) {
         &RunResult::frames, &RunResult::wallS, &RunResult::fps, &RunResult::detectMs, &RunResult::detectP95,
         &RunResult::procMs, &RunResult::procP95, &RunResult::targetsPerFrame, &RunResult::targetFramesPct,
         &RunResult::tracks, &RunResult::droneIds, &RunResult::birdIds, &RunResult::lockPct, &RunResult::hardPct,
-        &RunResult::lockAcq, &RunResult::skyPct, &RunResult::skyDarkPct, &RunResult::evalFrames,
+        &RunResult::lockAcq, &RunResult::skyPct, &RunResult::skyDarkPct, &RunResult::autoThrPct,
+        &RunResult::hazePct, &RunResult::skyNoise, &RunResult::evalFrames,
         &RunResult::gtDroneFrames, &RunResult::recallDrone, &RunResult::recallBird, &RunResult::droneAsDrone,
         &RunResult::falsePerFrame, &RunResult::falseTracks, &RunResult::lockOnDrone, &RunResult::hardOnDrone,
         &RunResult::falseLock, &RunResult::firstDetectS, &RunResult::firstLockS, &RunResult::score};
