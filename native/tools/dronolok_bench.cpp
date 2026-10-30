@@ -63,6 +63,8 @@ static void usage() {
         "  --smooth [--smooth-k 0.5] / --no-smooth   сглаживание 3x3 перед пулингом (согласованный фильтр)\n"
         "  --static N              память статичных помех, кадров (0 — выкл.; с --motion выкл.)\n"
         "  --gt file.gt.json       разметка: полнота, ложные треки, классы\n"
+        "  --gate 26 [--gate-speed-k 0 --gate-pps 360]   предел ворот ассоциации, пикс. кадра (+ столько скоростей\n"
+        "                          трека; с --fps-scale не меньше пути за кадр при gate-pps пикс./с)\n"
         "  --bird-resid 3 --bird-cv 0.3 --bird-speed 0   пороги классификатора дрон/птица\n"
         "  --flap-window 48 --flap-r2 0.45 --flap-depth 0.3 --flap-hold 50   взмахи (окно 0 — выкл.)\n"
         "  --hover 0.3 --flock 150     зависание = дрон, стая с машущей = птицы (0 — выкл.)\n"
@@ -180,6 +182,9 @@ int main(int argc, char** argv) {
         else if (a == "--tile") cfg.tile = std::atoi(val().c_str());
         else if (a == "--job") { std::string v = val(); std::sscanf(v.c_str(), "%dx%d", &cfg.job_rows, &cfg.job_cols); }
         else if (a == "--polarity") { std::string v = val(); cfg.dark = v != "bright"; cfg.bright = v != "dark"; }
+        else if (a == "--gate") tcfg.gate = (float)std::atof(val().c_str());
+        else if (a == "--gate-speed-k") tcfg.gate_speed_k = (float)std::atof(val().c_str());
+        else if (a == "--gate-pps") tcfg.gate_pps = (float)std::atof(val().c_str());
         else if (a == "--bird-resid") tcfg.bird_resid = (float)std::atof(val().c_str());
         else if (a == "--bird-cv") tcfg.bird_contrast_cv = (float)std::atof(val().c_str());
         else if (a == "--bird-speed") tcfg.bird_speed = (float)std::atof(val().c_str());

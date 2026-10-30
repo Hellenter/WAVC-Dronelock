@@ -3509,6 +3509,7 @@ int run_stress(int argc, char** argv) {
                 s.trk.overlay_rel = R(3) ? 0.f : F(0, 0.5f);
                 s.trk.gate = R(3) ? 26.f : F(0, 150);
                 s.trk.gate_speed_k = R(3) ? 0.f : F(0, 4);
+                s.trk.gate_pps = R(3) ? 360.f : F(0, 2000);
                 s.motionLong = R(3) != 0;
                 break;
             default:   // частота камеры и шаг: ниже частоты видео кадры файла пропускаются
