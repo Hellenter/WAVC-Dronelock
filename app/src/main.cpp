@@ -3497,6 +3497,7 @@ int run_stress(int argc, char** argv) {
                 s.trk.lock_slow = R(2) ? 1.f : F(0, 3);
                 s.trk.hard_switch = F(0, 4);
                 s.trk.lock_dwell = R(40);
+                s.trk.lock_dwell_keep = R(3) != 0;
                 s.trk.follow_k = F(0, 6);
                 s.trkSeconds = R(4) != 0;
                 // ночной подбор 30.10: дрейф фона, ведомая цель, ворота, класс по кадру, наложение у края

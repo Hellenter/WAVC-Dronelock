@@ -1168,6 +1168,14 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 nb.emplace_back(t.id, n);
                 if (w && n >= cfg_.lock_dwell && (!sw || t.lockW > sw->lockW)) sw = &t;
             }
+            // претендент жив, но в выдаче его нет (на прогнозе дольше выдачи) — счёт стоит
+            if (cfg_.lock_dwell_keep)
+                for (const auto& b : beat_) {
+                    bool shown = false, alive = false;
+                    for (const Track& t : out_) shown |= t.id == b.first;
+                    for (const Track& t : tracks_) alive |= t.id == b.first;
+                    if (!shown && alive) nb.push_back(b);
+                }
             beat_.swap(nb);
             if (sw) cur = sw, beat_.clear();
         }
