@@ -19,6 +19,7 @@
 // птица и её попутчики по стае остаются птицами; зависший после полёта — дрон.
 // Пороги — в TrackerConfig.
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 #include <cstdio>
 
@@ -587,7 +588,7 @@ void Tracker::focus(float camDx, float camDy, std::vector<FocusArea>& out) const
     }
 }
 
-void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
+void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out, bool targets) const {
     out.clear();
     const float q = cfg_.q_accel * cfg_.q_accel;
     for (const Track& t : tracks_) {
@@ -595,6 +596,8 @@ void Tracker::roi(float camDx, float camDy, std::vector<FocusArea>& out) const {
         // иначе вторая цель (дальний дрон рядом с захваченным самолётом) не набирает попаданий
         // на подтверждение и не находится никогда. Помехи и наложения пропускаем.
         if (hard_ && t.id != lockId_ && (t.clutter || t.overlay || t.cls == TargetClass::Clutter)) continue;
+        // цвет нужен треку, который можно захватить: помеху не захватить, а лист уже признан
+        if (targets && t.id != lockId_ && (t.leaf || t.cls == TargetClass::Clutter)) continue;
         const KfPeek k = kf_peek(t, camDx, camDy, q, dt_);
         const float S = k.p00 + measVar(t.level);
         const float gmin = cfg_.gate_min * (float)(1 << std::min(4, t.level));
@@ -720,6 +723,17 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         c.level = lv;
         c.energy = sil.contrast * (float)sil.area;
         c.margin = 0;
+        // цвет силуэта — от ближайшего к его центру отклика внутри с измеренным цветом (лист у камеры)
+        float cd = 1e30f;
+        for (size_t i = 0; i < dets.size(); ++i) {
+            const float d2 = (dets[i].x - sil.x) * (dets[i].x - sil.x) + (dets[i].y - sil.y) * (dets[i].y - sil.y);
+            if (part[i] && dets[i].colored && dets[i].polarity == c.polarity && d2 < cd) {
+                cd = d2;
+                c.colored = true;
+                c.leafy = dets[i].leafy;
+                c.leaf = dets[i].leaf;
+            }
+        }
         dets.push_back(c);
         part.push_back(0);
         silhDet = (int)dets.size() - 1;
@@ -917,6 +931,12 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         tr.level = d.level;
         tr.miss = 0;
         ++tr.hits;
+        if (d.colored) {
+            if (tr.colorN < 60000) ++tr.colorN;
+            if (d.leafy && tr.leafN < 60000) ++tr.leafN;
+            tr.leafBits = tr.leafBits << 1 | (d.leafy ? 1u : 0u);
+        }
+        tr.leaf = cfg_.leaf_hits > 0 && (tr.leaf || (int)std::bitset<32>(tr.leafBits).count() >= cfg_.leaf_hits);
         tr.path.push_back({tr.x, tr.y});
         while (tr.path.size() > 30) tr.path.pop_front();
         const float sx = d.x - gx_, sy = d.y - gy_;
@@ -1149,6 +1169,10 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         t.p11 = v0 * v0;
         t.hits = 1;
         t.evidence = std::max(0.f, evidenceOf(d));
+        t.colorN = d.colored;
+        t.leafN = d.leafy;
+        t.leafBits = d.leafy ? 1u : 0u;
+        t.leaf = cfg_.leaf_hits > 0 && t.leafN >= cfg_.leaf_hits;
         t.det = di;
         t.bx = d.x - gx_;
         t.by = d.y - gy_;
@@ -1199,9 +1223,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         const size_t from = tr.obs.size() > (size_t)cfg_.cls_window ? tr.obs.size() - cfg_.cls_window : 0;
         for (size_t i = from; i < tr.obs.size(); ++i) mc += tr.obs[i].c;
         mc /= std::max<size_t>(1, tr.obs.size() - from);
-        tr.score = tr.cls == TargetClass::Clutter ? 0.f
-                                                  : (float)(mc * std::min(1.0, tr.hits / 10.0) /
-                                                            (1.0 + 0.25 * tr.miss));
+        tr.score = tr.cls == TargetClass::Clutter || tr.leaf ? 0.f
+                                                             : (float)(mc * std::min(1.0, tr.hits / 10.0) /
+                                                                       (1.0 + 0.25 * tr.miss));
         tr.lockW = tr.score;
         if (cfg_.lock_cmax > 0 && mc > cfg_.lock_cmax) tr.lockW *= (float)(cfg_.lock_cmax / mc);
         // медленную цель предпочитаем, только если она уже пролетела по сцене: дрожащий отклик
@@ -1246,11 +1270,11 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     }
     bool lockOut = false;
     for (const Track& t : out_) lockOut |= t.id == lockId_ && outside(t);
-    // захваченное оказалось помехой (неподвижное, наложение на кадр) — не ждём его, как
-    // пропавшую цель, а сразу отпускаем
+    // захваченное оказалось помехой (неподвижное, наложение на кадр, лист у камеры) — не ждём
+    // его, как пропавшую цель, а сразу отпускаем
     bool lockClutter = false;
     if (cur && cur->score <= 0) {
-        lockClutter = cur->cls == TargetClass::Clutter;
+        lockClutter = cur->cls == TargetClass::Clutter || cur->leaf;
         cur = nullptr;
     }
     // ближайший живой трек к точке, где ждём захваченную цель (её же подхватил другой трек)

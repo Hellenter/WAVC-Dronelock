@@ -1038,6 +1038,73 @@ static void test_soft_tree() {
     std::printf("soft cloud over a dark tree top keeps the skyline: ok\n");
 }
 
+// Лист у камеры (leaf_color): тёмное пятно на голубом небе — зелёное, жёлтое, оранжевое, красное или бурое —
+// с цветом листвы; серое и серое, смешанное с цветом неба, — нет, как и серое на тёплом облаке. Трек с
+// попаданиями цвета листвы не захватывается, а захваченный отпускается
+static void test_leaf_color() {
+    const int w = 640, h = 480, X = 322, Y = 238;
+    struct Case { const char* name; int bu, bv, tu, tv; bool leafy; };
+    const Case cases[] = {{"green", 8, -10, -12, -8, true},  {"yellow", 8, -10, -25, 5, true},
+                          {"orange", 8, -10, -18, 20, true}, {"red", 8, -10, -8, 35, true},
+                          {"brown", 8, -10, -10, 8, true},   {"grey", 8, -10, 0, 0, false},
+                          {"grey in haze", 8, -10, 3, -4, false}, {"grey on a warm cloud", -8, 2, -4, 1, false},
+                          {"dark, colour of the cloud", -8, 2, -8, 2, false}};
+    std::mt19937 g(5);
+    std::vector<uint8_t> f((size_t)w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const bool in = (x - X) * (x - X) + (y - Y) * (y - Y) <= 25;
+            f[(size_t)y * w + x] = (uint8_t)((in ? 110 : 180) + (int)(g() % 5) - 2);
+        }
+    // отсчёт цвета — в углу блока 4x4 (как в приложении) и в середине блока 2x2 (yuv420 с камеры)
+    for (const int st : {4, 2})
+        for (const Case& k : cases) {
+            const int cw = w / st, ch = h / st, off = st == 4 ? 0 : 1;
+            std::vector<uint8_t> u((size_t)cw * ch), v(u.size());
+            for (int by = 0; by < ch; ++by)
+                for (int bx = 0; bx < cw; ++bx) {
+                    const int x = st * bx + off, y = st * by + off;
+                    const bool in = (x - X) * (x - X) + (y - Y) * (y - Y) <= 25;
+                    u[(size_t)by * cw + bx] = (uint8_t)(128 + (in ? k.tu : k.bu));
+                    v[(size_t)by * cw + bx] = (uint8_t)(128 + (in ? k.tv : k.bv));
+                }
+            DetectorConfig cfg;
+            cfg.threads = 1;
+            Detector d(cfg);
+            std::vector<Candidate> c;
+            d.setColor(u.data(), v.data(), cw, ch, cw, st, 1, off);
+            d.detect(f.data(), w, h, w, c);
+            const Candidate* t = nullptr;
+            for (const auto& q : c)
+                if (std::fabs(q.x - X) < 4 && std::fabs(q.y - Y) < 4) t = &q;
+            CHECK(t && t->colored && t->leafy == k.leafy, "leaf colour %s, step %d: %s, leaf %.1f", k.name, st,
+                  !t ? "no candidate" : !t->colored ? "colour not measured" : t->leafy ? "leafy" : "not leafy", t ? t->leaf : 0.f);
+            d.detect(f.data(), w, h, w, c);   // цвет — только на кадр, где он задан
+            for (const auto& q : c) CHECK(!q.colored, "leaf colour %s: colour measured without colour planes", k.name);
+        }
+    // трек: лист с первых кадров не захватывается; цвет листвы, увиденный позже, снимает захват; дрон — захвачен,
+    // и редкие случайные попадания с цветом листвы (раз в 40 замеров) за долгое ведение его не срывают
+    for (int variant = 0; variant < 4; ++variant) {
+        Tracker t(1280, 720, TrackerConfig());
+        bool locked = false, lockedLate = false, dropped = false;
+        const int n = variant == 3 ? 240 : 60;
+        for (int i = 0; i < n; ++i) {
+            Candidate d{};
+            d.x = 100 + 4.f * (float)i; d.y = 300 + 1.f * (float)i; d.contrast = 30; d.snr = 5; d.polarity = -1; d.margin = 3;
+            d.colored = true;
+            d.leafy = variant == 0 || (variant == 1 && i >= 40) || (variant == 3 && i % 40 == 39);
+            t.update({d});
+            dropped |= locked && t.lockedId() == 0;
+            locked |= t.lockedId() != 0;
+            if (i >= 45) lockedLate |= t.lockedId() != 0;
+        }
+        if (variant == 0) CHECK(!locked, "leaf track locked");
+        if (variant == 1) CHECK(locked && !lockedLate, "late leaf colour: locked %d, still locked %d", locked, lockedLate);
+        if (variant >= 2) CHECK(locked && !dropped, "drone lock (variant %d): locked %d, dropped %d", variant, locked, dropped);
+    }
+    std::printf("leaf colour: ok\n");
+}
+
 // Сдвиг камеры: текстура (пятна 24x24) сдвинута на известное число пикселей; с надписью
 // поверх кадра (неподвижные точки исключаются из оценки) и с повтором кадра
 static void test_motion() {
@@ -1331,6 +1398,7 @@ int main() {
     test_sky_color();
     test_soft_cloud();
     test_soft_tree();
+    test_leaf_color();
     test_scene();
     test_motion();
     test_bad_files();

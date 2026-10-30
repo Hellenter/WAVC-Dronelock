@@ -377,6 +377,77 @@ void Detector::sampleColor(const uint8_t* gray, int stride) {
         }
 }
 
+// Цвет цели против фона (DetectorConfig::leaf_color). Отсчёты цвета в кольце вокруг кандидата —
+// фон (медианы яркости и цвета) и его ровность. В круге тела — отсчёты, отклонённые от фона в
+// сторону цели не меньше половины самого сильного отклонения там: на облаке с голубыми просветами
+// просветы темнее облака, но слабее самой цели. Самое сильное — не меньше половины отклика цели,
+// иначе отсчёты прошли мимо неё. Листва — синего меньше яркости (жёлтое, оранжевое, красное, бурое)
+// или зелёный выше красного и синего: phi = max(Y - B, G - max(R, B)), уровни RGB (BT.709). Серая
+// цель — смесь серого с цветом фона (дымка, цвет yuv420 вдвое реже яркости и размыт), её phi не
+// больше max(0, phi фона), поэтому leaf — phi тела сверх max(0, phi фона). У кромки крон (в кольце
+// больше половины отсчётов не похожи на фон) цвет не измеряется: там и тело, и фон — от листвы
+void Detector::measureTint(const uint8_t* gray, int stride, Candidate& c) {
+    const int st = colStep_, rb = (cfg_.k * cfg_.pool / 2 + 2) << std::min(2, c.level);
+    const int r0 = 2 * rb, r1 = 3 * rb + rb / 2;
+    const int cx = (int)std::lround(c.x), cy = (int)std::lround(c.y);
+    auto at = [&](int b, int lim) { return std::min(b * st + colOff_, lim - 1); };
+    // отсчёты в круге радиуса r через k по каждой оси: f(яркость, u, v, квадрат расстояния)
+    auto each = [&](int r, int k, auto&& f) {
+        const int bx0 = std::max(0, (cx - r) / st), by0 = std::max(0, (cy - r) / st);
+        for (int by = (by0 + k - 1) / k * k; by <= std::min(colH_ - 1, (cy + r) / st); by += k) {
+            const int y = at(by, h_), dy = y - cy;
+            const uint8_t* g = gray + (size_t)y * stride;
+            const uint8_t* u = colU_ + (size_t)by * colStride_;
+            const uint8_t* v = colV_ + (size_t)by * colStride_;
+            for (int bx = (bx0 + k - 1) / k * k; bx <= std::min(colW_ - 1, (cx + r) / st); bx += k) {
+                const int x = at(bx, w_), d2 = (x - cx) * (x - cx) + dy * dy;
+                if (d2 <= r * r) f((int)g[x], (int)u[(size_t)bx * colPix_], (int)v[(size_t)bx * colPix_], d2);
+            }
+        }
+    };
+    tintY_.clear();
+    tintU_.clear();
+    tintV_.clear();
+    // фону хватает ~30 отсчётов: кольцо через kr; тело (цель 5-20 пикс.) — через 4 пикс. (цвет yuv420
+    // с камеры идёт через 2 — вчетверо дороже без пользы)
+    const int kr = std::max(1, (int)std::lround(0.9f * (float)rb / (float)st)), kb = std::max(1, 4 / st);
+    each(r1, kr, [&](int y, int u, int v, int d2) {
+        if (d2 < r0 * r0) return;
+        tintY_.push_back((uint8_t)y);
+        tintU_.push_back((uint8_t)u);
+        tintV_.push_back((uint8_t)v);
+    });
+    if (tintY_.size() < 8) return;
+    auto median = [](std::vector<uint8_t>& a) {
+        std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
+        return (int)a[a.size() / 2];
+    };
+    const int ybg = median(tintY_);
+    const float tol = std::max(6.f, 0.3f * c.contrast);
+    size_t rough = 0;
+    for (uint8_t y : tintY_) rough += std::fabs((float)(y - ybg)) > tol;
+    if (rough * 2 > tintY_.size()) return;
+    int top = 0;
+    each(rb, kb, [&](int y, int, int, int) { top = std::max(top, c.polarity * (y - ybg)); });
+    if ((float)top < std::max(8.f, 0.5f * c.contrast)) return;
+    const int need = (top + 1) / 2;
+    int nb = 0, su = 0, sv = 0;
+    each(rb, kb, [&](int y, int u, int v, int) {
+        if (c.polarity * (y - ybg) < need) return;
+        su += u - 128;
+        sv += v - 128;
+        ++nb;
+    });
+    auto phi = [](float u, float v) {   // max(Y - B, G - max(R, B)) по U, V от серого
+        const float gr = -0.1873f * u - 2.0429f * v, gb = -2.0429f * u - 0.4681f * v;
+        return std::max(-1.8556f * u, std::min(gr, gb));
+    };
+    const float ubg = (float)(median(tintU_) - 128), vbg = (float)(median(tintV_) - 128);
+    c.colored = true;
+    c.leaf = phi((float)su / nb, (float)sv / nb) - std::max(0.f, phi(ubg, vbg));
+    c.leafy = c.leaf >= cfg_.leaf_color;
+}
+
 // Облака по цвету (DetectorConfig::sky_color): тайл, закрытый маской по своей текстуре (доля frac
 // кадров обучения), но не зелёный, не темнее неба и без глубоких теней, — облако, освещённое
 // солнцем, а не кроны и дома. Яркость неба сцены (skyRef_) — медиана гладких тайлов, связанных с
@@ -1169,9 +1240,19 @@ void Detector::detect(const uint8_t* gray, int w, int h, int stride, std::vector
             }
             out.resize(keep);
         }
+        // цвет целей (leaf_color) — у кандидатов в прогнозах треков, которые можно захватить; прогнозы
+        // не заданы — у всех
+        const bool tint = cfg_.leaf_color > 0 && colU_ && colV_ && colStep_ > 0 && colPix_ > 0 && colW_ > 0 && colH_ > 0;
+        auto tintHere = [&](const Candidate& c) {
+            if (!tintSet_) return true;
+            for (const FocusArea& a : tint_)
+                if ((c.x - a.x) * (c.x - a.x) + (c.y - a.y) * (c.y - a.y) <= a.r * a.r) return true;
+            return false;
+        };
         for (Candidate& c : out) {
             measure_energy(gray, w, h, stride, c);
             if (cfg_.subpixel) refine_position(gray, w, h, stride, c);
+            if (tint && tintHere(c)) measureTint(gray, stride, c);
         }
     }
     if ((learning_ || verifyLeft_) && cfg_.sky_color) sampleColor(gray, stride);
