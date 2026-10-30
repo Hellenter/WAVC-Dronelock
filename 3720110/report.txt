@@ -1,3 +1,64 @@
+city_sectors_forest wide 4608x3456 14 к/с, кадров 84, с целями 84
+   drone id=1: в кадре 100.0%  10.3–12.1 пикс.  400–467 м
+   drone id=2: в кадре 100.0%  8.9–15.4 пикс.  210–367 м
+   drone id=3: в кадре 100.0%  4.2–5.2 пикс.  394–488 м
+   drone id=6: в кадре 100.0%  0.7–0.7 пикс.  1149–1164 м
+   drone id=7: в кадре 100.0%  2.8–3.1 пикс.  1249–1411 м
+   drone id=8: в кадре 100.0%  0.8–0.8 пикс.  1151–1214 м
+   bird  id=10: в кадре 100.0%  5.2–6.0 пикс.  170–198 м
+   bird  id=11: в кадре 100.0%  1.0–1.1 пикс.  1306–1382 м
+   bird  id=12: в кадре 100.0%  1.6–1.8 пикс.  470–536 м
+city_sectors_forest fine 640x480 60 к/с, кадров 360, с целями 360
+   drone id=1: в кадре  90.0%  14.4–16.5 пикс.  399–458 м
+   drone id=2: в кадре  65.8%  12.0–21.1 пикс.  210–368 м
+   drone id=3: в кадре  60.8%  6.1–7.0 пикс.  400–458 м
+   drone id=7: в кадре  91.4%  3.8–4.2 пикс.  1250–1399 м
+   drone id=8: в кадре   8.3%  1.1–1.2 пикс.  1151–1214 м
+   bird  id=10: в кадре  57.5%  7.7–8.2 пикс.  170–182 м
+   точная: цель назначена в 100% кадров
+city_sectors_highrise wide 4608x3456 14 к/с, кадров 84, с целями 84
+   drone id=1: в кадре 100.0%  10.0–12.6 пикс.  384–480 м
+   drone id=2: в кадре 100.0%  10.3–11.5 пикс.  283–315 м
+   drone id=3: в кадре 100.0%  4.5–4.7 пикс.  437–451 м
+   drone id=4: в кадре 100.0%  0.7–0.7 пикс.  1168–1241 м
+   drone id=6: в кадре 100.0%  0.7–0.7 пикс.  1131–1180 м
+   drone id=7: в кадре 100.0%  2.9–2.9 пикс.  1326–1337 м
+   drone id=8: в кадре 100.0%  0.8–0.8 пикс.  1180–1185 м
+   bird  id=9: в кадре 100.0%  1.3–1.4 пикс.  529–538 м
+   bird  id=10: в кадре 100.0%  5.0–6.5 пикс.  159–207 м
+   bird  id=11: в кадре 100.0%  1.0–1.1 пикс.  1329–1358 м
+   bird  id=12: в кадре 100.0%  1.6–1.8 пикс.  475–532 м
+city_sectors_highrise fine 640x480 60 к/с, кадров 360, с целями 360
+   drone id=1: в кадре 100.0%  13.7–17.1 пикс.  383–480 м
+   drone id=2: в кадре  39.7%  14.5–15.5 пикс.  286–305 м
+   drone id=3: в кадре  58.6%  6.3–6.4 пикс.  437–443 м
+   drone id=4: в кадре  41.9%  0.9–1.0 пикс.  1207–1238 м
+   drone id=6: в кадре   1.1%  0.9–0.9 пикс.  1180–1181 м
+   drone id=7: в кадре  95.8%  4.0–4.0 пикс.  1326–1337 м
+   drone id=8: в кадре   5.3%  1.1–1.1 пикс.  1180–1180 м
+   bird  id=10: в кадре  51.4%  6.8–7.9 пикс.  177–204 м
+   точная: цель назначена в 100% кадров
+city_sectors_lowrise wide 4608x3456 14 к/с, кадров 84, с целями 84
+   drone id=1: в кадре 100.0%  9.5–14.1 пикс.  343–508 м
+   drone id=2: в кадре 100.0%  9.2–13.8 пикс.  236–354 м
+   drone id=3: в кадре 100.0%  4.2–5.1 пикс.  400–484 м
+   drone id=4: в кадре 100.0%  0.7–0.7 пикс.  1194–1216 м
+   drone id=5: в кадре 100.0%  0.8–0.8 пикс.  1159–1173 м
+   drone id=6: в кадре 100.0%  0.7–0.7 пикс.  1139–1174 м
+   drone id=7: в кадре 100.0%  2.8–3.1 пикс.  1254–1402 м
+   drone id=8: в кадре 100.0%  0.8–0.8 пикс.  1154–1210 м
+   bird  id=9: в кадре 100.0%  1.3–1.4 пикс.  502–563 м
+   bird  id=10: в кадре 100.0%  4.7–7.2 пикс.  143–219 м
+   bird  id=11: в кадре 100.0%  1.0–1.1 пикс.  1321–1366 м
+   bird  id=12: в кадре 100.0%  1.7–1.7 пикс.  500–508 м
+city_sectors_lowrise fine 640x480 60 к/с, кадров 360, с целями 360
+   drone id=1: в кадре  95.3%  12.9–18.8 пикс.  350–509 м
+   drone id=2: в кадре  70.0%  12.5–18.9 пикс.  235–354 м
+   drone id=3: в кадре  93.3%  5.8–7.0 пикс.  400–478 м
+   drone id=7: в кадре  92.5%  3.8–4.2 пикс.  1265–1404 м
+   drone id=8: в кадре   6.1%  1.2–1.2 пикс.  1154–1157 м
+   bird  id=10: в кадре  84.7%  6.7–9.8 пикс.  142–207 м
+   точная: цель назначена в 100% кадров
 quick wide 2304x1728 14 к/с, кадров 42, с целями 42
    drone id=1: в кадре 100.0%  0.8–0.9 пикс.  264–287 м
    drone id=2: в кадре  31.0%  0.5–0.5 пикс.  379–379 м
@@ -15,8 +76,8 @@ WARNING: Could not set V-Sync mode, as changing V-Sync mode is not supported by 
      at: set_use_vsync (platform/linuxbsd/x11/gl_manager_x11.cpp:360)
 OpenGL API 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.4 - Compatibility - Using Device: Mesa - llvmpipe (LLVM 20.1.2, 256 bits)
 
-сцена: Godot подключился (порт 58769)
-live: связь с приложением, порт 58769
+сцена: Godot подключился (порт 34065)
+live: связь с приложением, порт 34065
 live: сцена готова, целей 4
 сцена: первый кадр 1152x864, целей 4
 live: кадров 1 (t 0.00)
@@ -32,15 +93,15 @@ live: кадров 2 (t 0.00)
 ведёт настоящий дрон 0% времени; цель только у точной 0.0 с (на назначенной 0%), не бросила цель 0 раз,
   вернула широкой 0; подтвердила дронов 0; отсеяла как птицу: птиц 0, дронов 0, пустых мест 0; переходов по частям цели 0
 ошибка: захват точной 0.000° (90% 0.000°, 0.0 пикс. точной), ось 0.000° (90% 0.000°), широкая 0.000° (90% 0.000°)
-обработка: широкая 1.2 мс/кадр, точная 0.21 мс/кадр; отрисовка широкой 8068.1, точной 1018.2 мс/кадр
+обработка: широкая 1.2 мс/кадр, точная 0.21 мс/кадр; отрисовка широкой 7993.9, точной 1004.7 мс/кадр
 == эмулятор: city_sectors, сектор highrise
 Godot Engine v4.3.stable.official.77dcf97d8 - https://godotengine.org
 WARNING: Could not set V-Sync mode, as changing V-Sync mode is not supported by the graphics driver.
      at: set_use_vsync (platform/linuxbsd/x11/gl_manager_x11.cpp:360)
 OpenGL API 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.4 - Compatibility - Using Device: Mesa - llvmpipe (LLVM 20.1.2, 256 bits)
 
-сцена: Godot подключился (порт 60219)
-live: связь с приложением, порт 60219
+сцена: Godot подключился (порт 42577)
+live: связь с приложением, порт 42577
 live: сцена готова, целей 4
 сцена: первый кадр 1152x864, целей 4
 live: кадров 1 (t 0.00)
@@ -60,6 +121,12 @@ live: кадров 2 (t 0.00)
 ведёт настоящий дрон 0% времени; цель только у точной 0.1 с (на назначенной 100%), не бросила цель 1 раз,
   вернула широкой 1; подтвердила дронов 1; отсеяла как птицу: птиц 0, дронов 0, пустых мест 0; переходов по частям цели 0
 ошибка: захват точной 0.008° (90% 0.023°, 0.2 пикс. точной), ось 0.279° (90% 0.986°), широкая 0.121° (90% 0.238°)
-обработка: широкая 1.4 мс/кадр, точная 0.27 мс/кадр; отрисовка широкой 3512.1, точной 1002.1 мс/кадр
-{"video": 0, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.41, "eval_frames": 155, "gt_drone_frames": 149, "score": 78.26, "recall_drone": 83.22, "lock_on_drone": 76.51, "hard_on_drone": 22.82, "false_lock": 14.93, "false_per_frame": 0.529, "false_tracks": 12.0, "drone_as_drone": 87.9, "recall_bird": 100.0, "first_detect_s": 0.383, "first_lock_s": 0.567, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 83.89, "hard_pct": 18.89, "lock_acq": 3.0, "targets_per_frame": 1.433, "tracks": 17.0, "drone_ids": 5.0, "bird_ids": 4.0, "proc_ms": 2.082, "proc_p95_ms": 5.129, "detect_ms": 1.133, "fps": 443.31, "frames": 180.0}
-{"video": 1, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.46, "eval_frames": 17, "gt_drone_frames": 17, "score": 0.0, "recall_drone": 0.0, "lock_on_drone": 0.0, "hard_on_drone": 0.0, "false_lock": 100.0, "false_per_frame": 0.118, "false_tracks": 1.0, "drone_as_drone": null, "recall_bird": 91.18, "first_detect_s": null, "first_lock_s": null, "sky_pct": 89.71, "sky_dark_pct": 90.64, "lock_pct": 61.9, "hard_pct": 40.48, "lock_acq": 2.0, "targets_per_frame": 5.048, "tracks": 51.0, "drone_ids": 3.0, "bird_ids": 0.0, "proc_ms": 3.851, "proc_p95_ms": 7.606, "detect_ms": 3.064, "fps": 91.17, "frames": 42.0}
+обработка: широкая 1.4 мс/кадр, точная 0.27 мс/кадр; отрисовка широкой 3493.5, точной 1006.1 мс/кадр
+{"video": 0, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.86, "eval_frames": 335, "gt_drone_frames": 335, "score": 85.44, "recall_drone": 89.65, "lock_on_drone": 84.48, "hard_on_drone": 48.96, "false_lock": 15.52, "false_per_frame": 0.221, "false_tracks": 5.0, "drone_as_drone": 87.54, "recall_bird": 100.0, "first_detect_s": 0.033, "first_lock_s": 0.15, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 97.5, "hard_pct": 45.56, "lock_acq": 4.0, "targets_per_frame": 3.717, "tracks": 26.0, "drone_ids": 10.0, "bird_ids": 7.0, "proc_ms": 2.256, "proc_p95_ms": 6.965, "detect_ms": 1.252, "fps": 420.09, "frames": 360.0}
+{"video": 1, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 2.77, "eval_frames": 59, "gt_drone_frames": 59, "score": 20.88, "recall_drone": 50.28, "lock_on_drone": 1.69, "hard_on_drone": 1.69, "false_lock": 98.31, "false_per_frame": 0.051, "false_tracks": 0.0, "drone_as_drone": 77.53, "recall_bird": 66.67, "first_detect_s": 0.143, "first_lock_s": 1.643, "sky_pct": 91.54, "sky_dark_pct": 91.56, "lock_pct": 80.95, "hard_pct": 70.24, "lock_acq": 2.0, "targets_per_frame": 8.69, "tracks": 84.0, "drone_ids": 9.0, "bird_ids": 5.0, "proc_ms": 10.572, "proc_p95_ms": 23.146, "detect_ms": 9.514, "fps": 30.37, "frames": 84.0}
+{"video": 2, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 1.08, "eval_frames": 335, "gt_drone_frames": 335, "score": 93.18, "recall_drone": 85.14, "lock_on_drone": 100.0, "hard_on_drone": 92.24, "false_lock": 0.0, "false_per_frame": 0.176, "false_tracks": 6.0, "drone_as_drone": 95.09, "recall_bird": 97.3, "first_detect_s": 0.033, "first_lock_s": 0.15, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 97.5, "hard_pct": 85.83, "lock_acq": 1.0, "targets_per_frame": 3.503, "tracks": 14.0, "drone_ids": 6.0, "bird_ids": 5.0, "proc_ms": 2.709, "proc_p95_ms": 8.099, "detect_ms": 1.53, "fps": 333.35, "frames": 360.0}
+{"video": 3, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 3.29, "eval_frames": 59, "gt_drone_frames": 59, "score": 18.73, "recall_drone": 47.46, "lock_on_drone": 0.0, "hard_on_drone": 0.0, "false_lock": 100.0, "false_per_frame": 0.051, "false_tracks": 0.0, "drone_as_drone": 69.9, "recall_bird": 50.0, "first_detect_s": 0.143, "first_lock_s": 0.5, "sky_pct": 99.79, "sky_dark_pct": 99.79, "lock_pct": 82.14, "hard_pct": 71.43, "lock_acq": 2.0, "targets_per_frame": 12.393, "tracks": 171.0, "drone_ids": 9.0, "bird_ids": 3.0, "proc_ms": 13.273, "proc_p95_ms": 28.736, "detect_ms": 11.173, "fps": 25.56, "frames": 84.0}
+{"video": 4, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.82, "eval_frames": 335, "gt_drone_frames": 335, "score": 95.71, "recall_drone": 97.48, "lock_on_drone": 94.33, "hard_on_drone": 87.16, "false_lock": 3.07, "false_per_frame": 0.081, "false_tracks": 0.0, "drone_as_drone": 86.07, "recall_bird": 97.7, "first_detect_s": 0.033, "first_lock_s": 0.567, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 90.56, "hard_pct": 81.11, "lock_acq": 2.0, "targets_per_frame": 4.708, "tracks": 14.0, "drone_ids": 8.0, "bird_ids": 5.0, "proc_ms": 1.955, "proc_p95_ms": 3.778, "detect_ms": 0.903, "fps": 439.75, "frames": 360.0}
+{"video": 5, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 3.06, "eval_frames": 59, "gt_drone_frames": 59, "score": 77.71, "recall_drone": 48.94, "lock_on_drone": 100.0, "hard_on_drone": 100.0, "false_lock": 0.0, "false_per_frame": 0.373, "false_tracks": 9.0, "drone_as_drone": 95.67, "recall_bird": 51.27, "first_detect_s": 0.143, "first_lock_s": 1.286, "sky_pct": 98.82, "sky_dark_pct": 99.02, "lock_pct": 80.95, "hard_pct": 70.24, "lock_acq": 2.0, "targets_per_frame": 11.536, "tracks": 158.0, "drone_ids": 9.0, "bird_ids": 4.0, "proc_ms": 13.904, "proc_p95_ms": 35.495, "detect_ms": 12.259, "fps": 27.42, "frames": 84.0}
+{"video": 6, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.6, "eval_frames": 155, "gt_drone_frames": 149, "score": 78.26, "recall_drone": 83.22, "lock_on_drone": 76.51, "hard_on_drone": 22.82, "false_lock": 14.93, "false_per_frame": 0.529, "false_tracks": 12.0, "drone_as_drone": 87.9, "recall_bird": 100.0, "first_detect_s": 0.383, "first_lock_s": 0.567, "sky_pct": null, "sky_dark_pct": null, "lock_pct": 83.89, "hard_pct": 18.89, "lock_acq": 3.0, "targets_per_frame": 1.433, "tracks": 17.0, "drone_ids": 5.0, "bird_ids": 4.0, "proc_ms": 2.787, "proc_p95_ms": 7.463, "detect_ms": 1.761, "fps": 302.21, "frames": 180.0}
+{"video": 7, "variant": 0, "done": true, "error": "", "gt": true, "wall_s": 0.61, "eval_frames": 17, "gt_drone_frames": 17, "score": 0.0, "recall_drone": 0.0, "lock_on_drone": 0.0, "hard_on_drone": 0.0, "false_lock": 100.0, "false_per_frame": 0.118, "false_tracks": 1.0, "drone_as_drone": null, "recall_bird": 91.18, "first_detect_s": null, "first_lock_s": null, "sky_pct": 89.71, "sky_dark_pct": 90.64, "lock_pct": 61.9, "hard_pct": 40.48, "lock_acq": 2.0, "targets_per_frame": 5.048, "tracks": 51.0, "drone_ids": 3.0, "bird_ids": 0.0, "proc_ms": 5.524, "proc_p95_ms": 10.034, "detect_ms": 4.721, "fps": 68.31, "frames": 42.0}
