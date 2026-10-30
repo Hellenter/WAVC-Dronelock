@@ -185,7 +185,7 @@ struct App {
     };
     std::vector<MtSel> mtSel;   // по mt::params()
     int mtMode = 0, mtFrames = 0, mtParallel = 1;
-    bool mtRealtime = false, mtEmulate = false;
+    bool mtRealtime = false, mtEmulate = false, mtAllPhases = false;
     std::vector<std::string> mtVideos;
     int mtGt = 0;
     std::string mtMsg, mtScanned;
@@ -1364,6 +1364,10 @@ void tab_algorithm(App& a, bool& changed) {
     help_marker("Скорости, ворота и выдержки трекера настроены на 25 новых кадров в секунду. Включено — они "
                 "пересчитываются под частоту камеры (повторы кадров в записи экрана не считаются). Камера 16 Мп "
                 "на 10 к/с: птиц находится 77% вместо 51%, дронов, принятых за птиц, нет.");
+    blk |= ImGui::Checkbox("Настоящий интервал кадра", &a.s.frameDt);
+    help_marker("Камера реже видео берёт кадры файла неровным тактом: 14 к/с из записи 60 к/с — через 4 и 5 "
+                "кадров, а пропущенный кадр — двойной интервал. Включено — трекер прогнозирует цель на настоящее "
+                "время между кадрами, как у камеры с ровным тактом. При шаге кадров целым числом ничего не меняет.");
     blk |= ImGui::Checkbox("Маска неба и поворот камеры в секундах", &a.s.fpsScale);
     help_marker("Окна маски неба (обучение, уточнение у кромки леса, доращивание по помехам, перепроверка "
                 "облаков), оценка поворота камеры и признак панорамы подобраны на 60 к/с. Включено — они "
@@ -1768,6 +1772,7 @@ void mt_start(App& a) {
     c.parallel = a.mtParallel;
     c.realtime = a.mtRealtime;
     c.emulate = a.mtEmulate;
+    c.allPhases = a.mtAllPhases;
     std::string err;
     if (!a.mt.start(c, err)) {
         a.mtMsg = err;
@@ -1853,7 +1858,8 @@ void mt_setup(App& a) {
     const auto ch = mt_choices(a, bad);
     const int nv = mt::count_variants(mt_base(a), ch, a.mtMode ? mt::Mode::Grid : mt::Mode::OneAtATime);
     const int nvc = std::min(nv, a.mtMode ? mt::GRID_MAX + 1 : nv);
-    ImGui::Text("вариантов %d x видео %d = %d прогонов", nvc, (int)a.mtVideos.size(), nvc * (int)a.mtVideos.size());
+    ImGui::Text("вариантов %d x видео %d = %d прогонов%s", nvc, (int)a.mtVideos.size(), nvc * (int)a.mtVideos.size(),
+                a.mtAllPhases ? " (x сдвиги такта)" : "");
     if (bad) ImGui::TextColored(TXT_BAD, "не разобрать значения (подсвечены)");
     if (a.mtMode && nv > mt::GRID_MAX) ImGui::TextColored(TXT_WARN, "сочетаний больше %d: возьмутся первые", mt::GRID_MAX);
 
@@ -1869,6 +1875,10 @@ void mt_setup(App& a) {
     ImGui::Checkbox("с имитацией устройства", &a.mtEmulate);
     help_marker("Оставить замедление выбранного устройства (Raspberry Pi). Имеет смысл вместе с «как камера» — тогда "
                 "видно, сколько захвата теряется из-за пропущенных кадров. Иначе только дольше.");
+    ImGui::Checkbox("все сдвиги такта", &a.mtAllPhases);
+    help_marker("Когда камера реже видео (шаг кадров, частота камеры), снимки зависят от того, с какого кадра файла "
+                "пошёл такт: дрон может попасть между снимками. Каждый вариант прогоняется со всеми сдвигами (шаг 4 — "
+                "4 прогона, 14 к/с из 60 — 5), в отчёте — среднее по сдвигам и разброс от худшего до лучшего.");
     ImGui::TextDisabled("каждый прогон — чистый старт, без накопленного опыта");
     ImGui::SetItemTooltip("Память помех и маска неба, накопленные прошлыми запусками рядом с видео (.static.bin, "
                           ".mask.bin), не загружаются и не перезаписываются: варианты сравниваются честно");
@@ -3507,6 +3517,7 @@ int run_stress(int argc, char** argv) {
             case 36:   // трекер: захват на летавший трек, переход жёсткого, птица, скорости в секундах
                 s.trk.lock_mover = R(2);
                 s.trk.lock_mover_fps = R(3) ? 31.f : F(0, 120);
+                s.trk.lock_dwell_strong = R(3) ? 0.f : F(0, 10);
                 s.trk.hard_switch_drone = R(3) != 0;
                 s.trk.hover_first = R(3) != 0;
                 s.trk.reupdate = R(2) ? 0.f : F(0, 1);
@@ -3529,8 +3540,18 @@ int run_stress(int argc, char** argv) {
                 s.trk.overlay_rel = R(3) ? 0.f : F(0, 0.5f);
                 s.trk.gate = R(3) ? 26.f : F(0, 150);
                 s.trk.gate_speed_k = R(3) ? 0.f : F(0, 4);
+                s.trk.gate_speed_straight = R(3) ? 0.8f : F(0, 1);
                 s.trk.gate_pps = R(3) ? 360.f : F(0, 2000);
                 s.motionLong = R(3) != 0;
+                // 30.10: цель у кромки (wt24) — захват в выдаче, слабая отметка, память о потерянной; интервал кадра
+                s.trk.lock_solid = R(3) != 0;
+                s.trk.weak_gate = R(3) ? 0.f : F(0, 8);
+                s.trk.relock_frames = R(3) ? 0 : R(200);
+                s.trk.relock_edge = R(2);
+                s.trk.lock_speed_max = R(3) ? 0.f : F(0, 60);
+                s.trk.lock_established = R(2);
+                s.trk.lost_r_max = R(3) ? 0.f : F(0, 10);
+                s.frameDt = R(3) != 0;
                 break;
             default:   // частота камеры и шаг: ниже частоты видео кадры файла пропускаются
                 s.targetFps = R(2) ? 0 : F(1, 120);

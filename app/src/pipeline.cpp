@@ -508,6 +508,7 @@ void Pipeline::processLoop() {
     bool relearnMoved = false;   // маска учится заново после плавного поворота камеры (панорамы)
     // частота кадров для трекера: камеры или видео, без повторов кадра (запись экрана)
     float uniqShare = 1.f, trkFps = 0.f;
+    int64_t trkIdx = -1;   // кадр файла, который трекер видел последним (интервал до следующего)
     // кадров в секунду у детектора, маски неба и трекера (повторы кадра считаются, пока их не пропускаем)
     auto procFps = [&](const Settings& st) { return st.skipDuplicates && trkFps > 0 ? (double)trkFps : cameraFps(st); };
     auto trkCfg = [&](const Settings& st) {
@@ -694,6 +695,7 @@ void Pipeline::processLoop() {
                                   : "не удалось сохранить " + staticPath();
         }
         if (p.loopStart || p.seekStart) {   // склейка зацикленного видео или перемотка — треки не должны "прыгать"
+            trkIdx = -1;
             trk->resetTracks();
             trk->setStatic(statSnap);
             // чистый старт: каждый проход как первый — и маска неба учится заново
@@ -838,6 +840,15 @@ void Pipeline::processLoop() {
             me.dx -= cropDx;
             me.dy -= cropDy;
             trk->setFollowing(s.follow);
+            // интервал до этого кадра в номинальных: шаг по файлу на шаг камеры. Номер кадра — по метке
+            // времени, и разрыв в самой записи (запись экрана теряет кадр-другой) — тоже длинный интервал.
+            // Повторы кадров записи экрана — своим порядком, интервал там не меняем
+            float fdt = 1.f;
+            if (s.frameDt && !s.skipDuplicates && trkIdx >= 0 && f.index > trkIdx)
+                fdt = (float)std::min(16.0, (double)(f.index - trkIdx) / fileStep(s));
+            if (std::fabs(fdt - 1.f) < 1e-4f) fdt = 1.f;
+            trk->setFrameDt(fdt);
+            trkIdx = f.index;
             const double tm = now_ms();
             focus.clear();
             if (s.focus) trk->focus(me.dx, me.dy, focus);
@@ -1079,19 +1090,19 @@ void Pipeline::processLoop() {
         if (!s.trackLog.empty()) {
             if (!tlog) {
                 tlog.reset(open_file(s.trackLog, "w"));
-                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w,resid,contrast_cv,speed,bird_score,flap_r2\n");
+                if (tlog) fprintf(tlog.get(), "loop,frame,lock,hard,id,x,y,cls,miss,hits,travel,score,static_cells,bw,bh,size_exp,view_x,view_y,followed,lock_w,resid,contrast_cv,speed,bird_score,flap_r2,edge_born,ever_mover,straight,travel_rel,age\n");
             }
             if (tlog) {
                 if (tracks.empty())
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,,,,,,\n", p.loop, (long long)f.index, r->lockId,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,0,,,,,,,,%zu,,,,%d,%d,,,,,,,,,,,,\n", p.loop, (long long)f.index, r->lockId,
                             (int)r->lockState, statCells.size(), r->fx, r->fy);
                 // координаты — исходного кадра (и при виртуальной поворотке)
                 for (const auto& t : tracks)
-                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", p.loop,
+                    fprintf(tlog.get(), "%d,%lld,%d,%d,%d,%.1f,%.1f,%s,%d,%d,%.0f,%.1f,%zu,%.0f,%.0f,%.0f,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%.2f,%.0f,%d\n", p.loop,
                             (long long)f.index, r->lockId, (int)r->lockState, t.id, t.x + (float)r->fx, t.y + (float)r->fy,
                             t.clutter ? "clutter" : class_name(t.cls), t.miss, t.hits, t.travel, t.score, statCells.size(), t.bw,
                             t.bh, t.expectedSize(), r->fx, r->fy, (int)t.followed, t.lockW, t.resid, t.contrastCv, t.speed,
-                            t.birdScore, t.flapR2);
+                            t.birdScore, t.flapR2, (int)t.edgeBorn, (int)t.everMover, t.straight, t.travelRel, t.age);
             }
         }
         if (observer_) observer_(*r);

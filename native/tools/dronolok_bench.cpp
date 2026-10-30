@@ -51,6 +51,8 @@ static void usage() {
         "  --scales 1..4           доп. масштабы для крупных целей\n"
         "  --focus                 пониженный порог возле прогноза треков\n"
         "  --motion                компенсация движения камеры\n"
+        "  --motion-long           ...и сдвиг от кадра ~1/15 с назад (длинная база, как в приложении от 22.5 к/с,\n"
+        "                          частота — из y4m). Время оценки поворота — отдельной строкой\n"
         "  --zones                 зоны кадра: небо / смешанные / земля\n"
         "  --full-every N          весь кадр раз в N кадров, между ними — только вокруг треков\n"
         "  --coarse-every N        грубые масштабы целиком раз в N кадров\n"
@@ -146,7 +148,7 @@ int main(int argc, char** argv) {
     int rawW = 0, rawH = 0, maxFrames = 100, loops = 3, learn = 0, learnLive = 0;
     bool evalAll = false, sceneOn = false, adapt = false;
     std::string sceneLog;
-    bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false, fpsScale = false;
+    bool yuv420 = false, stream = false, sweep = false, focus = false, motion = false, fpsScale = false, motionLong = false;
     GlobalMotion gm;
     std::vector<FocusArea> focusAreas, roiAreas;
     DetectorConfig cfg;
@@ -206,6 +208,7 @@ int main(int argc, char** argv) {
         else if (a == "--q") tcfg.q_accel = (float)std::atof(val().c_str());
         else if (a == "--gate-sigma") tcfg.gate_sigma = (float)std::atof(val().c_str());
         else if (a == "--motion") motion = true;
+        else if (a == "--motion-long") motion = motionLong = true;
         else if (a == "--zones") cfg.zones = true;
         else if (a == "--mixed-k") cfg.mixed_k = (float)std::atof(val().c_str());
         else if (a == "--full-every") cfg.full_every = std::atoi(val().c_str());
@@ -344,7 +347,11 @@ int main(int argc, char** argv) {
     }
     std::printf("бэкенд %s, потоков %d\n", det.backendName().c_str(), det.threads());
 
-    std::vector<double> total, resp, sel, trackMs, readMs;
+    std::vector<double> total, resp, sel, trackMs, readMs, motionMs;
+    if (motionLong) {   // длинная база включается от 22.5 к/с (GlobalMotion::setLong)
+        gm.setFps((float)rd.fps());
+        gm.setLong(true);
+    }
     std::vector<Candidate> cands;
     EvalStats ev, ev3;   // ev3 — первые 3 с первого прохода (с --eval-all)
     const int n = stream ? 0 : (int)frames.size();
@@ -372,6 +379,7 @@ int main(int argc, char** argv) {
         const double t0 = now_ms();
         MotionEstimate me;
         if (motion) me = gm.estimate(g, W, H, W);
+        const double tm1 = now_ms();
         if (focus) {
             trk.focus(me.dx, me.dy, focusAreas);
             det.setFocus(focusAreas);
@@ -427,6 +435,7 @@ int main(int argc, char** argv) {
             resp.push_back(det.timing().response_ms);
             sel.push_back(det.timing().select_ms);
             trackMs.push_back(t2 - t1);
+            if (motion) motionMs.push_back(tm1 - t0);
         }
         const bool evalFrame = haveGt && fi < (int)gt.frames.size() && (stream || evalAll || i >= n);
         if (evalFrame) {
@@ -468,14 +477,18 @@ int main(int argc, char** argv) {
                 pt.p50, pt.p95, pt.max, pt.mean > 0 ? 1000 / pt.mean : 0);
     std::printf("  отклик (бэкенд) %.2f мс, выбор кандидатов %.3f мс, трекер %.3f мс\n", pr.mean, ps.mean, pk.mean);
     if (stream) std::printf("  чтение кадра %.2f мс\n", pct(readMs).mean);
+    if (motion)
+        std::printf("  оценка поворота камеры %.2f мс (p95 %.2f)%s\n", pct(motionMs).mean, pct(motionMs).p95,
+                    motionLong ? (rd.fps() >= 22.5 ? ", с длинной базой" : ", длинной базы нет: ниже 22.5 к/с") : "");
     std::printf("  шум отклика %.2f, порог %.1f%s\n", det.noiseLevel(), det.threshold(), cfg.auto_thr ? " (по шуму)" : "");
     char json[1024];
     int len = std::snprintf(json, sizeof(json),
                             "{\"resolution\": \"%dx%d\", \"backend\": \"%s\", \"threads\": %d, \"pool\": %d, \"k\": %d, "
                             "\"mask\": %s, \"frames\": %zu, \"mean_ms\": %.2f, \"p95_ms\": %.2f, \"fps\": %.1f, "
-                            "\"response_ms\": %.2f, \"track_ms\": %.3f",
+                            "\"response_ms\": %.2f, \"track_ms\": %.3f, \"motion_ms\": %.3f, \"motion_long\": %s",
                             W, H, det.backendName().c_str(), det.threads(), cfg.pool, cfg.k, learn ? "true" : "false",
-                            total.size(), pt.mean, pt.p95, pt.mean > 0 ? 1000 / pt.mean : 0, pr.mean, pk.mean);
+                            total.size(), pt.mean, pt.p95, pt.mean > 0 ? 1000 / pt.mean : 0, pr.mean, pk.mean,
+                            motion ? pct(motionMs).mean : 0.0, motionLong ? "true" : "false");
     if (haveGt) {
         std::printf("  полнота: дроны %.1f%%, птицы %.1f%%; ложных треков на кадр %.2f\n", 100 * ev.recall(0),
                     100 * ev.recall(1), ev.falsePerFrame());

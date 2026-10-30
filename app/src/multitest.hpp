@@ -79,6 +79,9 @@ struct Config {
     bool emulate = false;    // оставить имитацию устройства (замедление); иначе — во всю силу ПК
     bool maskFile = false;   // брать маску неба из файла (.mask.bin) — иначе учится в каждом прогоне
     std::string tracksDir;   // журнал треков каждого прогона: <папка>/<видео>.<вариант>.csv (пусто — нет)
+    // все сдвиги такта: у камеры реже видео (step, cam_fps) снимки зависят от того, с какого кадра файла
+    // пошёл такт. Прогон по каждому сдвигу (шаг 4 — 4 прогона, 14 к/с из 60 — 5), в отчёте среднее и разброс
+    bool allPhases = false;
 };
 
 struct VideoMeta {
@@ -93,27 +96,32 @@ struct VideoMeta {
 // Итог одного прогона «видео x вариант». Отрицательное значение — нет данных
 struct RunResult {
     int video = 0, variant = 0;
+    int phase = -1;   // сдвиг такта этого прогона (Config::allPhases); -1 — сдвиг из настроек варианта
     bool done = false;
     std::string error;
-    long frames = 0;
+    double frames = 0;
     double wallS = 0, fps = 0;
     double detectMs = 0, detectP95 = 0, procMs = 0, procP95 = 0;
     // без разметки
     double targetsPerFrame = 0, targetFramesPct = 0;
-    long tracks = 0, droneIds = 0, birdIds = 0;
+    double tracks = 0, droneIds = 0, birdIds = 0;
     double lockPct = 0, hardPct = 0;
-    long lockAcq = 0;   // сколько раз захват брал новую цель
+    double lockAcq = 0;   // сколько раз захват брал новую цель
     double skyPct = -1; // доля кадра, где детектор ищет (не закрыто маской неба); -1 — маски нет
     double skyDarkPct = -1; // ...тёмные цели (с тайлами, закрытыми только светлой текстурой)
     // по разметке
     bool gt = false;
-    long evalFrames = 0, gtDroneFrames = 0;
+    double evalFrames = 0, gtDroneFrames = 0;
     double recallDrone = -1, recallBird = -1, droneAsDrone = -1;
     double falsePerFrame = -1;
-    long falseTracks = -1;
+    double falseTracks = -1;
     double lockOnDrone = -1, hardOnDrone = -1, falseLock = -1;
     double firstDetectS = -1, firstLockS = -1;
     double score = -1;
+    // среднее по сдвигам такта (merge_phases): сколько сдвигов и разброс по ним — у каждой метрики из
+    // metrics() худшее и лучшее значение (меньшее и большее; отрицательное — нет данных)
+    int phases = 1;
+    std::vector<double> lo, hi;
 };
 
 // Метрика для таблиц отчёта: как называть, как печатать и что считать лучше
@@ -128,6 +136,14 @@ struct Metric {
     const char* help;
 };
 const std::vector<Metric>& metrics();
+// значение метрики прогона; false — нет данных (прогон не готов, нет разметки или метрика не посчитана)
+bool metric_value(const Metric& m, const RunResult& r, double& v);
+
+// Сколько разных сдвигов такта у камеры реже видео: шаг 4 — 4, 14 к/с из 60 — 5 (шаги 4 и 5); 1 — кадры подряд
+int phase_count(const Settings& s, double videoFps);
+// Прогоны по сдвигам такта -> один итог на «видео x вариант»: среднее по сдвигам и разброс (lo, hi).
+// Итог готов, когда готовы все его сдвиги; ошибка любого сдвига — ошибка итога
+std::vector<RunResult> merge_phases(const std::vector<RunResult>& runs);
 
 class Runner {
 public:
@@ -145,7 +161,7 @@ public:
         std::string outDir, html, error;
     };
     Status status() const;
-    // снимок для интерфейса
+    // снимок для интерфейса; res — по одному итогу на «видео x вариант» (при всех сдвигах — среднее)
     void snapshot(std::vector<VideoMeta>& v, std::vector<Variant>& var, std::vector<RunResult>& res) const;
 
 private:
@@ -168,9 +184,10 @@ private:
     bool finished_ = false;
 };
 
-// Отчёт: report.html, results.json, results.csv в dir. false — не удалось записать
+// Отчёт: report.html, results.json, results.csv в dir. runs — все прогоны (при всех сдвигах такта —
+// каждый сдвиг отдельно, отчёт сам сводит их в среднее). false — не удалось записать
 bool write_report(const std::string& dir, const Config& c, const std::vector<VideoMeta>& videos,
-                  const std::vector<Variant>& variants, const std::vector<RunResult>& res, bool finished,
+                  const std::vector<Variant>& variants, const std::vector<RunResult>& runs, bool finished,
                   double elapsedS, std::string& err);
 
 // dronolok_app --multitest ...

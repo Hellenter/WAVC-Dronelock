@@ -135,17 +135,20 @@ MotionEstimate GlobalMotion::estimate(const uint8_t* gray, int w, int h, int str
         ms_ = now_ms() - t0;
         return res;
     }
-    res = match(pyr, prev_, 1);
     // Длинная база (setLong): на 60 к/с плавный поворот сдвигает картинку за кадр меньше чем на
     // пиксель уменьшенной копии, и оценка по соседнему кадру занижена втрое (точки, не сдвинувшиеся
     // и на уровень, считаются неподвижными, парабола по V-образной ошибке тянет к нулю) — панорама
     // находилась на 2 с позже, ведомая цель по сцене "дёргалась" и звалась птицей. Сдвиг
     // от кадра 1/15 с назад — в K раз больше, его хватает уменьшенной копии; за кадр — его K-я доля
     const int K = long_ && fps_ >= 22.5f ? std::min(8, (int)std::lround(fps_ / 15.f)) : 1;
+    bool found = false;
     if (K > 1 && (int)hist_.size() >= K && hist_.front().size() == pyr.size()) {
-        const MotionEstimate rk = match(pyr, hist_.front(), K);
-        if (rk.valid) res = rk;
+        res = match(pyr, hist_.front(), K);
+        found = res.valid;
     }
+    // по соседнему кадру — только когда длинной базы нет (начало ролика, сброс) или она не нашлась:
+    // иначе её оценка всё равно заменяет соседнюю, а считать обе — вдвое дольше (на Pi заметно)
+    if (!found) res = match(pyr, prev_, 1);
     if (K > 1) {
         hist_.push_back(pyr);
         while ((int)hist_.size() > K) hist_.pop_front();
