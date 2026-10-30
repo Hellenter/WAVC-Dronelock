@@ -14,6 +14,8 @@ extends Node
 #   [--sector forest|lowrise|highrise] [--az A] [--el E] [--pan DPS] [--sweep DEG] — куда смотрит широкая камера.
 #   [--panorama 1] — вместо ролика 12 снимков по кругу (pano_NN.png) для склейки панорамы.
 #   --view 1 — окно просмотра: стрелки поворачивают камеру, 1/2/3 — сектора, см. sim/README.md.
+#   --live <порт> — источник кадров эмулятора двух камер Dronolok (app/src/scenelink.hpp): сцена
+#   подключается к приложению и рисует кадры по запросу, цели летают без конца (новые вместо улетевших).
 
 const DEG := PI / 180.0
 
@@ -44,6 +46,11 @@ var view_t := 0.0
 var view_speed := 1.0
 var view_pan := false
 var view_hud: Label
+const LIVE_PATH_S := 40.0       # --live: столько секунд летит случайная цель, потом новая
+var live_mode := false
+var live_peer: StreamPeerTCP
+var live_buf := PackedByteArray()
+var live_next_id := 1000
 
 # поворотка точной камеры
 var f_az := 0.0
@@ -100,6 +107,9 @@ func _ready() -> void:
 		wcfg["pan_dps"] = float(args["pan"])
 	if args.has("sweep"):
 		wcfg["sweep_deg"] = float(args["sweep"])
+	if args.has("live") and not live_connect(int(args["live"])):
+		get_tree().quit(3)
+		return
 	if view_mode:
 		get_window().size = Vector2i(1280, 800)
 		get_window().move_to_center()
@@ -114,7 +124,7 @@ func _ready() -> void:
 	noise.seed = int(cfg.get("seed", 1))
 	noise.frequency = 0.004
 	Engine.max_fps = 60 if view_mode else 0
-	if not view_mode:
+	if not view_mode and not live_mode:
 		DirAccess.make_dir_recursive_absolute(out_dir + "/wide")
 		if fine_enabled() and not args.has("panorama"):
 			DirAccess.make_dir_recursive_absolute(out_dir + "/fine")
@@ -132,6 +142,10 @@ func _ready() -> void:
 	build_targets()
 	if view_mode:
 		start_view()
+		return
+	if live_mode:
+		await live_loop()
+		get_tree().quit()
 		return
 	if args.has("panorama"):
 		await run_panorama()
@@ -1097,67 +1111,83 @@ func box(sz: Vector3) -> BoxMesh:
 # Случайные цели: "random_targets": {"drones": 6, "birds": 3, "range": [150, 1500], "seed": 5,
 #   "types": {"quad": 0.5, "delta": 0.25, "plane": 0.25}} — разные типы, размеры и скорости,
 #   пролёт по прямой через поле зрения широкой камеры.
+var rt_rng := RandomNumberGenerator.new()   # случайные цели (и новые вместо улетевших в --live)
+var rt_ctx := {}
+
+
 func random_targets() -> Array:
 	var rc: Dictionary = cfg.get("random_targets", {})
 	var out = []
 	if rc.is_empty():
 		return out
-	var r = RandomNumberGenerator.new()
-	r.seed = int(rc.get("seed", int(cfg.get("seed", 1)) + 100))
-	var rng_r = rc.get("range", [150, 1500])
+	rt_rng.seed = int(rc.get("seed", int(cfg.get("seed", 1)) + 100))
 	var types: Dictionary = rc.get("types", {"quad": 0.5, "delta": 0.25, "plane": 0.25})
 	var tot = 0.0
 	for k in types:
 		tot += float(types[k])
-	var half = float(wcfg.get("hfov", 120.0)) * 0.4
-	var az0 = float(wcfg.get("az", 0.0))
-	var around = bool(rc.get("around", false)) or view_mode   # по всему кругу, а не только в кадре
+	rt_ctx = {"types": types, "tot": tot, "range": rc.get("range", [150, 1500]),
+		"half": float(wcfg.get("hfov", 120.0)) * 0.4, "az0": float(wcfg.get("az", 0.0)),
+		"around": bool(rc.get("around", false)) or view_mode,   # по всему кругу, а не только в кадре
+		"secs": LIVE_PATH_S if live_mode else float(cfg.get("seconds", 10.0))}
 	var mult = 3 if view_mode and not bool(rc.get("around", false)) else 1
 	var n_dr = int(rc.get("drones", 6)) * mult
 	for i in n_dr + int(rc.get("birds", 3)) * mult:
-		var t = {}
-		var model = "bird"
-		var size = r.randf_range(0.3, 1.2)
-		var speed = r.randf_range(8, 14)
-		if i < n_dr:
-			var x = r.randf() * tot
-			for k in types:
-				model = k
-				x -= float(types[k])
-				if x <= 0:
-					break
-			if model == "quad":
-				size = r.randf_range(0.3, 0.8)
-				speed = r.randf_range(5, 20)
-			elif model == "delta":
-				size = r.randf_range(1.8, 3.5)
-				speed = r.randf_range(25, 45)
-			else:
-				size = r.randf_range(1.5, 4.0)
-				speed = r.randf_range(15, 30)
-			t["kind"] = "drone"
-		else:
-			t["kind"] = "bird"
-			t["flap_hz"] = r.randf_range(3, 8)
-			t["flap_period"] = r.randf_range(2, 5)
-			t["flap_on"] = r.randf_range(0.8, 2)
-		t["model"] = model
-		t["size"] = size
-		t["speed"] = speed
-		var dist = r.randf_range(float(rng_r[0]), float(rng_r[1]))
-		var az = (az0 + r.randf_range(-half, half)) * DEG
-		if around:
-			az = r.randf() * TAU
-		var el = r.randf_range(3, 25) * DEG
-		var c = Vector3(sin(az) * cos(el), cos(az) * cos(el), sin(el)) * dist   # восток, север, верх
-		var hd = r.randf() * TAU
-		var dirv = Vector3(cos(hd), sin(hd), r.randf_range(-0.05, 0.05))
-		var secs = float(cfg.get("seconds", 10.0))
-		var a = c - dirv * speed * secs * 0.5
-		var b = c + dirv * speed * secs * 0.5
-		t["path"] = {"type": "line", "from": [a.x, a.y, maxf(a.z, 15.0)], "to": [b.x, b.y, maxf(b.z, 15.0)]}
-		out.append(t)
+		out.append(gen_random(i < n_dr, 0.0))
 	return out
+
+
+# Одна случайная цель: тип по долям, прямая через точку в поле зрения широкой (середина пути — в t0 + secs/2).
+func gen_random(drone: bool, t0: float) -> Dictionary:
+	var r = rt_rng
+	var types: Dictionary = rt_ctx["types"]
+	var rng_r = rt_ctx["range"]
+	var t = {}
+	var model = "bird"
+	var size = r.randf_range(0.3, 1.2)
+	var speed = r.randf_range(8, 14)
+	if drone:
+		var x = r.randf() * float(rt_ctx["tot"])
+		for k in types:
+			model = k
+			x -= float(types[k])
+			if x <= 0:
+				break
+		if model == "quad":
+			size = r.randf_range(0.3, 0.8)
+			speed = r.randf_range(5, 20)
+		elif model == "delta":
+			size = r.randf_range(1.8, 3.5)
+			speed = r.randf_range(25, 45)
+		else:
+			size = r.randf_range(1.5, 4.0)
+			speed = r.randf_range(15, 30)
+		t["kind"] = "drone"
+	else:
+		t["kind"] = "bird"
+		t["flap_hz"] = r.randf_range(3, 8)
+		t["flap_period"] = r.randf_range(2, 5)
+		t["flap_on"] = r.randf_range(0.8, 2)
+	t["model"] = model
+	t["size"] = size
+	t["speed"] = speed
+	var dist = r.randf_range(float(rng_r[0]), float(rng_r[1]))
+	var half = float(rt_ctx["half"])
+	var az = (float(rt_ctx["az0"]) + r.randf_range(-half, half)) * DEG
+	if rt_ctx["around"]:
+		az = r.randf() * TAU
+	var el = r.randf_range(3, 25) * DEG
+	var c = Vector3(sin(az) * cos(el), cos(az) * cos(el), sin(el)) * dist   # восток, север, верх
+	var hd = r.randf() * TAU
+	var dirv = Vector3(cos(hd), sin(hd), r.randf_range(-0.05, 0.05))
+	var secs = float(rt_ctx["secs"])
+	var a = c - dirv * speed * secs * 0.5
+	var b = c + dirv * speed * secs * 0.5
+	t["path"] = {"type": "line", "from": [a.x, a.y, maxf(a.z, 15.0)], "to": [b.x, b.y, maxf(b.z, 15.0)]}
+	if live_mode:
+		t["start"] = t0
+		t["end"] = t0 + secs
+		t["random"] = true
+	return t
 
 
 func build_targets() -> void:
@@ -1634,6 +1664,146 @@ func _unhandled_input(ev: InputEvent) -> void:
 		print("снимок: ", fn)
 	elif key == KEY_ESCAPE:
 		get_tree().quit()
+
+
+# ---------- источник кадров эмулятора (--live) ----------
+
+# Подключиться к приложению и принять hello: камеры и случайные цели задаёт эмулятор.
+func live_connect(port: int) -> bool:
+	live_peer = StreamPeerTCP.new()
+	if live_peer.connect_to_host("127.0.0.1", port) != OK:
+		push_error("нет связи с приложением, порт %d" % port)
+		return false
+	var t0 = Time.get_ticks_msec()
+	while live_peer.get_status() == StreamPeerTCP.STATUS_CONNECTING and Time.get_ticks_msec() - t0 < 10000:
+		live_peer.poll()
+		OS.delay_msec(5)
+	if live_peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+		push_error("нет связи с приложением, порт %d" % port)
+		return false
+	live_peer.set_no_delay(true)
+	var line = live_read_line()
+	var h = JSON.parse_string(line if line != null else "")
+	if typeof(h) != TYPE_DICTIONARY:
+		push_error("приложение не прислало hello")
+		return false
+	live_mode = true
+	var wv: Array = h.get("wide", [4608, 3456, 120, 14])
+	var fv: Array = h.get("fine", [640, 480, 20, 60])
+	wcfg["w"] = int(wv[0])
+	wcfg["h"] = int(wv[1])
+	wcfg["hfov"] = float(wv[2])
+	wcfg["fps"] = float(wv[3])
+	wcfg["az"] = float(h.get("az", wcfg.get("az", 0.0)))
+	wcfg["el"] = float(h.get("el", wcfg.get("el", 15.0)))
+	wcfg["pan_dps"] = 0.0
+	fcfg["enabled"] = true
+	fcfg["w"] = int(fv[0])
+	fcfg["h"] = int(fv[1])
+	fcfg["hfov"] = float(fv[2])
+	fcfg["fps"] = float(fv[3])
+	cfg["targets"] = []   # мир сцены — по её seed, цели — по номеру сцены эмулятора
+	cfg["random_targets"] = {"drones": int(h.get("drones", 3)), "birds": int(h.get("birds", 1)),
+		"seed": int(h.get("seed", 1)) + 100,
+		"range": h.get("range", [250, 1200]), "types": h.get("types", {"quad": 0.5, "delta": 0.25, "plane": 0.25})}
+	get_window().title = "Дронолок: 3D-сцена для эмулятора (не закрывать)"
+	return true
+
+
+func live_read_line():
+	while true:
+		var i = live_buf.find(10)
+		if i >= 0:
+			var s = live_buf.slice(0, i).get_string_from_utf8()
+			live_buf = live_buf.slice(i + 1)
+			return s
+		live_peer.poll()
+		if live_peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			return null
+		var n = live_peer.get_available_bytes()
+		if n > 0:
+			var r = live_peer.get_data(n)
+			if r[0] == OK:
+				live_buf.append_array(r[1])
+		else:
+			OS.delay_usec(200)
+	return null
+
+
+# Цель улетела из кадра широкой или её путь кончился — вместо неё новая (новый номер), как в эмуляторе.
+func live_respawn(t: float) -> void:
+	var w = wide_vp.size.x
+	var h = wide_vp.size.y
+	for tg in targets:
+		var c: Dictionary = tg["cfg"]
+		if not c.get("random", false):
+			continue
+		var p = target_pos(tg, t)
+		var gone = p == null or p.y < 5.0
+		if not gone:
+			if wide_cam.is_position_behind(p):
+				gone = true
+			else:
+				var px = wide_cam.unproject_position(p)
+				gone = px.x < -0.05 * w or px.x > 1.05 * w or px.y < -0.05 * h or px.y > 1.05 * h
+		if not gone:
+			continue
+		rt_ctx["az0"] = azel_of(-wide_cam.global_transform.basis.z).x
+		var n = gen_random(tg["kind"] == "drone", t)
+		n["model"] = c.get("model", n["model"])   # модель у узла та же: размер и форма прежние
+		n["size"] = c.get("size", n["size"])
+		tg["cfg"] = n
+		tg["id"] = live_next_id
+		live_next_id += 1
+
+
+func live_loop() -> void:
+	# прогрев шейдеров
+	set_time(0.0)
+	for _w in 2:
+		wide_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+		fine_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+		await RenderingServer.frame_post_draw
+	var shapes = {"bird": 0, "quad": 1, "delta": 2, "wing": 3, "plane": 3}
+	while true:
+		var line = live_read_line()
+		if line == null:
+			break
+		var q = JSON.parse_string(line)
+		if typeof(q) != TYPE_DICTIONARY:
+			continue
+		if q.has("quit"):
+			break
+		var t = float(q.get("t", 0.0))
+		var cam = int(q.get("cam", 0))
+		for m in time_mats:
+			(m as ShaderMaterial).set_shader_parameter("sim_time", t)
+		var vp: SubViewport = wide_vp if cam == 0 else fine_vp
+		aim(wide_cam if cam == 0 else fine_cam, float(q.get("az", 0.0)), float(q.get("el", 0.0)))
+		if cam == 0:
+			live_respawn(t)
+		update_targets(t)
+		vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+		await RenderingServer.frame_post_draw
+		var img = vp.get_texture().get_image()
+		img.convert(Image.FORMAT_L8)
+		var data = img.get_data()
+		var rows = []
+		for tg in targets:
+			var p = target_pos(tg, t)
+			if p == null:
+				continue
+			var p2 = target_pos(tg, t + 0.05)
+			var v = (p2 - p) / 0.05 if p2 != null else Vector3.ZERO
+			var c: Dictionary = tg["cfg"]
+			rows.append("%d %d %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %d" % [tg["id"], 1 if tg["kind"] == "bird" else 0,
+				shapes.get(str(c.get("model", "quad")), 1), float(tg["size"]), p.x, -p.z, p.y, v.x, -v.z, v.y,
+				1 if occluded(rig_pos, p) else 0])
+		var head = "FRAME %d %d %d %d\n" % [img.get_width(), img.get_height(), data.size(), rows.size()]
+		if rows.size() > 0:
+			head += "\n".join(rows) + "\n"
+		if live_peer.put_data(head.to_utf8_buffer()) != OK or live_peer.put_data(data) != OK:
+			break
 
 
 func save_json(path: String, obj) -> void:

@@ -21,6 +21,7 @@
 #include "dronolok/detector.hpp"
 #include "dronolok/geometry.hpp"
 #include "pipeline.hpp"
+#include "scenelink.hpp"
 #include "silhouette.hpp"
 
 namespace twocam {
@@ -33,6 +34,10 @@ using dronolok::Vec3;
 enum class SwitchMode : int { Manual = 0, Queue = 1, Nearest = 2 };
 
 struct Config {
+    // мир: пусто — синтетическое небо; иначе 3D-сцена Godot (путь к sim/scenes/*.json), см. scenelink.hpp.
+    // Цели тогда летают в сцене (числа, дальность и доли типов — ниже), облака и видимость — из сцены.
+    std::string scene, sector, godot, simProject;
+    uint64_t renderAffinity = 0;   // ядра для отрисовки сцены, 0 — любые
     // сцена
     int drones = 3, birds = 1;
     float rangeMin = 250, rangeMax = 1200;   // м
@@ -87,6 +92,8 @@ struct Body {
     double t0 = 0;       // когда появилось
     float size = 0.5f;   // м
     float flapHz = 0, phase = 0;
+    bool wobble = true;    // покачивание птицы (в 3D-сцене траекторию задаёт сцена)
+    bool hidden = false;   // в 3D-сцене: заслонено от установки домом или деревом
     Vec3 at(double t) const;
 };
 
@@ -133,6 +140,7 @@ struct View {
     int assigned = 0;                     // id трека широкой
     std::vector<WideTarget> targets;
     Pose axis, cmd;
+    Pose widePose;                        // куда смотрит широкая
     float rateAz = 0, rateEl = 0;
     dronolok::SearchWindow win;
     bool winOn = false;
@@ -163,6 +171,12 @@ public:
     void selectTarget(int wideId) { cmd_ = wideId; }
     void setSwitchMode(SwitchMode m) { switchMode_ = (int)m; }
     void setSpeed(float s) { speed_ = s; }
+    // повернуть широкую камеру (вступает с ближайшего её кадра); поворотка точной не трогается
+    void setWidePose(float az, float el) {
+        wantAz_ = az;
+        wantEl_ = el;
+        ++poseReq_;
+    }
     View view() const;
     // без интерфейса: прогнать seconds модельного времени как можно быстрее
     Stats runBlocking(const Config& c, double seconds, bool verbose);
@@ -171,6 +185,8 @@ public:
 private:
     void loop();
     void spawn(Body& b, double t, bool first);
+    void prepareWide();   // фон синтетического неба под текущий поворот широкой
+    bool sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out);
     void renderWide(double t, std::vector<uint8_t>& out);
     void renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out);
     void drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h);
@@ -187,6 +203,13 @@ private:
     std::atomic<bool> running_{false}, stop_{false}, paused_{false};
     std::atomic<int> cmd_{0}, switchMode_{1};
     std::atomic<float> speed_{1};
+    std::atomic<float> wantAz_{0}, wantEl_{0};
+    std::atomic<int> poseReq_{0};
+    int poseSeen_ = 0;
+    // 3D-сцена: отдельный процесс Godot
+    bool sceneMode_ = false;
+    std::unique_ptr<scene::Link> link_;
+    std::vector<scene::Body> sbodies_;
     mutable std::mutex vm_;
     View view_;
 

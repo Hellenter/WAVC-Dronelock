@@ -123,6 +123,14 @@ struct App {
     int64_t emuWSeq = -1;
     int emuRes = 0, emuSpeed = 2;
     bool emuTruth = true;
+    // мир эмулятора: 0 — синтетическое небо, 1 — 3D-сцена Godot (sim/)
+    int emuWorld = 0;
+    std::string simDir, simBase;
+    char godotPath[1024] = "";
+    std::vector<std::string> simScenes;
+    int simScene = 0;
+    std::vector<scene::Sector> simSectors;
+    int renderCores = 0;   // ядра только для отрисовки сцены (0 — общие)
     Settings s;
     // устройство и профиль
     int devIdx = 0, profIdx = 1;
@@ -2308,8 +2316,36 @@ bool upload_gray(App& a, SDL_Texture*& tex, int& tw, int& th, const uint8_t* src
     return true;
 }
 
+// сцены и Godot: папка sim рядом с программой (или в репозитории), Godot в ней или в PATH
+void sim_scan(App& a) {
+    std::string g = a.godotPath;
+    scene::find_sim(a.simBase, a.simDir, g);
+    if (!g.empty()) snprintf(a.godotPath, sizeof(a.godotPath), "%s", g.c_str());
+    a.simScenes = a.simDir.empty() ? std::vector<std::string>() : scene::list_scenes(a.simDir);
+    for (size_t i = 0; i < a.simScenes.size(); ++i)
+        if (a.simScenes[i] == "city_sectors.json") a.simScene = (int)i;
+    a.simScene = std::min(a.simScene, std::max(0, (int)a.simScenes.size() - 1));
+    a.simSectors = a.simScenes.empty() ? std::vector<scene::Sector>()
+                                       : scene::scene_sectors(a.simDir + "/scenes/" + a.simScenes[a.simScene]);
+}
+
 void emu_start(App& a) {
     twocam::Config c = a.emuCfg;
+    if (a.emuWorld == 1 && !a.simScenes.empty()) {
+        c.scene = a.simDir + "/scenes/" + a.simScenes[a.simScene];
+        c.simProject = a.simDir + "/godot";
+        c.godot = a.godotPath;
+        c.wideFisheye = false;   // сцена рисует обычным объективом
+        // ресурсы отдельно: отрисовке — последние renderCores ядер, алгоритму — остальные
+        const int n = std::min(64, plat::logical_cpus());
+        if (a.renderCores > 0 && a.renderCores < n) {
+            uint64_t rm = 0, am = 0;
+            for (int i = 0; i < n; ++i) (i >= n - a.renderCores ? rm : am) |= 1ull << i;
+            c.renderAffinity = rm;
+            if (plat::set_process_affinity(am))
+                for (int i = 0; i < (int)a.cpuOn.size(); ++i) a.cpuOn[i] = (am >> i) & 1;
+        }
+    }
     static const int res[][2] = {{4608, 3456}, {2304, 1728}};
     c.wideW = res[a.emuRes][0];
     c.wideH = res[a.emuRes][1];
@@ -2342,6 +2378,90 @@ void panel_twocam(App& a) {
     if (segmented("emusp", sp, 5, a.emuSpeed)) {
         static const float speeds[] = {0.25f, 0.5f, 1, 2, 0};
         a.emu.setSpeed(speeds[a.emuSpeed]);
+    }
+
+    heading("Мир");
+    {
+        static const char* ws[] = {"Синтетическое небо", "3D-сцена"};
+        static const char* wt[] = {"Небо с облаками и кромкой леса, считается в самом приложении.",
+                                   "Сцена Godot (лес, частный сектор, многоэтажки): рисует отдельная программа на своих "
+                                   "ядрах, кадры и правда о целях приходят по запросу на модельный момент — скорость "
+                                   "отрисовки не влияет на работу и замеры алгоритма."};
+        if (segmented("emuworld", ws, 2, a.emuWorld, 0, wt) && a.emuWorld == 1) sim_scan(a);
+    }
+    if (a.emuWorld == 1) {
+        if (a.simDir.empty()) {
+            ImGui::TextWrapped("Нет папки sim рядом с программой (sim/godot, sim/scenes). Она входит в сборку Dronolok-win64.");
+        } else {
+            label("Сцена");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##scene", a.simScenes.empty() ? "нет сцен" : a.simScenes[a.simScene].c_str())) {
+                for (int i = 0; i < (int)a.simScenes.size(); ++i)
+                    if (ImGui::Selectable(a.simScenes[i].c_str(), i == a.simScene)) {
+                        a.simScene = i;
+                        a.simSectors = scene::scene_sectors(a.simDir + "/scenes/" + a.simScenes[i]);
+                    }
+                ImGui::EndCombo();
+            }
+            label("Godot 4.3", "Программа, которая рисует сцену. В сборке лежит в sim\\Godot.exe.");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputText("##godot", a.godotPath, sizeof(a.godotPath))) {}
+            if (!a.godotPath[0]) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Godot не найден: укажите путь к Godot 4.3");
+            const int n = std::min(64, plat::logical_cpus());
+            label("Ядра для отрисовки сцены",
+                  "Столько последних ядер получает только Godot, алгоритм работает на остальных (это видно и во "
+                  "вкладке «Железо»). 0 — общие ядра. Видеокарту сцена занимает свою, ограничение CPU алгоритма на "
+                  "неё не действует.");
+            ImGui::SliderInt("##rcores", &a.renderCores, 0, std::max(0, n - 1), a.renderCores ? "%d" : "общие");
+        }
+    }
+
+    heading("Поворот широкой камеры");
+    {
+        twocam::Config& cc = a.emuCfg;
+        const twocam::Pose cur = a.emu.running() ? a.emuView.widePose : twocam::Pose{cc.wideAz, cc.wideEl, 0};
+        ImGui::Text("Азимут %.0f°, угол места %.0f°", cur.az, cur.el);
+        bool turn = false;
+        const float bw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4;
+        const float steps[] = {-30, -5, 5, 30};
+        const char* names[] = {"-30°", "-5°", "+5°", "+30°"};
+        for (int i = 0; i < 4; ++i) {
+            if (i) ImGui::SameLine();
+            if (ImGui::Button(names[i], ImVec2(bw, 0))) {
+                cc.wideAz = std::fmod(cc.wideAz + steps[i] + 360.f, 360.f);
+                turn = true;
+            }
+        }
+        ImGui::SetItemTooltip("Повернуть по азимуту. Стрелки ← → на клавиатуре — по 5°, ↑ ↓ — угол места.");
+        if (ImGui::Button("Выше 5°", ImVec2(bw * 2 + ImGui::GetStyle().ItemSpacing.x, 0))) {
+            cc.wideEl = std::min(80.f, cc.wideEl + 5);
+            turn = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Ниже 5°", ImVec2(-FLT_MIN, 0))) {
+            cc.wideEl = std::max(-5.f, cc.wideEl - 5);
+            turn = true;
+        }
+        if (a.emuWorld == 1 && !a.simSectors.empty()) {
+            const float sw = (ImGui::GetContentRegionAvail().x - (a.simSectors.size() - 1) * ImGui::GetStyle().ItemSpacing.x) /
+                             a.simSectors.size();
+            for (size_t i = 0; i < a.simSectors.size(); ++i) {
+                const auto& sc = a.simSectors[i];
+                static const char* ru[][2] = {{"forest", "Лес"}, {"lowrise", "Частный"}, {"highrise", "Многоэтажки"}};
+                const char* nm = sc.name.c_str();
+                for (const auto& r : ru)
+                    if (sc.name == r[0]) nm = r[1];
+                if (i) ImGui::SameLine();
+                ImGui::PushID((int)i);
+                if (ImGui::Button(nm, ImVec2(sw, 0))) {
+                    cc.wideAz = sc.mid;
+                    turn = true;
+                }
+                ImGui::SetItemTooltip("Сектор %s: %.0f–%.0f°", sc.name.c_str(), sc.from, sc.to);
+                ImGui::PopID();
+            }
+        }
+        if (turn && a.emu.running()) a.emu.setWidePose(cc.wideAz, cc.wideEl);
     }
 
     heading("Переключение целей");
@@ -2414,7 +2534,7 @@ void panel_twocam(App& a) {
     label("Частота кадров");
     ImGui::SliderFloat("##wfps", &c.wideFps, 2, 30, "%.0f к/с");
     label("Угол места оси");
-    ImGui::SliderFloat("##wel", &c.wideEl, 0, 60, "%.0f°");
+    if (ImGui::SliderFloat("##wel", &c.wideEl, 0, 60, "%.0f°") && a.emu.running()) a.emu.setWidePose(c.wideAz, c.wideEl);
 
     heading("Сцена");
     label("Дронов");
@@ -2457,7 +2577,7 @@ void draw_twocam(App& a) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(18, 18, 20, 255));
     if (!v.wide || !a.emuWTex) {
-        const char* msg = a.emu.running() ? "Готовим сцену..." : "Запустите эмулятор слева";
+        const char* msg = !v.status.empty() ? v.status.c_str() : a.emu.running() ? "Готовим сцену..." : "Запустите эмулятор слева";
         const ImVec2 ts = ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2(p0.x + (avail.x - ts.x) / 2, p0.y + (avail.y - ts.y) / 2), IM_COL32(170, 170, 180, 255), msg);
         ImGui::Dummy(avail);
@@ -3555,6 +3675,11 @@ int main(int argc, char** argv) {
             for (const char* k : {"auto_thr", "thr", "skyline", "lock_slow"}) a.mtSel[i].on |= !strcmp(P[i].key, k);
         }
     }
+    if (char* bp = SDL_GetBasePath()) {
+        a.simBase = bp;
+        SDL_free(bp);
+    }
+    sim_scan(a);
     if (argc > 1) open_video(a, argv[1]);
     a.cpuWall = now_ms();
     a.cpuT = plat::process_cpu_seconds();
@@ -3621,6 +3746,17 @@ int main(int argc, char** argv) {
             if (!v.narrow.empty()) upload_gray(a, a.emuNTex, a.emuNTw, a.emuNTh, v.narrow.data(), v.nw, v.nh, 1);
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Tab, false)) a.emu.nextTarget();
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Space, false)) a.emu.setPaused(!a.emu.paused());
+            // стрелки — поворот широкой камеры
+            if (!io.WantTextInput && a.emu.running()) {
+                twocam::Config& cc = a.emuCfg;
+                bool turn = false;
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) cc.wideAz -= 5, turn = true;
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) cc.wideAz += 5, turn = true;
+                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) cc.wideEl = std::min(80.f, cc.wideEl + 5), turn = true;
+                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) cc.wideEl = std::max(-5.f, cc.wideEl - 5), turn = true;
+                cc.wideAz = std::fmod(cc.wideAz + 360.f, 360.f);
+                if (turn) a.emu.setWidePose(cc.wideAz, cc.wideEl);
+            }
         }
         if (!io.WantTextInput && a.pipe.isOpen() && a.appMode == 0) {
             if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) toggle_pause(a);
