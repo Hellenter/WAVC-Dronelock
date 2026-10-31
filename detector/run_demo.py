@@ -7,7 +7,7 @@
 h264 не должно входить в замер). Время детекции и трекинга меряется отдельно
 от отрисовки и записи демо.
 """
-import argparse, json, os, time
+import argparse, json, os, subprocess, sys, time
 import numpy as np, cv2
 from detector import PointDetector, Tracker
 
@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--learn-mask", type=int, default=0, help="N первых кадров для авто-маски неба")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--stats", default="")
+    ap.add_argument("--native", action="store_true", help="нативное ядро (native/, C++ SIMD) вместо OpenCV")
     a = ap.parse_args()
     # параллелим полосами кадра; внутренний параллелизм OpenCV при этом только мешает
     cv2.setNumThreads(a.threads or (1 if a.workers > 1 else 0))
@@ -90,7 +91,13 @@ def main():
     gt_path = a.video + ".gt.json"
     gt = json.load(open(gt_path))["frames"] if os.path.exists(gt_path) and not up else None
 
-    det = PointDetector(k=a.k, pool=a.pool, thr=a.thr, workers=a.workers, use_umat=a.umat)
+    if a.native:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "native", "python"))
+        from dronolok_native import NativePointDetector
+        det = NativePointDetector(k=a.k, pool=a.pool, thr=a.thr, threads=a.workers)
+        print(f"нативное ядро: {det.backend}, потоков {det.threads}")
+    else:
+        det = PointDetector(k=a.k, pool=a.pool, thr=a.thr, workers=a.workers, use_umat=a.umat)
     if a.learn_mask:
         m = det.learn_mask(frames[:a.learn_mask])
         print(f"авто-маска: исключено {100 * (1 - m.mean()):.1f}% тайлов (лес/земля)")
@@ -143,14 +150,17 @@ def main():
                     break
     if writer is not None:
         writer.release()
-        os.system(f'ffmpeg -loglevel error -y -i "{a.out}.tmp.avi" -c:v libx264 -crf 23 -pix_fmt yuv420p "{a.out}" '
-                  f'&& rm "{a.out}.tmp.avi"')
+        # список аргументов, без оболочки: имя файла с кавычкой или ; не выполняется как команда
+        if subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", a.out + ".tmp.avi", "-c:v", "libx264", "-crf", "23",
+                           "-pix_fmt", "yuv420p", a.out]).returncode == 0:
+            os.remove(a.out + ".tmp.avi")
     ms = np.array(times) * 1000
     res = dict(mask=bool(a.learn_mask), resolution=f"{frames[0].shape[1]}x{frames[0].shape[0]}", pool=a.pool, k=a.k,
                threads=cv2.getNumThreads(), frames=len(ms),
                mean_ms=round(float(ms.mean()), 1), p95_ms=round(float(np.percentile(ms, 95)), 1),
                fps=round(1000 / float(ms.mean()), 1),
-               detect_ms=round(float(np.mean([p["detect_ms"] for p in parts])), 1), workers=a.workers)
+               detect_ms=round(float(np.mean([p["detect_ms"] for p in parts])), 1), workers=a.workers,
+               native=a.native)
     if gt is not None:
         res["recall_drone"] = round(hit["drone"][0] / max(1, hit["drone"][1]), 3)
         res["recall_bird"] = round(hit["bird"][0] / max(1, hit["bird"][1]), 3)
