@@ -693,11 +693,15 @@ func apply_env(e: Dictionary) -> void:
 	var amb: Color = hor.lerp(zen, 0.4)
 	amb = amb.lerp(Color(amb.get_luminance(), amb.get_luminance(), amb.get_luminance()), 0.3 + 0.5 * clouds)
 	env_obj.ambient_light_color = amb
-	env_obj.ambient_light_energy = (float(e["ambient"]) * bright * (1.0 + 0.5 * clouds) * dim + lp * 40.0) * gain
+	env_obj.ambient_light_energy = (float(e["ambient"]) * bright * (1.0 + 0.5 * clouds) * dim + lp * 1.5) * gain
 	# дымка на земле и целях: контраст падает до 2% на дальности видимости
 	env_obj.fog_density = ext
-	env_obj.fog_light_color = haze
-	env_obj.fog_light_energy = (bright * dim) * gain + lp * 30.0 * gain
+	# цвет дымки — как у горизонта в шейдере неба (там в линейном свете): дымка * яркость + засветка
+	var hz_lin = Color(pow(haze.r, 2.2), pow(haze.g, 2.2), pow(haze.b, 2.2)) * (bright * dim)
+	hz_lin += Color(0.95, 0.62, 0.34) * lp * 0.8
+	var fe = maxf(maxf(hz_lin.r, hz_lin.g), maxf(hz_lin.b, 1e-6))
+	env_obj.fog_light_color = Color(pow(hz_lin.r / fe, 1.0 / 2.2), pow(hz_lin.g / fe, 1.0 / 2.2), pow(hz_lin.b / fe, 1.0 / 2.2))
+	env_obj.fog_light_energy = fe * gain
 	env_obj.fog_sun_scatter = clampf(haze_ext * 1500.0, 0.0, 0.6) * sun_up * (1.0 - clouds)
 	# окна в многоэтажках вечером и ночью
 	var night = (1.0 - smoothstep(-6.0, 1.0, el)) * 0.03 * gain
@@ -726,7 +730,7 @@ uniform float bright = 1.0;
 uniform float flake = 0.0;                  // 1 — снег: лицом к камере, колышется
 varying float alpha;
 void vertex() {
-	vec3 u = MODEL_MATRIX[3].xyz;            // случайная точка в единичном кубе
+	vec3 u = INSTANCE_CUSTOM.xyz;            // случайная точка в единичном кубе
 	float id = u.x * 97.0 + u.y * 13.0 + u.z * 57.0;
 	vec3 size = vec3(2.0 * box.x, box.y, 2.0 * box.z);
 	vec3 p = mod(u * size + vel * sim_time, size);
@@ -758,7 +762,7 @@ void vertex() {
 		sd = normalize(cross(ax, tc / dist) + vec3(1e-5, 0.0, 0.0));
 	}
 	vec3 wp = p + sd * VERTEX.x * wid + ax * VERTEX.y * len;
-	VERTEX = wp - u;
+	VERTEX = (inverse(MODEL_MATRIX) * vec4(wp, 1.0)).xyz;
 }
 void fragment() {
 	vec2 c = abs(UV * 2.0 - 1.0);
@@ -768,12 +772,14 @@ void fragment() {
 }
 """
 
-# Осадки: капли и снежинки около камер — ближний слой (до ~6 м, много) и дальний (до ~40 м).
+# Осадки: капли и снежинки около камер — слои до ~4 м (гуще всего), ~12 м и ~40 м.
 # Дальше дождь — это дымка (видимость падает). Положение — функция модельного времени.
 func build_precip(wind: Vector3) -> void:
 	var r = RandomNumberGenerator.new()
 	r.seed = int(cfg.get("seed", 1)) * 7 + 3
-	var layers = [[12000, Vector3(6.0, 12.0, 6.0), -6.0], [9000, Vector3(40.0, 50.0, 40.0), -100.0]]
+	# в настоящем дожде сотни капель на м³; здесь у камеры ~20/м³ (дальше — реже), заметность — rain_gain
+	var layers = [[12000, Vector3(4.0, 8.0, 4.0), -4.0], [12000, Vector3(12.0, 22.0, 12.0), -9.0],
+		[9000, Vector3(40.0, 50.0, 40.0), -100.0]]
 	var qm = QuadMesh.new()
 	qm.size = Vector2(1, 1)
 	for kind in ["rain", "snow"]:
@@ -781,10 +787,12 @@ func build_precip(wind: Vector3) -> void:
 			var L: Array = layers[li]
 			var mm = MultiMesh.new()
 			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.use_custom_data = true   # точка капли — в INSTANCE_CUSTOM (MODEL_MATRIX у MultiMesh в Compatibility её не несёт)
 			mm.mesh = qm
 			mm.instance_count = int(L[0])
 			for i in mm.instance_count:
-				mm.set_instance_transform(i, Transform3D(Basis(), Vector3(r.randf(), r.randf(), r.randf())))
+				mm.set_instance_transform(i, Transform3D())
+				mm.set_instance_custom_data(i, Color(r.randf(), r.randf(), r.randf(), r.randf()))
 			mm.visible_instance_count = 0
 			var m = ShaderMaterial.new()
 			m.shader = make_shader(PRECIP_SHADER)
