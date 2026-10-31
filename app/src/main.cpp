@@ -2677,6 +2677,9 @@ void panel_twocam(App& a) {
         ImGui::SliderFloat("##rate", &c.maxRate, 5, 180, "%.0f °/с");
         label("Ускорение поворотки");
         ImGui::SliderFloat("##acc", &c.maxAccel, 20, 1000, "%.0f °/с²", ImGuiSliderFlags_Logarithmic);
+        label("Рывок поворотки", "Как быстро нарастает ускорение (плавный регулятор). Меньше — мягче разгон и меньше "
+                                 "раскачка крепления, но дольше поворот.");
+        ImGui::SliderFloat("##jerk", &c.maxJerk, 200, 30000, "%.0f °/с³", ImGuiSliderFlags_Logarithmic);
         label("Зум (поле зрения 20° без зума)", "Зум сужает поле точной: ошибка захвата в градусах падает во столько же "
                                               "раз (x2 — 0.015°, x4 — 0.008° на эмуляторе), но захват дольше, и близкую "
                                               "быструю цель легче упустить из кадра. Дальние цели, которых не видит широкая, "
@@ -2694,6 +2697,76 @@ void panel_twocam(App& a) {
         ImGui::SliderFloat("##lat", &c.handoffLatency, 0, 0.5f, "%.2f с");
         label("Дискретность датчиков угла");
         ImGui::SliderFloat("##enc", &c.encoderDeg, 0.001f, 0.1f, "%.3f°", ImGuiSliderFlags_Logarithmic);
+    }
+
+    if (heading("Поворотка: привод и регулятор", true)) {
+        {
+            static const char* mm[] = {"Как на железе", "Идеальная"};
+            static const char* mt[] = {"Кадр точной доходит до алгоритма с задержкой, команда до двигателя — тоже; двигатель "
+                                       "шаговый (микрошаг, пропуски шагов), в передаче люфт, камера на упругом креплении "
+                                       "раскачивается после рывков, за выдержку цель смазывается.",
+                                       "Как было до 31.10: команда исполняется сразу, положение известно точно, кадр — без "
+                                       "задержки. Для сравнения."};
+            int mi = c.mountIdeal ? 1 : 0;
+            if (segmented("emumount", mm, 2, mi, 0, mt)) c.mountIdeal = mi == 1;
+        }
+        if (!c.mountIdeal) {
+            static const char* cs[] = {"Плавный", "Прежний"};
+            static const char* ct[] = {"Фильтр цели по отметкам точной со временем кадра (задержка камеры учтена), уставка — "
+                                       "где будет цель, когда команда дойдёт до двигателя, с её скоростью и ускорением; "
+                                       "профиль с пределом рывка, люфт выбирается, положение — по профилю.",
+                                       "Закон до 31.10: скорость цели + ошибка до центра, торможение по корню, без предела "
+                                       "рывка и поправки на люфт, положение — по выданным шагам."};
+            int ci = c.mountCtl == 1 ? 0 : 1;
+            label("Регулятор");
+            if (segmented("emuctl", cs, 2, ci, 0, ct)) c.mountCtl = ci == 0 ? 1 : 0;
+            static const char* es[] = {"Нет", "На оси"};
+            static const char* et[] = {"Где поворотка — по тому, что выдал контроллер двигателя; пропуски шагов не видны, "
+                                       "уход нуля поправляется по широкой (обе камеры видят цель).",
+                                       "Датчик угла на выходе передачи (люфт и пропуски видит, раскачку камеры на "
+                                       "креплении — нет). Дискретность — «Дискретность датчиков угла» выше."};
+            label("Датчики угла");
+            segmented("emuenc", es, 2, c.encoder, 0, et);
+            if (c.encoder == 0) {
+                static const char* ps[] = {"По шагам", "По профилю", "Модель"};
+                static const char* pt[] = {"Положение — выданные шаги: лестница микрошагов, кадр «прыгает» на шаг.",
+                                           "Положение — гладкий профиль контроллера (камера на креплении шагов не видит).",
+                                           "Профиль через модель крепления (резонанс и затухание ниже — как замерены на "
+                                           "железе): точнее, если модель верна."};
+                label("Положение без датчиков");
+                segmented("emupose", ps, 3, c.poseModel, 0, pt);
+                ImGui::Checkbox("Уход нуля — по широкой", &c.wideBias);
+                ImGui::SetItemTooltip("Пропущенные шаги сдвигают ноль поворотки. Пока обе камеры видят одну цель, разница "
+                                      "медленно (за ~3 с) уходит в поправку.");
+            }
+            label("Задержка кадра точной", "От середины выдержки до результата алгоритма: считывание, передача, обработка.");
+            ImGui::SliderFloat("##camlat", &c.camLatency, 0, 0.15f, "%.3f с");
+            label("Задержка команды двигателю", "От решения на Pi до движения: связь, цикл контроллера.");
+            ImGui::SliderFloat("##cmdlat", &c.cmdLatency, 0, 0.1f, "%.3f с");
+            label("Выдержка точной");
+            {
+                float ms = c.exposure * 1000;
+                if (ImGui::SliderFloat("##exp", &ms, 0, 20, "%.1f мс")) c.exposure = ms / 1000;
+            }
+            label("Микрошаг на выходе", "1.8° / микрошаги / передаточное число. 0 — плавно.");
+            ImGui::SliderFloat("##step", &c.stepDeg, 0, 0.1f, "%.4f°");
+            label("Люфт передачи");
+            ImGui::SliderFloat("##bl", &c.backlash, 0, 0.5f, "%.3f°");
+            if (c.mountCtl == 1) ImGui::Checkbox("Выбирать люфт", &c.backlashComp);
+            label("Крепление камеры", "Собственная частота (0 — жёсткое) и затухание: после рывка камера раскачивается.");
+            ImGui::SliderFloat("##res", &c.resonanceHz, 0, 40, c.resonanceHz > 0 ? "%.0f Гц" : "жёсткое");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderFloat("##damp", &c.damping, 0.02f, 1, "затухание %.2f");
+            if (c.encoder == 0 && c.poseModel == 2) {
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::SliderFloat("##mhz", &c.modelHz, 0, 40, "модель %.0f Гц");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::SliderFloat("##mdamp", &c.modelDamping, 0.02f, 1, "модель: затухание %.2f");
+            }
+            label("Пропуск шагов", "Толчок, ветер, кабель: раз в столько секунд на 8 микрошагов. 0 — нет.");
+            ImGui::SliderFloat("##slip", &c.slipEvery, 0, 120, c.slipEvery > 0 ? "раз в %.0f с" : "нет");
+        }
+        ImGui::TextDisabled("Применяется при перезапуске.");
     }
 
     if (heading("Алгоритм точной", true)) {
@@ -2965,6 +3038,14 @@ void panel_twocam_metrics(App& a) {
     kpi("Ошибка захвата", val, ImVec4(0.85f, 0.88f, 0.95f, 1), sub, tw);
     ImGui::Text("ось: аз %.2f°, угол места %.2f°", v.axis.az, v.axis.el);
     ImGui::Text("скорость поворота: %.1f / %.1f °/с (предел %.0f)", v.rateAz, v.rateEl, a.emuCfg.maxRate);
+    if (!a.emuCfg.mountIdeal) {
+        const double jit = s.jitterN ? std::sqrt(s.jitterSq / s.jitterN) : 0, pe = s.poseN ? std::sqrt(s.poseSq / s.poseN) : 0;
+        ImGui::Text("ускорение %.0f / %.0f °/с², кадров точной в пути %d", v.accAz, v.accEl, v.narrowLagFrames);
+        ImGui::Text("дрожание цели %.2f пикс./кадр, ошибка положения %.3f°", jit, pe);
+        if (s.mount.slips || s.biasAz != 0 || s.biasEl != 0)
+            ImGui::Text("пропусков шагов %d (%.3f° / %.3f°), поправка по широкой %.3f° / %.3f°", s.mount.slips, s.slipAz, s.slipEl,
+                        s.biasAz, s.biasEl);
+    }
     ImGui::Text("назначений %d, взяла %d, не ту %d, потерь %d", s.assignments, s.acquired, s.wrongLocks, s.losses);
     ImGui::Text("точная подтвердила дронов %d, отсеяла птиц %d (по силуэту %d)", s.confirmed,
                 s.vetoBird + s.vetoDrone + s.vetoNone, s.vetoShape);

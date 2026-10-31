@@ -20,6 +20,8 @@
 
 #include "dronolok/detector.hpp"
 #include "dronolok/geometry.hpp"
+#include "dronolok/gimbal.hpp"
+#include "mountsim.hpp"
 #include "pipeline.hpp"
 #include "scenelink.hpp"
 #include "silhouette.hpp"
@@ -71,6 +73,27 @@ struct Config {
     bool narrowAutoThr = true;            // порог детектора точной по шуму кадра (CFAR): при шуме 3 зум x4 ведёт 84% времени вместо 18%
     float encoderDeg = 0.01f;             // дискретность датчиков угла
     float handoffLatency = 0.06f;         // от кадра широкой до команды поворотке, с
+    // поворотка как на железе (MountSim): кадр точной доходит до алгоритма с задержкой, команда до двигателя —
+    // тоже, двигатель шаговый (микрошаг, пропуски), передача с люфтом, камера на упругом креплении.
+    // mountIdeal — как до 31.10: команда исполняется мгновенно, положение известно точно (бит в бит)
+    bool mountIdeal = false;
+    int mountCtl = 1;                     // 0 — прежний закон (ошибка + скорость цели), 1 — плавный (фильтр цели, рывок)
+    float maxJerk = 3000;                 // град/с³
+    float mountKp = 8, mountKv = 32;      // плавный: скорость к ошибке и ускорение к ошибке скорости, 1/с
+    float camLatency = 0.033f;            // от середины выдержки до результата алгоритма: считывание, передача, обработка, с
+    float cmdLatency = 0.010f;            // от команды Pi до движения двигателя, с
+    float cmdJitter = 0.002f;             // разброс задержки команды, с
+    float exposure = 0.001f;              // выдержка точной, с: смаз цели, пока поворотка и цель движутся по-разному
+    float stepDeg = 0.01125f;             // микрошаг на выходе передачи: 1.8° / 16 / 10, град
+    float backlash = 0.05f;               // люфт передачи, град
+    bool backlashComp = true;             // плавный: контроллер выбирает люфт при смене направления
+    float resonanceHz = 12, damping = 0.15f;   // крепление камеры: собственная частота и затухание
+    float slipEvery = 0;                  // пропуск шагов в среднем раз в столько секунд (0 — нет)
+    int slipSteps = 8;                    // ...на столько микрошагов
+    int encoder = 0;                      // 0 — датчиков угла нет (положение по выданным шагам), 1 — на оси (encoderDeg)
+    int poseModel = 1;                    // без датчиков: 0 — по шагам, 1 — по профилю, 2 — профиль через модель крепления
+    float modelHz = 12, modelDamping = 0.15f;   // модель крепления у контроллера (по замеру на железе)
+    bool wideBias = true;                 // без датчиков: уход нуля поворотки — по широкой (обе видят цель)
     // наведение
     SwitchMode switchMode = SwitchMode::Manual;
     float dwell = 6;          // сколько вести цель, прежде чем перейти к следующей (авто), с
@@ -169,6 +192,16 @@ struct Stats {
     int nextAfterBird = 0;                    // переходов на следующую цель сразу после отсева птицы
     int partJumps = 0;                        // захват точной перешёл на соседний трек той же цели (часть крупной)
     double wideMs = 0, narrowMs = 0;          // среднее время обработки кадра
+    // поворотка: насколько ровно и точно она ведёт цель
+    double jitterSq = 0;  int jitterN = 0;    // дрожание цели на кадре точной (вторая разность положения), пикс.
+    double motionSq = 0;  int motionN = 0;    // ошибка сдвига кадра, которым трекер вычитает поворот, пикс.
+    double poseSq = 0;    int poseN = 0;      // ошибка положения поворотки, которое знает алгоритм, град
+    double blurSum = 0;   int blurN = 0;      // смаз цели за выдержку, пикс.
+    double centerSq = 0;  int centerN = 0;    // цель от центра кадра точной при ведении, пикс.
+    MountSim::Stats mount;                    // ускорение камеры, рывок профиля, пропуски шагов
+    float biasAz = 0, biasEl = 0;             // поправка ухода нуля по широкой, град
+    float slipAz = 0, slipEl = 0;             // на самом деле пропущено, град
+    double etaSum = 0, etaErr = 0; int etaN = 0;   // прогноз времени поворота к цели и его ошибка, с
     double renderWideMs = 0, renderNarrowMs = 0;   // отрисовка кадров, сумма, мс
 };
 
@@ -186,6 +219,9 @@ struct View {
     std::vector<std::pair<float, float>> vetoW;   // отсеянные точной (прогноз), на кадре широкой
     std::vector<WideTarget> targets;
     Pose axis, cmd;
+    Pose believed;                        // где поворотка по своему знанию (шаги или датчик)
+    float accAz = 0, accEl = 0;           // ускорение профиля
+    int narrowLagFrames = 0;              // кадров точной в пути (задержка камеры)
     Pose widePose;                        // куда смотрит широкая
     float rateAz = 0, rateEl = 0;
     dronolok::SearchWindow win;
@@ -242,11 +278,18 @@ private:
     void prepareWide();   // фон синтетического неба под текущий поворот широкой
     bool sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out);
     void renderWide(double t, std::vector<uint8_t>& out);
-    void renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out);
-    void drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h);
+    // pa, pb — положение камеры в начале и в конце выдержки ex (смаз цели); без них — без смаза
+    void renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out, const Pose* pa = nullptr,
+                      const Pose* pb = nullptr, double ex = 0);
+    void drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h, const Pose* pa = nullptr,
+                    const Pose* pb = nullptr, double ex = 0);
     float background(double az, double el, double t, bool fine) const;
     void onWide(double t, const Result& r);
     void stepNarrow(double t, double dt);
+    void stepNarrowReal(double t, double dt);   // поворотка как на железе (MountSim)
+    void processNarrow(double t, double dt, const Pose& truth, const Pose& enc, double tNow);
+    void controlReal(double t);
+    void mountFeed(double t);                   // отметка точной — фильтру цели, невязка с широкой — уходу нуля
     void choose(double t);
     void assign(double t, int wideId, const char* why);
     void rebind(double t);
@@ -350,6 +393,23 @@ private:
     float lastU_ = 0, lastV_ = 0, lastSz_ = 0;   // захват точной на прошлом кадре: где и какого размера, пикс.
     TargetReport nrep_;      // последнее положение по точной
     bool haveNrep_ = false;
+    // поворотка как на железе
+    MountSim msim_;
+    dronolok::GimbalConfig gcfg_;
+    dronolok::GimbalFilter gf_;   // цель для поворотки: по отметкам точной (или широкой, пока точная не видит)
+    dronolok::WideBias wbias_;
+    int gfAssignN_ = -1;           // фильтр начат на этом назначении (номер по счёту)
+    double gfWideT_ = -1, biasT_ = -1;
+    struct NFrame {
+        double t = 0, ready = 0;   // середина выдержки; когда кадр дойдёт до алгоритма
+        Pose truth, bel;           // где камера на самом деле и где по знанию поворотки
+        std::vector<uint8_t> px;
+    };
+    std::deque<NFrame> nq_;        // кадры точной в пути
+    Pose prevTruth_;
+    int jitBody_ = 0, jitK_ = 0;
+    double jitT_ = -1, jitU_[2] = {0, 0}, jitV_[2] = {0, 0};
+    double etaT_ = -1, etaPred_ = 0;   // прогноз времени поворота к назначенной цели
     dronolok::SearchWindow win_;
     bool winOn_ = false;
     Stats st_;
