@@ -180,8 +180,7 @@ jobs:
           unzip -q -j "$f" "Godot_v${GODOT_VERSION}_win64.exe" -d "$RUNNER_TEMP"
           mv "$RUNNER_TEMP/Godot_v${GODOT_VERSION}_win64.exe" $d/sim/Godot.exe
           x86_64-w64-mingw32-objdump -p $d/Dronolok.exe | grep -i "DLL Name" | sort -u
-          mkdir -p win-tests && cp build-win/native/test_kernels.exe build-win/native/test_fieldlog.exe win-tests/
-          mkdir -p win-tests && cp build-win/native/test_kernels.exe build-win/native/test_gimbal.exe win-tests/
+          mkdir -p win-tests && cp build-win/native/test_kernels.exe build-win/native/test_fieldlog.exe build-win/native/test_gimbal.exe win-tests/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Dronolok-win64
