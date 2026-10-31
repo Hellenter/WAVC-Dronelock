@@ -156,7 +156,7 @@ jobs:
           unzip -q -j "$f" "Godot_v${GODOT_VERSION}_win64.exe" -d "$RUNNER_TEMP"
           mv "$RUNNER_TEMP/Godot_v${GODOT_VERSION}_win64.exe" $d/sim/Godot.exe
           x86_64-w64-mingw32-objdump -p $d/Dronolok.exe | grep -i "DLL Name" | sort -u
-          mkdir -p win-tests && cp build-win/native/test_kernels.exe win-tests/
+          mkdir -p win-tests && cp build-win/native/test_kernels.exe build-win/native/test_multicam.exe win-tests/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Dronolok-win64
@@ -180,6 +180,16 @@ jobs:
         with: { name: sample-video, path: sample }
       - name: Тесты ядер (SSE2/AVX2 на реальном CPU)
         run: ./tests/test_kernels.exe
+      - name: Несколько широких камер (объединение, сверка часов, UDP через Winsock)
+        run: ./tests/test_multicam.exe
+      - name: Dronolok.exe --twocam, две широкие по UDP
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--twocam','--wides','2','--wide-step','110','--seam','1','--drones','2','--birds','0','--seconds','4','--wide','1152x864','--deploy','net','--udp','--json','twocam-2wide-win.json' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
+          $d = Get-Content twocam-2wide-win.json -Raw | ConvertFrom-Json
+          if ($d.wides -ne 2 -or $d.net_msgs -lt 50) { throw "широких $($d.wides), сообщений $($d.net_msgs)" }
+          Write-Output "кадров по камерам $($d.cam_frames), сообщений $($d.net_msgs)"
       - name: Dronolok.exe --bench
         shell: pwsh
         run: |
@@ -224,6 +234,7 @@ jobs:
           cmake -S native -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/native/cmake/${{ matrix.triple }}.cmake
           cmake --build build
           ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_kernels
+          ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_multicam
           d=dronolok-${{ matrix.triple }}
           mkdir -p $d && cp build/dronolok_bench build/libdronolok.so native/include/dronolok/*.h* native/python/dronolok_native.py $d/
           tar czf $d.tar.gz $d
