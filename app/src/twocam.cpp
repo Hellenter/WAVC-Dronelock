@@ -515,6 +515,7 @@ void Emulator::start(const Config& cfg) {
     gcfg_.kp = c.mountKp;
     gcfg_.kv = c.mountKv;
     gcfg_.lead_cmd = c.cmdLatency;   // задержку команды контроллер знает (номинальную)
+    gcfg_.jerk_noise = c.targetJerk;
     // ошибка положения на момент кадра: полшага, люфт (без датчика и без поправки) или датчик на оси
     gcfg_.sigma_pose = (float)std::sqrt(std::pow(0.5 * (c.encoder == 1 ? c.encoderDeg : c.stepDeg), 2) +
                                         std::pow(c.encoder == 1 || c.backlashComp ? 0.0 : 0.5 * c.backlash, 2) + 0.003 * 0.003);
@@ -1921,6 +1922,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--old-ctl") c.mountCtl = 0;
         else if (a == "--jerk") c.maxJerk = (float)atof(val().c_str());
         else if (a == "--gains") sscanf(val().c_str(), "%f,%f", &c.mountKp, &c.mountKv);
+        else if (a == "--target-jerk") c.targetJerk = (float)atof(val().c_str());
         else if (a == "--cam-latency") c.camLatency = (float)atof(val().c_str());
         else if (a == "--cmd-latency") sscanf(val().c_str(), "%f,%f", &c.cmdLatency, &c.cmdJitter);
         else if (a == "--exposure") c.exposure = (float)atof(val().c_str());
@@ -1951,7 +1953,7 @@ int run_cli(int argc, char** argv) {
                    "  3D-сцена Godot вместо синтетического неба: [--scene sim/scenes/city_sectors.json] [--sector highrise]\n"
                    "  [--godot путь] [--az 0] [--el 32]\n"
                    "  поворотка (по умолчанию — как на железе, плавный регулятор): [--ideal-mount — как до 31.10] [--old-ctl — прежний закон]\n"
-                   "  [--jerk 3000] [--gains 8,32] [--cam-latency 0.033] [--cmd-latency 0.01,0.002] [--exposure 0.001] [--step 0.01125]\n"
+                   "  [--jerk 3000] [--gains 8,32] [--target-jerk 2] [--cam-latency 0.033] [--cmd-latency 0.01,0.002] [--exposure 0.001] [--step 0.01125]\n"
                    "  [--backlash 0.05] [--no-backlash-comp] [--resonance 12,0.15] [--slip раз_в_с,шагов] [--encoder] [--encoder-deg 0.01]\n"
                    "  [--no-wide-bias] [--perfect-mount — без задержек, люфта, шагов, упругости]\n");
             return a == "--help" ? 0 : 2;
