@@ -170,6 +170,76 @@ DL_API void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose
 /* Состояние захвата: 0 нет, 1 захват, 2 жёсткий (подтверждён дрон). */
 DL_API int dl_tracker_hard(dl_tracker* t);
 
+/* ---- Несколько широких камер (dronolok/multicam.hpp, netmsg.hpp) ----
+   Объединение целей: широкие камеры (каждая — свой сектор) шлют свои цели (dl_target в системе камеры,
+   id — номер её трека), объединение ведёт цели установки в системе поворотки точной: одна цель — один номер,
+   даже когда её видят две камеры или она перелетела из сектора в сектор (в щели между секторами ждёт по
+   прогнозу). Калибровка широких — по точной (dl_fusion_observe_reference). Работает там, где поворотка:
+   на устройстве с камерами (одно устройство на все) или на устройстве поворотки (камеры шлют по сети). */
+typedef struct dl_fusion dl_fusion;
+
+typedef struct {
+    float gate_deg, gate_sigma; /* допуск сопоставления: градусы + столько СКО */
+    float coast_s;              /* цель, которую не видит ни одна камера, ждёт по прогнозу, с */
+    float drop_s;               /* трек камеры не приходил столько — связь с целью снимается, с */
+    float merge_s;              /* две цели совпадают столько — это одна, с */
+    float edge_deg;             /* сообщения от соседней камеры, если цель у края кадра своей */
+    float keep_s;               /* класс и жёсткий захват держатся после перехода, с */
+    float range_min, range_max, range_guess; /* м: дальности (параллакс камер не в начале отсчёта) */
+    int calib;                  /* 1 — калибровать широкие по точной */
+    float calib_init_deg;       /* неуверенность позы до калибровки, СКО */
+    float calib_max_deg;        /* пары с невязкой больше — выбросы */
+    float calib_half_life;      /* пар: старые забываются */
+    float calib_pair_max_dt;    /* с: сообщение точной не старше этого от кадра широкой */
+    int cue;                    /* 1 — подсказки камере, где ждать цель из соседнего сектора */
+    int independent;            /* 1 — без объединения (для сравнения): id = камера * 100000 + трек */
+} dl_fusion_config;
+
+/* Цель установки. rep — в системе поворотки, rep.id = id. cam — от какой камеры сообщение (-1 — ждёт по
+   прогнозу), local — номер трека этой камеры, seen_by — биты камер, которые видят цель. */
+typedef struct {
+    dl_target rep;
+    int cam, local;
+    unsigned seen_by;
+    int handoffs;  /* переходов от камеры к камере */
+} dl_fused;
+
+DL_API void dl_fusion_config_default(dl_fusion_config* c);
+DL_API dl_fusion* dl_fusion_create(const dl_fusion_config* c);
+DL_API void dl_fusion_destroy(dl_fusion* f);
+/* Камера установки: модель, куда смотрит ось по паспорту, положение (м: восток, север, верх от поворотки).
+   Возвращает её номер k (0, 1, ...). Добавлять до первого dl_fusion_update. */
+DL_API int dl_fusion_add_camera(dl_fusion* f, const dl_camera* c, const dl_pose* p, float x, float y, float z);
+DL_API void dl_fusion_set_pose(dl_fusion* f, int k, const dl_pose* p);
+/* Цели камеры k по кадру t (время — общие часы установки), по важности (первая — захваченная камерой). */
+DL_API void dl_fusion_update(dl_fusion* f, int k, double t, const dl_target* reps, int n);
+/* Цели установки по важности; возвращает их число (может быть больше cap). */
+DL_API int dl_fusion_targets(dl_fusion* f, dl_fused* out, int cap);
+/* Точная ведёт цель id (сообщение в системе поворотки): confident — уверена, что дрон, и держит его
+   (тогда это пары для калибровки широких). */
+DL_API void dl_fusion_observe_reference(dl_fusion* f, int id, const dl_target* r, int confident);
+DL_API int dl_fusion_resolve(dl_fusion* f, int id);              /* номер после слияний, 0 — цели нет */
+DL_API int dl_fusion_local_of(dl_fusion* f, int id, int k);      /* трек камеры k у цели id, 0 — не видит */
+DL_API int dl_fusion_global_of(dl_fusion* f, int k, int local);  /* цель трека камеры k, 0 — нет */
+/* Где камере k ждать к моменту t цель из соседнего сектора: тройки u, v, r (пикс.) для dl_detector_set_focus.
+   Возвращает число областей (может быть больше cap). */
+DL_API int dl_fusion_cues(dl_fusion* f, int k, double t, float* xyr, int cap);
+/* Направление в системе поворотки -> пиксель камеры k (с калибровкой); 1 — в кадре. */
+DL_API int dl_fusion_project(dl_fusion* f, int k, float az, float el, float* u, float* v);
+/* Калибровка камеры k: неуверенность (СКО, градусы) и число учтённых пар. */
+DL_API void dl_fusion_calib(dl_fusion* f, int k, float* sigma_deg, int* pairs);
+/* Калибровка в файл и из файла (строка на камеру): при следующем запуске не учиться заново. 1 — получилось. */
+DL_API int dl_fusion_save_calib(dl_fusion* f, const char* path);
+DL_API int dl_fusion_load_calib(dl_fusion* f, const char* path);
+
+/* Сообщения по сети (UDP, одна датаграмма — одна строка, см. netmsg.hpp): цели камеры cam по кадру t
+   (часы камеры), sent — когда отправлено. Возвращает длину строки (без нуля) или -1, если не влезла в cap. */
+DL_API int dl_msg_encode_targets(int cam, unsigned seq, double t, double sent, const dl_target* reps, int n, char* out,
+                                 int cap);
+/* Разбор: число целей (может быть больше cap) или -1 — не сообщение о целях. */
+DL_API int dl_msg_decode_targets(const char* s, int* cam, unsigned* seq, double* t, double* sent, dl_target* out,
+                                 int cap);
+
 #ifdef __cplusplus
 }
 #endif

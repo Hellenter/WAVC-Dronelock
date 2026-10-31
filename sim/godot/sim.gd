@@ -48,6 +48,9 @@ var view_pan := false
 var view_hud: Label
 const LIVE_PATH_S := 40.0       # --live: столько секунд летит случайная цель, потом новая
 var live_mode := false
+# --live, несколько широких: [аз, у.м., восток, север, верх] у каждой (камера 0 запроса — первая, 2, 3... — следующие);
+# поворот — из последнего запроса этой камеры. Одна широкая без смещения — пусто.
+var live_wides: Array = []
 var live_peer: StreamPeerTCP
 var live_buf := PackedByteArray()
 var live_next_id := 1000
@@ -1244,6 +1247,8 @@ func random_targets() -> Array:
 	var mult = 3 if view_mode and not bool(rc.get("around", false)) else 1
 	var n_dr = int(rc.get("drones", 6)) * mult
 	for i in n_dr + int(rc.get("birds", 3)) * mult:
+		if live_wides.size() > 1:   # несколько широких: цели по очереди в поле каждой
+			rt_ctx["az0"] = float(live_wides[i % live_wides.size()][0])
 		out.append(gen_random(i < n_dr, 0.0))
 	return out
 
@@ -1814,6 +1819,7 @@ func live_connect(port: int) -> bool:
 	fcfg["h"] = int(fv[1])
 	fcfg["hfov"] = float(fv[2])
 	fcfg["fps"] = float(fv[3])
+	live_wides = h.get("wides", [])
 	cfg["targets"] = []   # мир сцены — по её seed, цели — по номеру сцены эмулятора
 	cfg["random_targets"] = {"drones": int(h.get("drones", 3)), "birds": int(h.get("birds", 1)),
 		"seed": int(h.get("seed", 1)) + 100,
@@ -1851,10 +1857,18 @@ func live_read_line():
 	return null
 
 
-# Цель улетела из кадра широкой или её путь кончился — вместо неё новая (новый номер), как в эмуляторе.
+# Широкая k (несколько широких) смотрит, как в последнем запросе, из своего положения
+func live_aim_wide(k: int) -> void:
+	var wv: Array = live_wides[k]
+	aim(wide_cam, float(wv[0]), float(wv[1]), -float(wv[5]) if wv.size() > 5 else 0.0)
+	wide_cam.global_position = rig_pos + Vector3(float(wv[2]), float(wv[4]), -float(wv[3]))
+
+
+# Цель улетела из кадра широкой (всех широких) или её путь кончился — вместо неё новая (новый номер), как в эмуляторе.
 func live_respawn(t: float) -> void:
 	var w = wide_vp.size.x
 	var h = wide_vp.size.y
+	var nw = maxi(1, live_wides.size())
 	for tg in targets:
 		var c: Dictionary = tg["cfg"]
 		if not c.get("random", false):
@@ -1862,14 +1876,22 @@ func live_respawn(t: float) -> void:
 		var p = target_pos(tg, t)
 		var gone = p == null or p.y < 5.0
 		if not gone:
-			if wide_cam.is_position_behind(p):
-				gone = true
-			else:
+			gone = true
+			for k in nw:
+				if live_wides.size() > 0:
+					live_aim_wide(k)
+				if wide_cam.is_position_behind(p):
+					continue
 				var px = wide_cam.unproject_position(p)
-				gone = px.x < -0.05 * w or px.x > 1.05 * w or px.y < -0.05 * h or px.y > 1.05 * h
+				if not (px.x < -0.05 * w or px.x > 1.05 * w or px.y < -0.05 * h or px.y > 1.05 * h):
+					gone = false
+					break
 		if not gone:
 			continue
-		rt_ctx["az0"] = azel_of(-wide_cam.global_transform.basis.z).x
+		if live_wides.size() > 1:
+			rt_ctx["az0"] = float(live_wides[rt_rng.randi() % live_wides.size()][0])
+		else:
+			rt_ctx["az0"] = azel_of(-wide_cam.global_transform.basis.z).x
 		var n = gen_random(tg["kind"] == "drone", t)
 		n["model"] = c.get("model", n["model"])   # модель у узла та же: размер и форма прежние
 		n["size"] = c.get("size", n["size"])
@@ -1901,10 +1923,30 @@ func live_loop() -> void:
 		var cam = int(q.get("cam", 0))
 		for m in time_mats:
 			(m as ShaderMaterial).set_shader_parameter("sim_time", t)
-		var vp: SubViewport = wide_vp if cam == 0 else fine_vp
-		aim(wide_cam if cam == 0 else fine_cam, float(q.get("az", 0.0)), float(q.get("el", 0.0)))
-		if cam == 0:
-			live_respawn(t)
+		# камеры: 0 — первая широкая, 1 — точная, 2, 3... — следующие широкие (рисует тот же SubViewport)
+		var wide = cam != 1
+		var wk = 0 if cam == 0 else cam - 1
+		var vp: SubViewport = wide_vp if wide else fine_vp
+		if wide and wk < live_wides.size():
+			var wv: Array = live_wides[wk]
+			wv[0] = float(q.get("az", wv[0]))
+			wv[1] = float(q.get("el", wv[1]))
+			while wv.size() < 6:
+				wv.append(0.0)
+			wv[5] = float(q.get("roll", 0.0))
+			live_wides[wk] = wv
+		if live_wides.is_empty():   # одна широкая из центра установки — как раньше
+			# roll: у эмулятора — по часовой, если смотреть из камеры; у Godot — против
+			aim(wide_cam if wide else fine_cam, float(q.get("az", 0.0)), float(q.get("el", 0.0)), -float(q.get("roll", 0.0)))
+			if cam == 0:
+				live_respawn(t)
+		else:
+			if cam == 0:
+				live_respawn(t)   # смотрит во все широкие
+			if wide:
+				live_aim_wide(wk)
+			else:
+				aim(fine_cam, float(q.get("az", 0.0)), float(q.get("el", 0.0)))
 		update_targets(t)
 		vp.render_target_update_mode = SubViewport.UPDATE_ONCE
 		await RenderingServer.frame_post_draw

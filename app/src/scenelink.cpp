@@ -196,13 +196,16 @@ bool Link::recvAll(uint8_t* p, size_t n) {
 }
 
 bool Link::render(double t, int cam, double az, double el, std::vector<uint8_t>& px, int& w, int& h,
-                  std::vector<Body>& bodies, std::string& err) {
+                  std::vector<Body>& bodies, std::string& err, double roll) {
     if (sock_ < 0) {
         err = "сцена не запущена";
         return false;
     }
-    char q[200];
-    snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f}\n", t, cam, az, el);
+    char q[240];
+    if (roll != 0)
+        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f, \"roll\": %.5f}\n", t, cam, az, el, roll);
+    else
+        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f}\n", t, cam, az, el);
     std::string line;
     long long n = 0;
     int k = 0;

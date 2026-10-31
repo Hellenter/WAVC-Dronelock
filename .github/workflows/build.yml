@@ -53,6 +53,7 @@ jobs:
           cmake --build build-native
           ./build-native/test_kernels
           ./build-native/test_occlusion
+          ./build-native/test_multicam
       - name: Приложение
         run: |
           cmake -S app -B build-app -G Ninja
@@ -64,6 +65,14 @@ jobs:
       - name: Совпадение с Python-прототипом
         env: { DRONOLOK_LIB: build-native }
         run: python native/python/compare_with_python.py sample/sky16mp.mp4 --frames 10
+      - name: Несколько широких камер из Python (объединение целей, сообщения по сети)
+        env: { DRONOLOK_LIB: build-native }
+        run: python native/python/test_multicam.py
+      - name: Эмулятор, две широкие камеры (устройство на камеру, обмен по UDP)
+        run: |
+          ./build-app/dronolok_app --twocam --wides 2 --wide-step 110 --seam 1 --drones 2 --birds 0 --seconds 8 \
+            --wide 1152x864 --deploy net --udp --json twocam-2wide.json
+          python -c "import json; d=json.load(open('twocam-2wide.json')); f=d['cam_frames']; print(d); assert d['wides']==2 and min(f)>=100 and d['net_msgs']>100, f"
       - name: Замер
         run: |
           ffmpeg -loglevel error -i sample/sky16mp.mp4 -frames:v 20 -pix_fmt gray -f yuv4mpegpipe - | ./build-native/dronolok_bench - --frames 20 --sweep

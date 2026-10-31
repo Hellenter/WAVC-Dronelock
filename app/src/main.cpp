@@ -122,6 +122,18 @@ struct App {
     SDL_Texture *emuWTex = nullptr, *emuNTex = nullptr;
     int emuWTw = 0, emuWTh = 0, emuNTw = 0, emuNTh = 0;
     int64_t emuWSeq = -1;
+    // несколько широких: вторая и следующие (первая — emuWTex выше)
+    struct WideTex {
+        SDL_Texture* tex = nullptr;
+        int w = 0, h = 0;
+        int64_t seq = -1;
+    };
+    std::vector<WideTex> emuWMore;
+    int emuWides = 1;              // широких камер
+    float emuWideStep = 110;       // между осями соседних, °
+    float emuInstallErr = 0;       // ошибка установки широких, СКО, °
+    float emuClockErr = 0.05f;     // часы устройств до сверки, с
+    int emuCamSel = 0;             // какую широкую поворачивают кнопки и стрелки
     int emuRes = 0, emuSpeed = 2;
     bool emuTruth = true;
     bool emuShowMask = false;          // маска неба поверх кадра широкой
@@ -2462,9 +2474,37 @@ void emu_start(App& a) {
     c.wideH = res[a.emuRes][1];
     static const float speeds[] = {0.25f, 0.5f, 1, 2, 0};
     c.simSpeed = speeds[a.emuSpeed];
+    // широкие: оси — как выставлены кнопками поворота, ошибки установки и часы устройств — по номеру сцены
+    {
+        const std::vector<twocam::WideCam> keep = a.emuCfg.moreWide;
+        twocam::layout_wides(c, a.emuWides, a.emuWideStep, a.emuWides > 1 ? a.emuInstallErr : 0, a.emuClockErr);
+        for (size_t k = 0; k < c.moreWide.size() && k < keep.size(); ++k) {
+            c.moreWide[k].az = keep[k].az;
+            c.moreWide[k].el = keep[k].el;
+        }
+        a.emuCfg.moreWide = c.moreWide;
+    }
     a.pipe.setPaused(true);   // видео не отнимает процессор у эмулятора
     a.emu.start(c);
     a.emuWSeq = -1;
+    for (auto& t : a.emuWMore) t.seq = -1;
+}
+
+// широкие камеры: число и оси через emuWideStep от первой (повороты по отдельности — сброс)
+void emu_layout(App& a) {
+    twocam::layout_wides(a.emuCfg, a.emuWides, a.emuWideStep, 0, a.emuClockErr);
+    a.emuCamSel = std::min(a.emuCamSel, a.emuWides - 1);
+}
+
+// повернуть широкую k: по азимуту на daz (или на az, если az >= 0), угол места — на del
+void emu_turn(App& a, int k, float daz, float del, float az = -1) {
+    twocam::Config& c = a.emuCfg;
+    k = std::clamp(k, 0, (int)c.moreWide.size());
+    float& A = k ? c.moreWide[k - 1].az : c.wideAz;
+    float& E = k ? c.moreWide[k - 1].el : c.wideEl;
+    A = std::fmod((az >= 0 ? az : A + daz) + 720.f, 360.f);
+    E = std::clamp(E + del, -5.f, 80.f);
+    if (a.emu.running()) a.emu.setWidePose(k, A, E);
 }
 
 // Панорамная маска полосой: 360° по азимуту, угол места снизу вверх; рамка — текущий вид широкой.
@@ -2510,13 +2550,24 @@ void draw_pano(App& a) {
     const float span = twocam::PANO_H * twocam::PANO_STEP;
     auto X = [&](float az) { return p0.x + w * std::fmod(az + 720.f, 360.f) / 360.f; };
     auto Y = [&](float el) { return p0.y + h * (1.f - std::clamp((el - twocam::PANO_EL0) / span, 0.f, 1.f)); };
-    const float az0 = v.widePose.az - hf / 2, az1 = v.widePose.az + hf / 2;
-    const float y0 = Y(v.widePose.el + vf / 2), y1 = Y(v.widePose.el - vf / 2);
     const ImU32 col = IM_COL32(90, 220, 255, 230);
     dl->PushClipRect(p0, ImVec2(p0.x + w, p0.y + h), true);
-    for (float sh : {-360.f, 0.f, 360.f}) {   // вид через 0°/360° — двумя кусками
-        const float xa = p0.x + w * (az0 + sh) / 360.f, xb = p0.x + w * (az1 + sh) / 360.f;
-        dl->AddRect(ImVec2(xa, y0), ImVec2(xb, y1), col, 0, 0, 2.f);
+    std::vector<twocam::Pose> poses;   // виды всех широких
+    for (const auto& wv : v.wides) poses.push_back(wv.pose);
+    if (poses.empty()) poses.push_back(v.widePose);
+    for (size_t k = 0; k < poses.size(); ++k) {
+        const twocam::Pose& pw = poses[k];
+        const float az0 = pw.az - hf / 2, az1 = pw.az + hf / 2;
+        const float y0 = Y(pw.el + vf / 2), y1 = Y(pw.el - vf / 2);
+        for (float sh : {-360.f, 0.f, 360.f}) {   // вид через 0°/360° — двумя кусками
+            const float xa = p0.x + w * (az0 + sh) / 360.f, xb = p0.x + w * (az1 + sh) / 360.f;
+            dl->AddRect(ImVec2(xa, y0), ImVec2(xb, y1), col, 0, 0, 2.f);
+            if (poses.size() > 1) {
+                char nm[8];
+                snprintf(nm, sizeof(nm), "%zu", k + 1);
+                dl->AddText(ImVec2(xa + 4, y0 + 2), col, nm);
+            }
+        }
     }
     for (const auto& sc : a.emuWorld == 1 ? a.simSectors : std::vector<scene::Sector>()) {
         dl->AddLine(ImVec2(X(sc.from), p0.y), ImVec2(X(sc.from), p0.y + h), IM_COL32(255, 255, 255, 90));
@@ -2586,32 +2637,87 @@ void panel_twocam(App& a) {
         }
     }
 
+    if (heading("Широкие камеры", true)) {
+        static const char* ns[] = {"1", "2", "3"};
+        label("Сколько широких", "Каждая смотрит на свой сектор. Цель, перелетая из сектора в сектор, остаётся одной "
+                                 "целью установки с тем же номером, и точная её не бросает. Применяется при перезапуске.");
+        int n = a.emuWides - 1;
+        if (segmented("emunw", ns, 3, n)) {
+            a.emuWides = n + 1;
+            emu_layout(a);
+        }
+        if (a.emuWides > 1) {
+            label("Между осями соседних", "Меньше поля зрения — секторы перекрываются, цель у стыка видят обе камеры. "
+                                          "Больше — между секторами щель: там цель не видит никто, объединение ведёт её "
+                                          "по прогнозу до соседней камеры. Сбрасывает повороты камер по отдельности.");
+            if (ImGui::SliderFloat("##wstep", &a.emuWideStep, 30, 180, "%.0f°")) emu_layout(a);
+            const float over = c.wideFov - a.emuWideStep;
+            ImGui::TextDisabled(over >= 0 ? "перекрытие секторов %.0f°" : "щель между секторами %.0f°", std::fabs(over));
+            static const char* ds[] = {"Одно устройство", "Устройство на камеру"};
+            static const char* dt[] = {
+                "Все широкие на одном устройстве (например, Raspberry Pi 5 с двумя камерами): кадры в такт, цели "
+                "объединяются там же и уходят поворотке одним сообщением.",
+                "У каждой широкой своё устройство (Pi на камеру): кадры не в такт, часы разные. Цели идут устройству "
+                "поворотки по сети (UDP), объединяет оно; оно же сверяет часы с камерами."};
+            label("Где работают");
+            int d = (int)c.deploy;
+            if (segmented("emudeploy", ds, 2, d, 0, dt)) c.deploy = (twocam::Deploy)d;
+            if (c.deploy == twocam::Deploy::PerCamera) {
+                label("Сеть, в одну сторону", "Поворотка -> камера. Камера -> поворотка — в «Задержке передачи цели».");
+                ImGui::SliderFloat("##netlat", &c.netLatency, 0, 0.1f, "%.3f с");
+                label("Разброс задержки сети");
+                ImGui::SliderFloat("##netjit", &c.netJitter, 0, 0.05f, "%.3f с");
+                label("Часы устройств врут на", "До сверки: на столько часы камер спешат или отстают от часов поворотки.");
+                ImGui::SliderFloat("##clk", &a.emuClockErr, 0, 0.5f, "%.2f с");
+                ImGui::Checkbox("Сверка часов", &c.clockSync);
+                help_marker("Устройство поворотки сверяет часы с каждой камерой, как NTP: по самому быстрому из последних "
+                            "обменов. Выключено — время кадров берётся по часам камер как есть.");
+                ImGui::Checkbox("Настоящий UDP (127.0.0.1)", &c.netUdp);
+                help_marker("Сообщения камер идут через настоящий сокет на этом ПК: проверка, что обмен работает.");
+            }
+            ImGui::Checkbox("Объединять цели камер", &c.fusion);
+            help_marker("Цели всех широких — в одной системе (поворотки); одна цель — один номер, даже когда её видят "
+                        "две камеры или она перелетела из сектора в сектор. Выключено — у каждой камеры свои цели и "
+                        "номера: после перелёта точная получает «новую» цель.");
+            ImGui::Checkbox("Калибровка широких по точной", &c.fusionCalib);
+            help_marker("Пока точная ведёт цель, её направление сравнивается с направлением по каждой широкой — так "
+                        "уточняется, как широкая установлена на самом деле. Ошибка установки в доли градуса уходит "
+                        "за десятки секунд.");
+            ImGui::Checkbox("Подсказка соседней камере", &c.crossCue);
+            help_marker("Цель уходит из сектора — камере, к которой она летит, порог ниже там, где цель должна появиться.");
+            label("Ошибка установки", "СКО по азимуту, углу места и повороту, у каждой широкой своя (по номеру сцены).");
+            ImGui::SliderFloat("##ierr", &a.emuInstallErr, 0, 2, "%.2f°");
+            label("Цели через стык секторов", "Доля целей, которые появляются у стыка и летят через него.");
+            ImGui::SliderFloat("##seam", &c.seamShare, 0, 1, "%.2f");
+        }
+    }
+
     if (heading("Поворот широкой камеры", true)) {
         {
             twocam::Config& cc = a.emuCfg;
-            const twocam::Pose cur = a.emu.running() ? a.emuView.widePose : twocam::Pose{cc.wideAz, cc.wideEl, 0};
+            const int nwc = 1 + (int)cc.moreWide.size();
+            a.emuCamSel = std::clamp(a.emuCamSel, 0, nwc - 1);
+            if (nwc > 1) {
+                static const char* cs[] = {"Камера 1", "Камера 2", "Камера 3"};
+                segmented("emucamsel", cs, std::min(nwc, 3), a.emuCamSel);
+                ImGui::SetItemTooltip("Какую широкую поворачивают кнопки и стрелки.");
+            }
+            const int k = a.emuCamSel;
+            twocam::Pose cur{k ? cc.moreWide[k - 1].az : cc.wideAz, k ? cc.moreWide[k - 1].el : cc.wideEl, 0};
+            if (a.emu.running() && k < (int)a.emuView.wides.size()) cur = a.emuView.wides[k].pose;
+            else if (a.emu.running() && k == 0) cur = a.emuView.widePose;
             ImGui::Text("Азимут %.0f°, угол места %.0f°", cur.az, cur.el);
-            bool turn = false;
             const float bw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4;
             const float steps[] = {-30, -5, 5, 30};
             const char* names[] = {"-30°", "-5°", "+5°", "+30°"};
             for (int i = 0; i < 4; ++i) {
                 if (i) ImGui::SameLine();
-                if (ImGui::Button(names[i], ImVec2(bw, 0))) {
-                    cc.wideAz = std::fmod(cc.wideAz + steps[i] + 360.f, 360.f);
-                    turn = true;
-                }
+                if (ImGui::Button(names[i], ImVec2(bw, 0))) emu_turn(a, k, steps[i], 0);
             }
             ImGui::SetItemTooltip("Повернуть по азимуту. Стрелки ← → на клавиатуре — по 5°, ↑ ↓ — угол места.");
-            if (ImGui::Button("Выше 5°", ImVec2(bw * 2 + ImGui::GetStyle().ItemSpacing.x, 0))) {
-                cc.wideEl = std::min(80.f, cc.wideEl + 5);
-                turn = true;
-            }
+            if (ImGui::Button("Выше 5°", ImVec2(bw * 2 + ImGui::GetStyle().ItemSpacing.x, 0))) emu_turn(a, k, 0, 5);
             ImGui::SameLine();
-            if (ImGui::Button("Ниже 5°", ImVec2(-FLT_MIN, 0))) {
-                cc.wideEl = std::max(-5.f, cc.wideEl - 5);
-                turn = true;
-            }
+            if (ImGui::Button("Ниже 5°", ImVec2(-FLT_MIN, 0))) emu_turn(a, k, 0, -5);
             if (a.emuWorld == 1 && !a.simSectors.empty()) {
                 const float sw = (ImGui::GetContentRegionAvail().x - (a.simSectors.size() - 1) * ImGui::GetStyle().ItemSpacing.x) /
                                  a.simSectors.size();
@@ -2623,15 +2729,11 @@ void panel_twocam(App& a) {
                         if (sc.name == r[0]) nm = r[1];
                     if (i) ImGui::SameLine();
                     ImGui::PushID((int)i);
-                    if (ImGui::Button(nm, ImVec2(sw, 0))) {
-                        cc.wideAz = sc.mid;
-                        turn = true;
-                    }
+                    if (ImGui::Button(nm, ImVec2(sw, 0))) emu_turn(a, k, 0, 0, sc.mid);
                     ImGui::SetItemTooltip("Сектор %s: %.0f–%.0f°", sc.name.c_str(), sc.from, sc.to);
                     ImGui::PopID();
                 }
             }
-            if (turn && a.emu.running()) a.emu.setWidePose(cc.wideAz, cc.wideEl);
         }
     }
 
@@ -2756,7 +2858,10 @@ void panel_twocam(App& a) {
         label("Частота кадров");
         ImGui::SliderFloat("##wfps", &c.wideFps, 2, 30, "%.0f к/с");
         label("Угол места оси");
-        if (ImGui::SliderFloat("##wel", &c.wideEl, 0, 60, "%.0f°") && a.emu.running()) a.emu.setWidePose(c.wideAz, c.wideEl);
+        if (ImGui::SliderFloat("##wel", &c.wideEl, 0, 60, "%.0f°")) {   // у всех широких
+            for (auto& w : c.moreWide) w.el = c.wideEl;
+            for (int k = 0; a.emu.running() && k <= (int)c.moreWide.size(); ++k) emu_turn(a, k, 0, 0);
+        }
     }
 
     if (heading("Сцена", true)) {
@@ -2794,59 +2899,21 @@ static ImU32 cls_col(int cls) {
     return cls == 1 ? COL_DRONE : cls == 2 ? COL_BIRD : cls == 3 ? COL_CLUTTER : COL_UNKNOWN;
 }
 
-void draw_twocam(App& a) {
+// кадр широкой k с треками и проекциями; щелчок рядом с треком — его цель установки в pickId
+void draw_wide(App& a, int k, ImVec2 wPos, ImVec2 wSz, int& pickId, float& pickD) {
     const twocam::View& v = a.emuView;
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (k >= (int)v.wides.size() || !v.wides[k].res) return;
+    const twocam::View::WideView& wv = v.wides[k];
+    SDL_Texture* tex = k == 0 ? a.emuWTex : k - 1 < (int)a.emuWMore.size() ? a.emuWMore[k - 1].tex : nullptr;
+    if (!tex) return;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(18, 18, 20, 255));
-    if (!v.wide || !a.emuWTex) {
-        const char* msg = !v.status.empty() ? v.status.c_str() : a.emu.running() ? "Готовим сцену..." : "Запустите эмулятор слева";
-        const ImVec2 ts = ImGui::CalcTextSize(msg);
-        dl->AddText(ImVec2(p0.x + (avail.x - ts.x) / 2, p0.y + (avail.y - ts.y) / 2), IM_COL32(170, 170, 180, 255), msg);
-        ImGui::Dummy(avail);
-        return;
-    }
-    const Frame& f = *v.wide->frame;
-    // широкая сверху, точная снизу; на широком экране — рядом
-    const float gap = 8, capH = ImGui::GetTextLineHeightWithSpacing();
-    const bool side = avail.x > avail.y * 1.6f;
-    ImVec2 wSz, nSz, wPos, nPos;
-    if (side) {
-        const float ww = (avail.x - gap) * 0.58f;
-        const float ws = std::min(ww / f.w, (avail.y - capH) / f.h);
-        wSz = ImVec2(f.w * ws, f.h * ws);
-        const float nwid = avail.x - gap - wSz.x;
-        const float ns = std::min(nwid / v.nw, (avail.y - capH) / v.nh);
-        nSz = ImVec2(v.nw * ns, v.nh * ns);
-        wPos = ImVec2(p0.x, p0.y + capH);
-        nPos = ImVec2(p0.x + wSz.x + gap, p0.y + capH);
-    } else {
-        const float hTop = (avail.y - 2 * capH - gap) * 0.55f;
-        const float ws = std::min(avail.x / f.w, hTop / f.h);
-        wSz = ImVec2(f.w * ws, f.h * ws);
-        const float hBot = avail.y - 2 * capH - gap - wSz.y;
-        const float ns = std::min(avail.x / v.nw, hBot / v.nh);
-        nSz = ImVec2(v.nw * ns, v.nh * ns);
-        wPos = ImVec2(p0.x, p0.y + capH);
-        nPos = ImVec2(p0.x, wPos.y + wSz.y + gap + capH);
-    }
-    const ImU32 txt = IM_COL32(200, 205, 215, 255);
-    char cap[160];
-    snprintf(cap, sizeof(cap), "Широкая %dx%d, %.0f°, %.0f к/с — щелчок по цели: навести точную", f.w, f.h,
-             a.emuCfg.wideFov, a.emuCfg.wideFps);
-    dl->AddText(ImVec2(wPos.x, wPos.y - capH), txt, cap);
-    snprintf(cap, sizeof(cap), "Точная %dx%d, %.1f°: %s%s", v.nw, v.nh, a.emuCfg.narrowFov, twocam::state_name(v.state),
-             v.nOnly ? " — сама, широкая цель не видит" : v.nConf ? " — дрон подтверждён" : "");
-    dl->AddText(ImVec2(nPos.x, nPos.y - capH), txt, cap);
-
-    // --- широкая
+    const Result& r = *wv.res;
+    const Frame& f = *r.frame;
     const float ks = wSz.x / f.w;
     auto W = [&](float x, float y) { return ImVec2(wPos.x + x * ks, wPos.y + y * ks); };
-    dl->AddImage((ImTextureID)(intptr_t)a.emuWTex, wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y));
+    dl->AddImage((ImTextureID)(intptr_t)tex, wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y));
     dl->PushClipRect(wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y), true);
     if (a.emuShowMask) {   // маска неба: закрытые тайлы — красным, пока учится — жёлтая рамка
-        const Result& r = *v.wide;
         const float tp = r.tilePx * ks;
         if (r.mask.size() == (size_t)r.tilesX * r.tilesY && tp > 0)
             for (int ty = 0; ty < r.tilesY; ++ty)
@@ -2859,53 +2926,128 @@ void draw_twocam(App& a) {
             dl->AddText(ImVec2(wPos.x + 8, wPos.y + 6), IM_COL32(255, 210, 0, 255), "маска учится");
         }
     }
-    if (v.footprint.size() >= 3) {   // куда смотрит точная
+    if (wv.footprint.size() >= 3) {   // куда смотрит точная
         std::vector<ImVec2> poly;
-        for (const auto& p : v.footprint) poly.push_back(W(p.first, p.second));
+        for (const auto& p : wv.footprint) poly.push_back(W(p.first, p.second));
         dl->AddPolyline(poly.data(), (int)poly.size(), IM_COL32(90, 220, 255, 230), ImDrawFlags_Closed, 2.f);
     }
     if (a.emuTruth)
-        for (const auto& t : v.truth)
-            if (t.wu >= 0) {
-                const ImVec2 q = W(t.wu, t.wv);
-                dl->AddLine(ImVec2(q.x - 4, q.y), ImVec2(q.x + 4, q.y), COL_GT);
-                dl->AddLine(ImVec2(q.x, q.y - 4), ImVec2(q.x, q.y + 4), COL_GT);
-            }
+        for (const auto& t : wv.truth) {
+            const ImVec2 q = W(t.u, t.v);
+            dl->AddLine(ImVec2(q.x - 4, q.y), ImVec2(q.x + 4, q.y), COL_GT);
+            dl->AddLine(ImVec2(q.x, q.y - 4), ImVec2(q.x, q.y + 4), COL_GT);
+        }
     ImGuiIO& io = ImGui::GetIO();
     const bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                          ImGui::IsMouseHoveringRect(wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y));
-    int pickId = 0;
-    float pickD = 25;
-    for (const auto& tr : v.wide->tracks) {
+    for (const auto& tr : r.tracks) {
         if (tr.clutter) continue;
+        int g = v.wides.size() == 1 ? tr.id : 0;   // номер цели установки (одна широкая — номер трека)
+        for (const auto& m : wv.gid)
+            if (m.first == tr.id) g = m.second;
         const ImVec2 q = W(tr.x, tr.y);
-        const bool as = tr.id == v.assigned;
+        const bool as = g && g == v.assigned;
         dl->AddCircle(q, as ? 13.f : 8.f, cls_col((int)tr.cls), 0, as ? 3.f : 1.5f);
-        char id[16];
-        snprintf(id, sizeof(id), "%d", tr.id);
-        dl->AddText(ImVec2(q.x + 9, q.y - 16), cls_col((int)tr.cls), id);
-        if (clicked) {
+        if (g) {
+            char id[16];
+            snprintf(id, sizeof(id), "%d", g);
+            dl->AddText(ImVec2(q.x + 9, q.y - 16), cls_col((int)tr.cls), id);
+        }
+        if (clicked && g) {
             const float d = std::hypot(io.MousePos.x - q.x, io.MousePos.y - q.y);
             if (d < pickD) {
                 pickD = d;
-                pickId = tr.id;
+                pickId = g;
             }
         }
     }
-    if (pickId) a.emu.selectTarget(pickId);
-    for (const auto& p : v.vetoW) {   // отсеянные точной (птицы) — там, где они по прогнозу
+    for (const auto& p : wv.vetoW) {   // отсеянные точной (птицы) — там, где они по прогнозу
         const ImVec2 q = W(p.first, p.second);
         dl->AddLine(ImVec2(q.x - 7, q.y - 7), ImVec2(q.x + 7, q.y + 7), COL_BIRD, 2.f);
         dl->AddLine(ImVec2(q.x - 7, q.y + 7), ImVec2(q.x + 7, q.y - 7), COL_BIRD, 2.f);
     }
-    if (v.nWu >= 0 && (v.nOnly || v.nConf)) {   // где цель видит точная
-        const ImVec2 q = W(v.nWu, v.nWv);
+    if (wv.nWu >= 0 && (v.nOnly || v.nConf)) {   // где цель видит точная
+        const ImVec2 q = W(wv.nWu, wv.nWv);
         const ImU32 col = IM_COL32(90, 220, 255, 255);
         const ImVec2 d[] = {ImVec2(q.x, q.y - 16), ImVec2(q.x + 16, q.y), ImVec2(q.x, q.y + 16), ImVec2(q.x - 16, q.y)};
         dl->AddPolyline(d, 4, col, ImDrawFlags_Closed, 2.f);
         if (v.nOnly) dl->AddText(ImVec2(q.x + 18, q.y + 2), col, "по точной");
     }
+    if (v.wides.size() > 1 && wv.primary)   // от неё сообщения о цели точной
+        dl->AddRect(wPos, ImVec2(wPos.x + wSz.x, wPos.y + wSz.y), IM_COL32(90, 220, 255, 200), 0, 0, 2.f);
     dl->PopClipRect();
+}
+
+void draw_twocam(App& a) {
+    const twocam::View& v = a.emuView;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(18, 18, 20, 255));
+    if (!v.wide || !a.emuWTex || v.wides.empty()) {
+        const char* msg = !v.status.empty() ? v.status.c_str() : a.emu.running() ? "Готовим сцену..." : "Запустите эмулятор слева";
+        const ImVec2 ts = ImGui::CalcTextSize(msg);
+        dl->AddText(ImVec2(p0.x + (avail.x - ts.x) / 2, p0.y + (avail.y - ts.y) / 2), IM_COL32(170, 170, 180, 255), msg);
+        ImGui::Dummy(avail);
+        return;
+    }
+    const Frame& f = *v.wide->frame;
+    // широкие сверху, точная снизу; на широком экране — рядом. Несколько широких — в ряд или столбцом,
+    // как крупнее
+    const int NW = (int)v.wides.size();
+    const float gap = 8, capH = ImGui::GetTextLineHeightWithSpacing();
+    const bool side = avail.x > avail.y * 1.6f;
+    bool row = true;
+    auto fit = [&](float W, float H) {   // масштаб кадра широкой: NW плиток с подписями в области W x H
+        const float sr = std::min((W - (NW - 1) * gap) / NW / f.w, (H - capH) / f.h);
+        const float sc = std::min(W / f.w, (H - NW * capH - (NW - 1) * gap) / NW / f.h);
+        row = sr >= sc;
+        return std::max(0.01f, row ? sr : sc);
+    };
+    ImVec2 wSz, nSz, wPos, nPos, block;
+    if (side) {
+        const float ww = (avail.x - gap) * (NW > 1 ? 0.64f : 0.58f);
+        const float ws = fit(ww, avail.y);
+        wSz = ImVec2(f.w * ws, f.h * ws);
+        block = row ? ImVec2(NW * wSz.x + (NW - 1) * gap, wSz.y) : ImVec2(wSz.x, NW * wSz.y + (NW - 1) * (gap + capH));
+        const float nwid = avail.x - gap - block.x;
+        const float ns = std::min(nwid / v.nw, (avail.y - capH) / v.nh);
+        nSz = ImVec2(v.nw * ns, v.nh * ns);
+        wPos = ImVec2(p0.x, p0.y + capH);
+        nPos = ImVec2(p0.x + block.x + gap, p0.y + capH);
+    } else {
+        const float hTop = (avail.y - 2 * capH - gap) * 0.55f;
+        const float ws = fit(avail.x, hTop + capH);
+        wSz = ImVec2(f.w * ws, f.h * ws);
+        block = row ? ImVec2(NW * wSz.x + (NW - 1) * gap, wSz.y) : ImVec2(wSz.x, NW * wSz.y + (NW - 1) * (gap + capH));
+        const float hBot = avail.y - 2 * capH - gap - block.y;
+        const float ns = std::min(avail.x / v.nw, hBot / v.nh);
+        nSz = ImVec2(v.nw * ns, v.nh * ns);
+        wPos = ImVec2(p0.x, p0.y + capH);
+        nPos = ImVec2(p0.x, wPos.y + block.y + gap + capH);
+    }
+    const ImU32 txt = IM_COL32(200, 205, 215, 255);
+    char cap[200];
+    int pickId = 0;
+    float pickD = 25;
+    for (int k = 0; k < NW; ++k) {
+        const ImVec2 at = row ? ImVec2(wPos.x + k * (wSz.x + gap), wPos.y) : ImVec2(wPos.x, wPos.y + k * (wSz.y + gap + capH));
+        const twocam::View::WideView& wv = v.wides[k];
+        if (NW == 1)
+            snprintf(cap, sizeof(cap), "Широкая %dx%d, %.0f°, %.0f к/с — щелчок по цели: навести точную", f.w, f.h,
+                     a.emuCfg.wideFov, a.emuCfg.wideFps);
+        else
+            snprintf(cap, sizeof(cap), "Широкая %d: аз %.0f°, у.м. %.0f°%s", k + 1, wv.pose.az, wv.pose.el,
+                     wv.primary ? " — ведёт цель точной" : "");
+        dl->PushClipRect(ImVec2(at.x, at.y - capH), ImVec2(at.x + wSz.x, at.y), true);
+        dl->AddText(ImVec2(at.x, at.y - capH), wv.primary && NW > 1 ? IM_COL32(90, 220, 255, 255) : txt, cap);
+        dl->PopClipRect();
+        draw_wide(a, k, at, wSz, pickId, pickD);
+    }
+    if (pickId) a.emu.selectTarget(pickId);
+    snprintf(cap, sizeof(cap), "Точная %dx%d, %.1f°: %s%s", v.nw, v.nh, a.emuCfg.narrowFov, twocam::state_name(v.state),
+             v.nOnly ? " — сама, широкая цель не видит" : v.nConf ? " — дрон подтверждён" : "");
+    dl->AddText(ImVec2(nPos.x, nPos.y - capH), txt, cap);
 
     // --- точная
     const float kn = nSz.x / v.nw;
@@ -2976,11 +3118,47 @@ void panel_twocam_metrics(App& a) {
                         s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0);
     if (!v.status.empty()) ImGui::TextColored(TXT_WARN, "%s", v.status.c_str());
 
-    heading("Цели широкой");
-    if (ImGui::BeginTable("emutg", 4, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
+    const bool multi = v.wides.size() > 1;
+    if (multi) {
+        heading("Широкие камеры");
+        ImGui::TextWrapped("перелётов между камерами %d: номер цели сохранён %d, сменился %d", s.handoffOk + s.handoffBroken,
+                           s.handoffOk, s.handoffBroken);
+        ImGui::TextWrapped("точная вела цель при перелёте %d раз, не потеряла %d", s.seamTrack, s.seamKept);
+        ImGui::TextWrapped("у одной цели два номера %.1f с; та же камера дала новый номер %d раз", s.dupTime, s.renumbered);
+        ImGui::TextWrapped("объединение: целей %d, переходов %d, найдено после щели %d, слито %d", s.fusionCreated,
+                           s.fusionHandoffs, s.fusionReacquired, s.fusionMerged);
+        if (a.emuCfg.deploy == twocam::Deploy::PerCamera)
+            ImGui::TextWrapped("сеть: сообщений %d, %.1f КБ/с; ошибка часов после сверки %.2f мс", s.netMsgs,
+                               s.simT > 0 ? s.netBytes / 1024.0 / s.simT : 0, s.clockErrMs);
+        if (ImGui::BeginTable("emucams", 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("камера");
+            ImGui::TableSetupColumn("ось");
+            ImGui::TableSetupColumn("калибровка: ±σ / ошибка, пар");
+            ImGui::TableHeadersRow();
+            for (size_t k = 0; k < v.wides.size(); ++k) {
+                const auto& w = v.wides[k];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text(w.primary ? "%zu  <" : "%zu", k + 1);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.0f° / %.0f°", w.pose.az, w.pose.el);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("±%.3f° / %.3f°, %d", w.calibSigma, w.calibErr, w.calibPairs);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("Калибровка — по точной, пока она ведёт цель: ±σ — неуверенность, ошибка — правда "
+                            "эмулятора. «<» — от неё сейчас цель точной. Щелчок по цели на любой широкой — навести точную.");
+        ImGui::PopTextWrapPos();
+    }
+
+    heading(multi ? "Цели установки" : "Цели широкой");
+    if (ImGui::BeginTable("emutg", multi ? 5 : 4, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("цель");
         ImGui::TableSetupColumn("класс");
         ImGui::TableSetupColumn("аз / угол места");
+        if (multi) ImGui::TableSetupColumn("видят");
         ImGui::TableSetupColumn("");
         ImGui::TableHeadersRow();
         for (const auto& t : v.targets) {
@@ -2993,7 +3171,14 @@ void panel_twocam_metrics(App& a) {
                                t.verdict == 1 ? ", точная: дрон" : t.verdict == 2 ? ", точная: птица" : "");
             ImGui::TableSetColumnIndex(2);
             ImGui::Text("%.1f° / %.1f°", t.rep.az, t.rep.el);
-            ImGui::TableSetColumnIndex(3);
+            if (multi) {
+                ImGui::TableSetColumnIndex(3);
+                char seen[24] = "";
+                for (int k = 0; k < 8 && k < (int)v.wides.size(); ++k)
+                    if (t.seenBy >> k & 1) snprintf(seen + strlen(seen), sizeof(seen) - strlen(seen), "%s%d", seen[0] ? "," : "", k + 1);
+                ImGui::Text("%s", seen[0] ? seen : "прогноз");
+            }
+            ImGui::TableSetColumnIndex(multi ? 4 : 3);
             ImGui::PushID(t.id);
             if (t.id != v.assigned && ImGui::SmallButton("навести")) a.emu.selectTarget(t.id);
             ImGui::PopID();
@@ -4114,19 +4299,26 @@ int main(int argc, char** argv) {
                 upload_gray(a, a.emuWTex, a.emuWTw, a.emuWTh, f.px.data(), f.w, f.h, std::max(1, f.w / 1152));
                 a.emuWSeq = v.wide->seq;
             }
+            if (a.emuWMore.size() + 1 < v.wides.size()) a.emuWMore.resize(v.wides.size() - 1);
+            for (size_t k = 1; k < v.wides.size(); ++k) {   // вторая и следующие широкие
+                App::WideTex& t = a.emuWMore[k - 1];
+                const auto& r = v.wides[k].res;
+                if (r && r->seq != t.seq) {
+                    const Frame& f = *r->frame;
+                    upload_gray(a, t.tex, t.w, t.h, f.px.data(), f.w, f.h, std::max(1, f.w / 1152));
+                    t.seq = r->seq;
+                }
+            }
             if (!v.narrow.empty()) upload_gray(a, a.emuNTex, a.emuNTw, a.emuNTh, v.narrow.data(), v.nw, v.nh, 1);
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Tab, false)) a.emu.nextTarget();
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Space, false)) a.emu.setPaused(!a.emu.paused());
             // стрелки — поворот широкой камеры
-            if (!io.WantTextInput && a.emu.running()) {
-                twocam::Config& cc = a.emuCfg;
-                bool turn = false;
-                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) cc.wideAz -= 5, turn = true;
-                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) cc.wideAz += 5, turn = true;
-                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) cc.wideEl = std::min(80.f, cc.wideEl + 5), turn = true;
-                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) cc.wideEl = std::max(-5.f, cc.wideEl - 5), turn = true;
-                cc.wideAz = std::fmod(cc.wideAz + 360.f, 360.f);
-                if (turn) a.emu.setWidePose(cc.wideAz, cc.wideEl);
+            if (!io.WantTextInput && a.emu.running()) {   // выбранной в «Повороте широкой камеры»
+                const int k = a.emuCamSel;
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) emu_turn(a, k, -5, 0);
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) emu_turn(a, k, 5, 0);
+                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) emu_turn(a, k, 0, 5);
+                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) emu_turn(a, k, 0, -5);
             }
         }
         if (!io.WantTextInput && a.pipe.isOpen() && a.appMode == 0) {
@@ -4196,6 +4388,8 @@ int main(int argc, char** argv) {
     if (a.tex) SDL_DestroyTexture(a.tex);
     if (a.cropTex) SDL_DestroyTexture(a.cropTex);
     if (a.emuWTex) SDL_DestroyTexture(a.emuWTex);
+    for (auto& t : a.emuWMore)
+        if (t.tex) SDL_DestroyTexture(t.tex);
     if (a.emuPanoTex) SDL_DestroyTexture(a.emuPanoTex);
     if (a.emuNTex) SDL_DestroyTexture(a.emuNTex);
     SDL_DestroyRenderer(a.ren);

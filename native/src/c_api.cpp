@@ -2,10 +2,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/fileutil.hpp"
 #include "dronolok/geometry.hpp"
+#include "dronolok/multicam.hpp"
+#include "dronolok/netmsg.hpp"
 
 using namespace dronolok;
 
@@ -27,6 +32,17 @@ struct dl_tracker {
 
 struct dl_motion {
     GlobalMotion gm;
+};
+
+struct dl_fusion {
+    FusionConfig cfg;
+    std::vector<RigCamera> cams;
+    Fusion f;
+    bool started = false;
+    void start() {
+        if (!started) f.reset(cams, cfg);
+        started = true;
+    }
 };
 
 extern "C" {
@@ -287,5 +303,146 @@ void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose* to, f
     if (dy) *dy = (float)b;
 }
 int dl_tracker_hard(dl_tracker* t) { return (int)t->trk.lockState(); }
+
+static dl_target target(const TargetReport& r) {
+    return {r.id, r.t, r.az, r.el, r.vaz, r.vel, r.sigma, r.sigma_v, r.cls, r.confidence, r.hard, r.size_deg};
+}
+
+void dl_fusion_config_default(dl_fusion_config* c) {
+    if (!c) return;
+    const FusionConfig d;
+    *c = {d.gateDeg, d.gateSigma, d.coastS, d.dropS, d.mergeS, d.edgeDeg, d.keepS, d.rangeMin, d.rangeMax,
+          d.rangeGuess, d.calib ? 1 : 0, d.calibInitDeg, d.calibMaxDeg, d.calibHalfLife, d.calibPairMaxDt,
+          d.cue ? 1 : 0, d.independent ? 1 : 0};
+}
+dl_fusion* dl_fusion_create(const dl_fusion_config* c) {
+    dl_fusion* f = new dl_fusion;
+    if (c) {
+        FusionConfig& k = f->cfg;
+        k.gateDeg = c->gate_deg;
+        k.gateSigma = c->gate_sigma;
+        k.coastS = c->coast_s;
+        k.dropS = c->drop_s;
+        k.mergeS = c->merge_s;
+        k.edgeDeg = c->edge_deg;
+        k.keepS = c->keep_s;
+        k.rangeMin = c->range_min;
+        k.rangeMax = c->range_max;
+        k.rangeGuess = c->range_guess;
+        k.calib = c->calib != 0;
+        k.calibInitDeg = c->calib_init_deg;
+        k.calibMaxDeg = c->calib_max_deg;
+        k.calibHalfLife = c->calib_half_life;
+        k.calibPairMaxDt = c->calib_pair_max_dt;
+        k.cue = c->cue != 0;
+        k.independent = c->independent != 0;
+    }
+    return f;
+}
+void dl_fusion_destroy(dl_fusion* f) { delete f; }
+int dl_fusion_add_camera(dl_fusion* f, const dl_camera* c, const dl_pose* p, float x, float y, float z) {
+    if (!f || f->started) return -1;
+    f->cams.push_back({cam(c), pose(p), Vec3{x, y, z}});
+    return (int)f->cams.size() - 1;
+}
+void dl_fusion_set_pose(dl_fusion* f, int k, const dl_pose* p) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return;
+    f->cams[k].pose = pose(p);
+    if (f->started) f->f.setPose(k, pose(p));
+}
+void dl_fusion_update(dl_fusion* f, int k, double t, const dl_target* reps, int n) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return;
+    f->start();
+    std::vector<TargetReport> v;
+    for (int i = 0; i < n && reps; ++i) v.push_back(report(&reps[i]));
+    f->f.update(k, t, v);
+}
+int dl_fusion_targets(dl_fusion* f, dl_fused* out, int cap) {
+    if (!f) return 0;
+    f->start();
+    const std::vector<FusedTarget> v = f->f.targets();
+    for (int i = 0; i < std::min((int)v.size(), cap) && out; ++i)
+        out[i] = {target(v[i].rep), v[i].cam, v[i].local, v[i].seenBy, v[i].handoffs};
+    return (int)v.size();
+}
+void dl_fusion_observe_reference(dl_fusion* f, int id, const dl_target* r, int confident) {
+    if (!f || !r) return;
+    f->start();
+    f->f.observeReference(id, report(r), confident != 0);
+}
+int dl_fusion_resolve(dl_fusion* f, int id) { return f && f->started ? f->f.resolve(id) : 0; }
+int dl_fusion_local_of(dl_fusion* f, int id, int k) { return f && f->started ? f->f.localOf(id, k) : 0; }
+int dl_fusion_global_of(dl_fusion* f, int k, int local) { return f && f->started ? f->f.globalOf(k, local) : 0; }
+int dl_fusion_cues(dl_fusion* f, int k, double t, float* xyr, int cap) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return 0;
+    f->start();
+    const std::vector<CueArea> a = f->f.cues(k, t);
+    for (int i = 0; i < std::min((int)a.size(), cap) && xyr; ++i) {
+        xyr[3 * i] = a[i].u;
+        xyr[3 * i + 1] = a[i].v;
+        xyr[3 * i + 2] = a[i].r;
+    }
+    return (int)a.size();
+}
+int dl_fusion_project(dl_fusion* f, int k, float az, float el, float* u, float* v) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return 0;
+    f->start();
+    double uu = 0, vv = 0;
+    const bool ok = f->f.projectTo(k, az, el, uu, vv);
+    if (u) *u = (float)uu;
+    if (v) *v = (float)vv;
+    return ok && in_frame(f->cams[k].model, uu, vv) ? 1 : 0;
+}
+void dl_fusion_calib(dl_fusion* f, int k, float* sigma_deg, int* pairs) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return;
+    f->start();
+    if (sigma_deg) *sigma_deg = (float)f->f.calib(k).sigmaDeg;
+    if (pairs) *pairs = f->f.calib(k).used;
+}
+int dl_fusion_save_calib(dl_fusion* f, const char* path) {
+    if (!f || !path) return 0;
+    f->start();
+    FILE* o = open_file(path, "wb");
+    if (!o) return 0;
+    const std::string s = f->f.saveCalib();
+    const bool ok = fwrite(s.data(), 1, s.size(), o) == s.size();
+    return fclose(o) == 0 && ok ? 1 : 0;
+}
+int dl_fusion_load_calib(dl_fusion* f, const char* path) {
+    if (!f || !path) return 0;
+    f->start();
+    FILE* i = open_file(path, "rb");
+    if (!i) return 0;
+    std::string s;
+    char b[4096];
+    size_t n;
+    while ((n = fread(b, 1, sizeof(b), i)) > 0) s.append(b, n);
+    fclose(i);
+    return f->f.loadCalib(s) ? 1 : 0;
+}
+
+int dl_msg_encode_targets(int cam, unsigned seq, double t, double sent, const dl_target* reps, int n, char* out,
+                          int cap) {
+    net::WideMsg m;
+    m.cam = cam;
+    m.seq = seq;
+    m.t = t;
+    m.sent = sent;
+    for (int i = 0; i < n && reps; ++i) m.reps.push_back(report(&reps[i]));
+    const std::string s = net::encode(m);
+    if (!out || (int)s.size() + 1 > cap) return -1;
+    memcpy(out, s.c_str(), s.size() + 1);
+    return (int)s.size();
+}
+int dl_msg_decode_targets(const char* s, int* cam, unsigned* seq, double* t, double* sent, dl_target* out, int cap) {
+    net::WideMsg m;
+    if (!s || !net::decode(std::string(s), m)) return -1;
+    if (cam) *cam = m.cam;
+    if (seq) *seq = m.seq;
+    if (t) *t = m.t;
+    if (sent) *sent = m.sent;
+    for (int i = 0; i < std::min((int)m.reps.size(), cap) && out; ++i) out[i] = target(m.reps[i]);
+    return (int)m.reps.size();
+}
 
 }  // extern "C"

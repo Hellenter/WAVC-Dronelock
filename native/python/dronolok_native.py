@@ -57,6 +57,18 @@ class _Window(C.Structure):
     _fields_ = [("u", C.c_float), ("v", C.c_float), ("radius", C.c_float), ("visible", C.c_int)]
 
 
+class _FusionConfig(C.Structure):
+    _fields_ = [(n, C.c_float) for n in ("gate_deg", "gate_sigma", "coast_s", "drop_s", "merge_s", "edge_deg", "keep_s",
+                                         "range_min", "range_max", "range_guess")] + \
+               [("calib", C.c_int)] + [(n, C.c_float) for n in ("calib_init_deg", "calib_max_deg", "calib_half_life",
+                                                               "calib_pair_max_dt")] + \
+               [("cue", C.c_int), ("independent", C.c_int)]
+
+
+class _Fused(C.Structure):
+    _fields_ = [("rep", _Target), ("cam", C.c_int), ("local", C.c_int), ("seen_by", C.c_uint), ("handoffs", C.c_int)]
+
+
 class _Timing(C.Structure):
     _fields_ = [("total_ms", C.c_double), ("response_ms", C.c_double), ("select_ms", C.c_double),
                 ("jobs", C.c_int), ("jobs_skipped", C.c_int)]
@@ -126,6 +138,29 @@ def _load():
     lib.dl_target_aim.restype = _Pose
     lib.dl_target_aim.argtypes = [P(_Target), C.c_double, C.c_double]
     lib.dl_pose_shift.argtypes = [PC, PP, PP, C.c_float, C.c_float, PF, PF]
+    # несколько широких камер
+    V = C.c_void_p
+    lib.dl_fusion_config_default.argtypes = [P(_FusionConfig)]
+    lib.dl_fusion_create.restype = V
+    lib.dl_fusion_create.argtypes = [P(_FusionConfig)]
+    lib.dl_fusion_destroy.argtypes = [V]
+    lib.dl_fusion_add_camera.argtypes = [V, PC, PP, C.c_float, C.c_float, C.c_float]
+    lib.dl_fusion_set_pose.argtypes = [V, C.c_int, PP]
+    lib.dl_fusion_update.argtypes = [V, C.c_int, C.c_double, P(_Target), C.c_int]
+    lib.dl_fusion_targets.argtypes = [V, P(_Fused), C.c_int]
+    lib.dl_fusion_observe_reference.argtypes = [V, C.c_int, P(_Target), C.c_int]
+    lib.dl_fusion_resolve.argtypes = [V, C.c_int]
+    lib.dl_fusion_local_of.argtypes = [V, C.c_int, C.c_int]
+    lib.dl_fusion_global_of.argtypes = [V, C.c_int, C.c_int]
+    lib.dl_fusion_cues.argtypes = [V, C.c_int, C.c_double, PF, C.c_int]
+    lib.dl_fusion_project.argtypes = [V, C.c_int, C.c_float, C.c_float, PF, PF]
+    lib.dl_fusion_calib.argtypes = [V, C.c_int, PF, C.POINTER(C.c_int)]
+    lib.dl_fusion_save_calib.argtypes = [V, C.c_char_p]
+    lib.dl_fusion_load_calib.argtypes = [V, C.c_char_p]
+    lib.dl_msg_encode_targets.argtypes = [C.c_int, C.c_uint, C.c_double, C.c_double, P(_Target), C.c_int, C.c_char_p,
+                                          C.c_int]
+    lib.dl_msg_decode_targets.argtypes = [C.c_char_p, C.POINTER(C.c_int), C.POINTER(C.c_uint), C.POINTER(C.c_double),
+                                          C.POINTER(C.c_double), P(_Target), C.c_int]
     return lib
 
 
@@ -380,3 +415,103 @@ class Target:
     def aim(self, t, lead):
         p = lib().dl_target_aim(C.byref(self.raw), t, lead)
         return (p.az, p.el, p.roll)
+
+
+class Fusion:
+    """Цели нескольких широких камер — в одной системе (поворотки точной), одна цель — один номер,
+    в том числе при перелёте из сектора в сектор (dl_fusion_*). Камеры — до первого update:
+
+        f = Fusion()
+        k0 = f.add_camera(Camera(4608, 2592, 120), (0, 30, 0))
+        k1 = f.add_camera(Camera(4608, 2592, 120), (110, 30, 0), pos=(0.3, 0, 0))
+        f.update(k0, t, [Target.from_track(cam, pose, t, 14, tr, hard) ...])   # по кадру каждой камеры
+        for g in f.targets(): ...   # g["id"], g["target"] (в системе поворотки), g["cam"], g["seen_by"]
+        f.observe_reference(gid, narrow_target, confident=True)   # точная ведёт цель: калибровка широких
+    """
+
+    def __init__(self, **cfg):
+        c = _FusionConfig()
+        lib().dl_fusion_config_default(C.byref(c))
+        for k, v in cfg.items():
+            setattr(c, k, v)
+        self.h = lib().dl_fusion_create(C.byref(c))
+
+    def __del__(self):
+        if getattr(self, "h", None):
+            lib().dl_fusion_destroy(self.h)
+            self.h = None
+
+    def add_camera(self, cam, pose, pos=(0.0, 0.0, 0.0)):
+        """камера: модель, ось по паспорту (az, el, roll), положение (м: восток, север, верх от поворотки)"""
+        return lib().dl_fusion_add_camera(self.h, C.byref(cam.c), C.byref(_Pose(*pose)), *pos)
+
+    def set_pose(self, k, pose):
+        lib().dl_fusion_set_pose(self.h, k, C.byref(_Pose(*pose)))
+
+    def update(self, k, t, targets):
+        """цели камеры k по кадру t (Target или сырые _Target), по важности"""
+        arr = (_Target * max(1, len(targets)))(*[x.raw if isinstance(x, Target) else x for x in targets])
+        lib().dl_fusion_update(self.h, k, t, arr, len(targets))
+
+    def targets(self, cap=64):
+        buf = (_Fused * cap)()
+        n = min(cap, lib().dl_fusion_targets(self.h, buf, cap))
+        return [{"id": b.rep.id, "target": Target(b.rep), "cam": b.cam, "local": b.local, "seen_by": b.seen_by,
+                 "handoffs": b.handoffs} for b in buf[:n]]
+
+    def observe_reference(self, gid, target, confident):
+        raw = target.raw if isinstance(target, Target) else target
+        lib().dl_fusion_observe_reference(self.h, gid, C.byref(raw), 1 if confident else 0)
+
+    def resolve(self, gid):
+        return lib().dl_fusion_resolve(self.h, gid)
+
+    def local_of(self, gid, k):
+        return lib().dl_fusion_local_of(self.h, gid, k)
+
+    def global_of(self, k, local):
+        return lib().dl_fusion_global_of(self.h, k, local)
+
+    def cues(self, k, t, cap=16):
+        """где камере k ждать цель из соседнего сектора: [(u, v, r)] — для детектора (set_focus)"""
+        buf = (C.c_float * (3 * cap))()
+        n = min(cap, lib().dl_fusion_cues(self.h, k, t, buf, cap))
+        return [(buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]) for i in range(n)]
+
+    def project(self, k, az, el):
+        u, v = C.c_float(), C.c_float()
+        ok = lib().dl_fusion_project(self.h, k, az, el, C.byref(u), C.byref(v))
+        return u.value, v.value, bool(ok)
+
+    def calib(self, k):
+        s, n = C.c_float(), C.c_int()
+        lib().dl_fusion_calib(self.h, k, C.byref(s), C.byref(n))
+        return s.value, n.value
+
+    def save_calib(self, path):
+        return bool(lib().dl_fusion_save_calib(self.h, path.encode("utf-8")))
+
+    def load_calib(self, path):
+        return bool(lib().dl_fusion_load_calib(self.h, path.encode("utf-8")))
+
+
+def encode_targets(cam, seq, t, sent, targets):
+    """сообщение DLW1 (одна UDP-датаграмма): цели камеры cam по кадру t, часы камеры"""
+    arr = (_Target * max(1, len(targets)))(*[x.raw if isinstance(x, Target) else x for x in targets])
+    buf = C.create_string_buffer(65536)
+    n = lib().dl_msg_encode_targets(cam, seq, t, sent, arr, len(targets), buf, len(buf))
+    if n < 0:
+        raise ValueError("сообщение не влезло")
+    return buf.value
+
+
+def decode_targets(data, cap=64):
+    """(cam, seq, t, sent, [Target]) или None — не сообщение о целях"""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    cam, seq, t, sent = C.c_int(), C.c_uint(), C.c_double(), C.c_double()
+    buf = (_Target * cap)()
+    n = lib().dl_msg_decode_targets(data, C.byref(cam), C.byref(seq), C.byref(t), C.byref(sent), buf, cap)
+    if n < 0:
+        return None
+    return cam.value, seq.value, t.value, sent.value, [Target(buf[i]) for i in range(min(n, cap))]

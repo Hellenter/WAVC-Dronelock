@@ -89,6 +89,12 @@ jobs:
             timeout 1500 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
               --sector $sec --godot "$GODOT" --seconds 3 --wide 1152x864 --fps 30 --drones 3 --birds 1 --range 150,350 --size 1.5 --switch queue --json twocam-$sec.json | tee -a report.txt
           done
+          # две широкие камеры (вторая — третья камера сцены), цели летят через стык секторов
+          echo "== эмулятор: две широкие, стык секторов" | tee -a report.txt
+          timeout 1500 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
+            --godot "$GODOT" --seconds 3 --wide 1152x864 --fps 30 --wides 2 --wide-step 110 --seam 1 --drones 3 --birds 0 \
+            --range 150,350 --size 1.5 --json twocam-2wide.json | tee -a report.txt
+          python -c "import json; d=json.load(open('twocam-2wide.json')); f=d['cam_frames']; assert d['wides']==2 and min(f)>=30, f; print('кадров по камерам', f)" | tee -a report.txt
           # птицы: широкая указывает и их (--with-birds), точная с зумом x4 отсеивает по силуэту; для сравнения — без силуэта
           for v in shape no-shape; do
             ex=(); [ $v = no-shape ] && ex=(--no-shape --no-veto-wide)
