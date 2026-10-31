@@ -3879,6 +3879,7 @@ int run_stress(int argc, char** argv) {
                 s.trk.stuck_r = R(3) ? 6.f : F(0, 20);
                 s.trk.stuck_hold = R(3) ? 50 : R(200);
                 s.trk.stuck_heat = R(3) ? 0.1f : F(0, 1);
+                s.trk.stuck_yield = R(3) != 0;
                 s.trk.heir_still = R(3);
                 s.trk.lock_speed_max = R(3) ? 0.f : F(0, 60);
                 s.trk.lock_established = R(2);

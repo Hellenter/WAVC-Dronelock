@@ -123,6 +123,7 @@ void Tracker::resetTracks() {
     driftOn_ = false;
     lastGood_ = false;
     heir_ = false;
+    ghost_ = false;
     memT_ = -1;
     postLoss_ = false;
     occ_.clear();
@@ -370,6 +371,7 @@ bool Tracker::selectLock(int id) {
         if (id != lockId_) hard_ = false, verify_ = 0, lastLsN_ = 0;
         lockId_ = id;
         manual_ = true;
+        ghost_ = false;
         lostFor_ = 0;
         beat_.clear();
         lastX_ = t.x; lastY_ = t.y; lastVx_ = t.vsx; lastVy_ = t.vsy;
@@ -986,6 +988,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         tr.contrast = d.contrast;
         tr.level = d.level;
         tr.miss = 0;
+        tr.ghost = false;
         ++tr.hits;
         if (d.colored) {
             if (tr.colorN < 60000) ++tr.colorN;
@@ -1110,6 +1113,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                     tr.miss = 1;
                     tr.hist.back() = false;
                     tr.det = -1;
+                    tr.ghost = true;
                     owner[best] = -1;
                     match[ti] = -1;
                     ++stuckN_;
@@ -1362,6 +1366,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     };
     // захват не берёт трек быстрее lock_speed_max: ветки ближних деревьев на повороте камеры
     auto tooFast = [&](const Track& t) { return cfg_.lock_speed_max > 0 && !t.followed && relSpeed(t) > cfg_.lock_speed_max; };
+    // подтверждённый дрон: класс «дрон», летал по сцене, cls_min_hits попаданий
+    auto drone = [&](const Track& t) { return t.cls == TargetClass::Drone && t.birdScore < 0.5f && settled(t); };
     // новый захват (lock_mover): только на устоявшийся трек, который уже летал по сцене (или
     // ведомый камерой, или точку спокойного неба) — не на первый подтверждённый блик
     auto lockable = [&](const Track& t) {
@@ -1433,6 +1439,9 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 memT_ = -1;
                 postLoss_ = false;
             }
+        // захват на снятом с предмета треке — только прогноз, цели не видно: уступает другому
+        // подтверждённому дрону как мягкий (stuck_yield)
+        const bool ghost = cfg_.stuck_yield && cur->ghost && cur->miss > 0;
         if (cur->miss >= 2) {   // цель на прогнозе, а рядом её уже ведёт свежий трек
             float r = std::max(cfg_.gate, 4 * cur->sigma);
             if (cfg_.lost_r_max > 0) r = std::min(r, cfg_.lost_r_max * cfg_.gate);
@@ -1441,10 +1450,13 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 same = true;
                 heir_ = lastGood_;
             }
-        } else if (!manual_) {
+        }
+        if (!same && !manual_ && (cur->miss < 2 || ghost)) {
             // претенденты: весомее текущей (при жёстком захвате — только если задан hard_switch)
             // за lock_dwell кадров; из выдержавших — самый весомый
             auto wins = [&](const Track& t) {
+                if (ghost)
+                    return t.lockW > cfg_.lock_switch * cur->lockW && drone(t) && lockable(t) && !onOcc(t) && !outside(t);
                 // жёсткий — только на цель, которую классификатор зовёт дроном: медленная
                 // птица рядом весомее (lock_slow), и на 15 к/с захват уходил с дрона на неё (wt16, wt18)
                 // с самолёта на медленный дрон, не на яркую; на ведомую камерой — и без этого
@@ -1487,6 +1499,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             if (sw) cur = sw, beat_.clear();
         }
         lockId_ = cur->id;
+        ghost_ = cfg_.stuck_yield && cur->ghost && cur->miss > 0;
     } else if (lockId_ && !lockClutter && !lockOut && lostFor_ < (hard_ ? cfg_.hard_miss : cfg_.max_miss)) {
         // захваченный трек пропал: ищем цель там, где она должна быть, и там, где её видели
         // последний раз (если скорость была оценена неверно)
@@ -1501,6 +1514,15 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         const Track* n = nearest(lastX_ + lastVx_ * lostFor_, lastY_ + lastVy_ * lostFor_, r, v0, gone);
         if (!n) n = nearest(lastX_, lastY_, r, v0, gone);
         if (n) { lockId_ = n->id; lostFor_ = 0; same = true; heir_ = lastGood_; }
+        // пропал снятый с предмета трек, и у прогноза никого: цель не ждём, если есть подтверждённый дрон
+        else if (ghost_ && !manual_ && best && drone(*best)) {
+            lockId_ = best->id;
+            lostFor_ = 0;
+            lastX_ = best->x; lastY_ = best->y; lastVx_ = best->vsx; lastVy_ = best->vsy;
+            lastGood_ = heir_ = ghost_ = false;
+            memT_ = -1;
+            postLoss_ = false;
+        }
     } else {
         // захват на летавшей цели потерян — помним, где её ждать (relock_frames)
         if (lockId_ && !lockClutter && !lockOut && lastGood_ && cfg_.relock_frames > 0) {
@@ -1518,7 +1540,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         lockId_ = n ? n->id : 0;
         lostFor_ = 0;
         if (n) { lastX_ = n->x; lastY_ = n->y; lastVx_ = n->vsx; lastVy_ = n->vsy; }
-        lastGood_ = heir_ = false;
+        lastGood_ = heir_ = ghost_ = false;
     }
 
     // ожидание размера переходит к треку, подхватившему ту же цель

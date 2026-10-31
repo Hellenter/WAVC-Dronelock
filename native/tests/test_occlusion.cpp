@@ -4,7 +4,9 @@
 //    (heir_still: захват на прогнозе не передаётся стоящему треку);
 //  - «кромка»: на пути дрона всё время стоит неподвижный отклик предмета, дрон в нём «тонет»
 //    и выходит с другой стороны (stuck_obs: трек дрона не залипает на предмете);
-//  - «зависание»: дрон плавно тормозит и висит — это не предмет, захват на нём.
+//  - «зависание»: дрон плавно тормозит и висит — это не предмет, захват на нём;
+//  - «второй дрон»: дрон залетел за кромку и не вылетел, а в кадре летит другой — захват на прогнозе
+//    пропавшего уступает ему (stuck_yield), а не ждёт секунды; короткий заслон — захват остаётся на первом.
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -116,6 +118,39 @@ static int foliage(const TrackerConfig& base) {
     return t.stuckEvents();
 }
 
+// Первый дрон (захвачен) на t0 залетает за кромку на hide с (0 — не вылетает), второй летит в стороне с 3-й секунды.
+// Кромка мерцает (каждый 4-й кадр) 3 с до того, как дрон к ней подлетел, и откликается вся, пока он за ней: трек
+// дрона встаёт на её отклик и снимается с предмета (stuck_obs). Возвращает, через сколько кадров после пропажи
+// захват на втором (-1 — не перешёл); back — захват в конце на первом, stuck — сколько раз трек снимался с предмета
+static int second(float fps, float hide, const TrackerConfig& base, bool* back = nullptr, int* stuck = nullptr) {
+    std::mt19937 rng(5);
+    auto U = [&](float a, float b) { return a + (b - a) * (float)(rng() % 100000) / 100000.f; };
+    Tracker t(1280, 720, tracker_for_fps(base, fps));
+    const float v = 60.f / fps, v2 = 40.f / fps;
+    const int t0 = (int)(8 * fps), t2 = (int)(3 * fps), occ = hide > 0 ? (int)std::lround(hide * fps) : 1 << 20;
+    const float ox = 100 + v * t0, oy = 300;
+    float x = 100, y = 300, x2 = 900, y2 = 550;
+    int sw = -1;
+    for (int f = 0; f < t0 + (int)(6 * fps); ++f) {
+        x += v;
+        if (f >= t2) x2 -= v2;
+        std::vector<Candidate> d;
+        if (f < t0 || f >= t0 + occ) d.push_back(mk(x + U(-.5f, .5f), y + U(-.5f, .5f), 30));
+        if (f >= t0 || (f >= t0 - (int)(3 * fps) && f % 4 == 0)) d.push_back(mk(ox + 4, oy, 20));
+        if (f >= t2) d.push_back(mk(x2 + U(-.5f, .5f), y2 + U(-.5f, .5f), 25));
+        t.update(d);
+        if (f == t0 - 1) CHECK(t.lockState() == LockState::Hard, "%.0f к/с: до заслона нет жёсткого захвата", fps);
+        if (back) *back = false;
+        for (const Track& tr : t.confirmed())
+            if (tr.id == t.lockedId()) {
+                if (f >= t0 && sw < 0 && std::hypot(tr.x - x2, tr.y - y2) < 12) sw = f - t0;
+                if (back) *back = std::hypot(tr.x - x, tr.y - y) < 12;
+            }
+    }
+    if (stuck) *stuck = t.stuckEvents();
+    return sw;
+}
+
 int main() {
     for (float fps : {14.f, 25.f, 60.f})
         for (float brake : {0.5f, 1.f}) hover(fps, brake, 3.f);
@@ -141,6 +176,19 @@ int main() {
         const int a = foliage(TrackerConfig()), b = foliage(loose);
         std::printf("листва: снят с «предмета» %d раз (без проверки ровного полёта %d)\n", a, b);
         CHECK(a == 0, "трек листвы, перескочивший и вставший, принят за дрон за предметом (%d)", a);
+    }
+    for (float fps : {14.f, 25.f, 60.f}) {
+        TrackerConfig hold;
+        hold.stuck_yield = false;
+        int stuck = 0;
+        const int a = second(fps, 0, TrackerConfig(), nullptr, &stuck), b = second(fps, 0, hold);
+        bool back = false;
+        const int c = second(fps, 0.4f, TrackerConfig(), &back);
+        std::printf("%2.0f к/с, второй дрон: захват на нём через %.1f с (без уступки %.1f с); заслон 0.4 с — %s\n", fps,
+                    (float)a / fps, (float)b / fps, back ? "на первом" : c >= 0 ? "ушёл на второй" : "потерян");
+        CHECK(stuck > 0, "%.0f к/с: трек первого дрона не снялся с кромки", fps);
+        CHECK(a >= 0 && a <= (int)std::lround(1.5f * fps), "%.0f к/с: захват на прогнозе пропавшего не уступил второму (%d)", fps, a);
+        CHECK(back, "%.0f к/с: после короткого заслона захват не на первом дроне", fps);
     }
     if (failures) std::printf("%d ошибок\n", failures);
     else std::printf("заслон: всё в порядке\n");
