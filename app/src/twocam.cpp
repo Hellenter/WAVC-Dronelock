@@ -1087,6 +1087,11 @@ void Emulator::processNarrow(double t, double dt, const Pose& truth, const Pose&
                 st_.slewSum += tNow - tAssign_;
                 ++st_.slewN;
             }
+        } else if (nOnly_ && !winOn_ && t - tLastSeen_ > c_.narrowLostHold) {
+            // цель была только у точной, та её потеряла, окно ушло из кадра, а память кончилась: искать
+            // больше негде (без этого точная навсегда оставалась в повороте к окну, которого нет)
+            event(t, "точная потеряла цель " + std::to_string(assigned_) + ", широкая её не видит");
+            assign(t, 0, "");
         }
     } else if (state_ == NState::Acquire || state_ == NState::Lost) {
         // в окне — трек, ближайший к ожидаемому месту (летящий, не помеха, держится minHold)
@@ -1522,7 +1527,15 @@ void Emulator::controlReal(double t) {
             gfWideT_ = wt->rep.t;
         }
         const bool bias = c_.encoder == 0 && c_.wideBias;
-        sp = gimbal_setpoint(gf_, t, bias ? wbias_.az : 0, bias ? wbias_.el : 0);
+        const double baz = bias ? wbias_.az : 0, bel = bias ? wbias_.el : 0;
+        if (useN && state_ != NState::Track) {
+            // точная потеряла цель и ищет по последнему своему сообщению: туда же и поворотка
+            sp = report_setpoint(nrep_, t, gcfg_.lead_cmd, baz, bel);
+        } else if (!rep) {
+            sp.hold = true;   // ни точная, ни широкая не знают, где цель: остановиться (как прежний закон)
+        } else {
+            sp = gimbal_setpoint(gf_, t, baz, bel);
+        }
         if (!assigned_) sp.hold = true;
         if (!sp.hold) cmdPose_ = {(float)sp.az, (float)sp.el, 0};
     }

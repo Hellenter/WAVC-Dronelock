@@ -230,6 +230,20 @@ inline Setpoint gimbal_setpoint(const GimbalFilter& f, double now, double bias_a
     return s;
 }
 
+// уставка по одному сообщению о цели (по прямой, без ускорения): пока цель потеряна и её ищут по последнему
+// сообщению, поворотка идёт туда же, где окно поиска. Ускорение фильтра за секунду без отметок уводит ось
+// на градусы в сторону, и окно выходит из кадра
+inline Setpoint report_setpoint(const TargetReport& r, double now, double lead, double bias_az = 0, double bias_el = 0) {
+    Setpoint s;
+    s.t = now + lead;
+    const double dt = s.t - r.t;
+    s.az = az_norm(r.az + r.vaz * dt - bias_az);
+    s.el = std::min(90.0, r.el + r.vel * dt) - bias_el;
+    s.vaz = r.vaz, s.vel = r.vel;
+    s.hold = false;
+    return s;
+}
+
 // Профиль одной оси (контроллер двигателя): плавное ведение уставки
 struct AxisProfile {
     double p = 0, v = 0, a = 0;
