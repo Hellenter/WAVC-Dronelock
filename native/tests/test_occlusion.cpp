@@ -7,6 +7,8 @@
 //  - «зависание»: дрон плавно тормозит и висит — это не предмет, захват на нём;
 //  - «второй дрон»: дрон залетел за кромку и не вылетел, а в кадре летит другой — захват на прогнозе
 //    пропавшего уступает ему (stuck_yield), а не ждёт секунды; короткий заслон — захват остаётся на первом.
+//  - «вдоль кромки»: дрон летит вдоль верхушек крон, стоящих с начала ролика, и сливается с каждой —
+//    трек не пересаживается на верхушку (still_reject).
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -151,7 +153,56 @@ static int second(float fps, float hide, const TrackerConfig& base, bool* back =
     return sw;
 }
 
+// Дрон летит вдоль кромки леса: на его пути верхушки крон — отклики, стоящие на месте с начала ролика
+// (мерцают: видны 2 кадра из 3). Проходя верхушку ближе merge пикс., дрон с ней сливается (его отклика
+// нет, есть только её). Трек дрона не должен пересаживаться на верхушку и оставаться на ней (still_reject);
+// возвращает кадров захвата на верхушке, когда дрон уже дальше 12 пикс., на дроне — onDrone (после первой)
+static int treeline(float fps, float merge, const TrackerConfig& base, int* onDrone = nullptr) {
+    std::mt19937 rng(3);
+    auto U = [&](float a, float b) { return a + (b - a) * (float)(rng() % 100000) / 100000.f; };
+    Tracker t(1280, 720, tracker_for_fps(base, fps));
+    const float v = 50.f / fps;
+    std::vector<float> tops;
+    for (float x = 420; x < 1100; x += 90) tops.push_back(x);
+    float x = 100;
+    const float y = 300, ty = 305;
+    int onTop = 0, on = 0;
+    for (int f = 0; x < 1150; ++f) {
+        x += v;
+        std::vector<Candidate> d;
+        bool merged = false;
+        for (float tx : tops) {
+            const bool m = std::fabs(tx - x) < merge;
+            merged |= m;
+            if (f % 3 != 0 || m) d.push_back(mk(tx + U(-.3f, .3f), ty + U(-.3f, .3f), 18));
+        }
+        if (!merged) d.push_back(mk(x + U(-.5f, .5f), y + U(-.5f, .5f), 30));
+        t.update(d);
+        if (x < tops[0] - merge) continue;
+        for (const Track& tr : t.confirmed())
+            if (tr.id == t.lockedId()) {
+                bool top = false;
+                for (float tx : tops) top |= std::hypot(tr.x - tx, tr.y - ty) < 4 && std::hypot(x - tx, y - ty) > 12;
+                onTop += top;
+                on += std::hypot(tr.x - x, tr.y - y) < 12;
+            }
+    }
+    if (onDrone) *onDrone = on;
+    return onTop;
+}
+
 int main() {
+    for (float fps : {10.f, 14.f, 25.f, 60.f})
+        for (float merge : {8.f, 10.f}) {
+            TrackerConfig off;
+            off.still_reject = 0;
+            int onA = 0, onB = 0;
+            const int a = treeline(fps, merge, TrackerConfig(), &onA), b = treeline(fps, merge, off, &onB);
+            std::printf("%2.0f к/с, вдоль кромки (сливается за %.0f пикс.): захват на верхушке %d кадров, на дроне %d (без правила %d и %d)\n",
+                        fps, merge, a, onA, b, onB);
+            CHECK(a <= (int)std::lround(0.1f * fps), "%.0f к/с, вдоль кромки %.0f: захват на верхушке %d кадров", fps, merge, a);
+            CHECK(onA >= onB, "%.0f к/с, вдоль кромки %.0f: на дроне %d кадров, без правила %d", fps, merge, onA, onB);
+        }
     for (float fps : {14.f, 25.f, 60.f})
         for (float brake : {0.5f, 1.f}) hover(fps, brake, 3.f);
     const TrackerConfig on;

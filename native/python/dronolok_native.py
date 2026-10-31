@@ -69,6 +69,25 @@ class _Fused(C.Structure):
     _fields_ = [("rep", _Target), ("cam", C.c_int), ("local", C.c_int), ("seen_by", C.c_uint), ("handoffs", C.c_int)]
 
 
+class _FieldLogConfig(C.Structure):
+    _fields_ = [("root", C.c_char_p), ("session", C.c_char_p), ("max_mb", C.c_double), ("min_free_mb", C.c_double),
+                ("pre_s", C.c_float), ("post_s", C.c_float), ("max_clip_s", C.c_float), ("crop_px", C.c_int),
+                ("ring_tracks", C.c_int), ("jpeg_q", C.c_int), ("snap_px", C.c_int), ("overview_every_s", C.c_float),
+                ("clips_per_min", C.c_int), ("all_tracks", C.c_int)]
+
+
+class _GimbalConfig(C.Structure):
+    _fields_ = [("max_rate", C.c_float), ("max_accel", C.c_float), ("max_jerk", C.c_float), ("kp", C.c_float),
+                ("kv", C.c_float), ("brake_share", C.c_float), ("lead_cmd", C.c_float), ("jerk_noise", C.c_float),
+                ("acc_tau", C.c_float), ("sigma_pose", C.c_float), ("gate", C.c_float), ("gate_reset", C.c_int),
+                ("bias_tau", C.c_float), ("bias_max", C.c_float)]
+
+
+class _Setpoint(C.Structure):
+    _fields_ = [("t", C.c_double), ("az", C.c_float), ("el", C.c_float), ("vaz", C.c_float), ("vel", C.c_float),
+                ("aaz", C.c_float), ("ael", C.c_float), ("hold", C.c_int)]
+
+
 class _Timing(C.Structure):
     _fields_ = [("total_ms", C.c_double), ("response_ms", C.c_double), ("select_ms", C.c_double),
                 ("jobs", C.c_int), ("jobs_skipped", C.c_int)]
@@ -161,6 +180,33 @@ def _load():
                                           C.c_int]
     lib.dl_msg_decode_targets.argtypes = [C.c_char_p, C.POINTER(C.c_int), C.POINTER(C.c_uint), C.POINTER(C.c_double),
                                           C.POINTER(C.c_double), P(_Target), C.c_int]
+    lib.dl_fieldlog_config_default.argtypes = [P(_FieldLogConfig)]
+    lib.dl_fieldlog_open.restype = C.c_void_p
+    lib.dl_fieldlog_open.argtypes = [P(_FieldLogConfig), C.c_int, C.c_int, C.c_double, C.c_char_p, C.c_char_p]
+    lib.dl_fieldlog_error.restype = C.c_char_p
+    lib.dl_fieldlog_frame.argtypes = [C.c_void_p, C.c_void_p, C.c_int64, C.c_double, C.c_void_p, C.c_int, C.c_int,
+                                      C.c_int, C.c_float, C.c_float]
+    lib.dl_fieldlog_note.argtypes = [C.c_void_p, C.c_char_p, C.c_int, C.c_char_p, C.c_int]
+    lib.dl_fieldlog_dir.restype = C.c_char_p
+    lib.dl_fieldlog_dir.argtypes = [C.c_void_p]
+    lib.dl_fieldlog_close.argtypes = [C.c_void_p]
+    PG, PS, PT = C.c_void_p, P(_Setpoint), P(_Target)
+    lib.dl_gimbal_defaults.argtypes = [P(_GimbalConfig)]
+    lib.dl_gimbal_create.restype = C.c_void_p
+    lib.dl_gimbal_create.argtypes = [P(_GimbalConfig)]
+    lib.dl_gimbal_destroy.argtypes = [PG]
+    lib.dl_gimbal_target.argtypes = [PG, PT]
+    lib.dl_gimbal_measure.argtypes = [PG, C.c_double, C.c_float, C.c_float, C.c_float]
+    lib.dl_gimbal_estimate.argtypes = [PG, C.c_double, PT]
+    lib.dl_gimbal_setpoint.restype = _Setpoint
+    lib.dl_gimbal_setpoint.argtypes = [PG, C.c_double]
+    lib.dl_gimbal_report_pose.argtypes = [PG, C.c_double, C.c_float, C.c_float]
+    lib.dl_gimbal_pose_at.restype = _Pose
+    lib.dl_gimbal_pose_at.argtypes = [PG, C.c_double]
+    lib.dl_gimbal_wide_check.argtypes = [PG, PT, C.c_double, C.c_float, C.c_float, C.c_double]
+    lib.dl_gimbal_bias.argtypes = [PG, PF, PF]
+    lib.dl_gimbal_drive_reset.argtypes = [PG, C.c_float, C.c_float]
+    lib.dl_gimbal_drive.argtypes = [PG, PS, C.c_double, C.c_double, C.c_double, PF, PF]
     return lib
 
 
@@ -326,6 +372,73 @@ class NativeTracker:
                             flap_period=t.flap_period, hits=t.hits,
                             miss=t.miss, sigma=t.sigma, score=t.score, locked=bool(t.locked), path=[(t.x, t.y)]))
         return out
+
+
+class FieldLog:
+    """Журнал полевых испытаний (native/README.md, «Журнал полевых испытаний»).
+
+    log = FieldLog("/home/pi/dronolok-logs", (h, w), fps=14, source="cam0", max_mb=4096)
+    ... каждый кадр после tracker.update(...):
+    log.frame(tracker, index, t, gray, cam=(dx, dy))
+    log.note("slew", track_id, "поворотка навелась", clip=True)
+    log.close()
+
+    Параметры как у dl_fieldlog_config: pre_s, post_s, crop_px, ring_tracks, jpeg_q, snap_px, overview_every_s,
+    clips_per_min, all_tracks, min_free_mb, session. settings — словарь настроек, попадёт в session.json.
+    """
+
+    def __init__(self, root, shape, fps, source="", settings=None, **kw):
+        import json
+        h, w = shape
+        cfg = _FieldLogConfig()
+        lib().dl_fieldlog_config_default(C.byref(cfg))
+        self._root = os.fsencode(root)
+        cfg.root = self._root
+        self._session = os.fsencode(kw.pop("session", "") or "")
+        cfg.session = self._session
+        for k, v in kw.items():
+            if not hasattr(cfg, k):
+                raise TypeError(f"неизвестный параметр журнала: {k}")
+            setattr(cfg, k, int(v) if isinstance(v, bool) else v)
+        sj = json.dumps(settings, ensure_ascii=False).encode() if settings else None
+        self._h = lib().dl_fieldlog_open(C.byref(cfg), w, h, float(fps), source.encode(), sj)
+        if not self._h:
+            raise OSError("журнал не открыт: " + lib().dl_fieldlog_error().decode(errors="replace"))
+
+    @property
+    def dir(self):
+        return lib().dl_fieldlog_dir(self._h).decode() if self._h else ""
+
+    def frame(self, tracker, index, t, gray=None, cam=(0.0, 0.0)):
+        """кадр после NativeTracker.update: треки, захват и очередь берутся из трекера"""
+        if not self._h:
+            return
+        if gray is not None:
+            import numpy as np
+            g = np.ascontiguousarray(gray, dtype=np.uint8)
+            lib().dl_fieldlog_frame(self._h, tracker._h, int(index), float(t), g.ctypes.data, g.shape[1], g.shape[0],
+                                    g.strides[0], float(cam[0]), float(cam[1]))
+        else:
+            lib().dl_fieldlog_frame(self._h, tracker._h, int(index), float(t), None, 0, 0, 0, float(cam[0]),
+                                    float(cam[1]))
+
+    def note(self, kind, track_id=0, text="", clip=False):
+        if self._h:
+            lib().dl_fieldlog_note(self._h, kind.encode(), int(track_id), text.encode(), 1 if clip else 0)
+
+    def close(self):
+        if getattr(self, "_h", None):
+            lib().dl_fieldlog_close(self._h)
+            self._h = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
 
 
 class NativeMotion:
@@ -515,3 +628,65 @@ def decode_targets(data, cap=64):
     if n < 0:
         return None
     return cam.value, seq.value, t.value, sent.value, [Target(buf[i]) for i in range(min(n, cap))]
+
+
+class Gimbal:
+    """Наведение поворотки точной камеры (dl_gimbal): фильтр цели с временем кадра, уставка двигателю
+    на момент, когда команда дойдёт, плавный профиль (контроллер двигателя) и положение поворотки
+    без датчиков угла.
+
+        g = Gimbal(max_rate=30, max_accel=150, max_jerk=3000, lead_cmd=0.01)
+        g.target(wide_target)                    # назначили цель (Target широкой)
+        g.measure(t_frame, az, el, sigma)        # отметка точной: направление на момент КАДРА
+        sp = g.setpoint(now)                     # -> контроллеру двигателя
+        pos, vel = g.drive(sp, t_recv, t, 0.001) # в контроллере (или в потоке на Pi), ~1 кГц
+        g.report_pose(t, az, el)                 # что сообщил контроллер -> g.pose_at(t_frame)
+    """
+
+    def __init__(self, **cfg):
+        c = _GimbalConfig()
+        lib().dl_gimbal_defaults(C.byref(c))
+        for k, v in cfg.items():
+            setattr(c, k, v)
+        self._h = lib().dl_gimbal_create(C.byref(c))
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib().dl_gimbal_destroy(self._h)
+            self._h = None
+
+    def target(self, tg):
+        lib().dl_gimbal_target(self._h, C.byref(tg.raw) if tg is not None else None)
+
+    def measure(self, t_frame, az, el, sigma):
+        return bool(lib().dl_gimbal_measure(self._h, t_frame, az, el, sigma))
+
+    def estimate(self, t):
+        out = _Target()
+        return Target(out) if lib().dl_gimbal_estimate(self._h, t, C.byref(out)) else None
+
+    def setpoint(self, now):
+        return lib().dl_gimbal_setpoint(self._h, now)
+
+    def report_pose(self, t, az, el):
+        lib().dl_gimbal_report_pose(self._h, t, az, el)
+
+    def pose_at(self, t):
+        p = lib().dl_gimbal_pose_at(self._h, t)
+        return (p.az, p.el, p.roll)
+
+    def wide_check(self, wide, t_frame, az, el, dt):
+        lib().dl_gimbal_wide_check(self._h, C.byref(wide.raw), t_frame, az, el, dt)
+
+    def bias(self):
+        a, e = C.c_float(), C.c_float()
+        lib().dl_gimbal_bias(self._h, C.byref(a), C.byref(e))
+        return a.value, e.value
+
+    def drive_reset(self, az, el):
+        lib().dl_gimbal_drive_reset(self._h, az, el)
+
+    def drive(self, sp, t_recv, t, h):
+        pos, vel = (C.c_float * 2)(), (C.c_float * 2)()
+        lib().dl_gimbal_drive(self._h, C.byref(sp) if sp is not None else None, t_recv, t, h, pos, vel)
+        return (pos[0], pos[1]), (vel[0], vel[1])

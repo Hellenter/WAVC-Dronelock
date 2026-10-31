@@ -7,8 +7,10 @@
 #include <string>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/fieldlog.hpp"
 #include "dronolok/fileutil.hpp"
 #include "dronolok/geometry.hpp"
+#include "dronolok/gimbal.hpp"
 #include "dronolok/multicam.hpp"
 #include "dronolok/netmsg.hpp"
 
@@ -445,4 +447,225 @@ int dl_msg_decode_targets(const char* s, int* cam, unsigned* seq, double* t, dou
     return (int)m.reps.size();
 }
 
+struct dl_fieldlog {
+    FieldLog log;
+    std::vector<int> queue;
+};
+
+static thread_local std::string g_fieldlog_err;
+
+void dl_fieldlog_config_default(dl_fieldlog_config* c) {
+    if (!c) return;
+    const FieldLogConfig d;
+    c->root = nullptr;
+    c->session = nullptr;
+    c->max_mb = d.max_mb;
+    c->min_free_mb = d.min_free_mb;
+    c->pre_s = d.pre_s;
+    c->post_s = d.post_s;
+    c->max_clip_s = d.max_clip_s;
+    c->crop_px = d.crop_px;
+    c->ring_tracks = d.ring_tracks;
+    c->jpeg_q = d.jpeg_q;
+    c->snap_px = d.snap_px;
+    c->overview_every_s = d.overview_every_s;
+    c->clips_per_min = d.clips_per_min;
+    c->all_tracks = d.all_tracks ? 1 : 0;
+}
+
+dl_fieldlog* dl_fieldlog_open(const dl_fieldlog_config* c, int w, int h, double fps, const char* source,
+                              const char* settings_json) {
+    if (!c || !c->root || w <= 0 || h <= 0) {
+        g_fieldlog_err = "не задана папка журналов или размер кадра";
+        return nullptr;
+    }
+    FieldLogConfig f;
+    f.root = c->root;
+    f.session = c->session ? c->session : "";
+    f.max_mb = c->max_mb;
+    f.min_free_mb = c->min_free_mb;
+    f.pre_s = c->pre_s;
+    f.post_s = c->post_s;
+    f.max_clip_s = c->max_clip_s;
+    f.crop_px = c->crop_px;
+    f.ring_tracks = c->ring_tracks;
+    f.jpeg_q = c->jpeg_q;
+    f.snap_px = c->snap_px;
+    f.overview_every_s = c->overview_every_s;
+    f.clips_per_min = c->clips_per_min;
+    f.all_tracks = c->all_tracks != 0;
+    auto* l = new dl_fieldlog;
+    std::string err;
+    try {
+        if (!l->log.open(f, w, h, fps, source ? source : "", settings_json ? settings_json : "", err)) {
+            g_fieldlog_err = err;
+            delete l;
+            return nullptr;
+        }
+    } catch (const std::exception& e) {
+        g_fieldlog_err = e.what();
+        delete l;
+        return nullptr;
+    }
+    return l;
+}
+
+const char* dl_fieldlog_error(void) { return g_fieldlog_err.c_str(); }
+
+void dl_fieldlog_frame(dl_fieldlog* l, dl_tracker* t, int64_t index, double time_s, const uint8_t* gray, int w, int h,
+                       int stride, float cam_dx, float cam_dy) {
+    if (!l || !t) return;
+    FieldFrame f;
+    f.index = index;
+    f.t = time_s;
+    f.gray = gray && w > 0 && h > 0 ? gray : nullptr;
+    f.w = w;
+    f.h = h;
+    f.stride = stride > 0 ? stride : w;
+    f.tracks = &t->trk.confirmed();
+    t->trk.lockQueue(l->queue);
+    f.queue = &l->queue;
+    f.lockId = t->trk.lockedId();
+    f.lockState = t->trk.lockState();
+    f.verify = t->trk.verifyFrames();
+    f.manual = t->trk.manualLock();
+    f.camDx = cam_dx;
+    f.camDy = cam_dy;
+    try {
+        l->log.frame(f);
+    } catch (...) {
+    }
+}
+
+void dl_fieldlog_note(dl_fieldlog* l, const char* type, int id, const char* text, int clip) {
+    if (!l) return;
+    try {
+        l->log.note(type ? type : "note", id, text ? text : "", clip != 0);
+    } catch (...) {
+    }
+}
+
+const char* dl_fieldlog_dir(dl_fieldlog* l) { return l ? l->log.dir().c_str() : ""; }
+
+void dl_fieldlog_close(dl_fieldlog* l) {
+    if (!l) return;
+    try {
+        l->log.close();
+    } catch (...) {
+    }
+    delete l;
+}
+
 }  // extern "C"
+
+// ---- наведение поворотки
+struct dl_gimbal {
+    GimbalConfig cfg;
+    GimbalFilter f;
+    WideBias bias;
+    PoseHistory hist;
+    AxisProfile ax[2];
+    double anchor[2] = {0, 0};
+    bool anchored[2] = {false, false};
+    double spT = -1;
+};
+
+static GimbalConfig gimbal_cfg(const dl_gimbal_config* c) {
+    GimbalConfig g;
+    if (!c) return g;
+    g.max_rate = c->max_rate, g.max_accel = c->max_accel, g.max_jerk = c->max_jerk;
+    g.kp = c->kp, g.kv = c->kv, g.brake_share = c->brake_share, g.lead_cmd = c->lead_cmd;
+    g.jerk_noise = c->jerk_noise, g.acc_tau = c->acc_tau, g.sigma_pose = c->sigma_pose, g.gate = c->gate;
+    g.gate_reset = c->gate_reset, g.bias_tau = c->bias_tau, g.bias_max = c->bias_max;
+    return g;
+}
+void dl_gimbal_defaults(dl_gimbal_config* c) {
+    if (!c) return;
+    const GimbalConfig g;
+    c->max_rate = g.max_rate, c->max_accel = g.max_accel, c->max_jerk = g.max_jerk;
+    c->kp = g.kp, c->kv = g.kv, c->brake_share = g.brake_share, c->lead_cmd = g.lead_cmd;
+    c->jerk_noise = g.jerk_noise, c->acc_tau = g.acc_tau, c->sigma_pose = g.sigma_pose, c->gate = g.gate;
+    c->gate_reset = g.gate_reset, c->bias_tau = g.bias_tau, c->bias_max = g.bias_max;
+}
+dl_gimbal* dl_gimbal_create(const dl_gimbal_config* c) {
+    dl_gimbal* g = new dl_gimbal();
+    g->cfg = gimbal_cfg(c);
+    g->f.set_config(g->cfg);
+    return g;
+}
+void dl_gimbal_destroy(dl_gimbal* g) { delete g; }
+void dl_gimbal_target(dl_gimbal* g, const dl_target* tg) {
+    if (!g) return;
+    if (tg) g->f.reset(report(tg));
+    else g->f.clear();
+}
+int dl_gimbal_measure(dl_gimbal* g, double t_frame, float az, float el, float sigma) {
+    return g && g->f.measure(t_frame, az, el, sigma) ? 1 : 0;
+}
+int dl_gimbal_estimate(const dl_gimbal* g, double t, dl_target* out) {
+    if (!g || !out || !g->f.active()) return 0;
+    const TargetReport r = g->f.report(t);
+    *out = dl_target();
+    out->t = r.t, out->az = r.az, out->el = r.el, out->vaz = r.vaz, out->vel = r.vel, out->sigma = r.sigma;
+    out->sigma_v = r.sigma_v;
+    return 1;
+}
+dl_setpoint dl_gimbal_setpoint(const dl_gimbal* g, double now) {
+    dl_setpoint o{};
+    o.hold = 1;
+    if (!g) return o;
+    const Setpoint s = gimbal_setpoint(g->f, now, g->bias.az, g->bias.el);
+    o.t = s.t, o.az = (float)s.az, o.el = (float)s.el, o.vaz = (float)s.vaz, o.vel = (float)s.vel;
+    o.aaz = (float)s.aaz, o.ael = (float)s.ael, o.hold = s.hold ? 1 : 0;
+    return o;
+}
+void dl_gimbal_report_pose(dl_gimbal* g, double t, float az, float el) {
+    if (!g) return;
+    // азимут в историю — непрерывным (через 0° без скачка на 360)
+    double a = az;
+    double pa, pe;
+    if (g->hist.at(t, pa, pe)) a = pa + az_diff(az, pa);
+    g->hist.push(t, a, el);
+}
+dl_pose dl_gimbal_pose_at(const dl_gimbal* g, double t) {
+    dl_pose p{0, 0, 0};
+    if (!g) return p;
+    double az = 0, el = 0;
+    g->hist.at(t, az, el);
+    p.az = (float)az_norm(az + g->bias.az);
+    p.el = (float)(el + g->bias.el);
+    return p;
+}
+void dl_gimbal_wide_check(dl_gimbal* g, const dl_target* wide, double t_frame, float az, float el, double dt) {
+    if (!g || !wide) return;
+    double waz, wel, wsg;
+    predict(report(wide), t_frame, waz, wel, wsg);
+    g->bias.update(az_diff(waz, az), wel - el, std::max(wsg, 0.005), dt, g->cfg);
+}
+void dl_gimbal_bias(const dl_gimbal* g, float* az, float* el) {
+    if (az) *az = g ? (float)g->bias.az : 0.f;
+    if (el) *el = g ? (float)g->bias.el : 0.f;
+}
+void dl_gimbal_drive_reset(dl_gimbal* g, float az, float el) {
+    if (!g) return;
+    g->ax[0] = AxisProfile();
+    g->ax[1] = AxisProfile();
+    g->ax[0].p = az, g->ax[1].p = el;
+    g->anchored[0] = g->anchored[1] = false;
+}
+void dl_gimbal_drive(dl_gimbal* g, const dl_setpoint* sp, double t_recv, double t, double h, float* pos, float* vel) {
+    if (!g) return;
+    if (t_recv != g->spT) g->anchored[0] = g->anchored[1] = false, g->spT = t_recv;
+    for (int i = 0; i < 2; ++i) {
+        AxisProfile& a = g->ax[i];
+        if (!sp || sp->hold) {
+            a.hold(h, g->cfg, g->anchor[i], g->anchored[i], i == 0);
+        } else {
+            const double s = std::min(0.25, std::max(0.0, t - t_recv));
+            const double p0 = i ? sp->el : sp->az, v0 = i ? sp->vel : sp->vaz, a0 = i ? sp->ael : sp->aaz;
+            a.track(p0 + v0 * s + 0.5 * a0 * s * s, v0 + a0 * s, a0, h, g->cfg, i == 0);
+        }
+        if (pos) pos[i] = (float)(i ? a.p : az_norm(a.p));
+        if (vel) vel[i] = (float)a.v;
+    }
+}

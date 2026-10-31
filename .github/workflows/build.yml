@@ -54,10 +54,17 @@ jobs:
           ./build-native/test_kernels
           ./build-native/test_occlusion
           ./build-native/test_multicam
+          ./build-native/test_fieldlog
+          ./build-native/test_gimbal
       - name: Приложение
         run: |
           cmake -S app -B build-app -G Ninja
           cmake --build build-app
+      - name: Эмулятор двух камер без окна (поворотка как на железе и идеальная)
+        run: |
+          ./build-app/dronolok_app --twocam --seconds 4 --wide 1152x864 --json twocam-real.json | tee twocam.log
+          ./build-app/dronolok_app --twocam --seconds 4 --wide 1152x864 --ideal-mount --json twocam-ideal.json | tee -a twocam.log
+          grep -q "как на железе, плавный регулятор" twocam.log && grep -q '"mount_ideal": 1' twocam-ideal.json
       - name: Синтетическое видео 16 Мп с разметкой
         run: |
           mkdir -p sample
@@ -85,8 +92,34 @@ jobs:
           ./build-app/dronolok_app --bench sample-raw/cam.mjpeg --frames 8 | tee raw.log
           grep -q "14.00 к/с" raw.log && grep -q "пропущено кадров: 1" raw.log
           ./build-app/dronolok_app --bench sample-raw/cam.mjpeg --frames 8 --video-fps 10 | grep -q "10.00 к/с"
+      - name: Журнал полевых испытаний (запись, вырезки читаются FFmpeg, Python-обёртка)
+        env: { DRONOLOK_LIB: build-native }
+        run: |
+          ./build-app/dronolok_app --bench sample/sky16mp.mp4 --fieldlog fl --log-pre 1 --log-post 1 | tee fl.log
+          d=$(ls -d fl/*/ | head -1)
+          test -s $d/frames.jsonl && test -s $d/events.jsonl && grep -q '"summary"' $d/session.json
+          test $(wc -l < $d/frames.jsonl) -ge 50
+          for f in $d/clips/*.mjpeg $d/snap/*.jpg; do [ -e "$f" ] && ffmpeg -v error -xerror -i "$f" -f null -; done
+          python - <<'PY'
+          import sys, json, glob, numpy as np
+          sys.path.insert(0, "native/python")
+          import dronolok_native as dn
+          H, W = 360, 640
+          det, trk = dn.NativePointDetector(), dn.NativeTracker((H, W), fps=14)
+          with dn.FieldLog("fl-py", (H, W), 14, source="ci", settings={"ci": 1}, pre_s=1.0) as log:
+              for f in range(60):
+                  img = np.full((H, W), 160, np.uint8)
+                  x = 100 + 6 * f
+                  img[178:182, x:x + 4] = 60
+                  trk.update(det.detect(img))
+                  log.frame(trk, f, f / 14, img)
+              d = log.dir
+          ev = [json.loads(l) for l in open(d + "/events.jsonl")]
+          assert any(e["type"] == "lock" for e in ev), ev
+          print("журнал из Python:", d, len(ev), "событий,", len(glob.glob(d + "/clips/*.mjpeg")), "вырезок")
+          PY
       - name: Стресс-проверка приложения (случайные настройки, перемотка, пауза)
-        run: timeout 120 ./build-app/dronolok_app --stress sample/sky16mp.mp4 --seconds 30
+        run: timeout 120 ./build-app/dronolok_app --stress sample/sky16mp.mp4 --seconds 30 --fieldlog stress-fl
       - name: Мультитест (без окна, синтетика с разметкой)
         run: |
           ./build-app/dronolok_app --multitest sample --vary auto_thr --vary thr=8,14 --vary lock_slow --frames 40 --parallel 2 --out mt-linux
@@ -156,7 +189,7 @@ jobs:
           unzip -q -j "$f" "Godot_v${GODOT_VERSION}_win64.exe" -d "$RUNNER_TEMP"
           mv "$RUNNER_TEMP/Godot_v${GODOT_VERSION}_win64.exe" $d/sim/Godot.exe
           x86_64-w64-mingw32-objdump -p $d/Dronolok.exe | grep -i "DLL Name" | sort -u
-          mkdir -p win-tests && cp build-win/native/test_kernels.exe build-win/native/test_multicam.exe win-tests/
+          mkdir -p win-tests && cp build-win/native/test_kernels.exe build-win/native/test_multicam.exe build-win/native/test_fieldlog.exe build-win/native/test_gimbal.exe win-tests/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Dronolok-win64
@@ -190,6 +223,19 @@ jobs:
           $d = Get-Content twocam-2wide-win.json -Raw | ConvertFrom-Json
           if ($d.wides -ne 2 -or $d.net_msgs -lt 50) { throw "широких $($d.wides), сообщений $($d.net_msgs)" }
           Write-Output "кадров по камерам $($d.cam_frames), сообщений $($d.net_msgs)"
+      - name: Журнал испытаний (пути с кириллицей, предел места)
+        run: ./tests/test_fieldlog.exe
+      - name: Dronolok.exe --bench --fieldlog
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath app/Dronolok.exe -ArgumentList '--bench','sample/sky16mp.mp4','--fieldlog','журнал','--frames','40' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "exit code $($p.ExitCode)" }
+          $d = Get-ChildItem 'журнал' -Directory | Select-Object -First 1
+          if (-not $d) { throw "нет папки выезда" }
+          if (-not (Test-Path (Join-Path $d.FullName 'frames.jsonl'))) { throw "нет frames.jsonl" }
+          Get-Content (Join-Path $d.FullName 'session.json')
+      - name: Тест наведения поворотки
+        run: ./tests/test_gimbal.exe
       - name: Dronolok.exe --bench
         shell: pwsh
         run: |
@@ -235,6 +281,7 @@ jobs:
           cmake --build build
           ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_kernels
           ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_multicam
+          ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_fieldlog
           d=dronolok-${{ matrix.triple }}
           mkdir -p $d && cp build/dronolok_bench build/libdronolok.so native/include/dronolok/*.h* native/python/dronolok_native.py $d/
           tar czf $d.tar.gz $d

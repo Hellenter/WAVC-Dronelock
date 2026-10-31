@@ -26,6 +26,8 @@ set(DL_SOURCES
   src/c_api.cpp
   src/cpu.cpp
   src/detector.cpp
+  src/fieldlog.cpp
+  src/jpeg_gray.cpp
   src/kernels_scalar.cpp
   src/kernels_sse2.cpp
   src/kernels_avx2.cpp
@@ -114,10 +116,16 @@ if(DRONOLOK_TESTS)
   add_executable(test_geometry tests/test_geometry.cpp)
   target_link_libraries(test_geometry PRIVATE dronolok_static)
   add_test(NAME geometry COMMAND test_geometry)
+  add_executable(test_gimbal tests/test_gimbal.cpp)
+  target_link_libraries(test_gimbal PRIVATE dronolok_static)
+  add_test(NAME gimbal COMMAND test_gimbal)
   add_executable(test_occlusion tests/test_occlusion.cpp)
   target_link_libraries(test_occlusion PRIVATE dronolok_static)
   add_test(NAME occlusion COMMAND test_occlusion)
   add_executable(test_multicam tests/test_multicam.cpp)
   target_link_libraries(test_multicam PRIVATE dronolok_static)
   add_test(NAME multicam COMMAND test_multicam)
+  add_executable(test_fieldlog tests/test_fieldlog.cpp)
+  target_link_libraries(test_fieldlog PRIVATE dronolok_static)
+  add_test(NAME fieldlog COMMAND test_fieldlog)
 endif()

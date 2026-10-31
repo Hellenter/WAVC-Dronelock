@@ -23,6 +23,92 @@ env:
   GODOT_SHA256: '7de56444b130b10af84d19c7e0cf63cf9e9937ee4ba94364c3b7dd114253ca21'
 
 jobs:
+  # Галерея погоды и времени суток: по кадру на погоду в одном мире, короткие ролики дождя и снега.
+  # Отдельно от рендера сцен — кадры приходят через несколько минут.
+  weather:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GALLERY: >-
+        scene;clear@12;cumulus@15;cumulus@17.5@250;clear@18.1@265;clear@18.6@265;clear@19.2@270;clear@23@300;
+        overcast@22@300;cloudy@6.3@95;clear@18.3@90;overcast@11;haze@10@140;mist@8;fog@9;rain@14;storm@16@270;snow@12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      - name: Godot
+        run: |
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          echo "${GODOT_SHA256}  godot.zip" | sha256sum -c -
+          unzip -q godot.zip -d godot-bin
+          echo "GODOT=$PWD/godot-bin/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Проверка скрипта
+        run: |
+          timeout 300 "$GODOT" --headless --path sim/godot --import || true
+          timeout 120 "$GODOT" --headless --path sim/godot --check-only --script res://sim.gd
+      - name: Пакеты
+        timeout-minutes: 25
+        run: .github/scripts/apt.sh xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl1 libxcursor1 libxinerama1 libxrandr2 libxi6 ffmpeg
+      - name: Python-пакеты
+        timeout-minutes: 10
+        run: pip install --quiet --timeout 60 --retries 3 numpy==2.5.4 opencv-python-headless==5.0.0.93
+      - name: Галерея
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          set -o pipefail
+          mkdir -p wx
+          g=$(echo "$GALLERY" | tr -d ' \n')
+          xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene sim/scenes/city_sectors.json --out wx/gallery \
+            --gallery "$g" 2>&1 | tee wx/log.txt
+          # ошибки шейдеров Godot печатает, но не падает
+          ! grep -E "SHADER ERROR|Parse Error|SCRIPT ERROR" wx/log.txt
+      - name: Ролики дождя, снега и смены погоды
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          for v in "rain --time 15" "snow --time 12" "storm --time 18.3 --az 265"; do
+            set -- $v; n=$1; shift
+            xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene sim/scenes/city_sectors.json --out wx/$n \
+              --weather $n "$@" --seconds 1 --scale 0.5 --noise 0 --keep-png
+            python sim/preview.py wx/$n 0
+          done
+          # смена погоды по ходу ролика и время суток x600: сцена weather_change
+          xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene sim/scenes/weather_change.json --out wx/change \
+            --scale 0.25 --noise 0 --keep-png
+          python - <<'PY'
+          import cv2, glob, numpy as np
+          fs = sorted(glob.glob("wx/change/wide/*.png"))
+          pick = [fs[int(i * (len(fs) - 1) / 7)] for i in range(8)]
+          im = [cv2.resize(cv2.imread(f), (384, 288)) for f in pick]
+          cv2.imwrite("wx/change/strip.jpg", np.vstack([np.hstack(im[:4]), np.hstack(im[4:])]), [cv2.IMWRITE_JPEG_QUALITY, 85])
+          PY
+      - name: Превью в ветку sim-previews
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          REPO_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}
+        run: |
+          git clone -q --depth 1 --branch sim-previews "$REPO_URL" previews || \
+            { mkdir previews && git -C previews init -q && git -C previews checkout -q -b sim-previews; }
+          d=previews/${GITHUB_SHA::7}/weather
+          mkdir -p "$d"
+          cp wx/log.txt wx/gallery/gallery.jpg wx/gallery/gallery.json "$d"/ 2>/dev/null || true
+          cp wx/change/strip.jpg "$d"/change_strip.jpg 2>/dev/null || true
+          for n in rain snow storm change; do
+            [ -d wx/$n ] || continue
+            cp wx/$n/preview_wide_0.jpg "$d/${n}_wide.jpg" 2>/dev/null || true
+            cp wx/$n/wide/f_000000.png "$d/${n}_wide_full.png" 2>/dev/null || true
+            cp wx/$n/fine/f_000000.png "$d/${n}_fine.png" 2>/dev/null || true
+            cp wx/$n/*_wide.mp4 "$d/${n}_wide.mp4" 2>/dev/null || true
+          done
+          cd previews
+          git -c user.name=ci -c user.email=ci@localhost add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "погода ${GITHUB_SHA::7}" || exit 0
+          for i in 1 2 3; do
+            git push -q "$REPO_URL" HEAD:sim-previews && break
+            git -c user.name=ci -c user.email=ci@localhost pull -q --rebase "$REPO_URL" sim-previews
+          done
+
   render:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -103,6 +189,11 @@ jobs:
               --sector forest --godot "$GODOT" --seconds 5 --wide 1152x864 --fps 30 --drones 1 --birds 4 --range 150,350 --fov 5 \
               --with-birds "${ex[@]}" --json twocam-birds-$v.json | tee -a report.txt
           done
+          # погода из приложения (hello "env"): дождь в сумерках
+          echo "== эмулятор: city_sectors, лес, дождь, 18:30" | tee -a report.txt
+          timeout 1500 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
+            --sector forest --godot "$GODOT" --seconds 3 --wide 1152x864 --fps 30 --drones 3 --birds 1 --range 150,350 --size 1.5 \
+            --switch queue --weather rain --time 18:30 --json twocam-rain.json | tee -a report.txt
       - name: Мультитест по роликам сцены
         run: |
           ./build-app/dronolok_app --multitest vids --parallel 2 --out mt-sim

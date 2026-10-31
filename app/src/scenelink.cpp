@@ -203,13 +203,19 @@ bool Link::render(double t, int cam, double az, double el, std::vector<uint8_t>&
     }
     char q[240];
     if (roll != 0)
-        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f, \"roll\": %.5f}\n", t, cam, az, el, roll);
+        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f, \"roll\": %.5f", t, cam, az, el, roll);
     else
-        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f}\n", t, cam, az, el);
+        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f", t, cam, az, el);
+    std::string req = q;
+    if (!pendingEnv_.empty()) {
+        req += ", \"env\": " + pendingEnv_;
+        pendingEnv_.clear();
+    }
+    req += "}\n";
     std::string line;
     long long n = 0;
     int k = 0;
-    if (!sendAll(q, strlen(q)) || !recvLine(line) ||
+    if (!sendAll(req.data(), req.size()) || !recvLine(line) ||
         sscanf(line.c_str(), "FRAME %d %d %lld %d", &w, &h, &n, &k) != 4 || w <= 0 || h <= 0 || n != (long long)w * h ||
         n > MAX_FRAME || k < 0 || k > MAX_BODIES) {
         err = "сцена не ответила кадром";

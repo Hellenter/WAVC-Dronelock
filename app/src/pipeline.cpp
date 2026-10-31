@@ -174,6 +174,7 @@ void Pipeline::close() {
     hist_.clear();
     histBytes_ = 0;
     marks_.clear();
+    lockMarks_.clear();
 }
 
 VideoInfo Pipeline::info() const { return info_; }
@@ -294,6 +295,11 @@ int64_t Pipeline::length() const {
 void Pipeline::marks(std::vector<uint8_t>& out) const {
     std::lock_guard<std::mutex> lk(rm_);
     out = marks_;
+}
+
+void Pipeline::lockMarks(std::vector<LockMark>& out) const {
+    std::lock_guard<std::mutex> lk(rm_);
+    out = lockMarks_;
 }
 
 int Pipeline::findInHistory(int64_t frame) const {
@@ -570,6 +576,16 @@ void Pipeline::processLoop() {
     int seq = 0;
     struct FileCloser { void operator()(FILE* f) const { fclose(f); } };
     std::unique_ptr<FILE, FileCloser> tlog;
+    FieldLog flog;
+    std::string flogRoot;      // папка журналов, в которую пишем сейчас
+    bool flogDone = false;     // первый проход записан (или не открылся) — до смены папки не пишем
+    struct FlogGuard {   // статус журнала обнуляется при выходе из потока: flog — локальный
+        Pipeline* p;
+        ~FlogGuard() {
+            std::lock_guard<std::mutex> lk(p->rm_);
+            p->flog_ = nullptr;
+        }
+    } flogGuard{this};
     while (!stop_) {
         Packet p;
         {
@@ -1130,10 +1146,20 @@ void Pipeline::processLoop() {
                          std::fabs(t.y - g.y * r->gsy) < 10;
             if (!found) mk |= MARK_MISS;
         }
+        LockMark lm;
+        for (const auto& t : tracks)
+            if (r->lockId && t.id == r->lockId) {   // в пиксели видео, как track_to_video в приложении
+                const int W = r->follow ? r->srcW : r->frame->w, H = r->follow ? r->srcH : r->frame->h;
+                lm.x = (t.x + (float)r->fx) * (W > 0 ? (float)info_.w / W : 1.f);
+                lm.y = (t.y + (float)r->fy) * (H > 0 ? (float)info_.h / H : 1.f);
+                lm.state = r->lockState == LockState::Hard ? 2 : 1;
+            }
         std::lock_guard<std::mutex> lk(rm_);
         if (f.index >= 0 && f.index < (int64_t)4 << 20) {
             if ((size_t)f.index >= marks_.size()) marks_.resize((size_t)f.index + 1, 0);
             marks_[(size_t)f.index] = mk;
+            if ((size_t)f.index >= lockMarks_.size()) lockMarks_.resize((size_t)f.index + 1);
+            lockMarks_[(size_t)f.index] = lm;
         }
         rec.t = t3 - t0_;
         if (log_.size() < 500000) log_.push_back(rec);
@@ -1162,6 +1188,58 @@ void Pipeline::processLoop() {
                             t.birdScore, t.flapR2, (int)t.edgeBorn, (int)t.everMover, t.straight, t.travelRel, t.age);
             }
         }
+        // журнал полевых испытаний: первый проход видео, как одна поездка с камерой
+        if (s.fieldLog != flogRoot) {
+            flog_ = nullptr;
+            if (flog.isOpen()) flog.close();
+            flogRoot = s.fieldLog;
+            flogDone = false;
+            flogErr_.clear();
+            flogDir_.clear();
+        }
+        if (!flogRoot.empty() && !flogDone && (p.loop > 0 || (p.loopStart && flog.isOpen() && !p.seekStart))) {
+            flog_ = nullptr;
+            flog.close();   // ролик пошёл по второму кругу
+            flogDone = true;
+        }
+        if (!flogRoot.empty() && !flogDone && !r->dup) {
+            if (!flog.isOpen()) {
+                std::string err;
+                FieldLogConfig fc = s.fieldCfg;
+                fc.root = flogRoot;
+                std::error_code ec;
+                const std::string srcName = gen_ ? "эмулятор" : std::filesystem::absolute(std::filesystem::u8path(path_), ec).u8string();
+                if (!flog.open(fc, src.w, src.h, cameraFps(s), srcName.empty() ? path_ : srcName, settingsJson(s, src.w, src.h), err)) {
+                    flogErr_ = err;
+                    flogDone = true;
+                } else {
+                    flogDir_ = flog.dir();
+                    flog_ = &flog;
+                }
+            } else if (p.seekStart) {
+                flog.reset("seek");
+            }
+            if (flog.isOpen()) {
+                FieldFrame ff;
+                ff.index = f.index;
+                ff.t = info_.fps > 0 ? (double)f.index / info_.fps : (double)seq / std::max(1.0, cameraFps(s));
+                ff.gray = r->frame->px.data();
+                ff.w = r->frame->w;
+                ff.h = r->frame->h;
+                ff.stride = r->frame->w;
+                ff.ox = r->fx;
+                ff.oy = r->fy;
+                ff.tracks = &r->tracks;
+                ff.queue = &r->lockQueue;
+                ff.lockId = r->lockId;
+                ff.lockState = r->lockState;
+                ff.verify = r->verify;
+                ff.manual = r->manualLock;
+                ff.camDx = r->camDx;
+                ff.camDy = r->camDy;
+                flog.frame(ff);
+            }
+        }
         if (observer_) observer_(*r);
         latest_ = r;
         hist_.push_back(r);
@@ -1174,6 +1252,30 @@ void Pipeline::processLoop() {
         }
     }
     saveStatic();
+}
+
+Pipeline::FieldStatus Pipeline::fieldStatus() const {
+    FieldStatus fs;
+    std::lock_guard<std::mutex> lk(rm_);
+    fs.on = flog_ != nullptr;
+    fs.dir = flogDir_;
+    fs.err = flogErr_;
+    if (flog_) fs.st = flog_->stats();
+    return fs;
+}
+
+// Настройки, которые нужны, чтобы понять журнал испытаний потом: что включено и с какими порогами
+std::string Pipeline::settingsJson(const Settings& s, int w, int h) const {
+    const Effective ef = effective(s, w, h);
+    char b[1024];
+    snprintf(b, sizeof(b),
+             "{\"app\":\"dronolok_app\",\"video_fps\":%.3f,\"camera_fps\":%.3f,\"frame_step\":%d,\"proc_w\":%d,\"proc_h\":%d,"
+             "\"scales\":%d,\"motion\":%d,\"zones\":%d,\"adapt\":%d,\"follow\":%d,\"governor\":%d,\"thr\":%.1f,"
+             "\"auto_thr\":%d,\"scene_scale\":%.2f,\"hard_lock\":%d,\"verify_frames\":%d,\"max_miss\":%d,\"slowdown\":%.2f}",
+             info_.fps, cameraFps(s), s.frameStep, w, h, ef.scales, ef.motion ? 1 : 0, ef.zones ? 1 : 0, s.adapt ? 1 : 0,
+             s.follow ? 1 : 0, s.governor ? 1 : 0, s.det.thr, s.det.auto_thr ? 1 : 0, s.det.scene_scale,
+             s.trk.hard_lock ? 1 : 0, s.trk.verify_frames, s.trk.max_miss, s.slowdown);
+    return b;
 }
 
 Pipeline::Progress Pipeline::progress() const {
