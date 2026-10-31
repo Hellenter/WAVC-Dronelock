@@ -183,6 +183,11 @@ jobs:
               --sector forest --godot "$GODOT" --seconds 5 --wide 1152x864 --fps 30 --drones 1 --birds 4 --range 150,350 --fov 5 \
               --with-birds "${ex[@]}" --json twocam-birds-$v.json | tee -a report.txt
           done
+          # погода из приложения (hello "env"): дождь в сумерках
+          echo "== эмулятор: city_sectors, лес, дождь, 18:30" | tee -a report.txt
+          timeout 1500 xvfb-run -a -s "-screen 0 640x480x24" ./build-app/dronolok_app --twocam --scene sim/scenes/city_sectors.json \
+            --sector forest --godot "$GODOT" --seconds 3 --wide 1152x864 --fps 30 --drones 3 --birds 1 --range 150,350 --size 1.5 \
+            --switch queue --weather rain --time 18:30 --json twocam-rain.json | tee -a report.txt
       - name: Мультитест по роликам сцены
         run: |
           ./build-app/dronolok_app --multitest vids --parallel 2 --out mt-sim
