@@ -468,8 +468,8 @@ void Fusion::update(int k, double t, const std::vector<TargetReport>& reps) {
             if (ang(az1, el1, az2, el2) < gate) {
                 if (gb.nearId != ga.f.id) {
                     gb.nearId = ga.f.id;
-                    gb.near = now_;
-                } else if (now_ - gb.near >= c_.mergeS) {
+                    gb.nearT = now_;
+                } else if (now_ - gb.nearT >= c_.mergeS) {
                     mergeInto(ga, gb);
                     gb.f.id = 0;   // удалить ниже
                 }
