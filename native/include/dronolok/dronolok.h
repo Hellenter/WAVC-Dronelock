@@ -170,6 +170,39 @@ DL_API void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose
 /* Состояние захвата: 0 нет, 1 захват, 2 жёсткий (подтверждён дрон). */
 DL_API int dl_tracker_hard(dl_tracker* t);
 
+/* ---- Журнал полевых испытаний (dronolok/fieldlog.hpp): треки, захват, решения дрон/птица, вырезки вокруг
+   цели до и после срыва захвата и смены цели, снимки кадра. Пишет отдельный поток, место ограничено max_mb. ---- */
+typedef struct {
+    const char* root;      /* папка журналов (UTF-8); в ней по папке на запуск */
+    const char* session;   /* имя папки запуска, NULL или "" — дата и время */
+    double max_mb;         /* предел места на все журналы в root */
+    double min_free_mb;    /* свободно на диске меньше — вырезки и снимки не пишутся */
+    float pre_s, post_s, max_clip_s;   /* вырезка: секунд до события, после, не длиннее */
+    int crop_px;           /* сторона вырезки */
+    int ring_tracks;       /* кроме захваченной, держать вырезки стольких первых целей очереди */
+    int jpeg_q;            /* качество JPEG */
+    int snap_px;           /* снимок кадра не шире, 0 — без снимков */
+    float overview_every_s;   /* снимок кадра раз в столько секунд, 0 — только у событий */
+    int clips_per_min;     /* предел вырезок в минуту */
+    int all_tracks;        /* 1 — все подтверждённые треки каждого кадра, 0 — только захваченный */
+} dl_fieldlog_config;
+typedef struct dl_fieldlog dl_fieldlog;
+DL_API void dl_fieldlog_config_default(dl_fieldlog_config* c);
+/* w x h — кадр, fps — частота камеры, source — откуда кадры, settings_json — настройки (JSON-объект или NULL).
+   NULL — не открылся (почему — dl_fieldlog_error). */
+DL_API dl_fieldlog* dl_fieldlog_open(const dl_fieldlog_config* c, int w, int h, double fps, const char* source,
+                                     const char* settings_json);
+DL_API const char* dl_fieldlog_error(void);
+/* Кадр после dl_tracker_update: треки, захват и очередь берутся из трекера t. gray — тот же кадр (для вырезок),
+   NULL — без вырезок. time_s — время кадра от начала, с; cam_dx, cam_dy — сдвиг картинки за кадр. */
+DL_API void dl_fieldlog_frame(dl_fieldlog* l, dl_tracker* t, int64_t index, double time_s, const uint8_t* gray, int w,
+                              int h, int stride, float cam_dx, float cam_dy);
+/* Отметка извне (поворотка навелась, оператор, точная камера видит птицу...): type — короткое слово, id — трек
+   или 0, text — пояснение (UTF-8), clip = 1 — записать вырезку вокруг трека id. */
+DL_API void dl_fieldlog_note(dl_fieldlog* l, const char* type, int id, const char* text, int clip);
+DL_API const char* dl_fieldlog_dir(dl_fieldlog* l);   /* папка этого запуска */
+DL_API void dl_fieldlog_close(dl_fieldlog* l);        /* дописать и закрыть (итоги в session.json) */
+
 #ifdef __cplusplus
 }
 #endif

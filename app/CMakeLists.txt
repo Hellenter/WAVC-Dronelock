@@ -57,6 +57,7 @@ pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libswscale libavutil)
 
 add_executable(dronolok_app
   src/annotate.cpp
+  src/fieldview.cpp
   src/main.cpp
   src/multitest.cpp
   src/multitest_report.cpp
