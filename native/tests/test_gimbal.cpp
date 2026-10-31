@@ -166,6 +166,12 @@ static void test_eta() {
     const double eta = slew_eta(az, el, f, 0, 0.05);
     printf("время поворота к цели 30° в стороне, 5 °/с от поворотки: %.2f с\n", eta);
     CHECK(eta > 1.0 && eta < 2.5, "eta %.2f\n", eta);
+    // цель потеряна: уставка по последнему сообщению — по прямой, через 0° азимута, с поправкой на уход нуля
+    TargetReport q;
+    q.t = 1, q.az = 359, q.el = 10, q.vaz = 2, q.vel = -1;
+    const Setpoint s = report_setpoint(q, 1.5, 0.01, 0.1, 0.05);
+    CHECK(!s.hold && std::fabs(az_diff(s.az, 0.02 - 0.1)) < 1e-6 && std::fabs(s.el - (10 - 0.51 - 0.05)) < 1e-6 && s.aaz == 0,
+          "уставка по сообщению: %.4f %.4f\n", s.az, s.el);
 }
 
 int main() {
