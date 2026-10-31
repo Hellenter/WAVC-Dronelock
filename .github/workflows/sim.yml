@@ -70,7 +70,7 @@ jobs:
           for v in "rain --time 15" "snow --time 12" "storm --time 18.3 --az 265"; do
             set -- $v; n=$1; shift
             xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene sim/scenes/city_sectors.json --out wx/$n \
-              --weather $n "$@" --seconds 1.5 --scale 0.25 --noise 0 --keep-png
+              --weather $n "$@" --seconds 1 --scale 0.5 --noise 0 --keep-png
             python sim/preview.py wx/$n 0
           done
           # смена погоды по ходу ролика и время суток x600: сцена weather_change
