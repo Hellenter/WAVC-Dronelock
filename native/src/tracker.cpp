@@ -796,8 +796,8 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // Меньший силуэт принимается — это часть цели (крыло слилось с небом)
     if (sil.valid && lockIdx >= 0 && cfg_.size_predict && tracks_[lockIdx].lsN >= 3)
         silOk = std::max(sil.w, sil.h) < cfg_.size_tol * tracks_[lockIdx].expectedSize() + 16.f;
-    // стоящие отклики (still_reject): летящий устоявшийся трек (still_lock — только захваченный) их не
-    // берёт, и силуэт захвата, севший на стоящую точку (верхушку кроны у кромки), его не ведёт
+    // стоящие отклики (still_reject): летящий устоявшийся трек (still_lock — только жёстко захваченный) их
+    // не берёт, и силуэт захвата, севший на стоящую точку (верхушку кроны у кромки), его не ведёт
     const bool stillOn = cfg_.still_reject > 0 && !movingCam_ && std::fabs(camDx) < 0.5f && std::fabs(camDy) < 0.5f;
     auto stillSpeed = [&](const Track& t) {
         if (!stillOn || !settled(t) || t.followed) return 0.f;
@@ -820,7 +820,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
             if (it->ts <= t0 + 1e-6) { o = &*it; break; }
         return std::hypot(o->x - sx, o->y - sy) > cfg_.still_d0 * (float)(1 << std::min(4, std::max(0, level)));
     };
-    if (sil.valid && silOk && lockIdx >= 0) {
+    if (sil.valid && silOk && lockIdx >= 0 && (hard_ || !cfg_.still_lock)) {
         const Track& L = tracks_[lockIdx];
         const float v = stillSpeed(L);
         const double age = v > 0 ? stillAge(sil.x, sil.y, L.polarity, 0) : 0;
@@ -950,7 +950,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     std::vector<char> stillHeld(tracks_.size(), 0);   // в воротах трека — стоящий отклик чужой точки
     for (int ti = 0; ti < (int)tracks_.size(); ++ti) {
         const Track& t = tracks_[ti];
-        const float sv = cfg_.still_lock && ti != lockIdx ? 0.f : stillSpeed(t);
+        const float sv = cfg_.still_lock && !(ti == lockIdx && hard_) ? 0.f : stillSpeed(t);
         if (sv > 0 && stillA.empty()) {
             stillA.resize(dets.size());
             for (size_t di = 0; di < dets.size(); ++di)
