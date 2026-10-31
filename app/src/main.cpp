@@ -17,13 +17,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
 #include "annotate.hpp"
+#include "fieldview.hpp"
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
+#include "mini_json.hpp"
 #include "multitest.hpp"
 #include "twocam.hpp"
 #include "dronolok/fileutil.hpp"
@@ -201,6 +204,34 @@ struct App {
     int mtGt = 0;
     std::string mtMsg, mtScanned;
     bool mtOpen = false;
+    // диалог выбора папки: 0 — мультитест, 1 — журнал (просмотр), 2 — журнал (запись)
+    int folderFor = 0;
+    // журнал полевых испытаний: просмотр (режим 2)
+    fieldview::Session fl;
+    bool flLoaded = false;
+    char flRoot[1024] = "";
+    std::vector<std::string> flSessions;
+    int flSessionIdx = 0;
+    std::string flMsg;
+    int flSel = -1;                  // выбранное событие (индекс в fl.events)
+    bool flFilter[5] = {true, true, true, true, true};
+    bool flOnlyClips = false, flHideMinor = true, flShowTracks = true, flScrollTo = false, flStretch = true;
+    int flZoom = 1;
+    std::vector<int64_t> flRange;    // кадры просмотра события (вырезки)
+    int flPos = 0;                   // позиция в flRange
+    int64_t flCursor = -1;           // кадр, который смотрим
+    bool flPlay = false;
+    double flPlayAt = 0;
+    float flSpeed = 0.5f;
+    SDL_Texture* flTex[2] = {nullptr, nullptr};
+    int flTw[2] = {0, 0}, flTh[2] = {0, 0};
+    std::string flTexKey[2];
+    SDL_Texture* flSnapTex = nullptr;
+    int flSnapW = 0, flSnapH = 0;
+    std::string flSnapKey;
+    // журнал: запись при обработке видео
+    bool flWrite = false;
+    char flWriteDir[1024] = "";
 };
 
 void apply_resources(App& a) {
@@ -1144,6 +1175,7 @@ void panel_main(App& a, bool& changed) {
     }
 }
 
+void fieldlog_record_ui(App& a, bool& changed);
 void tab_video(App& a, bool& changed) {
     const VideoInfo vi = a.pipe.info();
     if (heading("Подача кадров", true)) {
@@ -1249,6 +1281,7 @@ void tab_video(App& a, bool& changed) {
                            "Home — в начало, +/- — скорость.");
         ImGui::PopStyleColor();
     }
+    if (heading("Журнал испытаний", true)) fieldlog_record_ui(a, changed);
 }
 
 void tab_hardware(App& a, bool& changed) {
@@ -2117,16 +2150,723 @@ void window_multitest(App& a, ImVec2 pos, ImVec2 size) {
     if (changed) a.pipe.setSettings(a.s);
 }
 
+// ------------------------------------------------------------ журнал полевых испытаний (режим «Журнал»)
+
+bool upload_gray(App& a, SDL_Texture*& tex, int& tw, int& th, const uint8_t* src, int w, int h, int ds);
+
+const ImU32 FL_GROUP_COL[5] = {IM_COL32(255, 60, 230, 255), IM_COL32(255, 80, 80, 255), IM_COL32(70, 170, 255, 255),
+                               IM_COL32(255, 200, 40, 255), IM_COL32(170, 170, 170, 255)};
+const char* FL_GROUPS[5] = {"захват, срыв, смена", "жёсткий захват", "дрон / птица", "на прогнозе", "прочее"};
+
+ImU32 fl_cls_col(int cls) {
+    return cls == 1 ? COL_DRONE : cls == 2 ? COL_BIRD : cls == 3 ? COL_CLUTTER : COL_UNKNOWN;
+}
+
+std::string fl_time(double t) {
+    char b[32];
+    const int m = (int)(t / 60);
+    snprintf(b, sizeof(b), "%d:%04.1f", m, t - 60.0 * m);
+    return b;
+}
+
+bool fl_visible(const App& a, const fieldview::Event& e) {
+    if (e.type == "start" || e.type == "stop") return a.flFilter[4];
+    if (!a.flFilter[fieldview::group(e.type)]) return false;
+    if (a.flOnlyClips && e.clips.empty()) return false;
+    // первые решения по целям без захвата: на крупном кадре их десятки в минуту (ложные цели)
+    if (a.flHideMinor && e.type == "cls" && !e.locked && (e.fromCls.empty() || e.fromCls == "unknown")) return false;
+    return true;
+}
+
+// кадры, по которым идёт просмотр события: все кадры его вырезок или ±2 с вокруг, если вырезок нет
+void fl_range(App& a) {
+    a.flRange.clear();
+    if (a.flSel < 0 || a.flSel >= (int)a.fl.events.size()) return;
+    const auto& e = a.fl.events[(size_t)a.flSel];
+    for (const auto& n : e.clips) {
+        auto it = a.fl.clips.find(n);
+        if (it == a.fl.clips.end()) continue;
+        for (const auto& cf : it->second.frames) a.flRange.push_back(cf.f);
+    }
+    if (a.flRange.empty())
+        for (const auto& fr : a.fl.frames)
+            if (std::fabs(fr.t - e.t) <= 2.0) a.flRange.push_back(fr.f);
+    std::sort(a.flRange.begin(), a.flRange.end());
+    a.flRange.erase(std::unique(a.flRange.begin(), a.flRange.end()), a.flRange.end());
+}
+
+void fl_select(App& a, int i, bool play) {
+    a.flSel = i;
+    fl_range(a);
+    a.flPos = 0;
+    a.flPlay = play && a.flRange.size() > 1;
+    a.flPlayAt = now_ms();
+    if (!a.flRange.empty()) {
+        const auto& e = a.fl.events[(size_t)i];
+        if (!play)   // без проигрывания — сразу на момент события
+            for (size_t k = 0; k < a.flRange.size(); ++k)
+                if (a.flRange[k] <= e.f) a.flPos = (int)k;
+        a.flCursor = a.flRange[(size_t)a.flPos];
+    } else if (i >= 0) {
+        a.flCursor = a.fl.events[(size_t)i].f;
+    }
+    a.flScrollTo = true;
+}
+
+void fl_load(App& a, const std::string& dir) {
+    std::string err;
+    a.flLoaded = fieldview::load(dir, a.fl, err);
+    a.flMsg = a.flLoaded ? "" : err;
+    a.flSel = -1;
+    a.flRange.clear();
+    a.flCursor = -1;
+    a.flTexKey[0] = a.flTexKey[1] = a.flSnapKey = "";
+    if (!a.flLoaded) return;
+    // сразу — первый срыв или смена цели, иначе первое событие захвата
+    int pick = -1;
+    for (int i = 0; i < (int)a.fl.events.size() && pick < 0; ++i)
+        if (a.fl.events[(size_t)i].type == "lost" || a.fl.events[(size_t)i].type == "switch") pick = i;
+    for (int i = 0; i < (int)a.fl.events.size() && pick < 0; ++i)
+        if (fieldview::group(a.fl.events[(size_t)i].type) == 0) pick = i;
+    if (pick >= 0) fl_select(a, pick, false);
+}
+
+void fl_open_root(App& a, const std::string& root) {
+    snprintf(a.flRoot, sizeof(a.flRoot), "%s", root.c_str());
+    a.flSessions = fieldview::list_sessions(root);
+    a.flSessionIdx = 0;
+    if (a.flSessions.empty()) {
+        a.flLoaded = false;
+        a.flMsg = "В папке нет журналов испытаний (папок с session.json)";
+        return;
+    }
+    fl_load(a, a.flSessions[0]);
+}
+
+void panel_fieldlog(App& a) {
+    const float em = ImGui::GetFontSize();
+    heading("Журнал испытаний");
+    label("папка журналов или выезда",
+          "Папка, которую указали для записи (в ней по папке на запуск, имя — дата и время), или папка одного "
+          "выезда. С Raspberry Pi скопируйте её целиком.");
+    ImGui::SetNextItemWidth(-em * 6.5f);
+    const bool enter = ImGui::InputText("##flroot", a.flRoot, sizeof(a.flRoot), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Выбрать…", ImVec2(-FLT_MIN, 0)) && !plat::folder_dialog_open()) {
+        a.folderFor = 1;
+        plat::open_folder_dialog(a.owner);
+    }
+    if (enter || ImGui::Button("Открыть", ImVec2(em * 7, 0))) fl_open_root(a, a.flRoot);
+    if (a.flLoaded) {
+        ImGui::SameLine();
+        if (ImGui::Button("Обновить")) {   // журнал ещё пишется — дочитать
+            const int sel = a.flSel;
+            const int64_t cur = a.flCursor;
+            fl_load(a, a.fl.dir);
+            if (sel >= 0 && sel < (int)a.fl.events.size()) fl_select(a, sel, false), a.flCursor = cur;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Папка")) plat::open_in_browser(a.fl.dir);
+    }
+    if (!a.flMsg.empty()) ImGui::TextColored(TXT_WARN, "%s", a.flMsg.c_str());
+    if (a.flSessions.size() > 1) {
+        label("выезд");
+        auto nameOf = [&](int i) { return std::filesystem::u8path(a.flSessions[(size_t)i]).filename().u8string(); };
+        if (ImGui::BeginCombo("##flsess", nameOf(a.flSessionIdx).c_str())) {
+            for (int i = 0; i < (int)a.flSessions.size(); ++i)
+                if (ImGui::Selectable(nameOf(i).c_str(), i == a.flSessionIdx)) {
+                    a.flSessionIdx = i;
+                    fl_load(a, a.flSessions[(size_t)i]);
+                }
+            ImGui::EndCombo();
+        }
+    }
+    if (!a.flLoaded) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
+        ImGui::TextWrapped("Журнал пишет устройство на выезде (или это приложение: вкладка «Видео» -> «Журнал "
+                           "испытаний»). В нём треки каждого кадра, захват и его срывы, решения дрон/птица, вырезки "
+                           "вокруг цели за 2 с до и после события и снимки всего кадра — без полной записи видео.");
+        ImGui::PopStyleColor();
+        return;
+    }
+    const fieldview::Session& s = a.fl;
+    heading("Выезд");
+    ImGui::TextWrapped("%s", s.source.c_str());
+    ImGui::Text("начало %s, длительность %s", s.started.c_str(), fl_time(s.duration).c_str());
+    ImGui::Text("кадр %dx%d, %.1f к/с, кадров %zu", s.w, s.h, s.fps, s.frames.size());
+    const double dur = std::max(1e-6, s.duration);
+    ImGui::Text("захват %.0f%% времени, жёсткий %.0f%%", 100 * s.lockS / dur, 100 * s.hardS / dur);
+    ImGui::Text("захватов %d, срывов %d, смен цели %d", s.locks, s.lost, s.switches);
+    ImGui::Text("жёстких %d, на прогнозе %d", s.hard, s.coast);
+    ImGui::Text("решения: дрон %d, птица %d, передумал %d", s.droneDecisions, s.birdDecisions, s.flips);
+    help_marker("По событиям «дрон/птица» у захваченной цели и первых целей очереди: сколько раз решили «дрон», "
+                "сколько «птица» и сколько раз решение по цели менялось.");
+    int missing = 0;
+    for (const auto& c : s.clips) missing += c.second.missing;
+    ImGui::Text("вырезок %zu, снимков %zu, %.1f МБ", s.clips.size(), s.snaps.size(), s.bytes / 1048576.0);
+    if (missing) ImGui::TextColored(TXT_WARN, "%d вырезок удалено (не хватило места)", missing);
+    if (!s.finished) ImGui::TextColored(TXT_WARN, "журнал оборвался (нет итогов: выключили питание?)");
+    if (s.badLines) ImGui::TextColored(TXT_WARN, "битых строк: %d", s.badLines);
+    if (s.gaps || s.resets) ImGui::TextColored(TXT_DIM, "пропусков кадров %d, начинали заново %d", s.gaps, s.resets);
+
+    heading("События");
+    for (int g = 0; g < 5; ++g) {
+        ImGui::PushStyleColor(ImGuiCol_CheckMark, ImGui::ColorConvertU32ToFloat4(FL_GROUP_COL[g]));
+        ImGui::Checkbox(FL_GROUPS[g], &a.flFilter[g]);
+        ImGui::PopStyleColor();
+        if (g % 2 == 0 && g < 4) ImGui::SameLine(em * 12);
+    }
+    ImGui::Checkbox("только с вырезками", &a.flOnlyClips);
+    ImGui::SameLine(em * 12);
+    ImGui::Checkbox("скрыть первые решения", &a.flHideMinor);
+    help_marker("Первое решение «дрон» или «птица» по цели, которую не захватывали. На крупном кадре таких десятки в "
+                "минуту (в основном ложные цели); смена решения и решения по захваченной цели видны всегда.");
+    ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
+    ImGui::TextWrapped("Стрелки вверх/вниз — соседнее событие, влево/вправо — кадр, пробел — проиграть.");
+    ImGui::PopStyleColor();
+    ImGui::BeginChild("flevents", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    for (int i = 0; i < (int)s.events.size(); ++i) {
+        const auto& e = s.events[(size_t)i];
+        if (!fl_visible(a, e)) continue;
+        char b[96];
+        snprintf(b, sizeof(b), "%s##ev%d", fl_time(e.t).c_str(), i);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(FL_GROUP_COL[fieldview::group(e.type)]));
+        if (ImGui::Selectable(b, a.flSel == i, ImGuiSelectableFlags_SpanAllColumns)) fl_select(a, i, true);
+        ImGui::PopStyleColor();
+        if (a.flSel == i && a.flScrollTo) {
+            ImGui::SetScrollHereY(0.4f);
+            a.flScrollTo = false;
+        }
+        ImGui::SameLine(em * 4.2f);
+        ImGui::TextUnformatted(fieldview::type_ru(e.type));
+        ImGui::SameLine(em * 11);
+        const std::string d = fieldview::describe(e);
+        ImGui::TextColored(TXT_DIM, "%s%s", e.clips.empty() ? "" : "▶ ", d.c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", d.c_str());
+    }
+    ImGui::EndChild();
+}
+
+// вырезка на экране: квадрат size x size в прямоугольнике (p, sz), треки кадра поверх
+void fl_draw_clip(App& a, int slot, fieldview::Clip& c, ImVec2 p, float side) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side), IM_COL32(30, 30, 34, 255));
+    if (!fieldview::load_clip(a.fl, c)) {
+        dl->AddText(ImVec2(p.x + 8, p.y + 8), IM_COL32(230, 180, 80, 255),
+                    c.missing ? "вырезки нет (удалена при нехватке места)" : c.err.c_str());
+        return;
+    }
+    // кадр вырезки: последний не позже курсора
+    int idx = 0;
+    for (int i = 0; i < (int)c.frames.size() && i < (int)c.px.size(); ++i)
+        if (c.frames[(size_t)i].f <= a.flCursor) idx = i;
+    idx = std::min(idx, (int)c.px.size() - 1);
+    const std::string key = c.name + "#" + std::to_string(idx) + (a.flStretch ? "s" : "");
+    if (a.flTexKey[slot] != key) {
+        const std::vector<uint8_t>& src = c.px[(size_t)idx];
+        std::vector<uint8_t> st;
+        if (a.flStretch) {   // растянуть яркость: 1-й..99-й процентиль на весь диапазон — тусклую цель видно
+            int hist[256] = {};
+            for (uint8_t v : src) ++hist[v];
+            const int n = (int)src.size();
+            int lo = 0, hi = 255, acc = 0;
+            while (lo < 255 && (acc += hist[lo]) < n / 100) ++lo;
+            acc = 0;
+            while (hi > 0 && (acc += hist[hi]) < n / 100) --hi;
+            const float g = 255.f / (float)std::max(40, hi - lo);
+            st.resize(src.size());
+            for (size_t i = 0; i < src.size(); ++i)
+                st[i] = (uint8_t)std::min(255.f, std::max(0.f, ((float)src[i] - (float)lo) * g));
+        }
+        if (upload_gray(a, a.flTex[slot], a.flTw[slot], a.flTh[slot], st.empty() ? src.data() : st.data(), c.size, c.size, 1)) {
+            SDL_SetTextureScaleMode(a.flTex[slot], SDL_ScaleModeNearest);   // пиксели цели — как есть
+            a.flTexKey[slot] = key;
+        }
+    }
+    // увеличение: середина вырезки во весь квадрат
+    const float zoom = (float)a.flZoom, c0 = (float)c.size * (0.5f - 0.5f / zoom);
+    const float k = side / (float)c.size * zoom;
+    if (a.flTex[slot]) {
+        const float u0 = c0 / (float)a.flTw[slot], u1 = (c0 + (float)c.size / zoom) / (float)a.flTw[slot];
+        const float v0 = c0 / (float)a.flTh[slot], v1 = (c0 + (float)c.size / zoom) / (float)a.flTh[slot];
+        dl->AddImage((ImTextureID)(intptr_t)a.flTex[slot], p, ImVec2(p.x + side, p.y + side), ImVec2(u0, v0), ImVec2(u1, v1));
+    }
+    if (idx >= (int)c.frames.size()) return;
+    const fieldview::ClipFrame& cf = c.frames[(size_t)idx];
+    const float zk = k / (float)cf.k;   // пиксель кадра -> экран
+    auto P = [&](float x, float y) {
+        return ImVec2(p.x + ((x - (float)cf.x0) / (float)cf.k - c0) * k, p.y + ((y - (float)cf.y0) / (float)cf.k - c0) * k);
+    };
+    const int fi = a.fl.frameAt(cf.f);
+    if (a.flShowTracks && fi >= 0 && a.fl.frames[(size_t)fi].f == cf.f) {
+        const fieldview::FrameRow& fr = a.fl.frames[(size_t)fi];
+        dl->PushClipRect(p, ImVec2(p.x + side, p.y + side), true);
+        for (uint32_t i = 0; i < fr.trackN; ++i) {
+            const fieldview::TrackRow& t = a.fl.tracks[fr.trackOff + i];
+            const ImVec2 q = P(t.x, t.y);
+            const float r = std::max(7.f, 0.6f * t.size * zk + 4);
+            const ImU32 col = (t.flags & 2) ? COL_CLUTTER : fl_cls_col(t.cls);
+            if (t.id == fr.lock) dl->AddRect(ImVec2(q.x - r - 3, q.y - r - 3), ImVec2(q.x + r + 3, q.y + r + 3), COL_LOCK, 0, 0, 2.5f);
+            if (t.miss > 0) {   // на прогнозе: пунктир
+                for (int s = 0; s < 12; s += 2)
+                    dl->PathArcTo(q, r, s * 3.14159f / 6, (s + 1) * 3.14159f / 6), dl->PathStroke(col, 0, 1.5f);
+            } else {
+                dl->AddCircle(q, r, col, 0, 1.5f);
+            }
+            char lb[48];
+            snprintf(lb, sizeof(lb), "%d %s%s", t.id, fieldview::class_ru(t.cls), t.miss > 0 ? " (прогноз)" : "");
+            dl->AddText(ImVec2(q.x + r + 3, q.y - r - 2), col, lb);
+        }
+        dl->PopClipRect();
+    }
+    dl->AddRect(p, ImVec2(p.x + side, p.y + side), IM_COL32(90, 90, 100, 255));
+    char cap[160];
+    const auto& e = a.fl.events[(size_t)a.flSel];
+    snprintf(cap, sizeof(cap), "цель %d   кадр %lld   %+.2f с   %s", c.track, (long long)cf.f, cf.t - e.t,
+             cf.k > 1 ? (cf.k == 2 ? "уменьшено x2" : "уменьшено x4") : "1:1");
+    dl->AddText(ImVec2(p.x, p.y + side + 3), cf.t < e.t - 1e-6 ? IM_COL32(170, 170, 180, 255) : IM_COL32(240, 240, 240, 255), cap);
+}
+
+void fl_draw_snap(App& a, ImVec2 p, ImVec2 sz) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const auto& e = a.fl.events[(size_t)a.flSel];
+    int si = -1;
+    if (!e.snap.empty())
+        for (int i = 0; i < (int)a.fl.snaps.size(); ++i)
+            if (a.fl.snaps[(size_t)i].file.find(e.snap) != std::string::npos) si = i;
+    if (si < 0) si = a.fl.snapNear(e.f, (int64_t)(a.fl.fps * 120));
+    if (si < 0) {
+        dl->AddText(p, IM_COL32(160, 160, 170, 255), "снимка всего кадра рядом с событием нет");
+        return;
+    }
+    const fieldview::Snap& sn = a.fl.snaps[(size_t)si];
+    if (a.flSnapKey != sn.file) {
+        std::string err;
+        int w = 0, h = 0;
+        std::vector<uint8_t> px;
+        if (fieldview::load_image(sn.file, px, w, h, err) &&
+            upload_gray(a, a.flSnapTex, a.flSnapW, a.flSnapH, px.data(), w, h, 1))
+            a.flSnapKey = sn.file;
+        else {
+            dl->AddText(p, IM_COL32(230, 180, 80, 255), ("снимок не читается: " + err).c_str());
+            return;
+        }
+    }
+    const float k = std::min(sz.x / (float)a.flSnapW, (sz.y - ImGui::GetTextLineHeight() - 4) / (float)a.flSnapH);
+    const ImVec2 q1(p.x + (float)a.flSnapW * k, p.y + (float)a.flSnapH * k);
+    dl->AddImage((ImTextureID)(intptr_t)a.flSnapTex, p, q1);
+    dl->AddRect(p, q1, IM_COL32(90, 90, 100, 255));
+    const float zk = k / (float)sn.k;
+    auto P = [&](float x, float y) { return ImVec2(p.x + (x - (float)sn.ox) * zk, p.y + (y - (float)sn.oy) * zk); };
+    const int fi = a.fl.frameAt(sn.f);
+    if (fi >= 0 && a.flShowTracks) {
+        const fieldview::FrameRow& fr = a.fl.frames[(size_t)fi];
+        for (uint32_t i = 0; i < fr.trackN; ++i) {
+            const fieldview::TrackRow& t = a.fl.tracks[fr.trackOff + i];
+            const ImVec2 q = P(t.x, t.y);
+            const ImU32 col = (t.flags & 2) ? COL_CLUTTER : fl_cls_col(t.cls);
+            dl->AddCircle(q, 6, col, 0, 1.5f);
+            if (t.id == fr.lock) dl->AddRect(ImVec2(q.x - 10, q.y - 10), ImVec2(q.x + 10, q.y + 10), COL_LOCK, 0, 0, 2.f);
+        }
+    }
+    // где вырезки события
+    for (const auto& n : e.clips) {
+        auto it = a.fl.clips.find(n);
+        if (it == a.fl.clips.end() || it->second.frames.empty()) continue;
+        const auto& cf = it->second.frames[it->second.frames.size() / 2];
+        const float side = (float)(it->second.size * cf.k);
+        dl->AddRect(P((float)cf.x0, (float)cf.y0), P((float)cf.x0 + side, (float)cf.y0 + side), IM_COL32(255, 255, 255, 160));
+    }
+    char cap[160];
+    snprintf(cap, sizeof(cap), "весь кадр, кадр %lld (%+.1f с от события)%s", (long long)sn.f, (sn.f - e.f) / std::max(1.0, a.fl.fps),
+             sn.why == "periodic" ? ", снимок по времени" : "");
+    dl->AddText(ImVec2(p.x, q1.y + 3), IM_COL32(170, 170, 180, 255), cap);
+}
+
+float fl_timeline_h() { return ImGui::GetFontSize() * 4.2f; }
+
+// шкала всего выезда: захват (жёлтый — захват, красный — жёсткий), события, где сейчас курсор
+void fl_draw_timeline(App& a) {
+    const fieldview::Session& s = a.fl;
+    if (s.frames.empty()) return;
+    const float em = ImGui::GetFontSize();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float W = ImGui::GetContentRegionAvail().x - 16, H = fl_timeline_h() - 8;
+    const ImVec2 p(p0.x + 8, p0.y + 4);
+    const double t0 = s.frames.front().t, dur = std::max(1e-3, s.frames.back().t - t0);
+    auto X = [&](double t) { return p.x + (float)((t - t0) / dur) * W; };
+    dl->AddRectFilled(p, ImVec2(p.x + W, p.y + H), IM_COL32(28, 28, 32, 255));
+    const float lockY0 = p.y + em * 1.4f, lockY1 = lockY0 + em * 0.9f;
+    // полосы захвата
+    size_t i = 0;
+    while (i < s.frames.size()) {
+        size_t j = i;
+        while (j + 1 < s.frames.size() && s.frames[j + 1].state == s.frames[i].state && s.frames[j + 1].t - s.frames[j].t < 1.0) ++j;
+        if (s.frames[i].state) {
+            const ImU32 col = s.frames[i].state == 2 ? IM_COL32(230, 70, 70, 255) : IM_COL32(240, 190, 40, 255);
+            const double te = j + 1 < s.frames.size() ? s.frames[j + 1].t : s.frames[j].t;
+            dl->AddRectFilled(ImVec2(X(s.frames[i].t), lockY0), ImVec2(std::max(X(te), X(s.frames[i].t) + 1), lockY1), col);
+        }
+        i = j + 1;
+    }
+    dl->AddText(ImVec2(p.x + 4, lockY1 + 2), IM_COL32(150, 150, 160, 255), "захват (жёлтый), жёсткий (красный)");
+    // события
+    for (int k = 0; k < (int)s.events.size(); ++k) {
+        const auto& e = s.events[(size_t)k];
+        if (!fl_visible(a, e) || e.type == "start" || e.type == "stop") continue;
+        const float x = X(e.t);
+        const bool sel = k == a.flSel;
+        dl->AddLine(ImVec2(x, p.y + 2), ImVec2(x, sel ? p.y + H - 2 : lockY0 - 2), FL_GROUP_COL[fieldview::group(e.type)],
+                    sel ? 3.f : 1.5f);
+    }
+    // курсор
+    const int ci = s.frameAt(a.flCursor);
+    if (ci >= 0) {
+        const float x = X(s.frames[(size_t)ci].t);
+        dl->AddTriangleFilled(ImVec2(x - 5, p.y + H), ImVec2(x + 5, p.y + H), ImVec2(x, p.y + H - 8), IM_COL32(255, 255, 255, 255));
+    }
+    char b[64];
+    snprintf(b, sizeof(b), "%s", fl_time(dur).c_str());
+    dl->AddText(ImVec2(p.x + W - ImGui::CalcTextSize(b).x - 4, p.y + H - em - 2), IM_COL32(150, 150, 160, 255), b);
+    ImGui::SetCursorScreenPos(p);
+    ImGui::InvisibleButton("fltl", ImVec2(W, H));
+    if (ImGui::IsItemHovered()) {
+        const double t = t0 + (ImGui::GetIO().MousePos.x - p.x) / W * dur;
+        int best = -1;
+        double bd = 1e18;
+        for (int k = 0; k < (int)s.events.size(); ++k) {
+            const auto& e = s.events[(size_t)k];
+            if (!fl_visible(a, e) || e.type == "start" || e.type == "stop") continue;
+            if (std::fabs(e.t - t) < bd) bd = std::fabs(e.t - t), best = k;
+        }
+        const int fi = s.frameAtTime(t);
+        const auto& fr = s.frames[(size_t)fi];
+        ImGui::SetTooltip("%s, кадр %lld, целей %u%s%s\nщелчок — ближайшее событие%s%s", fl_time(t - t0).c_str(),
+                          (long long)fr.f, fr.trackN, fr.lock ? ", захват " : "", fr.lock ? std::to_string(fr.lock).c_str() : "",
+                          best >= 0 ? ": " : "", best >= 0 ? fieldview::describe(s.events[(size_t)best]).c_str() : "");
+        if (ImGui::IsItemClicked() && best >= 0) fl_select(a, best, true);
+    }
+}
+
+void draw_fieldlog(App& a) {
+    const float em = ImGui::GetFontSize();
+    if (!a.flLoaded) {
+        ImGui::SetCursorPos(ImVec2(em * 2, em * 2));
+        ImGui::TextColored(TXT_DIM, "Откройте журнал испытаний слева.");
+        return;
+    }
+    // проигрывание: по кадрам вырезки в темпе съёмки, x0.25–x1
+    if (a.flPlay && !a.flRange.empty()) {
+        const double nw = now_ms();
+        const int fi0 = a.fl.frameAt(a.flRange[(size_t)a.flPos]);
+        const int fi1 = a.flPos + 1 < (int)a.flRange.size() ? a.fl.frameAt(a.flRange[(size_t)a.flPos + 1]) : -1;
+        double dt = 1.0 / std::max(1.0, a.fl.fps);
+        if (fi0 >= 0 && fi1 >= 0) dt = std::max(0.0, a.fl.frames[(size_t)fi1].t - a.fl.frames[(size_t)fi0].t);
+        if (nw - a.flPlayAt >= 1000 * std::min(1.0, dt) / a.flSpeed) {
+            a.flPlayAt = nw;
+            if (a.flPos + 1 < (int)a.flRange.size()) ++a.flPos;
+            else a.flPlay = false;
+            a.flCursor = a.flRange[(size_t)a.flPos];
+        }
+    }
+    const float tlH = fl_timeline_h();
+    ImGui::BeginChild("flview", ImVec2(0, -tlH), ImGuiChildFlags_None);
+    if (a.flSel < 0 || a.flSel >= (int)a.fl.events.size()) {
+        ImGui::SetCursorPos(ImVec2(em * 2, em * 2));
+        ImGui::TextColored(TXT_DIM, "Выберите событие слева или на шкале снизу.");
+        ImGui::EndChild();
+        fl_draw_timeline(a);
+        return;
+    }
+    const auto& e = a.fl.events[(size_t)a.flSel];
+    ImGui::SetCursorPos(ImVec2(em, em * 0.6f));
+    {
+        FontSize f(1.25f);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(FL_GROUP_COL[fieldview::group(e.type)]), "%s  %s",
+                           fl_time(e.t).c_str(), fieldview::type_ru(e.type));
+    }
+    ImGui::SetCursorPosX(em);
+    ImGui::TextWrapped("%s", fieldview::describe(e).c_str());
+    // плеер
+    ImGui::SetCursorPosX(em);
+    const float bw = em * 2.6f;
+    if (ImGui::Button("|<", ImVec2(bw, 0)) && !a.flRange.empty()) a.flPos = 0, a.flCursor = a.flRange[0], a.flPlay = false;
+    ImGui::SameLine();
+    if (ImGui::Button("<", ImVec2(bw, 0)) && a.flPos > 0) a.flCursor = a.flRange[(size_t)--a.flPos], a.flPlay = false;
+    ImGui::SameLine();
+    if (ImGui::Button(a.flPlay ? "||" : ">", ImVec2(bw, 0)) && !a.flRange.empty()) {
+        if (!a.flPlay && a.flPos + 1 >= (int)a.flRange.size()) a.flPos = 0, a.flCursor = a.flRange[0];
+        a.flPlay = !a.flPlay;
+        a.flPlayAt = now_ms();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(">", ImVec2(bw, 0)) && a.flPos + 1 < (int)a.flRange.size())
+        a.flCursor = a.flRange[(size_t)++a.flPos], a.flPlay = false;
+    ImGui::SameLine();
+    if (ImGui::Button("событие", ImVec2(0, 0)))
+        for (size_t k = 0; k < a.flRange.size(); ++k)
+            if (a.flRange[k] <= e.f) a.flPos = (int)k, a.flCursor = a.flRange[k], a.flPlay = false;
+    ImGui::SetItemTooltip("К кадру события");
+    ImGui::SameLine();
+    static const char* speeds[] = {"x0.25", "x0.5", "x1"};
+    int sp = a.flSpeed <= 0.3f ? 0 : a.flSpeed <= 0.6f ? 1 : 2;
+    ImGui::SetNextItemWidth(em * 5);
+    if (ImGui::Combo("##flsp", &sp, speeds, 3)) a.flSpeed = sp == 0 ? 0.25f : sp == 1 ? 0.5f : 1.f;
+    ImGui::SameLine();
+    static const char* zooms[] = {"1:1", "x2", "x4"};
+    int zi = a.flZoom >= 4 ? 2 : a.flZoom >= 2 ? 1 : 0;
+    ImGui::SetNextItemWidth(em * 4.2f);
+    if (ImGui::Combo("##flzoom", &zi, zooms, 3)) a.flZoom = zi == 2 ? 4 : zi == 1 ? 2 : 1;
+    ImGui::SetItemTooltip("Увеличить середину вырезки (цель в несколько пикселей)");
+    ImGui::SetCursorPosX(em);
+    ImGui::Checkbox("треки", &a.flShowTracks);
+    ImGui::SameLine();
+    ImGui::Checkbox("контраст", &a.flStretch);
+    ImGui::SetItemTooltip("Растянуть яркость вырезки: тусклую цель на ровном небе видно лучше (заметнее и сжатие видео)");
+    if (!a.flRange.empty()) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-em);
+        int pos = a.flPos;
+        char fmt[64];
+        const int fi = a.fl.frameAt(a.flCursor);
+        snprintf(fmt, sizeof(fmt), "%+.2f с от события", fi >= 0 ? a.fl.frames[(size_t)fi].t - e.t : 0.0);
+        if (ImGui::SliderInt("##flpos", &pos, 0, (int)a.flRange.size() - 1, fmt)) {
+            a.flPos = pos;
+            a.flCursor = a.flRange[(size_t)pos];
+            a.flPlay = false;
+        }
+        // где на ползунке само событие (и другие события этих вырезок)
+        const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
+        const float gw = ImGui::GetStyle().GrabMinSize, n = (float)std::max<size_t>(1, a.flRange.size() - 1);
+        for (int k = 0; k < (int)a.fl.events.size(); ++k) {
+            const auto& o = a.fl.events[(size_t)k];
+            if (o.f < a.flRange.front() || o.f > a.flRange.back() || o.type == "start" || o.type == "stop") continue;
+            int idx = 0;
+            for (size_t q = 0; q < a.flRange.size(); ++q)
+                if (a.flRange[q] <= o.f) idx = (int)q;
+            const float x = r0.x + gw * 0.5f + (r1.x - r0.x - gw) * (float)idx / n;
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(x, r0.y), ImVec2(x, r0.y + (k == a.flSel ? (r1.y - r0.y) : 5)),
+                                                FL_GROUP_COL[fieldview::group(o.type)], k == a.flSel ? 3.f : 2.f);
+        }
+    }
+    // вырезки (до двух: смена цели — старая и новая) и снимок всего кадра
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImVec2 o = ImGui::GetCursorScreenPos();
+    std::vector<fieldview::Clip*> cl;
+    for (const auto& n : e.clips) {
+        auto it = a.fl.clips.find(n);
+        if (it != a.fl.clips.end() && cl.size() < 2) cl.push_back(&it->second);
+    }
+    const float capH = ImGui::GetTextLineHeight() + 6;
+    float clipSide = 0;
+    if (!cl.empty()) {
+        clipSide = std::min((avail.x - em * (1 + cl.size())) / (float)cl.size(), avail.y * 0.58f - capH);
+        clipSide = std::max(em * 6, clipSide);
+        for (size_t k = 0; k < cl.size(); ++k)
+            fl_draw_clip(a, (int)k, *cl[k], ImVec2(o.x + em + (float)k * (clipSide + em), o.y + em * 0.5f), clipSide);
+    } else {
+        ImGui::GetWindowDrawList()->AddText(ImVec2(o.x + em, o.y + em * 0.5f), IM_COL32(160, 160, 170, 255),
+                                            "у события нет вырезки (предел вырезок в минуту, место на диске или событие без вырезки)");
+        clipSide = em;
+    }
+    const float sy = o.y + em * 0.5f + clipSide + capH + em * 0.5f;
+    fl_draw_snap(a, ImVec2(o.x + em, sy), ImVec2(avail.x - 2 * em, o.y + avail.y - sy));
+    ImGui::EndChild();
+    fl_draw_timeline(a);
+}
+
+void panel_fieldlog_details(App& a) {
+    if (!a.flLoaded) {
+        ImGui::TextColored(TXT_DIM, "Журнал не открыт");
+        return;
+    }
+    const fieldview::Session& s = a.fl;
+    const int fi = s.frameAt(a.flCursor);
+    if (fi >= 0) {
+        const fieldview::FrameRow& fr = s.frames[(size_t)fi];
+        char h[96];
+        snprintf(h, sizeof(h), "Кадр %lld, %s", (long long)fr.f, fl_time(fr.t).c_str());
+        heading(h);
+        if (fr.lock)
+            ImGui::Text("захват: цель %d, %s%s", fr.lock, fr.state == 2 ? "жёсткий" : "проверка", fr.manual ? ", вручную" : "");
+        else ImGui::TextColored(TXT_DIM, "захвата нет");
+        if (fr.lock && fr.state != 2) ImGui::Text("кадров подряд «дрон»: %d", fr.verify);
+        if (fr.cdx != 0 || fr.cdy != 0) ImGui::Text("сдвиг камеры %.1f, %.1f пикс./кадр", fr.cdx, fr.cdy);
+        if (ImGui::BeginTable("fltr", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY,
+                              ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 10))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            for (const char* c : {"цель", "класс", "птичн.", "вес", "попад.", "размер"}) ImGui::TableSetupColumn(c);
+            ImGui::TableHeadersRow();
+            for (uint32_t i = 0; i < fr.trackN; ++i) {
+                const fieldview::TrackRow& t = s.tracks[fr.trackOff + i];
+                ImGui::TableNextRow();
+                if (t.id == fr.lock) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(110, 30, 100, 140));
+                ImGui::TableNextColumn();
+                ImGui::Text("%d%s", t.id, t.miss > 0 ? "*" : "");
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4((t.flags & 2) ? COL_CLUTTER : fl_cls_col(t.cls)), "%s",
+                                   (t.flags & 2) ? "помеха" : (t.flags & 4) ? "лист" : fieldview::class_ru(t.cls));
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", t.bird);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.1f", t.weight);
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", t.hits);
+                ImGui::TableNextColumn();
+                if (t.size > 0) ImGui::Text("%.0f", t.size);
+                else ImGui::TextDisabled("-");
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("* — цель не видна, трек на прогнозе");
+    }
+    if (a.flSel >= 0 && a.flSel < (int)s.events.size()) {
+        const auto& e = s.events[(size_t)a.flSel];
+        const int id = e.id;
+        if (id) {
+            char h[64];
+            snprintf(h, sizeof(h), "Цель %d вокруг события", id);
+            heading(h);
+            // птичность и класс за ±10 с
+            std::vector<float> bird;
+            int nD = 0, nB = 0, nU = 0, nL = 0, nMiss = 0;
+            double first = -1, last = -1;
+            for (const auto& fr : s.frames) {
+                if (fr.t < e.t - 10 || fr.t > e.t + 10) continue;
+                const fieldview::TrackRow* t = s.track(fr, id);
+                if (!t) continue;
+                if (first < 0) first = fr.t;
+                last = fr.t;
+                bird.push_back(t->bird);
+                nD += t->cls == 1;
+                nB += t->cls == 2;
+                nU += t->cls == 0;
+                nL += fr.lock == id;
+                nMiss += t->miss > 0;
+            }
+            if (!bird.empty()) {
+                ImGui::Text("виден %.1f с (%+.1f…%+.1f с от события)", last - first, first - e.t, last - e.t);
+                ImGui::Text("дрон %d, птица %d, не решено %d кадров", nD, nB, nU);
+                ImGui::Text("в захвате %d, на прогнозе %d кадров", nL, nMiss);
+                label("птичность (0 — дрон, 1 — птица)");
+                ImGui::PlotLines("##flbird", bird.data(), (int)bird.size(), 0, nullptr, 0.f, 1.f,
+                                 ImVec2(0, ImGui::GetFontSize() * 4));
+            } else {
+                ImGui::TextColored(TXT_DIM, "в строках кадров цели нет (пишется только захваченная?)");
+            }
+        }
+        heading("Событие");
+        ImGui::TextWrapped("%s", fieldview::describe(e).c_str());
+        ImGui::Text("№ %d, кадр %lld", e.n, (long long)e.f);
+        if (e.x >= 0) ImGui::Text("где: %.0f, %.0f", e.x, e.y);
+        std::error_code ec;
+        const bool srcFile = !s.source.empty() && std::filesystem::exists(std::filesystem::u8path(s.source), ec);
+        if (srcFile) {
+            if (ImGui::Button("Открыть видео на этом кадре", ImVec2(-FLT_MIN, 0))) {
+                const int64_t f = a.flCursor >= 0 ? a.flCursor : e.f;
+                a.appMode = 0;
+                {   // частота камеры, с которой писали журнал (14 к/с с ролика 60 к/с и т.п.)
+                    minijson::Value v;
+                    if (minijson::parse(s.settings, v)) {
+                        const double cam = v["camera_fps"].num(0), vid = v["video_fps"].num(0);
+                        a.s.frameStep = std::max(1, (int)v["frame_step"].num(1));
+                        a.s.targetFps = cam > 0 && vid > 0 && cam * std::max(1, a.s.frameStep) < 0.99 * vid ? cam * std::max(1, a.s.frameStep) : 0;
+                        a.pipe.setSettings(a.s);
+                    }
+                }
+                open_video(a, s.source);
+                a.pipe.setPaused(true);
+                seek_to(a, std::max<int64_t>(0, f), false);
+            }
+            ImGui::SetItemTooltip("Журнал записан с видео: открыть его на вкладке «Видео» (на паузе), с этого кадра, с той же "
+                                  "частотой камеры. Треки начнутся заново, поэтому захват может пойти иначе, чем в журнале.");
+        }
+    }
+    if (!s.settings.empty() && heading("Настройки при записи", true)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, TXT_DIM);
+        ImGui::TextWrapped("%s", s.settings.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+// видео или папка журнала испытаний (аргумент командной строки, файл перетащили в окно)
+void open_any(App& a, const std::string& path) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(std::filesystem::u8path(path), ec)) {
+        a.appMode = 2;
+        fl_open_root(a, path);
+        return;
+    }
+    open_video(a, path);
+}
+
+// запись журнала при обработке видео (вкладка «Видео»)
+void fieldlog_record_ui(App& a, bool& changed) {
+    const float em = ImGui::GetFontSize();
+    if (ImGui::Checkbox("Писать журнал испытаний", &a.flWrite)) {
+        a.s.fieldLog = a.flWrite ? a.flWriteDir : "";
+        changed = true;
+    }
+    help_marker("Как устройство на выезде: треки каждого кадра, захват, срывы и смены цели, решения дрон/птица, "
+                "вырезки вокруг цели за 2 с до и после события, снимки всего кадра. Пишется первый проход видео; "
+                "перемотка начинает треки заново. Открыть — переключатель «Журнал» сверху.");
+    label("папка журналов");
+    ImGui::SetNextItemWidth(-em * 6.5f);
+    if (ImGui::InputText("##flw", a.flWriteDir, sizeof(a.flWriteDir), ImGuiInputTextFlags_EnterReturnsTrue) && a.flWrite) {
+        a.s.fieldLog = a.flWriteDir;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Выбрать…##flw", ImVec2(-FLT_MIN, 0)) && !plat::folder_dialog_open()) {
+        a.folderFor = 2;
+        plat::open_folder_dialog(a.owner);
+    }
+    float mb = (float)a.s.fieldCfg.max_mb;
+    label("предел места на все журналы, МБ",
+          "Когда журналы займут больше, сначала удаляются вырезки и снимки старых выездов, потом старые выезды, "
+          "потом вырезки текущего. Строки треков пишутся до последнего. Чужие файлы в папке не трогаются.");
+    if (ImGui::SliderFloat("##flmb", &mb, 100, 32768, "%.0f", ImGuiSliderFlags_Logarithmic)) a.s.fieldCfg.max_mb = mb;
+    if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+    label("вырезка: секунд до и после события");
+    float pp[2] = {a.s.fieldCfg.pre_s, a.s.fieldCfg.post_s};
+    if (ImGui::SliderFloat2("##flpp", pp, 0.5f, 6.f, "%.1f")) a.s.fieldCfg.pre_s = pp[0], a.s.fieldCfg.post_s = pp[1];
+    if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+    const Pipeline::FieldStatus fs = a.pipe.fieldStatus();
+    if (!fs.err.empty()) ImGui::TextColored(TXT_BAD, "не пишется: %s", fs.err.c_str());
+    else if (fs.on)
+        ImGui::TextColored(TXT_OK, "пишется: событий %d, вырезок %d, %.1f МБ%s", fs.st.events, fs.st.clips, fs.st.usedMb,
+                           fs.st.diskFull ? " — МЕСТО КОНЧИЛОСЬ" : "");
+    else if (!fs.dir.empty()) ImGui::TextColored(TXT_DIM, "записан (первый проход видео)");
+    if (!fs.dir.empty()) {
+        ImGui::TextDisabled("%s", fs.dir.c_str());
+        if (ImGui::Button("Открыть в «Журнал»", ImVec2(-FLT_MIN, 0))) {
+            a.appMode = 2;
+            snprintf(a.flRoot, sizeof(a.flRoot), "%s", fs.dir.c_str());
+            a.flSessions = {fs.dir};
+            a.flSessionIdx = 0;
+            fl_load(a, fs.dir);
+        }
+    }
+}
+
 void panel_twocam(App& a);
 void panel_controls(App& a) {
-    static const char* modes[] = {"Видео", "Две камеры"};
+    static const char* modes[] = {"Видео", "Две камеры", "Журнал"};
     static const char* modeTips[] = {"Обработка видео и записей с камеры.",
                                      "Эмулятор: широкая камера находит цели и указывает их точной 640x480 на "
-                                     "поворотке, точная захватывает и ведёт сама."};
-    segmented("appmode", modes, 2, a.appMode, 0, modeTips);
+                                     "поворотке, точная захватывает и ведёт сама.",
+                                     "Разбор журнала полевых испытаний: срывы и смены захвата, решения дрон/птица, "
+                                     "вырезки вокруг цели до и после события."};
+    segmented("appmode", modes, 3, a.appMode, 0, modeTips);
     ImGui::Spacing();
     if (a.appMode == 1) {
         panel_twocam(a);
+        return;
+    }
+    if (a.appMode == 2) {
+        panel_fieldlog(a);
         return;
     }
     bool changed = false;
@@ -3549,6 +4289,7 @@ int run_bench(int argc, char** argv) {
     plat::attach_console();
     std::string video, json, csv;
     int frames = 300, preload = 0;
+    bool framesSet = false;
     Settings s;
     s.pace = Pace::MaxSpeed;
     s.loop = true;
@@ -3557,8 +4298,14 @@ int run_bench(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
-        if (a == "--frames") frames = atoi(val().c_str());
+        if (a == "--frames") frames = atoi(val().c_str()), framesSet = true;
         else if (a == "--threads") s.det.threads = atoi(val().c_str());
+        // журнал полевых испытаний: один проход видео (как выезд), до конца, если не задано --frames
+        else if (a == "--fieldlog") s.fieldLog = val(), s.loop = false;
+        else if (a == "--log-max-mb") s.fieldCfg.max_mb = atof(val().c_str());
+        else if (a == "--log-pre") s.fieldCfg.pre_s = (float)atof(val().c_str());
+        else if (a == "--log-post") s.fieldCfg.post_s = (float)atof(val().c_str());
+        else if (a == "--log-crop") s.fieldCfg.crop_px = atoi(val().c_str());
         else if (a == "--isa") {
             std::string v = val();
             s.det.isa = v == "scalar" ? Isa::Scalar : v == "sse2" ? Isa::SSE2 : v == "avx2" ? Isa::AVX2 : v == "neon" ? Isa::NEON : Isa::Auto;
@@ -3627,6 +4374,7 @@ int run_bench(int argc, char** argv) {
         s.source = Source::Preload;
         s.preloadFrames = preload;
     }
+    if (!s.fieldLog.empty() && !framesSet) frames = 1 << 30;
     Pipeline p;
     p.setSettings(s);
     std::string err;
@@ -3661,7 +4409,16 @@ int run_bench(int argc, char** argv) {
             fclose(f);
         }
     if (!csv.empty()) p.exportCsv(csv);
-    p.close();
+    const Pipeline::FieldStatus fs = p.fieldStatus();
+    p.close();   // журнал дописывается при остановке обработки
+    if (!s.fieldLog.empty()) {
+        if (!fs.err.empty()) printf("журнал не записан: %s\n", fs.err.c_str());
+        else
+            printf("журнал: %s\n  кадров %lld, захватов %d, срывов %d, смен цели %d, жёстких %d, вырезок %d (пропущено %d), "
+                   "снимков %d, журналы занимают %.1f МБ%s\n",
+                   fs.dir.c_str(), (long long)fs.st.frames, fs.st.locks, fs.st.lost, fs.st.switches, fs.st.hard, fs.st.clips,
+                   fs.st.clipsSkipped, fs.st.snaps, fs.st.usedMb, fs.st.diskFull ? ", МЕСТО КОНЧИЛОСЬ" : "");
+    }
     return 0;
 }
 
@@ -3670,13 +4427,14 @@ int run_bench(int argc, char** argv) {
 // (в сборке с -fsanitize=address) и в CI.
 int run_stress(int argc, char** argv) {
     plat::attach_console();
-    std::string video;
+    std::string video, flDir;
     double seconds = 20;
     unsigned seed = 1;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--seconds" && i + 1 < argc) seconds = atof(argv[++i]);
         else if (a == "--seed" && i + 1 < argc) seed = (unsigned)atoi(argv[++i]);
+        else if (a == "--fieldlog" && i + 1 < argc) flDir = argv[++i];
         else video = a;
     }
     Pipeline p;
@@ -3720,6 +4478,20 @@ int run_stress(int argc, char** argv) {
             for (const auto& t : r->tracks) sum += (unsigned)t.path.size();
         }
         p.metrics();
+        // журнал испытаний: включить/выключить с разными вырезками и пределом места (2 МБ — удаление старых)
+        if (!flDir.empty() && R(25) == 0) {
+            s.fieldLog = s.fieldLog.empty() ? flDir : "";
+            s.fieldCfg.crop_px = R(4) ? 160 : R(400);
+            s.fieldCfg.pre_s = F(0, 4);
+            s.fieldCfg.post_s = F(0, 4);
+            s.fieldCfg.max_mb = R(2) ? 2 : 200;
+            s.fieldCfg.ring_tracks = R(8);
+            s.fieldCfg.snap_px = R(3) ? 1280 : R(2000);
+            s.fieldCfg.overview_every_s = F(0, 5);
+            s.fieldCfg.clips_per_min = R(60);
+            p.setSettings(s);
+            p.fieldStatus();
+        }
         bool set = true;
         int a = R(38);
         // перезапуск чтения (источник, разрешение) и сброс — реже, иначе кадры почти не идут
@@ -4051,7 +4823,7 @@ int main(int argc, char** argv) {
         SDL_free(bp);
     }
     sim_scan(a);
-    if (argc > 1) open_video(a, argv[1]);
+    if (argc > 1) open_any(a, argv[1]);
     a.cpuWall = now_ms();
     a.cpuT = plat::process_cpu_seconds();
 
@@ -4062,14 +4834,23 @@ int main(int argc, char** argv) {
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) done = true;
             if (e.type == SDL_DROPFILE) {
-                open_video(a, e.drop.file);
+                open_any(a, e.drop.file);
                 SDL_free(e.drop.file);
             }
         }
         std::string picked;
         if (plat::video_dialog_result(picked) && !picked.empty()) open_video(a, picked);
-        if (plat::folder_dialog_result(picked) && !picked.empty())
-            snprintf(a.mtFolder, sizeof(a.mtFolder), "%s", picked.c_str());
+        if (plat::folder_dialog_result(picked) && !picked.empty()) {
+            if (a.folderFor == 1) fl_open_root(a, picked);
+            else if (a.folderFor == 2) {
+                snprintf(a.flWriteDir, sizeof(a.flWriteDir), "%s", picked.c_str());
+                if (a.flWrite) {
+                    a.s.fieldLog = a.flWriteDir;
+                    a.pipe.setSettings(a.s);
+                }
+            } else snprintf(a.mtFolder, sizeof(a.mtFolder), "%s", picked.c_str());
+            a.folderFor = 0;
+        }
         if (SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED) {
             SDL_Delay(20);
             continue;
@@ -4129,6 +4910,23 @@ int main(int argc, char** argv) {
                 if (turn) a.emu.setWidePose(cc.wideAz, cc.wideEl);
             }
         }
+        if (!io.WantTextInput && a.appMode == 2 && a.flLoaded) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && !a.flRange.empty()) {
+                if (!a.flPlay && a.flPos + 1 >= (int)a.flRange.size()) a.flPos = 0, a.flCursor = a.flRange[0];
+                a.flPlay = !a.flPlay;
+                a.flPlayAt = now_ms();
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && a.flPos > 0) a.flCursor = a.flRange[(size_t)--a.flPos], a.flPlay = false;
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && a.flPos + 1 < (int)a.flRange.size())
+                a.flCursor = a.flRange[(size_t)++a.flPos], a.flPlay = false;
+            const int dir = ImGui::IsKeyPressed(ImGuiKey_DownArrow) ? 1 : ImGui::IsKeyPressed(ImGuiKey_UpArrow) ? -1 : 0;
+            if (dir)
+                for (int i = a.flSel + dir; i >= 0 && i < (int)a.fl.events.size(); i += dir)
+                    if (fl_visible(a, a.fl.events[(size_t)i])) {
+                        fl_select(a, i, true);
+                        break;
+                    }
+        }
         if (!io.WantTextInput && a.pipe.isOpen() && a.appMode == 0) {
             if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) toggle_pause(a);
             const int64_t curIdx = shown ? shown->frame->index : 0;
@@ -4158,6 +4956,7 @@ int main(int argc, char** argv) {
         ImGui::SetNextWindowSize(ImVec2(rw, ds.y));
         ImGui::Begin("Метрики", nullptr, fixed);
         if (a.appMode == 1) panel_twocam_metrics(a);
+        else if (a.appMode == 2) panel_fieldlog_details(a);
         else panel_metrics(a, m, shown);
         ImGui::End();
         ImGui::SetNextWindowPos(ImVec2(lw, 0));
@@ -4168,6 +4967,7 @@ int main(int argc, char** argv) {
         ImGui::BeginChild("view", ImVec2(0, -barH), ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         if (a.appMode == 1) draw_twocam(a);
+        else if (a.appMode == 2) draw_fieldlog(a);
         else draw_view(a, shown);
         ImGui::EndChild();
         if (a.pipe.isOpen() && a.appMode == 0) draw_timeline(a, shown, m);
@@ -4198,6 +4998,8 @@ int main(int argc, char** argv) {
     if (a.emuWTex) SDL_DestroyTexture(a.emuWTex);
     if (a.emuPanoTex) SDL_DestroyTexture(a.emuPanoTex);
     if (a.emuNTex) SDL_DestroyTexture(a.emuNTex);
+    for (SDL_Texture* t : {a.flTex[0], a.flTex[1], a.flSnapTex})
+        if (t) SDL_DestroyTexture(t);
     SDL_DestroyRenderer(a.ren);
     SDL_DestroyWindow(win);
     SDL_Quit();

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/fieldlog.hpp"
 #include "dronolok/geometry.hpp"
 
 using namespace dronolok;
@@ -287,5 +288,115 @@ void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose* to, f
     if (dy) *dy = (float)b;
 }
 int dl_tracker_hard(dl_tracker* t) { return (int)t->trk.lockState(); }
+
+
+struct dl_fieldlog {
+    FieldLog log;
+    std::vector<int> queue;
+};
+
+static thread_local std::string g_fieldlog_err;
+
+void dl_fieldlog_config_default(dl_fieldlog_config* c) {
+    if (!c) return;
+    const FieldLogConfig d;
+    c->root = nullptr;
+    c->session = nullptr;
+    c->max_mb = d.max_mb;
+    c->min_free_mb = d.min_free_mb;
+    c->pre_s = d.pre_s;
+    c->post_s = d.post_s;
+    c->max_clip_s = d.max_clip_s;
+    c->crop_px = d.crop_px;
+    c->ring_tracks = d.ring_tracks;
+    c->jpeg_q = d.jpeg_q;
+    c->snap_px = d.snap_px;
+    c->overview_every_s = d.overview_every_s;
+    c->clips_per_min = d.clips_per_min;
+    c->all_tracks = d.all_tracks ? 1 : 0;
+}
+
+dl_fieldlog* dl_fieldlog_open(const dl_fieldlog_config* c, int w, int h, double fps, const char* source,
+                              const char* settings_json) {
+    if (!c || !c->root || w <= 0 || h <= 0) {
+        g_fieldlog_err = "не задана папка журналов или размер кадра";
+        return nullptr;
+    }
+    FieldLogConfig f;
+    f.root = c->root;
+    f.session = c->session ? c->session : "";
+    f.max_mb = c->max_mb;
+    f.min_free_mb = c->min_free_mb;
+    f.pre_s = c->pre_s;
+    f.post_s = c->post_s;
+    f.max_clip_s = c->max_clip_s;
+    f.crop_px = c->crop_px;
+    f.ring_tracks = c->ring_tracks;
+    f.jpeg_q = c->jpeg_q;
+    f.snap_px = c->snap_px;
+    f.overview_every_s = c->overview_every_s;
+    f.clips_per_min = c->clips_per_min;
+    f.all_tracks = c->all_tracks != 0;
+    auto* l = new dl_fieldlog;
+    std::string err;
+    try {
+        if (!l->log.open(f, w, h, fps, source ? source : "", settings_json ? settings_json : "", err)) {
+            g_fieldlog_err = err;
+            delete l;
+            return nullptr;
+        }
+    } catch (const std::exception& e) {
+        g_fieldlog_err = e.what();
+        delete l;
+        return nullptr;
+    }
+    return l;
+}
+
+const char* dl_fieldlog_error(void) { return g_fieldlog_err.c_str(); }
+
+void dl_fieldlog_frame(dl_fieldlog* l, dl_tracker* t, int64_t index, double time_s, const uint8_t* gray, int w, int h,
+                       int stride, float cam_dx, float cam_dy) {
+    if (!l || !t) return;
+    FieldFrame f;
+    f.index = index;
+    f.t = time_s;
+    f.gray = gray && w > 0 && h > 0 ? gray : nullptr;
+    f.w = w;
+    f.h = h;
+    f.stride = stride > 0 ? stride : w;
+    f.tracks = &t->trk.confirmed();
+    t->trk.lockQueue(l->queue);
+    f.queue = &l->queue;
+    f.lockId = t->trk.lockedId();
+    f.lockState = t->trk.lockState();
+    f.verify = t->trk.verifyFrames();
+    f.manual = t->trk.manualLock();
+    f.camDx = cam_dx;
+    f.camDy = cam_dy;
+    try {
+        l->log.frame(f);
+    } catch (...) {
+    }
+}
+
+void dl_fieldlog_note(dl_fieldlog* l, const char* type, int id, const char* text, int clip) {
+    if (!l) return;
+    try {
+        l->log.note(type ? type : "note", id, text ? text : "", clip != 0);
+    } catch (...) {
+    }
+}
+
+const char* dl_fieldlog_dir(dl_fieldlog* l) { return l ? l->log.dir().c_str() : ""; }
+
+void dl_fieldlog_close(dl_fieldlog* l) {
+    if (!l) return;
+    try {
+        l->log.close();
+    } catch (...) {
+    }
+    delete l;
+}
 
 }  // extern "C"
