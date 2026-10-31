@@ -604,8 +604,9 @@ void Emulator::start(const Config& cfg) {
     bodySeen_.clear();
     seamCheck_.clear();
     lastSnapT_ = -1;
-    offRefT_ = -1;
+    offRefT_ = offTrack_ = -1;
     offN_ = 0;
+    offCam_ = -1;
     narrowCam_ = CameraModel();
     narrowCam_.w = c.narrowW;
     narrowCam_.h = c.narrowH;
@@ -1678,16 +1679,20 @@ void Emulator::stepNarrow(double t, double dt) {
                 off = ang(waz, wel, nrep_.az, nrep_.el) > tol && t - tTrackStart_ > (c_.wideCheck ? 0.3 : 1.0);
                 // сдвиг калибровки у всех сообщений камеры один и тот же: точная, взявшая цель, видит её на том же
                 // смещении от прогноза широкой, что и в начале. Смещение поползло (трек точной сползает с цели на
-                // помеху) — заметно с обычным допуском, без запаса на калибровку
-                if (wt->bias > 0) {
+                // помеху) — заметно с обычным допуском, без запаса на калибровку. Пока точная не подтвердила дрон,
+                // пар для калибровки нет, и сдвиг не меняется; потом калибровка его убирает — сверка по началу
+                // захвата уже не годится. Сообщения перешли к другой широкой — у неё свой сдвиг, смещение заново
+                if (wt->bias > 0 && !nConf_) {
                     const double cosE = std::cos(deg2rad(nrep_.el));
                     const double dx = az_diff(nrep_.az, waz) * cosE, dy = nrep_.el - wel;
-                    if (offRefT_ != tTrackStart_) {
-                        offRefT_ = tTrackStart_;
+                    if (offTrack_ != tTrackStart_ || offCam_ != wt->cam) {
+                        offRefT_ = offTrack_ != tTrackStart_ ? tTrackStart_ : t;   // откуда считать смещение
+                        offTrack_ = tTrackStart_;
+                        offCam_ = wt->cam;
                         offN_ = 0;
                         offX_ = offY_ = 0;
                     }
-                    if (t - tTrackStart_ <= 0.15) {   // смещение — по первым кадрам
+                    if (t - offRefT_ <= 0.15) {   // смещение — по первым кадрам
                         offX_ = (offX_ * offN_ + dx) / (offN_ + 1);
                         offY_ = (offY_ * offN_ + dy) / (offN_ + 1);
                         ++offN_;

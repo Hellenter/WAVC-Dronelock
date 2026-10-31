@@ -406,8 +406,8 @@ private:
     std::vector<std::pair<double, int>> seamCheck_;   // точная вела тело на стыке: проверить через 1 с
     double lastSnapT_ = -1;
     // смещение точной от прогноза широкой в начале захвата (калибровка не сошлась): по нему — сползла ли точная
-    double offRefT_ = -1, offX_ = 0, offY_ = 0;
-    int offN_ = 0;
+    double offTrack_ = -1, offRefT_ = -1, offX_ = 0, offY_ = 0;
+    int offN_ = 0, offCam_ = -1;
     std::vector<int> visited_;          // уже обслуженные цели (авто: по очереди)
     std::vector<std::pair<int, double>> cool_;   // не подтверждённые точной цели широкой и до какого времени
     std::vector<std::pair<TargetReport, double>> veto_;   // отсеянные точной (где были) и до какого времени
