@@ -120,7 +120,11 @@ jobs:
           cd previews
           git -c user.name=ci -c user.email=ci@localhost add -A
           git -c user.name=ci -c user.email=ci@localhost commit -qm "превью ${GITHUB_SHA::7}"
-          git push -q "$REPO_URL" HEAD:sim-previews
+          # два прогона с разных веток пушат одновременно: папки разные (по SHA), догоняем и пушим снова
+          for i in 1 2 3; do
+            git push -q "$REPO_URL" HEAD:sim-previews && break
+            git -c user.name=ci -c user.email=ci@localhost pull -q --rebase "$REPO_URL" sim-previews
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sim-videos

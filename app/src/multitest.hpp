@@ -91,6 +91,9 @@ struct VideoMeta {
     long frames = 0;
     bool gt = false;
     bool noDrones = false;   // по разметке в ролике нет ни одной цели
+    std::string codec;
+    std::string fpsNote;     // частота не из контейнера (fps_note): «голый» поток, файл меток
+    bool fpsAssumed = false; // частота в файле не записана — нужна video_fps или файл меток
 };
 
 // Итог одного прогона «видео x вариант». Отрицательное значение — нет данных
@@ -109,6 +112,8 @@ struct RunResult {
     double lockAcq = 0;   // сколько раз захват брал новую цель
     double skyPct = -1; // доля кадра, где детектор ищет (не закрыто маской неба); -1 — маски нет
     double skyDarkPct = -1; // ...тёмные цели (с тайлами, закрытыми только светлой текстурой)
+    // подстройка под сцену: доля кадров с порогом по шуму, средние дымка (%) и шум неба
+    double autoThrPct = -1, hazePct = -1, skyNoise = -1;
     // по разметке
     bool gt = false;
     double evalFrames = 0, gtDroneFrames = 0;

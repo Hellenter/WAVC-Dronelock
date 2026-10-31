@@ -121,7 +121,8 @@ static std::string dialog_blocking(void* owner) {
     // с владельцем диалог модальный для окна приложения: всегда поверх него, сворачивается вместе
     // с ним, а щелчки по окну приложения не копятся, пока диалог открыт
     ofn.hwndOwner = (HWND)owner;
-    ofn.lpstrFilter = L"Видео (*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm)\0*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm\0"
+    ofn.lpstrFilter = L"Видео (*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm;*.h264;*.h265;*.mjpeg)\0"
+                      L"*.mp4;*.mkv;*.avi;*.mov;*.ts;*.y4m;*.webm;*.m4v;*.mts;*.h264;*.264;*.h265;*.hevc;*.265;*.mjpeg;*.mjpg\0"
                       L"Все файлы (*.*)\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH * 4;
@@ -195,11 +196,29 @@ static std::wstring widen(const std::string& s) {
     return w;
 }
 
+// аргумент в кавычках по правилам CommandLineToArgvW: обратные косые перед кавычкой удваиваются,
+// кавычка внутри экранируется («D:\Godot\» или имя сектора с кавычкой не склеивают аргументы)
+static void quote_arg(const std::wstring& a, std::wstring& cmd) {
+    cmd += L'"';
+    size_t bs = 0;
+    for (wchar_t c : a) {
+        if (c == L'\\') {
+            ++bs;
+            continue;
+        }
+        cmd.append(c == L'"' ? bs * 2 + 1 : bs, L'\\');
+        bs = 0;
+        cmd += c;
+    }
+    cmd.append(bs * 2, L'\\');
+    cmd += L'"';
+}
+
 void* proc_start(const std::vector<std::string>& args, uint64_t affinity, std::string& err) {
     std::wstring cmd;
     for (const auto& a : args) {
         if (!cmd.empty()) cmd += L' ';
-        cmd += L'"' + widen(a) + L'"';
+        quote_arg(widen(a), cmd);
     }
     STARTUPINFOW si;
     memset(&si, 0, sizeof(si));

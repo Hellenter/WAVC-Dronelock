@@ -269,13 +269,17 @@ void set_resolution(App& a) {
     if (r.scale > 0) {
         a.s.procW = r.scale == 1.f ? 0 : std::max(64, (int)(vi.w * r.scale) & ~1);
         a.s.procH = r.scale == 1.f ? 0 : std::max(64, (int)(vi.h * r.scale) & ~1);
-    } else {
-        a.s.procW = r.w;
-        a.s.procH = r.h;
+    } else {   // размер камеры — в ориентации видео: портретное с телефона иначе растягивалось втрое
+        const bool portrait = vi.h > vi.w;
+        a.s.procW = portrait ? r.h : r.w;
+        a.s.procH = portrait ? r.w : r.h;
     }
 }
 
+void ann_flush(App& a);
+
 void open_video(App& a, const std::string& path) {
+    ann_flush(a);   // разметка прошлого видео: точки «за целью» и ещё не записанные
     a.err.clear();
     a.shown.reset();
     a.texSeq = -1;
@@ -470,6 +474,14 @@ void ann_follow_stop(App& a, const char* why) {
     if (a.annDirty) ann_changed(a);
     a.annDirty = false;
     if (why) a.annMsg = why;
+}
+
+// перед сменой видео и выходом: последняя точка «за целью» и точки, ждущие автосохранения (раз в секунду)
+void ann_flush(App& a) {
+    if (!a.pipe.isOpen()) return;
+    ann_follow_stop(a, nullptr);
+    if (a.annDirty) ann_changed(a);
+    a.annDirty = false;
 }
 
 // Трек алгоритма рядом с местом, где цель видели: трекер сбросил треки (маска неба выучена
@@ -1064,6 +1076,12 @@ void panel_main(App& a, bool& changed) {
         ImGui::TextDisabled("%dx%d, %.2f к/с, %s%s%s", vi.w, vi.h, vi.fps, vi.codec.c_str(),
                             vi.frames ? (", ~" + std::to_string(vi.frames) + " кадров").c_str() : "",
                             vi.rotation ? (", повёрнуто на " + std::to_string(vi.rotation) + "°").c_str() : "");
+        const std::string fn = fps_note(vi);
+        if (!fn.empty()) {   // частота не из контейнера: от неё зависят скорости и выдержки трекера
+            ImGui::PushStyleColor(ImGuiCol_Text, vi.fpsFrom == FpsFrom::Assumed ? TXT_WARN : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("%s", fn.c_str());
+            ImGui::PopStyleColor();
+        }
     } else {
         ImGui::TextDisabled("или перетащите файл в окно");
     }
@@ -1129,6 +1147,18 @@ void panel_main(App& a, bool& changed) {
 void tab_video(App& a, bool& changed) {
     const VideoInfo vi = a.pipe.info();
     if (heading("Подача кадров", true)) {
+        {   // применяется, когда ползунок отпущен: смена частоты перезапускает чтение файла
+            float vf = (float)a.s.videoFps;
+            label("частота кадров файла, к/с");
+            if (ImGui::SliderFloat("##vfps", &vf, 0, 120, vf <= 0 ? "из файла" : "%.2f")) a.s.videoFps = vf < 0.5f ? 0 : vf;
+            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+            help_marker("С какой частотой камера на самом деле снимала. Нужна, если в файле её нет или она неверна: "
+                        "«голые» .h264 и .mjpeg с rpicam-vid FFmpeg читает как 25 к/с, OpenCV VideoWriter пишет ту частоту, "
+                        "что ему задали. Трекер и маска неба считают скорости и выдержки в секундах, поэтому неверная "
+                        "частота сдвигает их все. Номера кадров и разметка не меняются. Файл меток rpicam-vid --save-pts "
+                        "рядом с видео (<имя>.pts или <имя>.txt) подхватывается сам — с ним учитываются и пропуски кадров. "
+                        "Ctrl+щелчок — ввести число. Остаётся для следующих открытых файлов.");
+        }
         static const char* paces[] = {"Как камера", "Максимально быстро"};
         static const char* paceTips[] = {
             "Кадры приходят с частотой видео (или заданной). Если обработка не успевает, лишние кадры "
@@ -1455,6 +1485,13 @@ void tab_algorithm(App& a, bool& changed) {
         help_marker("Маска неба: в каждом столбце всё ниже кромки леса или крыш считается землёй, даже гладкие места "
                     "(трава, поляна, дорога, просветы между стволами). Дрон прилетает из-за горизонта и бывает над "
                     "кромкой, ниже почти никогда. Записи War Thunder: ложных целей на кадр 8 -> ~1. Действует со "
+                    "следующего обучения маски.");
+        blk |= ImGui::SliderFloat("Масштаб сцены", &d.scene_scale, 1.f, 3.f, "x%.2f");
+        help_marker("Во сколько раз сцена в пикселях крупнее, чем на записях War Thunder 2560x1440 (~0.03 град. на "
+                    "пиксель), по которым подбиралась маска неба. Для Pi Camera 3 Wide (4608 пикс. на 102 град.) — "
+                    "x1.3. На крупной сцене маска открывала гладкую землю (воду, тёмный склон), и там бывал ложный "
+                    "захват: ролики War Thunder, растянутые x1.3, на 14 к/с — на дроне 80.9%, без дронов захват в "
+                    "2.6% кадров; с масштабом x1.3 — 83.7% и 1.0%. Для записей War Thunder — x1. Действует со "
                     "следующего обучения маски.");
         blk |= ImGui::Checkbox("Маска уточняется по ячейкам", &d.fine_mask);
         help_marker("Тайлы земли 64x64 у самой кромки делятся на ячейки 16x16: ячейка, где несколько секунд "
@@ -3561,6 +3598,7 @@ int run_bench(int argc, char** argv) {
         else if (a == "--step") s.frameStep = std::max(1, atoi(val().c_str()));
         else if (a == "--phase") s.framePhase = std::max(0, atoi(val().c_str()));
         else if (a == "--cam-fps") s.targetFps = atof(val().c_str());
+        else if (a == "--video-fps") s.videoFps = atof(val().c_str());
         else if (a == "--no-fps-scale") s.fpsScale = false;
         else if (a == "--no-anchor") s.trk.anchor_check = false;
         else if (a == "--no-size") s.trk.size_predict = false;
@@ -3598,6 +3636,7 @@ int run_bench(int argc, char** argv) {
     }
     printf("видео %dx%d, %.2f к/с, %s, поворот %d°\n", p.info().w, p.info().h, p.info().fps, p.info().codec.c_str(),
            p.info().rotation);
+    if (!fps_note(p.info()).empty()) printf("  %s\n", fps_note(p.info()).c_str());
     bool counting = preload == 0;
     for (;;) {
         SDL_Delay(50);
@@ -3794,6 +3833,7 @@ int run_stress(int argc, char** argv) {
                 s.det.bg_near = R(3) != 0;
                 s.det.fine_mask = R(3) != 0;
                 s.det.fine_frames = R(3) ? 150 : 1 + R(400);
+                s.det.scene_scale = R(3) ? 1.f : F(0.5f, 3.f);
                 s.det.thin_tiles = R(3);
                 s.det.zone_strip = R(3) != 0;
                 s.det.zone_vote = R(3);
@@ -3870,6 +3910,17 @@ int run_stress(int argc, char** argv) {
                 s.trk.weak_gate = R(3) ? 0.f : F(0, 8);
                 s.trk.relock_frames = R(3) ? 0 : R(200);
                 s.trk.relock_edge = R(2);
+                // 30.10 ночь: дрон за предметом — трек не залипает на нём, захват не переходит на стоящий трек
+                s.trk.stuck_obs = R(3) ? 4 : R(12);
+                s.trk.stuck_base = R(3) ? 12 : R(40);
+                s.trk.stuck_steady = R(3) ? 0.7f : F(0, 1.5f);
+                s.trk.stuck_px = R(3) ? 3.f : F(0, 6);
+                s.trk.stuck_travel = R(3) ? 8.f : F(0, 20);
+                s.trk.stuck_r = R(3) ? 6.f : F(0, 20);
+                s.trk.stuck_hold = R(3) ? 50 : R(200);
+                s.trk.stuck_heat = R(3) ? 0.1f : F(0, 1);
+                s.trk.stuck_yield = R(3) != 0;
+                s.trk.heir_still = R(3);
                 s.trk.lock_speed_max = R(3) ? 0.f : F(0, 60);
                 s.trk.lock_established = R(2);
                 s.trk.lost_r_max = R(3) ? 0.f : F(0, 10);
@@ -4134,6 +4185,7 @@ int main(int argc, char** argv) {
         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), a.ren);
         SDL_RenderPresent(a.ren);
     }
+    ann_flush(a);
     a.emu.stop();
     a.emuView = twocam::View();
     a.pipe.close();

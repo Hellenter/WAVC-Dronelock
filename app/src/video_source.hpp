@@ -1,6 +1,7 @@
 // Чтение видео через FFmpeg (libavformat + libavcodec + swscale) в серые кадры u8.
 #pragma once
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,15 @@ struct ColorPlanes {
     int w = 0, h = 0, step = 4, off = 0;
 };
 
+// откуда взята частота кадров видео
+enum class FpsFrom {
+    File,        // из контейнера (mp4, mkv, avi, ...)
+    Assumed,     // «голый» поток (.h264, .mjpeg с rpicam-vid): времени кадров в файле нет, частота —
+                 // из параметров потока или 25 по умолчанию FFmpeg, может быть неверной
+    Timecodes,   // из файла меток времени рядом с видео (rpicam-vid --save-pts, mkvmerge timecode v2)
+    User,        // задана вручную (Settings::videoFps)
+};
+
 struct VideoInfo {
     int w = 0, h = 0;
     double fps = 25;
@@ -27,7 +37,16 @@ struct VideoInfo {
     std::string codec;
     std::string pixfmt;
     int rotation = 0;        // поворот из метаданных (матрица отображения), градусов по часовой: 0/90/180/270
+    FpsFrom fpsFrom = FpsFrom::File;
+    std::string format;      // контейнер (демуксер FFmpeg): mov,mp4,..., h264, mjpeg
+    std::string timecodes;   // файл меток времени, если частота и пропуски взяты из него
+    int64_t dropped = 0;     // по меткам времени: пропущено кадров (интервал больше полутора)
+    double fileFps = 0;      // при частоте, заданной вручную, — какая была в файле
 };
+
+// Откуда частота кадров, для человека: "" — из контейнера, иначе пояснение (предупреждение для «голого»
+// потока, где частота могла быть взята наугад)
+std::string fps_note(const VideoInfo& vi);
 
 class VideoSource {
 public:
@@ -49,6 +68,12 @@ public:
 
 private:
     bool decodeNext();
+    void loadTimecodes(const std::string& path);
+    void scanRaw();
+    void notePacket();
+    bool byteSeek(int64_t pos);
+    bool rewindSeq();
+    bool seekSeq(int64_t frame);
     void convert(uint8_t* dst, int outW, int outH, int dstStride);
     void sampleColor(ColorPlanes& c, int outW, int outH);
 
@@ -69,6 +94,21 @@ private:
     double tb_ = 0;                 // единица времени потока, с
     int64_t start_ = 0;             // pts первого кадра
     int64_t index_ = -1, skipTo_ = 0;
+    int badFrames_ = 0;             // кадров подряд, которые декодер не смог собрать
+    std::vector<uint8_t> lutY_;     // яркость 9-16 бит -> 8 бит (HDR/10-бит с телефона)
+    int lutKey_ = -1;
+    // частота, по которой метки времени переводятся в номера кадров: у контейнера — его частота, у
+    // «голого» потока — шаг меток, которые проставил FFmpeg (не обязательно настоящая частота камеры)
+    double idxFps_ = 25;
+    // «голый» поток (seq_): номер кадра — по счёту от ключевого кадра, с которого читали; перемотка — по
+    // байтовым позициям ключевых кадров (номер кадра потока -> позиция в файле)
+    bool seq_ = false;
+    bool reorder_ = false;   // в потоке есть B-кадры (порядок показа не совпадает с порядком декодирования)
+    int64_t seqN_ = -1, pktN_ = 0, rawFrames_ = 0;
+    std::map<int64_t, int64_t> keys_;
+    // по файлу меток времени: номер кадра (по настоящему времени) k-го кадра потока; пропуск кадра
+    // камерой — скачок номера, как у записи с потерями
+    std::vector<int64_t> tcIdx_;
     VideoInfo info_;
     Orient orient_;
     std::vector<uint8_t> raw_;             // кадр до поворота

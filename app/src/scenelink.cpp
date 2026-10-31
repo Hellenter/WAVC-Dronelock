@@ -28,8 +28,13 @@ typedef int socklen_t;
 #include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <unistd.h>
 #define CLOSESOCK close
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0   // Windows: SIGPIPE нет
 #endif
 
 namespace fs = std::filesystem;
@@ -37,6 +42,11 @@ namespace fs = std::filesystem;
 namespace scene {
 
 namespace {
+
+// больше не бывает: кадр 8192x8192, 10000 целей, строка 64 КБ — иначе чужой или сбойный ответ
+constexpr long long MAX_FRAME = 8192LL * 8192;
+constexpr int MAX_BODIES = 10000;
+constexpr size_t MAX_LINE = 1 << 16;
 
 #if defined(_WIN32)
 struct WsaInit {
@@ -62,6 +72,9 @@ bool Link::start(const Options& o, const std::string& hello, std::string& err) {
 #endif
     // слушаем 127.0.0.1 на свободном порту, Godot подключается сам
     const auto ls = socket(AF_INET, SOCK_STREAM, 0);
+#if !defined(_WIN32)
+    if ((intptr_t)ls >= 0) fcntl(ls, F_SETFD, FD_CLOEXEC);   // Godot не наследует порт
+#endif
     sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
@@ -91,7 +104,7 @@ bool Link::start(const Options& o, const std::string& hello, std::string& err) {
         return false;
     }
     // ждём подключения: сцена строится несколько секунд (лес, дома)
-    for (int i = 0; i < 1200; ++i) {
+    for (int i = 0; i < 1200 && !cancelled(); ++i) {
         fd_set fs_;
         FD_ZERO(&fs_);
         FD_SET(ls, &fs_);
@@ -112,7 +125,7 @@ bool Link::start(const Options& o, const std::string& hello, std::string& err) {
         }
     }
     if (sock_ < 0) {
-        err = "Godot не подключился за 2 минуты";
+        err = cancelled() ? "остановлено" : "Godot не подключился за 2 минуты";
         stop();
         return false;
     }
@@ -128,7 +141,7 @@ bool Link::start(const Options& o, const std::string& hello, std::string& err) {
 
 bool Link::sendAll(const char* p, size_t n) {
     while (n > 0) {
-        const int k = send((decltype(socket(0, 0, 0)))sock_, p, (int)std::min<size_t>(n, 1 << 20), 0);
+        const int k = send((decltype(socket(0, 0, 0)))sock_, p, (int)std::min<size_t>(n, 1 << 20), MSG_NOSIGNAL);
         if (k <= 0) return false;
         p += k;
         n -= k;
@@ -136,10 +149,10 @@ bool Link::sendAll(const char* p, size_t n) {
     return true;
 }
 
-// данные от сцены: ждём не дольше 2 минут на кадр и бросаем, если Godot закрылся
+// данные от сцены: ждём не дольше 2 минут на кадр и бросаем, если Godot закрылся или эмулятор остановили
 bool Link::waitReadable() {
     const auto s = (decltype(socket(0, 0, 0)))sock_;
-    for (int i = 0; i < 1200; ++i) {
+    for (int i = 0; i < 1200 && !cancelled(); ++i) {
         fd_set fs_;
         FD_ZERO(&fs_);
         FD_SET(s, &fs_);
@@ -159,7 +172,7 @@ bool Link::recvLine(std::string& line) {
             return true;
         }
         char tmp[4096];
-        if (!waitReadable()) return false;
+        if (buf_.size() > MAX_LINE || !waitReadable()) return false;
         const int k = recv((decltype(socket(0, 0, 0)))sock_, tmp, sizeof(tmp), 0);
         if (k <= 0) return false;
         buf_.append(tmp, k);
@@ -194,7 +207,8 @@ bool Link::render(double t, int cam, double az, double el, std::vector<uint8_t>&
     long long n = 0;
     int k = 0;
     if (!sendAll(q, strlen(q)) || !recvLine(line) ||
-        sscanf(line.c_str(), "FRAME %d %d %lld %d", &w, &h, &n, &k) != 4 || n != (long long)w * h) {
+        sscanf(line.c_str(), "FRAME %d %d %lld %d", &w, &h, &n, &k) != 4 || w <= 0 || h <= 0 || n != (long long)w * h ||
+        n > MAX_FRAME || k < 0 || k > MAX_BODIES) {
         err = "сцена не ответила кадром";
         return false;
     }
@@ -224,7 +238,7 @@ bool Link::render(double t, int cam, double az, double el, std::vector<uint8_t>&
 
 void Link::stop() {
     if (sock_ >= 0) {
-        sendAll("{\"quit\": 1}\n", 12);
+        if (proc_ && plat::proc_alive(proc_)) sendAll("{\"quit\": 1}\n", 12);
         CLOSESOCK((decltype(socket(0, 0, 0)))sock_);
         sock_ = -1;
     }

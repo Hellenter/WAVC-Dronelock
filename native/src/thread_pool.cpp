@@ -49,9 +49,20 @@ void set_current_thread_name(const char* name) {
 
 ThreadPool::ThreadPool(int threads, const std::vector<int>& cpus) {
     if (threads < 1) threads = 1;
-    for (int i = 0; i < threads; ++i) {
-        int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
-        workers_.emplace_back([this, i, cpu] { loop(i, cpu); });
+    try {
+        for (int i = 0; i < threads; ++i) {
+            int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
+            workers_.emplace_back([this, i, cpu] { loop(i, cpu); });
+        }
+    } catch (...) {   // поток не создался (нет ресурсов): запущенные — остановить, иначе terminate
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_ = true;
+            ++gen_;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+        throw;
     }
 }
 
