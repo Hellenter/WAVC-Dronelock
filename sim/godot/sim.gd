@@ -295,7 +295,7 @@ func wide_pose(t: float) -> Vector2:
 # Пресеты погоды: что не задано явно, берётся отсюда.
 const WEATHER := {
 	"clear": {"clouds": 0.06, "cirrus": 0.15, "visibility": 30000.0, "cloud_dark": 0.2},
-	"cumulus": {"clouds": 0.38, "cirrus": 0.1, "visibility": 20000.0, "cloud_dark": 0.35},
+	"cumulus": {"clouds": 0.38, "cirrus": 0.1, "visibility": 20000.0, "cloud_dark": 0.35, "cloud_soft": 0.1},
 	"cloudy": {"clouds": 0.65, "cirrus": 0.0, "visibility": 14000.0, "cloud_dark": 0.5},
 	"overcast": {"clouds": 0.97, "cirrus": 0.0, "visibility": 9000.0, "cloud_dark": 0.6},
 	"haze": {"clouds": 0.12, "cirrus": 0.35, "visibility": 3500.0, "cloud_dark": 0.25},
@@ -310,19 +310,19 @@ const ENV_DEFAULT := {
 	"clouds": 0.4, "cloud_soft": 0.18, "cloud_dark": 0.35, "cirrus": 0.0, "cloud_scale": 0.0008,
 	"visibility": 15650.0, "rain": 0.0, "snow": 0.0, "sun_az": 150.0, "sun_el": 35.0,
 	"sun": 1.1, "ambient": 0.55, "lat": 55.75, "day": 258.0, "time_rate": 0.0,
-	"light_pollution": 0.35, "shutter": 0.004, "max_gain": 16.0, "wet": 0.0,
+	"light_pollution": 0.35, "shutter": 0.004, "max_gain": 24.0, "wet": 0.0, "rain_gain": 4.0,
 }
 const ENV_NUMS := ["clouds", "cloud_soft", "cloud_dark", "cirrus", "cloud_scale", "visibility", "rain", "snow",
 	"sun_az", "sun_el", "sun", "ambient", "lat", "day", "time", "time_rate", "light_pollution", "shutter",
-	"max_gain", "exposure", "wet"]
+	"max_gain", "exposure", "wet", "rain_gain"]
 
 # Небо по высоте солнца: [угол, зенит, горизонт, заря у горизонта со стороны солнца, сила зари,
 # яркость неба относительно дня]. Цвета sRGB; яркость — множитель в линейном свете.
 const SKY_TABLE := [
-	[-18.0, Color(0.05, 0.07, 0.14), Color(0.07, 0.08, 0.12), Color(0.10, 0.08, 0.10), 0.0, 0.00025],
-	[-12.0, Color(0.08, 0.11, 0.24), Color(0.16, 0.17, 0.26), Color(0.35, 0.22, 0.20), 0.15, 0.0012],
-	[-8.0, Color(0.12, 0.17, 0.36), Color(0.36, 0.30, 0.38), Color(0.75, 0.36, 0.20), 0.45, 0.006],
-	[-4.0, Color(0.17, 0.25, 0.48), Color(0.72, 0.48, 0.40), Color(1.00, 0.45, 0.18), 0.75, 0.035],
+	[-18.0, Color(0.05, 0.07, 0.14), Color(0.07, 0.08, 0.12), Color(0.10, 0.08, 0.10), 0.0, 0.0005],
+	[-12.0, Color(0.08, 0.11, 0.24), Color(0.16, 0.17, 0.26), Color(0.35, 0.22, 0.20), 0.15, 0.0028],
+	[-8.0, Color(0.12, 0.17, 0.36), Color(0.36, 0.30, 0.38), Color(0.75, 0.36, 0.20), 0.45, 0.013],
+	[-4.0, Color(0.17, 0.25, 0.48), Color(0.72, 0.48, 0.40), Color(1.00, 0.45, 0.18), 0.75, 0.05],
 	[0.0, Color(0.21, 0.33, 0.58), Color(0.95, 0.66, 0.45), Color(1.00, 0.55, 0.25), 0.8, 0.22],
 	[5.0, Color(0.24, 0.40, 0.70), Color(0.86, 0.80, 0.70), Color(1.00, 0.75, 0.45), 0.45, 0.6],
 	[15.0, Color(0.22, 0.42, 0.76), Color(0.74, 0.80, 0.88), Color(1.00, 0.90, 0.75), 0.12, 0.9],
@@ -408,7 +408,7 @@ void sky() {
 			vec2 q = d.xz / max(d.y, 0.02) * 8000.0 + wind * sim_time * 3.0;
 			q = vec2(q.x + q.y * 0.6, q.y * 0.25 - q.x * 0.15);
 			float nc = fbm(q * 0.00012 + vec2(seed * 3.1, 1.7), 5);
-			float kc = smoothstep(0.42, 0.78, nc) * cirrus * 0.7 * smoothstep(0.003, 0.15, d.y);
+			float kc = smoothstep(0.45, 0.8, nc) * cirrus * 0.55 * smoothstep(0.02, 0.25, d.y);
 			c = mix(c, csun * (0.85 + pow(sdp, 6.0)) + amb * 0.6 + lpc * 0.3, kc);
 			occl = max(occl, kc * 0.5);
 		}
@@ -466,6 +466,7 @@ func env_layer(dst: Dictionary, src: Dictionary) -> void:
 		dst["rain"] = 0.0   # пресет задаёт осадки целиком: «ясно» после «дождя» — без дождя
 		dst["snow"] = 0.0
 		dst["cirrus"] = 0.0
+		dst["cloud_soft"] = 0.18
 		for k in WEATHER[str(w)]:
 			dst[k] = WEATHER[str(w)][k]
 		dst["weather"] = str(w)
@@ -646,13 +647,12 @@ func apply_env(e: Dictionary) -> void:
 	var direct = sun_up * minf(mx, 1.15) * (1.0 - 0.92 * smoothstep(0.45, 0.97, clouds))
 	# облачное небо и туман темнее ясного, автоэкспозиция это частично вытягивает
 	var dim = (1.0 - 0.45 * clouds * clouds * (0.5 + float(e["cloud_dark"]))) * (1.0 - 0.3 * clampf(float(e["rain"]) + float(e["snow"]) * 0.5, 0.0, 1.0))
-	var lum = bright * dim
 	var gain = 1.0
 	if e.has("exposure"):
 		gain = float(e["exposure"])
 	else:
-		gain = clampf(0.85 / maxf(lum, 1e-6), 1.0, float(e["max_gain"]))
-	var lp = float(e["light_pollution"]) * 0.004 * (1.0 - smoothstep(-10.0, -2.0, el))
+		gain = clampf(0.85 / maxf(bright, 1e-6) / sqrt(maxf(dim, 0.05)), 1.0, float(e["max_gain"]))
+	var lp = float(e["light_pollution"]) * 0.008 * (1.0 - smoothstep(-10.0, -2.0, el))
 	var haze: Color = hor.lerp(Color(hor.get_luminance(), hor.get_luminance(), hor.get_luminance()),
 		clampf(0.35 + 0.5 * (1.0 - vis / 10000.0), 0.35, 0.85))
 	haze = haze.lerp(Color(0.62, 0.64, 0.66) * maxf(hor.get_luminance(), 0.05) / 0.64, clouds * 0.6)
@@ -817,7 +817,7 @@ func apply_precip(e: Dictionary, haze: Color, bright: float, gain: float) -> voi
 		if pr[2] == "rain":
 			m.set_shader_parameter("vel", gw + Vector3(0.0, -lerpf(5.0, 9.0, rain), 0.0))
 			m.set_shader_parameter("drop", lerpf(0.0010, 0.0025, rain))
-			m.set_shader_parameter("opacity", 0.7)
+			m.set_shader_parameter("opacity", 0.7 * float(e["rain_gain"]))
 			m.set_shader_parameter("tint", haze.lerp(Color(1, 1, 1), 0.3))
 		else:
 			m.set_shader_parameter("vel", gw * 0.6 + Vector3(0.0, -1.0, 0.0))
@@ -889,8 +889,8 @@ func run_gallery(spec: String) -> void:
 			if tp == null or occluded(rig_pos, tp) or wide_cam.is_position_behind(tp):
 				continue
 			var ae = azel_of(tp - rig_pos)
-			var dd = absf(wrap180(ae.x - az))
-			if dd < bd and dd < float(wide_cam.fov) * 0.5:
+			var dd = (tp - rig_pos).length()
+			if dd < bd and absf(wrap180(ae.x - az)) < float(wide_cam.fov) * 0.45:
 				bd = dd
 				best = [ae, (tp - rig_pos).length()]
 		if best != null:

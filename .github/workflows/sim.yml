@@ -31,7 +31,7 @@ jobs:
     env:
       GALLERY: >-
         scene;clear@12;cumulus@15;cumulus@17.5@250;clear@18.1@265;clear@18.6@265;clear@19.2@270;clear@23@300;
-        overcast@11;haze@10@140;mist@8;fog@9;rain@14;storm@16@270;snow@12
+        overcast@22@300;cloudy@6.3@95;clear@18.3@90;overcast@11;haze@10@140;mist@8;fog@9;rain@14;storm@16@270;snow@12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -75,7 +75,7 @@ jobs:
           done
           # смена погоды по ходу ролика и время суток x600: сцена weather_change
           xvfb-run -a -s "-screen 0 640x480x24" python sim/render.py --scene sim/scenes/weather_change.json --out wx/change \
-            --scale 0.2 --noise 0 --keep-png
+            --scale 0.25 --noise 0 --keep-png
           python - <<'PY'
           import cv2, glob, numpy as np
           fs = sorted(glob.glob("wx/change/wide/*.png"))
