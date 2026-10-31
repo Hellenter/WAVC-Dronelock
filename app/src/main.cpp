@@ -127,8 +127,11 @@ struct App {
     bool emuTruth = true;
     bool emuShowMask = false;          // маска неба поверх кадра широкой
     SDL_Texture* emuPanoTex = nullptr; // панорамная маска 360°, PANO_W/4 x PANO_H/4
-    // мир эмулятора: 0 — синтетическое небо, 1 — 3D-сцена Godot (sim/)
-    int emuWorld = 0;
+    // мир эмулятора: 0 — синтетическое небо, 1 — 3D-сцена Godot (sim/). По умолчанию 3D-сцена;
+    // нет папки sim или Godot, либо Godot не запустился — откат на синтетику с пояснением simNote.
+    int emuWorld = 1;
+    std::string simNote;
+    bool emuSceneStarting = false;   // запущена 3D-сцена, первого кадра ещё не было
     std::string simDir, simBase;
     char godotPath[1024] = "";
     std::vector<std::string> simScenes;
@@ -2601,9 +2604,26 @@ void sim_scan(App& a) {
                                        : scene::scene_sectors(a.simDir + "/scenes/" + a.simScenes[a.simScene]);
 }
 
+// почему 3D-сцену сейчас не запустить (пусто — можно)
+std::string sim_missing(const App& a) {
+    if (a.simDir.empty()) return "нет папки sim рядом с программой";
+    if (a.simScenes.empty()) return "в sim/scenes нет сцен";
+    if (!a.godotPath[0]) return "не найден Godot 4.3";
+    return std::string();
+}
+
 void emu_start(App& a) {
     twocam::Config c = a.emuCfg;
-    if (a.emuWorld == 1 && !a.simScenes.empty()) {
+    if (a.emuWorld == 1) {
+        const std::string why = sim_missing(a);
+        if (!why.empty()) {
+            a.emuWorld = 0;
+            a.simNote = "3D-сцена недоступна (" + why + ") — запущено синтетическое небо.";
+        }
+    }
+    a.emuSceneStarting = a.emuWorld == 1;
+    if (a.emuWorld == 1) {
+        a.simNote.clear();
         c.scene = a.simDir + "/scenes/" + a.simScenes[a.simScene];
         c.simProject = a.simDir + "/godot";
         c.godot = a.godotPath;
@@ -2700,7 +2720,10 @@ void panel_twocam(App& a) {
         const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
         if (ImGui::Button(a.emu.paused() ? "Продолжить" : "Пауза", ImVec2(w, 0))) a.emu.setPaused(!a.emu.paused());
         ImGui::SameLine();
-        if (ImGui::Button("Остановить", ImVec2(w, 0))) a.emu.stop();
+        if (ImGui::Button("Остановить", ImVec2(w, 0))) {
+            a.emuSceneStarting = false;   // остановили сами — не откат
+            a.emu.stop();
+        }
     }
     static const char* sp[] = {"x0.25", "x0.5", "x1", "x2", "макс"};
     label("Скорость времени", "x1 — как в жизни. «макс» — так быстро, как успевает ПК; результат тот же, "
@@ -2717,8 +2740,12 @@ void panel_twocam(App& a) {
                                        "Сцена Godot (лес, частный сектор, многоэтажки): рисует отдельная программа на своих "
                                        "ядрах, кадры и правда о целях приходят по запросу на модельный момент — скорость "
                                        "отрисовки не влияет на работу и замеры алгоритма."};
-            if (segmented("emuworld", ws, 2, a.emuWorld, 0, wt) && a.emuWorld == 1) sim_scan(a);
+            if (segmented("emuworld", ws, 2, a.emuWorld, 0, wt)) {
+                a.simNote.clear();
+                if (a.emuWorld == 1) sim_scan(a);
+            }
         }
+        if (!a.simNote.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "%s", a.simNote.c_str());
         if (a.emuWorld == 1) {
             if (a.simDir.empty()) {
                 ImGui::TextWrapped("Нет папки sim рядом с программой (sim/godot, sim/scenes). Она входит в сборку Dronolok-win64.");
@@ -4220,6 +4247,13 @@ int main(int argc, char** argv) {
         SDL_free(bp);
     }
     sim_scan(a);
+    if (a.emuWorld == 1) {   // 3D-сцена по умолчанию, если есть чем её рисовать
+        const std::string why = sim_missing(a);
+        if (!why.empty()) {
+            a.emuWorld = 0;
+            a.simNote = "3D-сцена недоступна (" + why + "), выбрано синтетическое небо.";
+        }
+    }
     if (argc > 1) open_video(a, argv[1]);
     a.cpuWall = now_ms();
     a.cpuT = plat::process_cpu_seconds();
@@ -4277,6 +4311,17 @@ int main(int argc, char** argv) {
         ImGui::NewFrame();
         if (a.appMode == 1) {   // эмулятор: кадр широкой — когда он новый, точной — каждый кадр интерфейса
             a.emuView = a.emu.view();
+            if (a.emuSceneStarting) {
+                if (a.emuView.wide) a.emuSceneStarting = false;
+                else if (!a.emu.running() && !a.emuView.status.empty()) {
+                    // Godot не поднялся до первого кадра: та же сцена целей, но на синтетическом небе
+                    const std::string err = a.emuView.status;
+                    a.emuWorld = 0;
+                    emu_start(a);
+                    a.simNote = err + " — запущено синтетическое небо.";
+                    a.emuView = a.emu.view();
+                }
+            }
             const twocam::View& v = a.emuView;
             if (v.wide && v.wide->seq != a.emuWSeq) {
                 const Frame& f = *v.wide->frame;
