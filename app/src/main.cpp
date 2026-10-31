@@ -3446,6 +3446,104 @@ void draw_pano(App& a) {
     ImGui::TextDisabled("Азимут 0–360° слева направо: голубое — небо, бурое — закрыто, тёмное — не видели.");
 }
 
+// Погода 3D-сцены: пресет, время суток (солнце по дате и широте), подстройка. Меняется на ходу.
+void panel_scene_weather(App& a) {
+    twocam::Config& c = a.emuCfg;
+    if (a.emuWorld != 1) {
+        ImGui::TextWrapped("Для 3D-сцены (раздел «Мир»). Синтетическому небу — облачность и видимость в разделе «Сцена».");
+        return;
+    }
+    bool ch = false;
+    static const char* ids[] = {"", "clear", "cumulus", "cloudy", "overcast", "haze", "mist", "fog", "rain", "storm", "snow"};
+    static const char* names[] = {"Как в сцене", "Ясно", "Кучевые облака", "Облачно", "Пасмурно", "Дымка",
+                                  "Мгла", "Туман", "Дождь", "Ливень", "Снег"};
+    static const char* tips[] = {"Погода из файла сцены.",
+                                 "Почти без облаков, лёгкие перистые, видимость 30 км.",
+                                 "Отдельные кучевые облака (около 40% неба), видимость 20 км.",
+                                 "Облаков больше половины неба, нижние края темнее.",
+                                 "Сплошная серая облачность, солнца нет, видимость 9 км.",
+                                 "Ясно, но воздух мутный: дальние дома и лес тонут, видимость 3.5 км.",
+                                 "Пасмурно и мутно, видимость 1.2 км.",
+                                 "Туман: видимость 300 м, небо — сплошная серая пелена.",
+                                 "Сплошные тучи, капли у камеры (следы за выдержку), видимость 4 км.",
+                                 "Тёмные тучи, сильный дождь, видимость 1.8 км.",
+                                 "Снегопад: снежинки у камеры, видимость 2.5 км."};
+    int cur = 0;
+    for (int i = 0; i < 11; ++i)
+        if (c.sceneWeather == ids[i]) cur = i;
+    label("Погода", "Поверх погоды из файла сцены. Меняется сразу, сцена не перезапускается.");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##wx", names[cur])) {
+        for (int i = 0; i < 11; ++i) {
+            if (ImGui::Selectable(names[i], i == cur)) {
+                c.sceneWeather = ids[i];
+                if (c.sceneClouds >= 0)   // подстройка начинается с нового пресета
+                    twocam::scene_weather_preset(c.sceneWeather, c.sceneClouds, c.sceneVis, c.sceneRain, c.sceneSnow);
+                ch = true;
+            }
+            ImGui::SetItemTooltip("%s", tips[i]);
+        }
+        ImGui::EndCombo();
+    }
+    bool ownTime = c.sceneTime >= 0;
+    if (ImGui::Checkbox("Своё время суток", &ownTime)) {
+        c.sceneTime = ownTime ? 13.f : -1.f;
+        ch = true;
+    }
+    ImGui::SameLine();
+    help_marker("Солнце — по местному солнечному времени (12:00 — на юге), дате и широте. В сумерках камера "
+                "вытягивает кадр (как автоэкспозиция, до x16), ночью темно: звёзды, засветка от города, окна домов.");
+    if (ownTime) {
+        const int hh = (int)c.sceneTime, mm = (int)std::lround((c.sceneTime - hh) * 60) % 60;
+        const float el = twocam::sun_elevation(c.sceneTime, c.sceneDay, c.sceneLat);
+        const char* phase = el > 6 ? "день" : el > 0 ? "солнце у горизонта" : el > -6 ? "гражданские сумерки"
+                          : el > -12 ? "навигационные сумерки" : el > -18 ? "астрономические сумерки" : "ночь";
+        char fmt[96];
+        snprintf(fmt, sizeof(fmt), "%02d:%02d, солнце %.0f°", hh, mm, el);
+        ch |= ImGui::SliderFloat("##tod", &c.sceneTime, 0, 23.99f, fmt);
+        ImGui::TextDisabled("%s", phase);
+        static const char* rates[] = {"стоит", "x60", "x600"};
+        static const float rv[] = {0, 60, 600};
+        int r = c.sceneTimeRate >= 300 ? 2 : c.sceneTimeRate >= 30 ? 1 : 0;
+        label("Ход времени суток", "x60 — час за минуту, x600 — закат за пару минут модельного времени.");
+        if (segmented("todrate", rates, 3, r)) {
+            c.sceneTimeRate = rv[r];
+            ch = true;
+        }
+        static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365};
+        static const char* mon[] = {"января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+                                    "сентября", "октября", "ноября", "декабря"};
+        int m = 0;
+        while (m < 11 && c.sceneDay > cum[m + 1]) ++m;
+        snprintf(fmt, sizeof(fmt), "%d %s", c.sceneDay - cum[m], mon[m]);
+        label("Дата", "От даты зависит, как высоко солнце и когда закат.");
+        ch |= ImGui::SliderInt("##day", &c.sceneDay, 1, 365, fmt);
+        label("Широта");
+        ch |= ImGui::SliderFloat("##lat", &c.sceneLat, 40, 70, "%.1f°");
+    }
+    bool tune = c.sceneClouds >= 0;
+    if (ImGui::Checkbox("Подстроить облачность и осадки", &tune)) {
+        if (tune) {
+            c.sceneClouds = 0.4f, c.sceneVis = 15000, c.sceneRain = 0, c.sceneSnow = 0;
+            twocam::scene_weather_preset(c.sceneWeather, c.sceneClouds, c.sceneVis, c.sceneRain, c.sceneSnow);
+        } else {
+            c.sceneClouds = c.sceneVis = c.sceneRain = c.sceneSnow = -1;
+        }
+        ch = true;
+    }
+    if (tune) {
+        label("Облачность");
+        ch |= ImGui::SliderFloat("##scl", &c.sceneClouds, 0, 1, "%.2f");
+        label("Видимость, м", "Дымка и туман: контраст падает до 2% на этой дальности (и у целей тоже).");
+        ch |= ImGui::SliderFloat("##svis", &c.sceneVis, 100, 40000, "%.0f", ImGuiSliderFlags_Logarithmic);
+        label("Дождь", "Капли у камеры — следы за выдержку 1/250 с, вблизи размыты (объектив на бесконечность).");
+        ch |= ImGui::SliderFloat("##srain", &c.sceneRain, 0, 1, "%.2f");
+        label("Снег");
+        ch |= ImGui::SliderFloat("##ssnow", &c.sceneSnow, 0, 1, "%.2f");
+    }
+    if (ch && a.emu.running()) a.emu.setSceneEnv(c);
+}
+
 void panel_twocam(App& a) {
     twocam::Config& c = a.emuCfg;
     const float bigH = ImGui::GetFrameHeight() * 1.6f;
@@ -3731,6 +3829,8 @@ void panel_twocam(App& a) {
         ImGui::TextDisabled("Сцена, камеры и алгоритм применяются при перезапуске.");
         ImGui::Checkbox("Показывать правду (где цели на самом деле)", &a.emuTruth);
     }
+
+    if (heading("Погода и время суток", true)) panel_scene_weather(a);
 }
 
 static ImU32 cls_col(int cls) {
