@@ -202,6 +202,18 @@ void Emulator::spawn(Body& b, double t, bool first) {
     b.v = {sp * std::cos(hd), sp * std::sin(hd), (U(rng_) * 2 - 1) * (b.bird ? 0.5 : 1.5)};
     b.flapHz = b.bird ? (float)(4 + U(rng_) * 4) : 0;
     b.phase = (float)(U(rng_) * 6.28);
+    if (!b.bird && c_.droneWobble) {   // порывы ветра: дрон иногда качается
+        const double f1 = std::fmod(b.phase * 5.13, 1.0), f2 = std::fmod(b.phase * 2.71, 1.0), f3 = std::fmod(b.phase * 9.07, 1.0);
+        b.wobPer = (float)(3 + 5 * f1);
+        b.wobOn = (float)(0.2 + 0.4 * f2);
+        b.wobHz = (float)(3 + 3 * f3);
+    }
+    if (b.bird && c_.birdGlide) {   // как в 3D-сцене (sim.gd): пачки взмахов, между ними крылья раскрыты
+        // из фазы, а не новыми числами генератора: остальная сцена (очерёдность, места целей) та же, что без планирования
+        const double f1 = std::fmod(b.phase * 7.31, 1.0), f2 = std::fmod(b.phase * 3.17, 1.0);
+        b.flapPer = (float)(2 + 3 * f1);
+        b.flapOn = (float)(0.8 + 1.2 * f2);
+    }
     (void)first;
 }
 
@@ -217,12 +229,18 @@ void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t
         const double sp = std::sqrt(b.v.x * b.v.x + b.v.y * b.v.y);
         if (b.bird) {   // взмахи: крылья ходят вверх-вниз, силуэт меняется
             flap = 0.7 * std::sin(2 * PI * b.flapHz * (t - b.t0) + b.phase);
+            if (b.flapPer > 0 && std::fmod(t - b.t0 + b.id * 0.37, (double)b.flapPer) > b.flapOn) flap = 0.12;   // планирует
             bank = 0.15 * std::sin(0.7 * t + b.phase);
         } else if (b.shape == Shape::Quad) {
             pitch = -std::min(0.45, 0.02 * sp);   // квадрокоптер летит с наклоном носом вниз
             bank = 0.05 * std::sin(1.3 * t + b.phase);
         } else {
             bank = 0.12 * std::sin(0.4 * t + b.phase);
+        }
+        if (b.wobPer > 0 && std::fmod(t - b.t0 + b.id * 0.53, (double)b.wobPer) < b.wobOn) {   // качнуло порывом
+            const double w = 2 * PI * b.wobHz * (t - b.t0);
+            bank += 0.35 * std::sin(w);
+            pitch += 0.2 * std::sin(w + 1.1);
         }
         build_silhouette(b.shape, b.size, flap, tris);
         draw_silhouette(tris, q, body_frame(b.v, pitch, bank), c, c_.psf,
@@ -516,6 +534,7 @@ void Emulator::start(const Config& cfg) {
     detachId_ = 0;
     tDetach_ = -10;
     tBird_ = -1;
+    birdT_ = 0;
     lastU_ = lastV_ = lastSz_ = 0;
     pipe_.setCue({});
     // широкая: настоящий конвейер, кадры — от нас
@@ -699,8 +718,11 @@ void Emulator::assign(double t, int wideId, const char* why) {
     manualPick_ = !strcmp(why, "выбрана вручную");
     nConf_ = nOnly_ = false;
     tBird_ = -1;
+    birdT_ = 0;
+    nBird_ = 0;
     shapeE_.clear();
-    shapeId_ = shapeBirdN_ = 0;
+    shapeId_ = shapeBirdN_ = shapeLag_ = 0;
+    shapeEv_ = 0;
     shapeRigid_ = false;
     ntrk_->setFollowing(false);
     nextPick_ = false;
@@ -1147,12 +1169,18 @@ void Emulator::stepNarrow(double t, double dt) {
             // птица по силуэту: «масса» силуэта (контраст x площадь) по кадрам, взмахи — её колебания
             // с периодом 1/12–1/3 с. Классификатор трекера смотрит то же по отклику детектора и копит
             // дольше; по силуэту крупной на точной цели решение — за полсекунды после захвата
+            if (c_.birdMemory) {   // накопленное сгорает вдвое за birdHalf секунд
+                const double burn = std::exp2(-dt / std::max(0.05f, c_.birdHalf));
+                shapeEv_ *= burn;
+                birdT_ *= burn;
+            }
             bool shapeBird = false;
             if (c_.narrowShape) {
                 if (shapeId_ != me->id) {   // другой трек — та же цель, но ряд начинаем заново
                     shapeE_.clear();
                     shapeId_ = me->id;
-                    shapeBirdN_ = 0;
+                    shapeBirdN_ = shapeLag_ = 0;
+                    shapeEv_ = 0;
                     shapeRigid_ = false;
                 }
                 if (!me->miss) {
@@ -1174,7 +1202,16 @@ void Emulator::stepNarrow(double t, double dt) {
                         shapeBirdN_ = flap ? shapeBirdN_ + 1 : 0;
                         if (flap) shapeHz_ = c_.narrowFps / std::max(1, lag);
                         shapeRigid_ = !flap && amp < 0.5f * c_.shapeAmp;
-                        shapeBird = shapeBirdN_ >= (nConf_ ? 2 : 1) * c_.shapeHits;
+                        if (c_.birdMemory) {
+                            // пачка взмахов, пауза (планирует), снова пачка: накопленное не обнуляется, а сгорает
+                            const double fr = 1.0 / c_.narrowFps;
+                            if (flap) shapeEv_ += fr;
+                            else if (amp >= c_.shapeAmp && R >= c_.shapeRWeak && lag && std::abs(lag - shapeLag_) <= 1) shapeEv_ += c_.shapeWeakW * fr;
+                            shapeLag_ = lag;
+                            shapeBird = shapeEv_ >= memLevel(confK(t) * c_.shapeHits * fr);
+                        } else {
+                            shapeBird = shapeBirdN_ >= (nConf_ ? 2 : 1) * c_.shapeHits;
+                        }
                         if (dumpAt_ > 0 && t >= dumpAt_ && t < dumpAt_ + dumpLen_)
                             printf("  силуэт: размах %.3f, автокорр. %.2f на %d кадрах, подряд %d\n", amp, R, lag, shapeBirdN_);
                     }
@@ -1186,22 +1223,36 @@ void Emulator::stepNarrow(double t, double dt) {
             const bool shapeWait = c_.narrowShape && !shapeE_.empty() &&
                                    (int)shapeE_.size() < std::max(8, (int)std::lround(c_.shapeWin * c_.narrowFps));
             const bool droneNow = (ntrk_->lockState() == LockState::Hard || me->cls == TargetClass::Drone) && !shapeBird &&
-                                  shapeBirdN_ == 0 && !shapeWait;
+                                  (c_.birdMemory ? shapeEv_ < 0.25 * memLevel(c_.shapeHits / c_.narrowFps) && birdT_ < 0.25 * memLevel(c_.vetoT)
+                                                 : shapeBirdN_ == 0) && !shapeWait;
             if (!nConf_ && droneNow && t - tTrackStart_ >= c_.confirmT) {
                 nConf_ = true;
+                tConf_ = t;
                 ++st_.confirmed;
                 if (whoBird) ++st_.confirmedBird;
                 event(t, "точная: цель " + std::to_string(assigned_) + " — дрон");
             }
             if (me->cls == TargetClass::Bird) {
                 if (tBird_ < 0) tBird_ = t;
+                birdT_ += dt;
             } else {
                 tBird_ = -1;
             }
+            const double birdFor = tBird_ >= 0 ? t - tBird_ : 0;
             // цель выбрал оператор: отсеиваем, только если точная уверена вдвое (вдвое больше оценок силуэта или
             // вдвое дольше птица у классификатора)
-            const bool birdSure = manualPick_ ? c_.vetoManual && (shapeBirdN_ >= 2 * c_.shapeHits || (tBird_ >= 0 && t - tBird_ >= 2 * c_.vetoT))
-                                              : shapeBird || (tBird_ >= 0 && t - tBird_ >= c_.vetoT);
+            // доли до отсева: силуэт и классификатор (1 — отсеять). Выбранную вручную — при вдвое большей
+            double fShape, fCls;
+            const double k = manualPick_ ? 2 : 1;
+            if (c_.birdMemory) {
+                fShape = shapeEv_ / memLevel(k * confK(t) * c_.shapeHits / c_.narrowFps);
+                fCls = birdT_ / memLevel(k * c_.vetoT);
+            } else {
+                fShape = (double)shapeBirdN_ / (k * (nConf_ ? 2 : 1) * c_.shapeHits);
+                fCls = birdFor / (k * c_.vetoT);
+            }
+            const bool birdSure = manualPick_ ? c_.vetoManual && (fShape >= 1 || fCls >= 1) : shapeBird || fCls >= 1;
+            nBird_ = (float)std::min(1.0, std::max(fShape, fCls));
             if (c_.narrowVeto && birdSure) {
                 bool bird = false;
                 for (const Body& b : bodies_)
@@ -1287,6 +1338,7 @@ ui:
         if (vetoed(t, w.rep)) w.verdict = 2;
     }
     view_.nConf = nConf_;
+    view_.nBird = state_ == NState::Track ? nBird_ : 0.f;
     view_.nOnly = nOnly_;
     view_.nWu = view_.nWv = -1;
     if (haveNrep_ && assigned_) {
@@ -1673,6 +1725,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-silhouette") c.narrowSilhouette = false;
         else if (a == "--silh-min") c.silhMinPx = (float)atof(val().c_str());
         else if (a == "--no-hold") c.narrowHold = false;
+        else if (a == "--no-glide") c.birdGlide = false;
         else if (a == "--no-veto") c.narrowVeto = false;
         else if (a == "--no-shape") c.narrowShape = false;
         else if (a == "--no-veto-wide") c.vetoToWide = false;
@@ -1681,21 +1734,24 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-cue") c.wideCue = false;
         else if (a == "--no-next") c.nextOnBird = false;
         else if (a == "--no-veto-manual") c.vetoManual = false;
+        else if (a == "--no-bird-memory") c.birdMemory = false;
+        else if (a == "--bird-memory") sscanf(val().c_str(), "%f,%f,%f,%f,%f,%f", &c.shapeRWeak, &c.shapeWeakW, &c.birdHalf, &c.shapeConfK0, &c.shapeConfK, &c.shapeProveT);
+        else if (a == "--drone-wobble") c.droneWobble = true;
         else if (a == "--legacy")
-            c.narrowSilhouette = c.narrowHold = c.narrowVeto = c.wideCue = c.narrowShape = c.vetoToWide = c.nextOnBird = c.vetoManual = false;
+            c.narrowSilhouette = c.narrowHold = c.narrowVeto = c.wideCue = c.narrowShape = c.vetoToWide = c.nextOnBird = c.vetoManual = c.birdMemory = false;
         else if (a == "--scene") c.scene = val();
         else if (a == "--sector") c.sector = val();
         else if (a == "--godot") c.godot = val();
         else if (a == "--az") c.wideAz = (float)atof(val().c_str());
         else if (a == "--el") c.wideEl = (float)atof(val().c_str());
         else {
-            printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--seed 1] [--range 100,750]\n"
+            printf("dronolok_app --twocam [--seconds 60] [--drones 3] [--birds 1] [--no-glide] [--seed 1] [--range 100,750]\n"
                    "  [--speed 6,22] [--clouds 0.35] [--noise 2] [--visibility 6000] [--size 0.5] [--types 0.5,0.25,0.25] [--wide 4608x3456] [--wide-fps 14] [--fisheye] [--fov 5 (x4; 20 — без зума)]\n"
                    "  [--fps 60] [--rate 30] [--accel 150] [--latency 0.06] [--dwell 6]\n"
                    "  [--switch manual|queue|nearest] [--json out.json] [--quiet]\n"
                    "  сравнение доработок точной: [--image-motion] [--no-ff] [--no-window] [--no-lock-focus]\n"
                    "  [--min-hold 0.08] [--give-up 3] [--cool-down 10]\n"
-                   "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--no-shape] [--shape амп,автокорр,оценок,окно] [--no-veto-wide] [--no-next] [--no-veto-manual] [--with-birds] [--legacy — всё выключено]\n"
+                   "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--no-shape] [--shape амп,автокорр,оценок,окно] [--no-veto-wide] [--no-next] [--no-veto-manual] [--no-bird-memory] [--bird-memory rслаб,вес,полураспад_с,K_подтв,K_проверен,проверка_с] [--drone-wobble] [--with-birds] [--legacy — всё выключено]\n"
                    "  3D-сцена Godot вместо синтетического неба: [--scene sim/scenes/city_sectors.json] [--sector highrise]\n"
                    "  [--godot путь] [--az 0] [--el 32]\n");
             return a == "--help" ? 0 : 2;
