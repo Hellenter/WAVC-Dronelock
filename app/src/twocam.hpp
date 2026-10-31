@@ -41,6 +41,14 @@ struct Config {
     // Цели тогда летают в сцене (числа, дальность и доли типов — ниже), облака и видимость — из сцены.
     std::string scene, sector, godot, simProject;
     uint64_t renderAffinity = 0;   // ядра для отрисовки сцены, 0 — любые
+    // Погода и время суток 3D-сцены (sim.gd) поверх погоды из сцены; меняются и на ходу (setSceneEnv).
+    // Пусто или < 0 — как в сцене.
+    std::string sceneWeather;      // clear, cumulus, cloudy, overcast, haze, mist, fog, rain, storm, snow
+    float sceneTime = -1;          // ч, местное солнечное время (12 — солнце на юге)
+    float sceneTimeRate = 0;       // во сколько раз быстрее идёт время суток (0 — стоит)
+    int sceneDay = 258;            // день года: высота солнца (258 — 15 сентября)
+    float sceneLat = 55.75f;       // широта, °
+    float sceneClouds = -1, sceneVis = -1, sceneRain = -1, sceneSnow = -1;   // подстройка поверх погоды
     // Панорамная маска 360°: маска неба широкой копится по азимуту и углу места; после поворота
     // широкой маска берётся из панорамы (если она покрывает новый вид), а не учится заново
     bool panoMask = true;
@@ -208,6 +216,13 @@ struct View {
     std::string status;
 };
 
+// погода 3D-сцены для sim.gd (объект "env"): только заданное, {} — как в сцене
+std::string scene_env_json(const Config& c);
+// пресет погоды sim.gd: облачность, видимость (м), дождь, снег — чтобы подстройка начиналась с него
+bool scene_weather_preset(const std::string& name, float& clouds, float& vis, float& rain, float& snow);
+// высота солнца, ° (как в sim.gd: местное солнечное время, день года, широта)
+float sun_elevation(float hours, int day, float lat);
+
 class Emulator {
 public:
     Emulator();
@@ -226,6 +241,12 @@ public:
     // обзор 360°: широкая поворачивается шагами по полкадра, на каждом шаге маска учится и
     // ложится в панораму, в конце — обратно
     void startScan() { scanReq_ = true; }
+    // погода и время суток 3D-сцены — с ближайшего кадра (Godot не перезапускается)
+    void setSceneEnv(const Config& c) {
+        std::lock_guard<std::mutex> lk(envM_);
+        envJson_ = scene_env_json(c);
+        ++envReq_;
+    }
     void setWidePose(float az, float el) {
         wantAz_ = az;
         wantEl_ = el;
@@ -277,7 +298,11 @@ private:
     bool sceneMode_ = false;
     std::unique_ptr<scene::Link> link_;
     scene::Options linkOpt_;
-    std::string linkHello_;
+    std::string linkHello_, linkHelloBase_;
+    std::mutex envM_;
+    std::string envJson_;
+    std::atomic<int> envReq_{0};
+    int envSeen_ = 0;
     int linkRestarts_ = 0;
     std::vector<scene::Body> sbodies_;
     mutable std::mutex vm_;

@@ -235,6 +235,13 @@ void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t
 bool Emulator::sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out) {
     int w = 0, h = 0;
     std::string err;
+    if (envReq_ != envSeen_) {   // погоду поменяли: со следующим кадром, и при перезапуске Godot — она же
+        std::lock_guard<std::mutex> lk(envM_);
+        envSeen_ = envReq_;
+        link_->setEnv(envJson_);
+        linkHello_ = linkHelloBase_ + ", \"env\": " + envJson_ + "}";
+        event(t, "3D-сцена: погода " + envJson_);
+    }
     bool ok = link_->render(t, cam, p.az, p.el, out, w, h, sbodies_, err);
     // Godot закрыли или он упал: поднимаем заново (до 3 раз), мир тот же по seed, кадр просим повторно
     while (!ok && !stop_ && linkRestarts_ < 3) {
@@ -1363,19 +1370,25 @@ void Emulator::loop() {
         o.scene = c_.scene;
         o.sector = c_.sector;
         o.affinity = c_.renderAffinity;
-        char hello[600];
+        char hello[700];
         snprintf(hello, sizeof(hello),
                  "{\"wide\": [%d, %d, %.3f, %.3f], \"fine\": [%d, %d, %.3f, %.3f], \"seed\": %u, \"drones\": %d, "
                  "\"birds\": %d, \"range\": [%.1f, %.1f], \"types\": {\"quad\": %.3f, \"delta\": %.3f, \"plane\": %.3f}, "
-                 "\"az\": %.3f, \"el\": %.3f, \"sector\": %s}",
+                 "\"az\": %.3f, \"el\": %.3f, \"sector\": %s",
                  c_.wideW, c_.wideH, c_.wideFov, c_.wideFps, c_.narrowW, c_.narrowH, c_.narrowFov, c_.narrowFps, c_.seed,
                  c_.drones, c_.birds, c_.rangeMin, c_.rangeMax, c_.quadShare, c_.deltaShare, c_.planeShare, widePose_.az,
                  widePose_.el, c_.sector.empty() ? "false" : "true");
         std::string err;
         linkOpt_ = o;
-        linkHello_ = hello;
+        linkHelloBase_ = hello;
+        {
+            std::lock_guard<std::mutex> lk(envM_);
+            envJson_ = scene_env_json(c_);
+            envSeen_ = envReq_;
+            linkHello_ = linkHelloBase_ + ", \"env\": " + envJson_ + "}";
+        }
         linkRestarts_ = 0;
-        if (!link_->start(o, hello, err)) {
+        if (!link_->start(o, linkHello_, err)) {
             std::lock_guard<std::mutex> lk(vm_);
             view_.status = "3D-сцена: " + err;
             view_.running = false;
@@ -1589,6 +1602,51 @@ View Emulator::view() const {
     return view_;
 }
 
+std::string scene_env_json(const Config& c) {
+    std::string j = "{";
+    auto num = [&](const char* k, double v, const char* fmt) {
+        char b[64];
+        snprintf(b, sizeof(b), fmt, v);
+        j += (j.size() > 1 ? ", \"" : "\"") + std::string(k) + "\": " + b;
+    };
+    if (!c.sceneWeather.empty()) j += "\"weather\": \"" + c.sceneWeather + "\"";
+    if (c.sceneTime >= 0) {
+        num("time", c.sceneTime, "%.4f");
+        num("time_rate", c.sceneTimeRate, "%.2f");
+        num("day", c.sceneDay, "%.0f");
+        num("lat", c.sceneLat, "%.3f");
+    }
+    if (c.sceneClouds >= 0) num("clouds", c.sceneClouds, "%.3f");
+    if (c.sceneVis >= 0) num("visibility", c.sceneVis, "%.0f");
+    if (c.sceneRain >= 0) num("rain", c.sceneRain, "%.3f");
+    if (c.sceneSnow >= 0) num("snow", c.sceneSnow, "%.3f");
+    return j + "}";
+}
+
+bool scene_weather_preset(const std::string& name, float& clouds, float& vis, float& rain, float& snow) {
+    // как WEATHER в sim/godot/sim.gd
+    static const struct {
+        const char* n;
+        float c, v, r, s;
+    } P[] = {{"clear", 0.06f, 30000, 0, 0},  {"cumulus", 0.38f, 20000, 0, 0}, {"cloudy", 0.65f, 14000, 0, 0},
+             {"overcast", 0.97f, 9000, 0, 0}, {"haze", 0.12f, 3500, 0, 0},    {"mist", 0.85f, 1200, 0, 0},
+             {"fog", 1.0f, 300, 0, 0},        {"rain", 1.0f, 4000, 0.5f, 0},  {"storm", 1.0f, 1800, 1.0f, 0},
+             {"snow", 1.0f, 2500, 0, 0.6f}};
+    for (const auto& p : P)
+        if (name == p.n) {
+            clouds = p.c, vis = p.v, rain = p.r, snow = p.s;
+            return true;
+        }
+    return false;
+}
+
+float sun_elevation(float hours, int day, float lat) {
+    const double D = 3.14159265358979 / 180;
+    const double decl = 23.44 * D * std::sin(2 * 3.14159265358979 * (day - 81) / 365.0);
+    const double ha = (hours - 12) * 15 * D, la = lat * D;
+    return (float)(std::asin(std::sin(la) * std::sin(decl) + std::cos(la) * std::cos(decl) * std::cos(ha)) / D);
+}
+
 static void pct(std::vector<float> v, float& med, float& p90) {
     med = p90 = 0;
     if (v.empty()) return;
@@ -1686,6 +1744,22 @@ int run_cli(int argc, char** argv) {
         else if (a == "--scene") c.scene = val();
         else if (a == "--sector") c.sector = val();
         else if (a == "--godot") c.godot = val();
+        else if (a == "--weather") c.sceneWeather = val();
+        else if (a == "--time") {   // 19.5 или 19:30
+            const std::string v = val();
+            int hh = 0, mm = 0;
+            c.sceneTime = v.find(':') != std::string::npos && sscanf(v.c_str(), "%d:%d", &hh, &mm) == 2 ? hh + mm / 60.f
+                                                                                                    : (float)atof(v.c_str());
+        } else if (a == "--time-rate") c.sceneTimeRate = (float)atof(val().c_str());
+        else if (a == "--date") {   // ММ-ДД
+            int m = 9, d = 15;
+            static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+            if (sscanf(val().c_str(), "%d-%d", &m, &d) == 2) c.sceneDay = cum[std::max(1, std::min(12, m)) - 1] + d;
+        } else if (a == "--lat") c.sceneLat = (float)atof(val().c_str());
+        else if (a == "--rain") c.sceneRain = (float)atof(val().c_str());
+        else if (a == "--snow") c.sceneSnow = (float)atof(val().c_str());
+        else if (a == "--scene-clouds") c.sceneClouds = (float)atof(val().c_str());
+        else if (a == "--scene-visibility") c.sceneVis = (float)atof(val().c_str());
         else if (a == "--az") c.wideAz = (float)atof(val().c_str());
         else if (a == "--el") c.wideEl = (float)atof(val().c_str());
         else {
@@ -1697,7 +1771,10 @@ int run_cli(int argc, char** argv) {
                    "  [--min-hold 0.08] [--give-up 3] [--cool-down 10]\n"
                    "  обмен между камерами: [--no-silhouette] [--no-hold] [--no-veto] [--no-cue] [--no-shape] [--shape амп,автокорр,оценок,окно] [--no-veto-wide] [--no-next] [--no-veto-manual] [--with-birds] [--legacy — всё выключено]\n"
                    "  3D-сцена Godot вместо синтетического неба: [--scene sim/scenes/city_sectors.json] [--sector highrise]\n"
-                   "  [--godot путь] [--az 0] [--el 32]\n");
+                   "  [--godot путь] [--az 0] [--el 32]\n"
+                   "  погода и время суток сцены: [--weather clear|cumulus|cloudy|overcast|haze|mist|fog|rain|storm|snow]\n"
+                   "  [--time 19:30] [--time-rate 60] [--date 09-15] [--lat 55.75] [--scene-clouds 0.8] [--scene-visibility 3000]\n"
+                   "  [--rain 0.5] [--snow 0.5]\n");
             return a == "--help" ? 0 : 2;
         }
     }
@@ -1716,6 +1793,7 @@ int run_cli(int argc, char** argv) {
         if (!c.sector.empty())   // ось широкой — на середину сектора
             for (const auto& sc : scene::scene_sectors(c.scene))
                 if (sc.name == c.sector) c.wideAz = sc.mid;
+        printf("погода сцены (поверх своей): %s\n", scene_env_json(c).c_str());
     }
     const Stats s = e.runBlocking(c, seconds, verbose);
     if (!c.scene.empty() && s.wideFrames == 0) {

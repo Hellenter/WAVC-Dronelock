@@ -60,6 +60,7 @@ var f_vel := 0.0
 var f_t := 0.0
 var f_target := -1
 
+var env_cli := {}            # погода из командной строки или от приложения (поверх сцены)
 var gt_wide: Array = []
 var gt_fine: Array = []
 var poses_wide: Array = []
@@ -107,6 +108,10 @@ func _ready() -> void:
 		wcfg["pan_dps"] = float(args["pan"])
 	if args.has("sweep"):
 		wcfg["sweep_deg"] = float(args["sweep"])
+	# погода и время суток поверх сцены: --weather rain --time 19.5 --clouds 0.8 --visibility 2000 ...
+	for k in ["weather", "time", "clouds", "visibility", "rain", "snow", "cirrus", "date", "lat", "time-rate", "exposure"]:
+		if args.has(k):
+			env_cli[k.replace("-", "_")] = args[k] if k in ["weather", "date", "exposure", "time"] else float(args[k])
 	if args.has("live") and not live_connect(int(args["live"])):
 		get_tree().quit(3)
 		return
@@ -140,6 +145,13 @@ func _ready() -> void:
 	build_poles()
 	bucket_boxes()
 	build_targets()
+	setup_env_state(env_cli)
+	apply_env(env_at(0.0))
+	print("погода: %s" % env_brief(env_now))
+	if args.has("gallery"):
+		await run_gallery(str(args["gallery"]))
+		get_tree().quit()
+		return
 	if view_mode:
 		start_view()
 		return
@@ -274,68 +286,308 @@ func wide_pose(t: float) -> Vector2:
 	return Vector2(fposmod(az0 + sweep * tri, 360.0), el)
 
 
-# ---------- окружение ----------
+# ---------- окружение: небо, время суток, погода ----------
+#
+# Погода и время задаются в world (сцена), поверх — пресетом world.weather, а из командной строки
+# (--weather, --time, ...) или из приложения (hello / запрос кадра с "env") — поверх сцены.
+# Всё, что меняется (солнце, облака, дымка, осадки), — функция модельного времени: ролик повторяется.
+
+# Пресеты погоды: что не задано явно, берётся отсюда.
+const WEATHER := {
+	"clear": {"clouds": 0.06, "cirrus": 0.15, "visibility": 30000.0, "cloud_dark": 0.2},
+	"cumulus": {"clouds": 0.38, "cirrus": 0.1, "visibility": 20000.0, "cloud_dark": 0.35},
+	"cloudy": {"clouds": 0.65, "cirrus": 0.0, "visibility": 14000.0, "cloud_dark": 0.5},
+	"overcast": {"clouds": 0.97, "cirrus": 0.0, "visibility": 9000.0, "cloud_dark": 0.6},
+	"haze": {"clouds": 0.12, "cirrus": 0.35, "visibility": 3500.0, "cloud_dark": 0.25},
+	"mist": {"clouds": 0.85, "cirrus": 0.0, "visibility": 1200.0, "cloud_dark": 0.4},
+	"fog": {"clouds": 1.0, "cirrus": 0.0, "visibility": 300.0, "cloud_dark": 0.3},
+	"rain": {"clouds": 1.0, "cirrus": 0.0, "visibility": 4000.0, "cloud_dark": 0.75, "rain": 0.5},
+	"storm": {"clouds": 1.0, "cirrus": 0.0, "visibility": 1800.0, "cloud_dark": 0.95, "rain": 1.0},
+	"snow": {"clouds": 1.0, "cirrus": 0.0, "visibility": 2500.0, "cloud_dark": 0.55, "snow": 0.6},
+}
+# По умолчанию — как было до погоды: небо с кучевыми, солнце на 150°/35°, видимость ~15 км.
+const ENV_DEFAULT := {
+	"clouds": 0.4, "cloud_soft": 0.18, "cloud_dark": 0.35, "cirrus": 0.0, "cloud_scale": 0.0008,
+	"visibility": 15650.0, "rain": 0.0, "snow": 0.0, "sun_az": 150.0, "sun_el": 35.0,
+	"sun": 1.1, "ambient": 0.55, "lat": 55.75, "day": 258.0, "time_rate": 0.0,
+	"light_pollution": 0.35, "shutter": 0.004, "max_gain": 16.0, "wet": 0.0,
+}
+const ENV_NUMS := ["clouds", "cloud_soft", "cloud_dark", "cirrus", "cloud_scale", "visibility", "rain", "snow",
+	"sun_az", "sun_el", "sun", "ambient", "lat", "day", "time", "time_rate", "light_pollution", "shutter",
+	"max_gain", "exposure", "wet"]
+
+# Небо по высоте солнца: [угол, зенит, горизонт, заря у горизонта со стороны солнца, сила зари,
+# яркость неба относительно дня]. Цвета sRGB; яркость — множитель в линейном свете.
+const SKY_TABLE := [
+	[-18.0, Color(0.05, 0.07, 0.14), Color(0.07, 0.08, 0.12), Color(0.10, 0.08, 0.10), 0.0, 0.00025],
+	[-12.0, Color(0.08, 0.11, 0.24), Color(0.16, 0.17, 0.26), Color(0.35, 0.22, 0.20), 0.15, 0.0012],
+	[-8.0, Color(0.12, 0.17, 0.36), Color(0.36, 0.30, 0.38), Color(0.75, 0.36, 0.20), 0.45, 0.006],
+	[-4.0, Color(0.17, 0.25, 0.48), Color(0.72, 0.48, 0.40), Color(1.00, 0.45, 0.18), 0.75, 0.035],
+	[0.0, Color(0.21, 0.33, 0.58), Color(0.95, 0.66, 0.45), Color(1.00, 0.55, 0.25), 0.8, 0.22],
+	[5.0, Color(0.24, 0.40, 0.70), Color(0.86, 0.80, 0.70), Color(1.00, 0.75, 0.45), 0.45, 0.6],
+	[15.0, Color(0.22, 0.42, 0.76), Color(0.74, 0.80, 0.88), Color(1.00, 0.90, 0.75), 0.12, 0.9],
+	[35.0, Color(0.22, 0.42, 0.78), Color(0.72, 0.80, 0.90), Color(1.00, 0.95, 0.85), 0.0, 1.0],
+	[90.0, Color(0.18, 0.38, 0.78), Color(0.68, 0.78, 0.92), Color(1.00, 0.95, 0.85), 0.0, 1.05],
+]
 
 const SKY_SHADER := """
 shader_type sky;
 uniform vec3 zenith : source_color = vec3(0.22, 0.42, 0.78);
 uniform vec3 horizon : source_color = vec3(0.72, 0.80, 0.90);
-uniform vec3 cloud_lit : source_color = vec3(0.96, 0.96, 0.97);
-uniform vec3 cloud_dark : source_color = vec3(0.58, 0.61, 0.66);
+uniform vec3 glow : source_color = vec3(1.0, 0.6, 0.3);
+uniform float glow_k = 0.0;
+uniform vec3 haze_col : source_color = vec3(0.75, 0.80, 0.86);
+uniform vec3 sun_col : source_color = vec3(1.0, 0.97, 0.9);
+uniform vec3 sun_dir = vec3(0.0, 0.57, 0.82);
+uniform float bright = 1.0;      // яркость неба (день = 1)
+uniform float gain = 1.0;        // экспозиция камеры
+uniform float sun_k = 1.0;       // солнце над горизонтом (диск и ореол)
+uniform float cloud_sun = 1.0;   // солнце освещает облака (на закате — снизу, дольше, чем землю)
 uniform float cloud_cover = 0.4;
 uniform float cloud_soft = 0.18;
+uniform float cloud_dark = 0.35;
 uniform float cloud_scale = 0.0008;
 uniform float cloud_height = 1500.0;
+uniform float cirrus = 0.0;
+uniform float haze_ext = 0.0;    // ослабление дымкой сверх чистого воздуха, 1/м
+uniform float lp = 0.0;          // засветка от города у горизонта и на облаках (ночью)
+uniform float stars = 0.0;
 uniform vec2 wind = vec2(6.0, 2.0);
 uniform float sim_time = 0.0;
 uniform float seed = 0.0;
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float hash3(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
 float vnoise(vec2 p) {
 	vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
 	return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
 }
-float fbm(vec2 p) {
+float fbm(vec2 p, int oct) {
 	float a = 0.5; float s = 0.0;
-	for (int i = 0; i < 6; i++) { s += a * vnoise(p); p = p * 2.03 + vec2(17.0, 9.0); a *= 0.5; }
+	for (int i = 0; i < 6; i++) { if (i >= oct) break; s += a * vnoise(p); p = p * 2.03 + vec2(17.0, 9.0); a *= 0.5; }
 	return s;
 }
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 void sky() {
 	vec3 d = EYEDIR;
 	float h = max(d.y, 0.0);
-	vec3 c = mix(horizon, zenith, pow(h, 0.45));
-	float sd = max(dot(d, LIGHT0_DIRECTION), 0.0);
-	c += LIGHT0_COLOR * (pow(sd, 900.0) * 6.0 + pow(sd, 12.0) * 0.12);
-	if (d.y > 0.003) {
-		vec2 uv = d.xz / d.y * cloud_height + wind * sim_time;
-		float n = fbm(uv * cloud_scale + vec2(seed * 13.1, seed * 7.7));
-		float k = smoothstep(1.0 - cloud_cover - cloud_soft, 1.0 - cloud_cover + cloud_soft, n);
-		k *= smoothstep(0.003, 0.08, d.y);
-		vec3 cc = mix(cloud_lit, cloud_dark, smoothstep(0.55, 0.95, n));
-		cc += LIGHT0_COLOR * pow(sd, 6.0) * 0.25;
-		c = mix(c, cc, k);
+	float sd = dot(d, sun_dir);
+	vec2 dh = normalize(d.xz + vec2(1e-6, 0.0));
+	vec2 sh = normalize(sun_dir.xz + vec2(1e-6, 0.0));
+	float toward = 0.5 + 0.5 * dot(dh, sh);   // 1 — в сторону солнца по азимуту, 0 — от него
+	// чистое небо: от горизонта к зениту, заря со стороны солнца, пояс Венеры напротив
+	vec3 c = mix(horizon, zenith, pow(h, 0.5));
+	c = mix(c, glow, glow_k * pow(toward, 3.0) * exp(-h * 6.0));
+	c += glow_k * vec3(0.35, 0.18, 0.25) * pow(1.0 - toward, 4.0) * exp(-abs(h - 0.06) * 18.0) * 0.4;
+	c *= bright;
+	vec3 sunl = sun_col * sun_k;
+	float sdp = max(sd, 0.0);
+	c += sunl * bright * (pow(sdp, 12.0) * 0.10 + pow(sdp, 200.0) * 0.5) * (0.4 + 6000.0 * haze_ext);
+	vec3 lpc = vec3(0.95, 0.62, 0.34) * lp;
+	c += lpc * exp(-h * 4.0);
+	// звёзды: точка на ячейку направления, размер — пиксель камеры (fwidth)
+	if (stars > 0.0 && d.y > 0.0) {
+		vec3 sp = d * 400.0;
+		vec3 cell = floor(sp);
+		float hs = hash3(cell);
+		if (hs > 0.996) {
+			vec3 off = vec3(hash3(cell + 1.3), hash3(cell + 2.7), hash3(cell + 4.1)) * 0.8 + 0.1;
+			float r = length(sp - cell - off) / 400.0;
+			float px = max(length(fwidth(d)), 2e-5);
+			float mag = pow(hash3(cell + 7.9), 6.0);
+			c += vec3(0.9, 0.95, 1.0) * stars * mag * 0.25 * exp(-r * r / (px * px * 0.6)) * smoothstep(0.0, 0.12, d.y);
+		}
 	}
-	COLOR = c;
+	float dist = cloud_height / max(d.y, 0.012);
+	vec3 amb = mix(horizon, zenith, 0.5) * bright;
+	amb = mix(amb, vec3(luma(amb)), 0.55);
+	vec3 csun = sun_col * cloud_sun;
+	float occl = 0.0;   // насколько облака закрывают солнце в этом направлении
+	if (d.y > 0.003) {
+		// перистые: высоко, тонкие, вытянутые
+		if (cirrus > 0.0) {
+			vec2 q = d.xz / max(d.y, 0.02) * 8000.0 + wind * sim_time * 3.0;
+			q = vec2(q.x + q.y * 0.6, q.y * 0.25 - q.x * 0.15);
+			float nc = fbm(q * 0.00012 + vec2(seed * 3.1, 1.7), 5);
+			float kc = smoothstep(0.42, 0.78, nc) * cirrus * 0.7 * smoothstep(0.003, 0.15, d.y);
+			c = mix(c, csun * (0.85 + pow(sdp, 6.0)) + amb * 0.6 + lpc * 0.3, kc);
+			occl = max(occl, kc * 0.5);
+		}
+		// кучевые и слоистые: форма — шум с искажением, свет — разница плотности в сторону солнца
+		vec2 uv = d.xz / max(d.y, 0.012) * cloud_height + wind * sim_time;
+		vec2 p = uv * cloud_scale + vec2(seed * 13.1, seed * 7.7);
+		p += 0.6 * vec2(vnoise(p * 0.5 + 3.1), vnoise(p * 0.5 + 8.7)) - 0.3;
+		float n = fbm(p, 6);
+		float th = 1.0 - cloud_cover;
+		float k = smoothstep(th - cloud_soft, th + cloud_soft, n);
+		k *= smoothstep(0.003, 0.06, d.y);
+		if (k > 0.001) {
+			float n2 = fbm(p + sh * 0.35, 4);
+			float lit = clamp(0.6 + (n - n2) * 3.0, 0.0, 1.0);
+			float thick = smoothstep(th, th + 0.35, n);
+			float deep = cloud_cover * cloud_cover * (0.3 + 0.7 * cloud_dark);   // сплошная толща — темнее снизу
+			vec3 base = amb * (1.0 - 0.55 * cloud_dark) + csun * 0.22 * (1.0 - 0.7 * cloud_dark);
+			vec3 top = csun * 0.95 + amb * 0.7;
+			vec3 cc = mix(base, top, lit * (1.0 - 0.75 * deep) * (1.0 - 0.5 * thick * cloud_dark));
+			cc += csun * pow(sdp, 8.0) * (1.0 - thick) * 0.9;           // светлая кайма против солнца
+			cc *= 1.0 - 0.25 * deep * smoothstep(0.55, 1.0, n);          // тёмные пятна в сплошной облачности
+			cc += lpc * 0.7;                                             // ночью облака подсвечены городом
+			c = mix(c, cc, k);
+			occl = max(occl, k);
+		}
+	}
+	// солнечный диск: за облаками его нет
+	c += sunl * smoothstep(0.99996, 0.99999, sd) * 40.0 * (1.0 - occl);
+	// дымка и туман: по пути через слой дымки (~800 м) небо и облака тянутся к цвету дымки
+	float tau = haze_ext * 800.0 / max(d.y, 0.02);
+	if (d.y < 0.0) tau = 50.0;
+	float T = exp(-tau);
+	vec3 hz = haze_col * bright + lpc * 0.8 + sunl * bright * pow(sdp, 8.0) * 0.4 * (1.0 - T);
+	c = mix(hz, c, T);
+	COLOR = c * gain;
 }
 """
 
+var env_obj: Environment
+var sky_mat: ShaderMaterial
+var sun_light: DirectionalLight3D
+var env_base := {}       # погода сцены после пресета
+var env_over := {}       # поверх: командная строка, приложение
+var env_track: Array = [] # world.weather_track: [{"at": с, ...}] — смена погоды по ходу ролика
+var env_now := {}        # применённое (для meta.json и окна просмотра)
+var env_mats: Array = [] # материалы с параметром night_light (окна домов)
+var ground_mats: Array = []
+var precip: Array = []   # [MultiMesh, ShaderMaterial, "rain"/"snow", слой 0 ближний / 1 дальний]
+var env_dynamic := false
+
+
+func env_layer(dst: Dictionary, src: Dictionary) -> void:
+	var w = src.get("weather", null)
+	if w != null and WEATHER.has(str(w)):
+		dst["rain"] = 0.0   # пресет задаёт осадки целиком: «ясно» после «дождя» — без дождя
+		dst["snow"] = 0.0
+		dst["cirrus"] = 0.0
+		for k in WEATHER[str(w)]:
+			dst[k] = WEATHER[str(w)][k]
+		dst["weather"] = str(w)
+	elif w != null and str(w) != "":
+		push_warning("нет погоды " + str(w) + ", есть: " + ", ".join(WEATHER.keys()))
+	for k in src:
+		if k in ENV_NUMS and src[k] != null:
+			if k == "exposure" and str(src[k]) == "auto":
+				dst.erase("exposure")
+			elif k == "time" and typeof(src[k]) == TYPE_STRING and ":" in str(src[k]):
+				var hm = str(src[k]).split(":")
+				dst["time"] = float(hm[0]) + float(hm[1]) / 60.0
+			else:
+				dst[k] = float(src[k])
+	if src.has("date"):
+		dst["day"] = float(day_of_year(str(src["date"])))
+	# прежние имена ключей сцены
+	if src.has("cloud_cover"):
+		dst["clouds"] = float(src["cloud_cover"])
+	if src.has("fog") and not src.has("visibility"):
+		var f = float(src["fog"])
+		dst["visibility"] = 3.912 / f if f > 0.0 else 60000.0
+	if src.has("time") and src["time"] == null:
+		dst.erase("time")
+
+
+func day_of_year(s: String) -> int:
+	var p = s.split("-")
+	if p.size() < 2:
+		return int(s)
+	var m = clampi(int(p[p.size() - 2]), 1, 12)
+	var dd = clampi(int(p[p.size() - 1]), 1, 31)
+	var cum = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+	return cum[m - 1] + dd
+
+
+func setup_env_state(over: Dictionary) -> void:
+	var w: Dictionary = cfg.get("world", {})
+	env_base = ENV_DEFAULT.duplicate()
+	env_layer(env_base, w)
+	env_over = over
+	env_track = w.get("weather_track", [])
+	env_dynamic = not env_track.is_empty()
+
+
+# Погода на модельный момент t: сцена, смена по weather_track (линейно между точками), поверх — over.
+func env_at(t: float) -> Dictionary:
+	var e = env_base.duplicate()
+	if not env_track.is_empty():
+		var a = null
+		var b = null
+		for kf in env_track:
+			if float(kf.get("at", 0.0)) <= t:
+				a = kf
+			elif b == null:
+				b = kf
+		var ea = e.duplicate()
+		if a != null:
+			env_layer(ea, a)
+		if b != null and a != null:
+			var eb = ea.duplicate()
+			env_layer(eb, b)
+			var ta = float(a.get("at", 0.0))
+			var u = clampf((t - ta) / maxf(float(b.get("at", 0.0)) - ta, 1e-6), 0.0, 1.0)
+			u = u * u * (3.0 - 2.0 * u)
+			for k in eb:
+				if typeof(eb[k]) == TYPE_FLOAT and ea.has(k) and typeof(ea[k]) == TYPE_FLOAT:
+					ea[k] = lerpf(ea[k], eb[k], u)
+				else:
+					ea[k] = eb[k] if u > 0.5 else ea.get(k, eb[k])
+		elif b != null:
+			pass   # до первой точки — погода сцены
+		e = ea
+	env_layer(e, env_over)
+	if e.has("time"):
+		var hrs = float(e["time"]) + t * float(e.get("time_rate", 0.0)) / 3600.0
+		var se = sun_from_time(fposmod(hrs, 24.0), float(e["lat"]), float(e["day"]))
+		e["sun_az"] = se.x
+		e["sun_el"] = se.y
+		e["time_now"] = fposmod(hrs, 24.0)
+	return e
+
+
+# Солнце по местному солнечному времени (12:00 — на юге), широте и дню года. Азимут от севера по часовой.
+func sun_from_time(hrs: float, lat: float, day: float) -> Vector2:
+	var decl = 23.44 * DEG * sin(TAU * (day - 81.0) / 365.0)
+	var ha = (hrs - 12.0) * 15.0 * DEG
+	var la = lat * DEG
+	var sel = asin(clampf(sin(la) * sin(decl) + cos(la) * cos(decl) * cos(ha), -1.0, 1.0))
+	var saz = atan2(sin(ha), cos(ha) * sin(la) - tan(decl) * cos(la)) + PI
+	return Vector2(fposmod(saz / DEG, 360.0), sel / DEG)
+
+
+func sky_row(el: float) -> Array:
+	var n = SKY_TABLE.size()
+	if el <= SKY_TABLE[0][0]:
+		return SKY_TABLE[0]
+	if el >= SKY_TABLE[n - 1][0]:
+		return SKY_TABLE[n - 1]
+	for i in range(1, n):
+		var b: Array = SKY_TABLE[i]
+		if el <= b[0]:
+			var a: Array = SKY_TABLE[i - 1]
+			var u = (el - a[0]) / (b[0] - a[0])
+			# яркость — по логарифму: в сумерках она падает на порядки
+			return [el, (a[1] as Color).lerp(b[1], u), (a[2] as Color).lerp(b[2], u), (a[3] as Color).lerp(b[3], u),
+				lerpf(a[4], b[4], u), exp(lerpf(log(a[5]), log(b[5]), u))]
+	return SKY_TABLE[n - 1]
+
+
 func build_environment() -> void:
 	var w: Dictionary = cfg.get("world", {})
-	var env = Environment.new()
-	env.background_mode = Environment.BG_SKY
+	env_obj = Environment.new()
+	env_obj.background_mode = Environment.BG_SKY
 	var sky = Sky.new()
-	var sm = ShaderMaterial.new()
-	sm.shader = make_shader(SKY_SHADER)
-	var hz = col(w.get("horizon"), Color(0.72, 0.80, 0.90))
-	sm.set_shader_parameter("horizon", hz)
-	sm.set_shader_parameter("zenith", col(w.get("zenith"), Color(0.22, 0.42, 0.78)))
-	sm.set_shader_parameter("cloud_cover", float(w.get("cloud_cover", 0.4)))
-	sm.set_shader_parameter("cloud_soft", float(w.get("cloud_soft", 0.18)))
-	sm.set_shader_parameter("cloud_scale", float(w.get("cloud_scale", 0.0008)))
+	sky_mat = ShaderMaterial.new()
+	sky_mat.shader = make_shader(SKY_SHADER)
+	sky_mat.set_shader_parameter("seed", float(cfg.get("seed", 1)))
 	var wind = enu(w.get("cloud_wind", [6.0, 2.0, 0.0]))
-	sm.set_shader_parameter("wind", Vector2(wind.x, wind.z))
-	sm.set_shader_parameter("seed", float(cfg.get("seed", 1)))
-	time_mats.append(sm)
-	sky.sky_material = sm
+	sky_mat.set_shader_parameter("wind", Vector2(wind.x, wind.z))
+	time_mats.append(sky_mat)
+	sky.sky_material = sky_mat
 	# настоящее небо: панорама HDRI (.hdr/.exr, например Poly Haven) вместо нарисованного
 	var hdri := str(w.get("sky_hdri", ""))
 	if hdri != "":
@@ -349,31 +601,318 @@ func build_environment() -> void:
 			pm.panorama = ImageTexture.create_from_image(img)
 			pm.energy_multiplier = float(w.get("sky_energy", 1.0))
 			sky.sky_material = pm
-			env.sky_rotation = Vector3(0, -float(w.get("sky_rotation", 0.0)) * DEG, 0)
-	env.sky = sky
-	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = hz
-	env.ambient_light_energy = float(w.get("ambient", 0.55))
-	env.tonemap_mode = Environment.TONE_MAPPER_LINEAR
-	var fog = float(w.get("fog", 0.00025))
-	if fog > 0.0:
-		env.fog_enabled = true
-		env.fog_light_color = hz
-		env.fog_density = fog
-		env.fog_sky_affect = 0.0
+			env_obj.sky_rotation = Vector3(0, -float(w.get("sky_rotation", 0.0)) * DEG, 0)
+	env_obj.sky = sky
+	env_obj.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	env_obj.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+	env_obj.fog_enabled = true
+	env_obj.fog_sky_affect = 0.0   # небо затягивает дымкой сам шейдер неба
 	var we = WorldEnvironment.new()
-	we.environment = env
+	we.environment = env_obj
 	world.add_child(we)
+	sun_light = DirectionalLight3D.new()
+	sun_light.shadow_enabled = bool(w.get("shadows", false))
+	sun_light.directional_shadow_max_distance = 600.0
+	world.add_child(sun_light)
+	build_precip(wind)
 
-	var sun = DirectionalLight3D.new()
-	var saz = float(w.get("sun_az", 150.0))
-	var sel = clampf(float(w.get("sun_el", 35.0)), 1.0, 85.0)
-	sun.light_energy = float(w.get("sun", 1.1))
-	sun.light_color = col(w.get("sun_color"), Color(1.0, 0.97, 0.9))
-	sun.shadow_enabled = bool(w.get("shadows", false))
-	sun.directional_shadow_max_distance = 600.0
-	world.add_child(sun)
-	sun.global_transform = Transform3D(Basis.looking_at(-dir_azel(saz, sel), Vector3.UP), Vector3.ZERO)
+
+# Применить погоду e: небо, солнце, рассеянный свет, дымка, осадки, окна. Экспозиция камеры — как
+# автоэкспозиция: в сумерках кадр вытягивается (до max_gain раз), ночью темнеет.
+func apply_env(e: Dictionary) -> void:
+	env_now = e
+	var w: Dictionary = cfg.get("world", {})
+	var el = float(e["sun_el"])
+	var az = float(e["sun_az"])
+	var clouds = clampf(float(e["clouds"]), 0.0, 1.0)
+	var vis = maxf(float(e["visibility"]), 30.0)
+	var row = sky_row(el)
+	var zen: Color = col(w.get("zenith"), row[1]) if el >= 30.0 else row[1]
+	var hor: Color = col(w.get("horizon"), row[2]) if el >= 30.0 else row[2]
+	var bright = float(row[5])
+	# солнце сквозь атмосферу: краснеет и слабеет у горизонта (воздушная масса), дымка гасит
+	var se = maxf(el, -1.0)
+	var am = 1.0 / (sin(maxf(se, 0.0) * DEG) + 0.15 * pow(maxf(se + 3.885, 0.1), -1.253))
+	var ext = 3.912 / vis
+	var haze_ext = maxf(ext - 3.912 / 40000.0, 0.0)
+	var k_rgb = Vector3(0.03, 0.06, 0.12)   # рэлеевское рассеяние по каналам
+	var amc = minf(am, 20.0)
+	var tr = Vector3(exp(-k_rgb.x * amc), exp(-k_rgb.y * amc), exp(-k_rgb.z * amc))
+	var scol = Color(1.0, clampf(tr.y / tr.x, 0.0, 1.0), clampf(tr.z / tr.x, 0.0, 1.0))
+	# сила солнца: воздух и дымка; 1 — как в прежней сцене (35°, видимость 15.6 км)
+	var mx = tr.x * exp(-haze_ext * 700.0 * am) / 0.788
+	var sun_up = smoothstep(-0.8, 2.0, el)
+	# облака закрывают прямой свет: при кучевых солнце в основном видно, при сплошных — нет
+	var direct = sun_up * minf(mx, 1.15) * (1.0 - 0.92 * smoothstep(0.45, 0.97, clouds))
+	# облачное небо и туман темнее ясного, автоэкспозиция это частично вытягивает
+	var dim = (1.0 - 0.45 * clouds * clouds * (0.5 + float(e["cloud_dark"]))) * (1.0 - 0.3 * clampf(float(e["rain"]) + float(e["snow"]) * 0.5, 0.0, 1.0))
+	var lum = bright * dim
+	var gain = 1.0
+	if e.has("exposure"):
+		gain = float(e["exposure"])
+	else:
+		gain = clampf(0.85 / maxf(lum, 1e-6), 1.0, float(e["max_gain"]))
+	var lp = float(e["light_pollution"]) * 0.004 * (1.0 - smoothstep(-10.0, -2.0, el))
+	var haze: Color = hor.lerp(Color(hor.get_luminance(), hor.get_luminance(), hor.get_luminance()),
+		clampf(0.35 + 0.5 * (1.0 - vis / 10000.0), 0.35, 0.85))
+	haze = haze.lerp(Color(0.62, 0.64, 0.66) * maxf(hor.get_luminance(), 0.05) / 0.64, clouds * 0.6)
+	var sm = sky_mat
+	sm.set_shader_parameter("zenith", zen)
+	sm.set_shader_parameter("horizon", hor)
+	sm.set_shader_parameter("glow", row[3])
+	sm.set_shader_parameter("glow_k", float(row[4]) * (1.0 - 0.8 * clouds))
+	sm.set_shader_parameter("haze_col", haze)
+	sm.set_shader_parameter("sun_col", scol)
+	sm.set_shader_parameter("sun_dir", dir_azel(az, el))
+	sm.set_shader_parameter("bright", bright * dim)
+	sm.set_shader_parameter("gain", gain)
+	sm.set_shader_parameter("sun_k", sun_up * clampf(mx, 0.05, 1.15))
+	sm.set_shader_parameter("cloud_sun", smoothstep(-5.0, 1.0, el) * clampf(mx, 0.3, 1.15))
+	sm.set_shader_parameter("cloud_cover", clouds)
+	sm.set_shader_parameter("cloud_soft", float(e["cloud_soft"]))
+	sm.set_shader_parameter("cloud_dark", float(e["cloud_dark"]))
+	sm.set_shader_parameter("cloud_scale", float(e["cloud_scale"]))
+	sm.set_shader_parameter("cirrus", float(e["cirrus"]))
+	sm.set_shader_parameter("haze_ext", haze_ext)
+	sm.set_shader_parameter("lp", lp)
+	sm.set_shader_parameter("stars", (1.0 - smoothstep(0.0012, 0.008, bright)) * (1.0 - clouds) * minf(vis / 8000.0, 1.0))
+	# солнце (под горизонтом — не светит), рассеянный свет неба
+	var sel = clampf(el, 2.0, 85.0)
+	sun_light.global_transform = Transform3D(Basis.looking_at(-dir_azel(az, sel), Vector3.UP), Vector3.ZERO)
+	sun_light.light_color = col(w.get("sun_color"), scol) if el >= 30.0 else scol
+	sun_light.light_energy = float(e["sun"]) * direct * gain
+	sun_light.visible = sun_light.light_energy > 0.002
+	var amb: Color = hor.lerp(zen, 0.4)
+	amb = amb.lerp(Color(amb.get_luminance(), amb.get_luminance(), amb.get_luminance()), 0.3 + 0.5 * clouds)
+	env_obj.ambient_light_color = amb
+	env_obj.ambient_light_energy = (float(e["ambient"]) * bright * (1.0 + 0.5 * clouds) * dim + lp * 40.0) * gain
+	# дымка на земле и целях: контраст падает до 2% на дальности видимости
+	env_obj.fog_density = ext
+	env_obj.fog_light_color = haze
+	env_obj.fog_light_energy = (bright * dim) * gain + lp * 30.0 * gain
+	env_obj.fog_sun_scatter = clampf(haze_ext * 1500.0, 0.0, 0.6) * sun_up * (1.0 - clouds)
+	# окна в многоэтажках вечером и ночью
+	var night = (1.0 - smoothstep(-6.0, 1.0, el)) * 0.03 * gain
+	for m in env_mats:
+		(m as ShaderMaterial).set_shader_parameter("night_light", night)
+	var wet = clampf(maxf(float(e["wet"]), float(e["rain"]) * 1.5), 0.0, 1.0)
+	for m in ground_mats:
+		(m as ShaderMaterial).set_shader_parameter("wet", wet)
+	apply_precip(e, haze, bright * dim, gain)
+
+
+const PRECIP_SHADER := """
+shader_type spatial;
+render_mode unshaded, cull_disabled, depth_draw_never, shadows_disabled, blend_mix;
+uniform float sim_time = 0.0;
+uniform vec3 center = vec3(0.0);
+uniform vec3 box = vec3(30.0, 40.0, 30.0);   // полуширина по x, высота, полуширина по z
+uniform float y0 = 0.0;                     // низ слоя
+uniform vec3 vel = vec3(0.0, -8.0, 0.0);    // м/с
+uniform float drop = 0.0015;                // размер капли или снежинки, м
+uniform float shutter = 0.004;              // выдержка, с: длина следа = скорость * выдержка
+uniform float aper = 1e-6;                  // зрачок объектива на пиксель фокусного (м): размытие вблизи
+uniform float opacity = 0.6;
+uniform vec3 tint : source_color = vec3(0.8);
+uniform float bright = 1.0;
+uniform float flake = 0.0;                  // 1 — снег: лицом к камере, колышется
+varying float alpha;
+void vertex() {
+	vec3 u = MODEL_MATRIX[3].xyz;            // случайная точка в единичном кубе
+	float id = u.x * 97.0 + u.y * 13.0 + u.z * 57.0;
+	vec3 size = vec3(2.0 * box.x, box.y, 2.0 * box.z);
+	vec3 p = mod(u * size + vel * sim_time, size);
+	vec3 q = p / size;
+	p += center + vec3(-box.x, y0, -box.z);
+	if (flake > 0.5) {
+		p.xz += vec2(sin(sim_time * 1.3 + id * 6.0), cos(sim_time * 1.1 + id * 4.0)) * 0.35;
+	}
+	vec3 e = min(q, 1.0 - q);
+	float fade = smoothstep(0.0, 0.15, min(min(e.x, e.y), e.z));   // у граней слоя — плавно
+	vec3 cam = INV_VIEW_MATRIX[3].xyz;
+	vec3 tc = cam - p;
+	float dist = max(length(tc), 0.05);
+	float fpx = PROJECTION_MATRIX[1][1] * VIEWPORT_SIZE.y * 0.5;  // фокусное, пикс.
+	float px = dist / fpx * 1.3;                                  // пиксель на этой дальности, м
+	float blur = fpx * aper;                                      // кружок нерезкости (фокус на бесконечность), м
+	float L = length(vel) * shutter + drop;
+	float wid = max(max(drop, blur), px);
+	float len = max(max(L, blur), px);
+	// след размазан: точку пикселя капля проходит за долю выдержки; на больший квадрат — свет тот же
+	alpha = opacity * fade * (drop / L) * (drop * L) / (wid * len);
+	vec3 ax;
+	vec3 sd;
+	if (flake > 0.5) {
+		ax = INV_VIEW_MATRIX[1].xyz;
+		sd = INV_VIEW_MATRIX[0].xyz;
+	} else {
+		ax = normalize(vel);
+		sd = normalize(cross(ax, tc / dist) + vec3(1e-5, 0.0, 0.0));
+	}
+	vec3 wp = p + sd * VERTEX.x * wid + ax * VERTEX.y * len;
+	VERTEX = wp - u;
+}
+void fragment() {
+	vec2 c = abs(UV * 2.0 - 1.0);
+	float prof = (1.0 - c.x) * (1.0 - c.y * c.y) * 2.6;
+	ALBEDO = tint * bright;
+	ALPHA = clamp(alpha * prof, 0.0, 1.0);
+}
+"""
+
+# Осадки: капли и снежинки около камер — ближний слой (до ~6 м, много) и дальний (до ~40 м).
+# Дальше дождь — это дымка (видимость падает). Положение — функция модельного времени.
+func build_precip(wind: Vector3) -> void:
+	var r = RandomNumberGenerator.new()
+	r.seed = int(cfg.get("seed", 1)) * 7 + 3
+	var layers = [[7000, Vector3(6.0, 12.0, 6.0), -6.0], [9000, Vector3(40.0, 50.0, 40.0), -100.0]]
+	var qm = QuadMesh.new()
+	qm.size = Vector2(1, 1)
+	for kind in ["rain", "snow"]:
+		for li in layers.size():
+			var L: Array = layers[li]
+			var mm = MultiMesh.new()
+			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.mesh = qm
+			mm.instance_count = int(L[0])
+			for i in mm.instance_count:
+				mm.set_instance_transform(i, Transform3D(Basis(), Vector3(r.randf(), r.randf(), r.randf())))
+			mm.visible_instance_count = 0
+			var m = ShaderMaterial.new()
+			m.shader = make_shader(PRECIP_SHADER)
+			var bx: Vector3 = L[1]
+			var y0 = rig_pos.y + float(L[2]) if float(L[2]) > -50.0 else 0.0
+			m.set_shader_parameter("center", Vector3(rig_pos.x, 0.0, rig_pos.z))
+			m.set_shader_parameter("box", bx)
+			m.set_shader_parameter("y0", y0)
+			m.set_shader_parameter("flake", 1.0 if kind == "snow" else 0.0)
+			time_mats.append(m)
+			var mi = MultiMeshInstance3D.new()
+			mi.multimesh = mm
+			mi.material_override = m
+			mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			mi.custom_aabb = AABB(Vector3(rig_pos.x - bx.x - 2.0, y0 - 2.0, rig_pos.z - bx.z - 2.0),
+				Vector3(2.0 * bx.x + 4.0, bx.y + 4.0, 2.0 * bx.z + 4.0))
+			mi.visible = false
+			world.add_child(mi)
+			precip.append([mm, m, kind, li, mi, wind])
+
+
+func apply_precip(e: Dictionary, haze: Color, bright: float, gain: float) -> void:
+	var rain = clampf(float(e["rain"]), 0.0, 1.0)
+	var snow = clampf(float(e["snow"]), 0.0, 1.0)
+	for pr in precip:
+		var mm: MultiMesh = pr[0]
+		var m: ShaderMaterial = pr[1]
+		var mi: MultiMeshInstance3D = pr[4]
+		var wind: Vector3 = pr[5]
+		var amt = rain if pr[2] == "rain" else snow
+		var n = int(round(mm.instance_count * amt))
+		mm.visible_instance_count = n
+		mi.visible = n > 0
+		if n == 0:
+			continue
+		# ветер у земли — треть от ветра облаков
+		var gw = Vector3(wind.x, 0.0, wind.z) * 0.3
+		if pr[2] == "rain":
+			m.set_shader_parameter("vel", gw + Vector3(0.0, -lerpf(5.0, 9.0, rain), 0.0))
+			m.set_shader_parameter("drop", lerpf(0.0010, 0.0025, rain))
+			m.set_shader_parameter("opacity", 0.7)
+			m.set_shader_parameter("tint", haze.lerp(Color(1, 1, 1), 0.3))
+		else:
+			m.set_shader_parameter("vel", gw * 0.6 + Vector3(0.0, -1.0, 0.0))
+			m.set_shader_parameter("drop", lerpf(0.003, 0.008, snow))
+			m.set_shader_parameter("opacity", 0.9)
+			m.set_shader_parameter("tint", Color(0.95, 0.96, 1.0))
+		m.set_shader_parameter("shutter", float(e["shutter"]))
+		m.set_shader_parameter("aper", 1.0e-6)
+		m.set_shader_parameter("bright", maxf(bright, 0.002) * gain * (1.4 if pr[2] == "snow" else 1.0))
+
+
+func env_update(t: float) -> void:
+	if env_dynamic or float(env_now.get("time_rate", 0.0)) != 0.0:
+		apply_env(env_at(t))
+
+
+# Коротко о погоде: в журнал, в окно просмотра и в meta.json.
+func env_summary(e: Dictionary) -> Dictionary:
+	var o = {}
+	for k in ["weather", "time_now", "sun_az", "sun_el", "clouds", "cirrus", "visibility", "rain", "snow"]:
+		if e.has(k):
+			o[k] = e[k] if typeof(e[k]) == TYPE_STRING else snappedf(float(e[k]), 0.01)
+	return o
+
+
+func env_brief(e: Dictionary) -> String:
+	var tm = ""
+	if e.has("time_now"):
+		var hm = float(e["time_now"])
+		tm = "%02d:%02d, " % [int(hm), int(fposmod(hm * 60.0, 60.0))]
+	return "%s%sсолнце %.0f°/%.1f°, облака %.2f, видимость %.0f м%s%s" % [
+		str(e.get("weather", "")) + ", " if e.has("weather") else "", tm, float(e["sun_az"]), float(e["sun_el"]),
+		float(e["clouds"]), float(e["visibility"]),
+		", дождь %.2f" % float(e["rain"]) if float(e["rain"]) > 0.0 else "",
+		", снег %.2f" % float(e["snow"]) if float(e["snow"]) > 0.0 else ""]
+
+
+# Галерея погоды: один мир, по кадру широкой (и точной на ближайший видимый дрон) на каждую погоду.
+# spec — через «;»: "погода@часы[@азимут]", например "clear@13;cumulus@19.5@300;fog@8".
+func run_gallery(spec: String) -> void:
+	var shots = []
+	var t = 2.0
+	if wide_vp.size.x > 1600:   # галерея — обзорные кадры, точная — в своём разрешении
+		wide_vp.size = Vector2i(1152, int(round(wide_vp.size.y * 1152.0 / wide_vp.size.x)))
+	set_time(t)
+	var idx = 0
+	for item in spec.split(";", false):
+		var p = item.strip_edges().split("@")
+		var over = {}
+		if p[0] != "" and p[0] != "scene":
+			over["weather"] = p[0]
+		if p.size() > 1 and p[1] != "":
+			over["time"] = float(p[1])
+		for k in env_cli:
+			if not over.has(k):
+				over[k] = env_cli[k]
+		env_over = over
+		var az = float(p[2]) if p.size() > 2 else float(wcfg.get("az", 0.0))
+		aim(wide_cam, az, float(wcfg.get("el", 15.0)))
+		apply_env(env_at(t))
+		update_targets(t)
+		# точная — на ближайший к оси широкой видимый дрон
+		var best = null
+		var bd = 1e9
+		for tg in targets:
+			if tg["kind"] != "drone":
+				continue
+			var tp = target_pos(tg, t)
+			if tp == null or occluded(rig_pos, tp) or wide_cam.is_position_behind(tp):
+				continue
+			var ae = azel_of(tp - rig_pos)
+			var dd = absf(wrap180(ae.x - az))
+			if dd < bd and dd < float(wide_cam.fov) * 0.5:
+				bd = dd
+				best = [ae, (tp - rig_pos).length()]
+		if best != null:
+			aim(fine_cam, best[0].x, best[0].y)
+		for _w in (3 if idx == 0 else 1):
+			wide_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+			fine_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+			await RenderingServer.frame_post_draw
+		var img = wide_vp.get_texture().get_image()
+		img.convert(Image.FORMAT_RGB8)
+		img.save_png("%s/gallery_%02d.png" % [out_dir, idx])
+		var fimg = fine_vp.get_texture().get_image()
+		fimg.convert(Image.FORMAT_RGB8)
+		fimg.save_png("%s/gallery_%02d_fine.png" % [out_dir, idx])
+		var rec = env_summary(env_now)
+		rec["label"] = item.strip_edges()
+		rec["az"] = az
+		rec["fine_dist"] = snappedf(best[1], 1.0) if best != null else null
+		shots.append(rec)
+		print("галерея %d: %s — %s" % [idx, item, env_brief(env_now)])
+		idx += 1
+	save_json(out_dir + "/gallery.json", {"name": str(cfg.get("name", "sim")), "shots": shots})
 
 
 const NOISE_FN := """
@@ -390,13 +929,14 @@ render_mode cull_disabled;
 uniform vec3 c1 : source_color = vec3(0.30, 0.42, 0.18);
 uniform vec3 c2 : source_color = vec3(0.45, 0.43, 0.25);
 uniform float freq = 0.02;
+uniform float wet = 0.0;   // дождь: мокрая земля темнее и глаже
 varying vec3 wp;
 %s
 void vertex() { wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz; }
 void fragment() {
 	float n = vnoise(wp.xz * freq) * 0.6 + vnoise(wp.xz * freq * 7.3) * 0.4;
-	ALBEDO = mix(c1, c2, smoothstep(0.3, 0.8, n));
-	ROUGHNESS = 1.0;
+	ALBEDO = mix(c1, c2, smoothstep(0.3, 0.8, n)) * (1.0 - 0.35 * wet);
+	ROUGHNESS = 1.0 - 0.5 * wet;
 	if (!FRONT_FACING) { NORMAL = -NORMAL; }
 }
 """
@@ -407,6 +947,7 @@ func ground_mat(c1: Color, c2: Color, freq: float) -> ShaderMaterial:
 	m.set_shader_parameter("c1", c1)
 	m.set_shader_parameter("c2", c2)
 	m.set_shader_parameter("freq", freq)
+	ground_mats.append(m)
 	return m
 
 
@@ -948,6 +1489,7 @@ shader_type spatial;
 render_mode cull_back;
 uniform float floor_h = 2.9;
 uniform float win_w = 3.0;
+uniform float night_light = 0.0;   // вечером и ночью часть окон горит
 varying vec3 lv;
 varying vec3 ln;
 varying vec3 sc;
@@ -978,6 +1520,12 @@ void fragment() {
 		wall *= 1.0 - 0.10 * step(f.y, 0.05) * (1.0 - aa);                      // швы панелей
 		ALBEDO = mix(wall, g, win);
 		glass = win;
+		if (night_light > 0.0) {
+			float on = step(0.62, h21(id * 1.37 + seed * 0.71 + ln.xz * 5.0));
+			vec3 lamp = mix(vec3(1.0, 0.78, 0.48), vec3(0.85, 0.9, 1.0), step(0.85, h21(id + seed * 3.3)));
+			// издалека — средняя доля горящих окон
+			EMISSION = lamp * night_light * mix(on * win, 0.38 * 0.24, aa);
+		}
 	} else {
 		ALBEDO = wall * 0.5;
 	}
@@ -1040,6 +1588,7 @@ func build_highrise() -> void:
 		return
 	var m = ShaderMaterial.new()
 	m.shader = make_shader(BUILDING_SHADER)
+	env_mats.append(m)
 	var bm = BoxMesh.new()
 	bm.material = m
 	var mm = MultiMesh.new()
@@ -1586,6 +2135,7 @@ func turret_to(t: float) -> void:
 func set_time(t: float) -> void:
 	for m in time_mats:
 		(m as ShaderMaterial).set_shader_parameter("sim_time", t)
+	env_update(t)
 	update_targets(t)
 	var wp = Vector2(view_az, view_el) if view_mode else wide_pose(t)
 	aim(wide_cam, wp.x, wp.y, float(wcfg.get("roll", 0.0)))
@@ -1733,7 +2283,8 @@ func _process(delta: float) -> void:
 	var tid = targets[f_target]["id"] if f_target >= 0 else "—"
 	view_hud.text = "az %.1f°  el %.1f°  fov %.0f°  сектор: %s  t %.1f/%.0f с%s  точная → цель %s\n" % [
 		view_az, view_el, wide_cam.fov, nm, view_t, secs, " (пауза)" if view_speed == 0.0 else "", str(tid)] + \
-		"←→↑↓/WASD поворот (Shift быстрее)  1-9 сектор  Tab следующий  колесо/+- зум  M обзор по кругу  Пробел пауза  R сначала  F12 снимок  Esc выход"
+		"погода: " + env_brief(env_now) + "\n" + \
+		"←→↑↓/WASD поворот (Shift быстрее)  1-9 сектор  Tab следующий  колесо/+- зум  M обзор по кругу  Q/E время суток  C погода  Пробел пауза  R сначала  F12 снимок  Esc выход"
 
 
 func _unhandled_input(ev: InputEvent) -> void:
@@ -1763,6 +2314,18 @@ func _unhandled_input(ev: InputEvent) -> void:
 		wide_cam.fov = minf(wide_cam.fov * 1.25, 150.0)
 	elif key == KEY_M:
 		view_pan = not view_pan
+	elif key == KEY_Q or key == KEY_E:   # время суток ∓30 мин (Shift — 2 ч)
+		var dh = (2.0 if ev.shift_pressed else 0.5) * (-1.0 if key == KEY_Q else 1.0)
+		var cur = float(env_now.get("time_now", 12.0 + (float(env_now["sun_az"]) - 180.0) / 15.0))
+		env_over["time"] = fposmod(cur + dh, 24.0)
+		apply_env(env_at(view_t))
+	elif key == KEY_C:   # погода по кругу: пресеты из WEATHER
+		var names = WEATHER.keys()
+		var i = names.find(str(env_now.get("weather", ""))) + 1
+		env_over["weather"] = names[i % names.size()]
+		for k in ["clouds", "visibility", "rain", "snow", "cirrus"]:
+			env_over.erase(k)
+		apply_env(env_at(view_t))
 	elif key == KEY_SPACE:
 		view_speed = 1.0 if view_speed == 0.0 else 0.0
 	elif key == KEY_R:
@@ -1814,6 +2377,9 @@ func live_connect(port: int) -> bool:
 	fcfg["h"] = int(fv[1])
 	fcfg["hfov"] = float(fv[2])
 	fcfg["fps"] = float(fv[3])
+	if typeof(h.get("env")) == TYPE_DICTIONARY:   # погода и время суток из приложения
+		for k in h["env"]:
+			env_cli[k] = h["env"][k]
 	cfg["targets"] = []   # мир сцены — по её seed, цели — по номеру сцены эмулятора
 	cfg["random_targets"] = {"drones": int(h.get("drones", 3)), "birds": int(h.get("birds", 1)),
 		"seed": int(h.get("seed", 1)) + 100,
@@ -1901,6 +2467,12 @@ func live_loop() -> void:
 		var cam = int(q.get("cam", 0))
 		for m in time_mats:
 			(m as ShaderMaterial).set_shader_parameter("sim_time", t)
+		if typeof(q.get("env")) == TYPE_DICTIONARY:   # погоду поменяли на ходу: целиком новая поверх сцены
+			env_over = q["env"]
+			apply_env(env_at(t))
+			printerr("live: погода %s" % env_brief(env_now))
+		else:
+			env_update(t)
 		var vp: SubViewport = wide_vp if cam == 0 else fine_vp
 		aim(wide_cam if cam == 0 else fine_cam, float(q.get("az", 0.0)), float(q.get("el", 0.0)))
 		if cam == 0:
@@ -1968,5 +2540,5 @@ func write_outputs(secs: float, wfps: float, ffps: float) -> void:
 		"wide": {"w": wide_vp.size.x, "h": wide_vp.size.y, "fps": wfps, "hfov": wide_cam.fov, "poses": poses_wide},
 		"fine": {"enabled": fine_enabled(), "w": fine_vp.size.x, "h": fine_vp.size.y, "fps": ffps, "hfov": fine_cam.fov,
 			"poses": poses_fine, "pose_fields": ["t", "az", "el", "vaz", "vel", "target"]},
-		"rig_height": rig_pos.y, "targets": tracks,
+		"rig_height": rig_pos.y, "targets": tracks, "env": env_summary(env_now),
 		"sector": str(sector_at(float(wcfg.get("az", 0.0))).get("type", "")), "sectors": sectors()})
