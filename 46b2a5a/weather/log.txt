@@ -1,0 +1,23 @@
+Godot Engine v4.3.stable.official.77dcf97d8 - https://godotengine.org
+WARNING: Could not set V-Sync mode, as changing V-Sync mode is not supported by the graphics driver.
+     at: set_use_vsync (platform/linuxbsd/x11/gl_manager_x11.cpp:360)
+OpenGL API 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.4 - Compatibility - Using Device: Mesa - llvmpipe (LLVM 20.1.2, 256 bits)
+
+погода: солнце 150°/35.0°, облака 0.35, видимость 15648 м
+галерея 0: scene — солнце 150°/35.0°, облака 0.35, видимость 15648 м
+галерея 1: clear@12 — clear, 12:00, солнце 180°/36.5°, облака 0.06, видимость 30000 м
+галерея 2: cumulus@15 — cumulus, 15:00, солнце 231°/25.4°, облака 0.38, видимость 20000 м
+галерея 3: cumulus@17.5@250 — cumulus, 17:30, солнце 265°/6.0°, облака 0.38, видимость 20000 м
+галерея 4: clear@18.1@265 — clear, 18:06, солнце 272°/1.0°, облака 0.06, видимость 30000 м
+галерея 5: clear@18.6@265 — clear, 18:36, солнце 279°/-3.2°, облака 0.06, видимость 30000 м
+галерея 6: clear@19.2@270 — clear, 19:12, солнце 286°/-8.2°, облака 0.06, видимость 30000 м
+галерея 7: clear@23@300 — clear, 23:00, солнце 342°/-30.7°, облака 0.06, видимость 30000 м
+галерея 8: overcast@11 — overcast, 11:00, солнце 162°/35.1°, облака 0.97, видимость 9000 м
+галерея 9: haze@10@140 — haze, 10:00, солнце 144°/31.3°, облака 0.12, видимость 3500 м
+галерея 10: mist@8 — mist, 08:00, солнце 114°/18.2°, облака 0.85, видимость 1200 м
+галерея 11: fog@9 — fog, 09:00, солнце 129°/25.4°, облака 1.00, видимость 300 м
+галерея 12: rain@14 — rain, 14:00, солнце 216°/31.3°, облака 1.00, видимость 4000 м, дождь 0.50
+галерея 13: storm@16@270 — storm, 16:00, солнце 246°/18.2°, облака 1.00, видимость 1800 м, дождь 1.00
+галерея 14: snow@12 — snow, 12:00, солнце 180°/36.5°, облака 1.00, видимость 2500 м, снег 0.60
+gallery.jpg: 15 кадров
+/home/runner/work/WAVC-Dronelock/WAVC-Dronelock/godot-bin/Godot_v4.3-stable_linux.x86_64 --path /home/runner/work/WAVC-Dronelock/WAVC-Dronelock/sim/godot --rendering-driver opengl3 --audio-driver Dummy -- --config /home/runner/work/WAVC-Dronelock/WAVC-Dronelock/sim/scenes/city_sectors.json --out /home/runner/work/WAVC-Dronelock/WAVC-Dronelock/wx/gallery --gallery scene;clear@12;cumulus@15;cumulus@17.5@250;clear@18.1@265;clear@18.6@265;clear@19.2@270;clear@23@300;overcast@11;haze@10@140;mist@8;fog@9;rain@14;storm@16@270;snow@12
