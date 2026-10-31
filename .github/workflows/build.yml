@@ -52,6 +52,7 @@ jobs:
           cmake -S native -B build-native -G Ninja
           cmake --build build-native
           ./build-native/test_kernels
+          ./build-native/test_occlusion
       - name: Приложение
         run: |
           cmake -S app -B build-app -G Ninja
