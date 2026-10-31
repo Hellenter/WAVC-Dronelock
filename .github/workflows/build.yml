@@ -282,6 +282,7 @@ jobs:
           ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_kernels
           ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_multicam
           ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_fieldlog
+          ${{ matrix.qemu }} -L /usr/${{ matrix.triple }} build/test_gimbal
           d=dronolok-${{ matrix.triple }}
           mkdir -p $d && cp build/dronolok_bench build/libdronolok.so native/include/dronolok/*.h* native/python/dronolok_native.py $d/
           tar czf $d.tar.gz $d
