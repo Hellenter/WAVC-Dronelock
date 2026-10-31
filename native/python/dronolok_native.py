@@ -64,6 +64,18 @@ class _FieldLogConfig(C.Structure):
                 ("clips_per_min", C.c_int), ("all_tracks", C.c_int)]
 
 
+class _GimbalConfig(C.Structure):
+    _fields_ = [("max_rate", C.c_float), ("max_accel", C.c_float), ("max_jerk", C.c_float), ("kp", C.c_float),
+                ("kv", C.c_float), ("brake_share", C.c_float), ("lead_cmd", C.c_float), ("jerk_noise", C.c_float),
+                ("acc_tau", C.c_float), ("sigma_pose", C.c_float), ("gate", C.c_float), ("gate_reset", C.c_int),
+                ("bias_tau", C.c_float), ("bias_max", C.c_float)]
+
+
+class _Setpoint(C.Structure):
+    _fields_ = [("t", C.c_double), ("az", C.c_float), ("el", C.c_float), ("vaz", C.c_float), ("vel", C.c_float),
+                ("aaz", C.c_float), ("ael", C.c_float), ("hold", C.c_int)]
+
+
 class _Timing(C.Structure):
     _fields_ = [("total_ms", C.c_double), ("response_ms", C.c_double), ("select_ms", C.c_double),
                 ("jobs", C.c_int), ("jobs_skipped", C.c_int)]
@@ -143,6 +155,23 @@ def _load():
     lib.dl_fieldlog_dir.restype = C.c_char_p
     lib.dl_fieldlog_dir.argtypes = [C.c_void_p]
     lib.dl_fieldlog_close.argtypes = [C.c_void_p]
+    PG, PS, PT = C.c_void_p, P(_Setpoint), P(_Target)
+    lib.dl_gimbal_defaults.argtypes = [P(_GimbalConfig)]
+    lib.dl_gimbal_create.restype = C.c_void_p
+    lib.dl_gimbal_create.argtypes = [P(_GimbalConfig)]
+    lib.dl_gimbal_destroy.argtypes = [PG]
+    lib.dl_gimbal_target.argtypes = [PG, PT]
+    lib.dl_gimbal_measure.argtypes = [PG, C.c_double, C.c_float, C.c_float, C.c_float]
+    lib.dl_gimbal_estimate.argtypes = [PG, C.c_double, PT]
+    lib.dl_gimbal_setpoint.restype = _Setpoint
+    lib.dl_gimbal_setpoint.argtypes = [PG, C.c_double]
+    lib.dl_gimbal_report_pose.argtypes = [PG, C.c_double, C.c_float, C.c_float]
+    lib.dl_gimbal_pose_at.restype = _Pose
+    lib.dl_gimbal_pose_at.argtypes = [PG, C.c_double]
+    lib.dl_gimbal_wide_check.argtypes = [PG, PT, C.c_double, C.c_float, C.c_float, C.c_double]
+    lib.dl_gimbal_bias.argtypes = [PG, PF, PF]
+    lib.dl_gimbal_drive_reset.argtypes = [PG, C.c_float, C.c_float]
+    lib.dl_gimbal_drive.argtypes = [PG, PS, C.c_double, C.c_double, C.c_double, PF, PF]
     return lib
 
 
@@ -464,3 +493,65 @@ class Target:
     def aim(self, t, lead):
         p = lib().dl_target_aim(C.byref(self.raw), t, lead)
         return (p.az, p.el, p.roll)
+
+
+class Gimbal:
+    """Наведение поворотки точной камеры (dl_gimbal): фильтр цели с временем кадра, уставка двигателю
+    на момент, когда команда дойдёт, плавный профиль (контроллер двигателя) и положение поворотки
+    без датчиков угла.
+
+        g = Gimbal(max_rate=30, max_accel=150, max_jerk=3000, lead_cmd=0.01)
+        g.target(wide_target)                    # назначили цель (Target широкой)
+        g.measure(t_frame, az, el, sigma)        # отметка точной: направление на момент КАДРА
+        sp = g.setpoint(now)                     # -> контроллеру двигателя
+        pos, vel = g.drive(sp, t_recv, t, 0.001) # в контроллере (или в потоке на Pi), ~1 кГц
+        g.report_pose(t, az, el)                 # что сообщил контроллер -> g.pose_at(t_frame)
+    """
+
+    def __init__(self, **cfg):
+        c = _GimbalConfig()
+        lib().dl_gimbal_defaults(C.byref(c))
+        for k, v in cfg.items():
+            setattr(c, k, v)
+        self._h = lib().dl_gimbal_create(C.byref(c))
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib().dl_gimbal_destroy(self._h)
+            self._h = None
+
+    def target(self, tg):
+        lib().dl_gimbal_target(self._h, C.byref(tg.raw) if tg is not None else None)
+
+    def measure(self, t_frame, az, el, sigma):
+        return bool(lib().dl_gimbal_measure(self._h, t_frame, az, el, sigma))
+
+    def estimate(self, t):
+        out = _Target()
+        return Target(out) if lib().dl_gimbal_estimate(self._h, t, C.byref(out)) else None
+
+    def setpoint(self, now):
+        return lib().dl_gimbal_setpoint(self._h, now)
+
+    def report_pose(self, t, az, el):
+        lib().dl_gimbal_report_pose(self._h, t, az, el)
+
+    def pose_at(self, t):
+        p = lib().dl_gimbal_pose_at(self._h, t)
+        return (p.az, p.el, p.roll)
+
+    def wide_check(self, wide, t_frame, az, el, dt):
+        lib().dl_gimbal_wide_check(self._h, C.byref(wide.raw), t_frame, az, el, dt)
+
+    def bias(self):
+        a, e = C.c_float(), C.c_float()
+        lib().dl_gimbal_bias(self._h, C.byref(a), C.byref(e))
+        return a.value, e.value
+
+    def drive_reset(self, az, el):
+        lib().dl_gimbal_drive_reset(self._h, az, el)
+
+    def drive(self, sp, t_recv, t, h):
+        pos, vel = (C.c_float * 2)(), (C.c_float * 2)()
+        lib().dl_gimbal_drive(self._h, C.byref(sp) if sp is not None else None, t_recv, t, h, pos, vel)
+        return (pos[0], pos[1]), (vel[0], vel[1])

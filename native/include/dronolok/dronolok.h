@@ -203,6 +203,58 @@ DL_API void dl_fieldlog_note(dl_fieldlog* l, const char* type, int id, const cha
 DL_API const char* dl_fieldlog_dir(dl_fieldlog* l);   /* папка этого запуска */
 DL_API void dl_fieldlog_close(dl_fieldlog* l);        /* дописать и закрыть (итоги в session.json) */
 
+/* ---- Наведение поворотки точной камеры (dronolok/gimbal.hpp) ----
+   На Pi: фильтр цели (положение, скорость, ускорение по осям поворотки) по отметкам точной — со временем
+   КАДРА (середина выдержки), а не обработки: задержка камеры учитывается сама — и по сообщениям широкой,
+   пока точная цель не видит. Уставка двигателю — где будет цель, когда команда дойдёт (lead_cmd), с её
+   скоростью и ускорением. Контроллер двигателя (или поток на Pi, ~1 кГц): dl_gimbal_drive — плавный профиль
+   с пределами скорости, ускорения и рывка. Без датчиков угла: где была поворотка в момент кадра — по тому,
+   что сообщал контроллер (dl_gimbal_report_pose -> dl_gimbal_pose_at), уход нуля — по широкой. */
+typedef struct {
+    float max_rate, max_accel, max_jerk; /* град/с, град/с², град/с³ */
+    float kp, kv;                        /* 1/с: скорость к ошибке, ускорение к ошибке скорости (kv = 4 kp) */
+    float brake_share;                   /* доля ускорения на торможение к цели */
+    float lead_cmd;                      /* задержка команды до двигателя, с */
+    float jerk_noise, acc_tau;           /* манёвр цели: СКО рывка (град/с³) и сколько длится (с) */
+    float sigma_pose;                    /* ошибка положения поворотки на момент кадра, град */
+    float gate;                          /* отметка дальше стольких СКО — выброс */
+    int gate_reset;                      /* столько выбросов подряд — принять (цель сманеврировала) */
+    float bias_tau, bias_max;            /* уход нуля по широкой: за сколько секунд, не больше скольких градусов */
+} dl_gimbal_config;
+
+typedef struct {
+    double t;        /* на этот момент (now + lead_cmd) */
+    float az, el;    /* град, в координатах привода */
+    float vaz, vel;  /* град/с */
+    float aaz, ael;  /* град/с² */
+    int hold;        /* 1 — цели нет: остановиться плавно */
+} dl_setpoint;
+
+typedef struct dl_gimbal dl_gimbal;
+DL_API void dl_gimbal_defaults(dl_gimbal_config* c);
+DL_API dl_gimbal* dl_gimbal_create(const dl_gimbal_config* c); /* NULL — по умолчанию */
+DL_API void dl_gimbal_destroy(dl_gimbal* g);
+/* Цель по сообщению (обычно широкой, при назначении); NULL — цели нет. */
+DL_API void dl_gimbal_target(dl_gimbal* g, const dl_target* tg);
+/* Отметка цели точной: направление на момент кадра t_frame, СКО (град). 1 — принята, 0 — выброс. */
+DL_API int dl_gimbal_measure(dl_gimbal* g, double t_frame, float az, float el, float sigma);
+/* Оценка цели на момент t как сообщение (окно поиска, сверка с широкой). 0 — цели нет. */
+DL_API int dl_gimbal_estimate(const dl_gimbal* g, double t, dl_target* out);
+/* Уставка двигателю: цель через lead_cmd после now, минус уход нуля. */
+DL_API dl_setpoint dl_gimbal_setpoint(const dl_gimbal* g, double now);
+/* Положение поворотки со временем, как его сообщил контроллер (по профилю, шагам или датчику) — в историю;
+   dl_gimbal_pose_at — где была поворотка в момент t (с поправкой ухода нуля). */
+DL_API void dl_gimbal_report_pose(dl_gimbal* g, double t, float az, float el);
+DL_API dl_pose dl_gimbal_pose_at(const dl_gimbal* g, double t);
+/* Без датчиков угла: широкая видит ту же цель — её сообщение и направление на цель по точной (с поправкой)
+   на время кадра t_frame; dt — сколько прошло с прошлой сверки. dl_gimbal_bias — нынешняя поправка. */
+DL_API void dl_gimbal_wide_check(dl_gimbal* g, const dl_target* wide, double t_frame, float az, float el, double dt);
+DL_API void dl_gimbal_bias(const dl_gimbal* g, float* az, float* el);
+/* Профиль (контроллер двигателя): поставить в (az, el) и шаг h к уставке sp, которая дошла в момент t_recv
+   (между уставками продолжается по её скорости). pos, vel — по 2 значения: азимут, угол места. */
+DL_API void dl_gimbal_drive_reset(dl_gimbal* g, float az, float el);
+DL_API void dl_gimbal_drive(dl_gimbal* g, const dl_setpoint* sp, double t_recv, double t, double h, float* pos, float* vel);
+
 #ifdef __cplusplus
 }
 #endif

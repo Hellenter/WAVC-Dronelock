@@ -217,13 +217,20 @@ void Emulator::spawn(Body& b, double t, bool first) {
     (void)first;
 }
 
-void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h) {
+void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h, const Pose* pa,
+                          const Pose* pb, double ex) {
     std::vector<Tri> tris;
     for (const Body& b : bodies_) {
         const Vec3 q = b.at(t);
         const double R = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
         double u, v;
         if (!project(m, p, q, u, v) || !in_frame(m, u, v, 20)) continue;
+        // смаз за выдержку: где цель на кадре в начале и в конце выдержки (камера и цель движутся)
+        double su = 0, sv = 0;
+        if (pa && pb && ex > 0) {
+            double ua, va, ub, vb;
+            if (project(m, *pa, b.at(t - 0.5 * ex), ua, va) && project(m, *pb, b.at(t + 0.5 * ex), ub, vb)) su = ub - ua, sv = vb - va;
+        }
         double c = (b.bird ? -55.0 : -70.0) * std::exp(-R / c_.visibility);
         double flap = 0, pitch = 0, bank = 0;
         const double sp = std::sqrt(b.v.x * b.v.x + b.v.y * b.v.y);
@@ -244,7 +251,7 @@ void Emulator::drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t
         }
         build_silhouette(b.shape, b.size, flap, tris);
         draw_silhouette(tris, q, body_frame(b.v, pitch, bank), c, c_.psf,
-                        [&](const Vec3& d, double& uu, double& vv) { return project(m, p, d, uu, vv); }, px, w, h);
+                        [&](const Vec3& d, double& uu, double& vv) { return project(m, p, d, uu, vv); }, px, w, h, su, sv);
     }
 }
 
@@ -383,7 +390,7 @@ void Emulator::renderWide(double t, std::vector<uint8_t>& out) {
     drawBodies(wideCam_, widePose_, t, out.data(), W, H);
 }
 
-void Emulator::renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out) {
+void Emulator::renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out, const Pose* pa, const Pose* pb, double ex) {
     const int W = narrowCam_.w, H = narrowCam_.h;
     out.resize((size_t)W * H);
     if (sceneMode_) {
@@ -436,7 +443,7 @@ void Emulator::renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out) 
         }
     }
     });
-    drawBodies(narrowCam_, p, t, out.data(), W, H);
+    drawBodies(narrowCam_, p, t, out.data(), W, H, pa, pb, ex);
 }
 
 int Emulator::nearestBody(double t, double az, double el, double maxDeg) const {
@@ -525,6 +532,45 @@ void Emulator::start(const Config& cfg) {
     cmdPose_ = {(float)mount_.az, (float)mount_.el, 0};
     ffAz_ = ffEl_ = 0;
     havePrev_ = false;
+    // поворотка как на железе
+    gcfg_ = GimbalConfig();
+    gcfg_.max_rate = c.maxRate;
+    gcfg_.max_accel = c.maxAccel;
+    gcfg_.max_jerk = c.maxJerk;
+    gcfg_.kp = c.mountKp;
+    gcfg_.kv = c.mountKv;
+    gcfg_.lead_cmd = c.cmdLatency;   // задержку команды контроллер знает (номинальную)
+    gcfg_.jerk_noise = c.targetJerk;
+    // ошибка положения на момент кадра: полшага, люфт (без датчика и без поправки) или датчик на оси
+    gcfg_.sigma_pose = (float)std::sqrt(std::pow(0.5 * (c.encoder == 1 ? c.encoderDeg : c.stepDeg), 2) +
+                                        std::pow(c.encoder == 1 || c.backlashComp ? 0.0 : 0.5 * c.backlash, 2) + 0.003 * 0.003);
+    gf_ = GimbalFilter(gcfg_);
+    wbias_ = WideBias();
+    gfWideT_ = biasT_ = -1;
+    gfAssignN_ = -1;
+    nq_.clear();
+    jitBody_ = jitK_ = 0;
+    jitT_ = etaT_ = -1;
+    {
+        MountParams mp;
+        mp.ctl = c.mountCtl;
+        mp.cmdLatency = c.cmdLatency;
+        mp.cmdJitter = c.cmdJitter;
+        mp.stepDeg = c.stepDeg;
+        mp.backlash = c.backlash;
+        mp.backlashComp = c.backlashComp;
+        mp.resonanceHz = c.resonanceHz;
+        mp.damping = c.damping;
+        mp.slipEvery = c.slipEvery;
+        mp.slipSteps = c.slipSteps;
+        mp.encoder = c.encoder;
+        mp.encoderDeg = c.encoderDeg;
+        mp.poseModel = c.poseModel;
+        mp.modelHz = c.modelHz;
+        mp.modelDamping = c.modelDamping;
+        mp.g = gcfg_;
+        msim_.reset(mp, c.wideAz, c.wideEl, c.seed);
+    }
     state_ = NState::Idle;
     assigned_ = assignedBody_ = nlock_ = 0;
     haveNrep_ = false;
@@ -911,6 +957,10 @@ void Emulator::choose(double t) {
 }
 
 void Emulator::stepNarrow(double t, double dt) {
+    if (!c_.mountIdeal) {   // поворотка как на железе: задержки, рывок, люфт, упругость
+        stepNarrowReal(t, dt);
+        return;
+    }
     // цель только у точной: трек широкой с этим номером (если ещё жив) — уже не она
     const WideTarget* wt = nullptr;
     if (!nOnly_)
@@ -953,6 +1003,17 @@ void Emulator::stepNarrow(double t, double dt) {
     const double t0 = now_s();
     renderNarrow(t, truth, nframe_);
     st_.renderNarrowMs += (now_s() - t0) * 1000;
+    processNarrow(t, dt, truth, enc, t);
+}
+
+// Кадр точной (снят в t при положении камеры truth; enc — где она по знанию поворотки) — наш алгоритм
+// на нём. tNow — модельное время сейчас (кадр мог дойти с задержкой)
+void Emulator::processNarrow(double t, double dt, const Pose& truth, const Pose& enc, double tNow) {
+    const WideTarget* wt = nullptr;
+    if (!nOnly_)
+        for (const auto& x : targets_)
+            if (x.id == assigned_) wt = &x;
+    const bool useN = haveNrep_ && (state_ == NState::Track || t - tLastSeen_ < (nOnly_ ? c_.narrowLostHold : 0.6));
     const double t1 = now_s();
     double dx = 0, dy = 0;
     if (c_.encoderMotion) {
@@ -964,6 +1025,18 @@ void Emulator::stepNarrow(double t, double dt) {
             dy = e.dy;
         }
     }
+    // поворотка: насколько вычтенный трекером сдвиг кадра расходится с настоящим, и её положение — с правдой
+    // (при ведении цели — тогда это и важно)
+    if (havePrev_ && state_ == NState::Track) {
+        double tx, ty;
+        pose_shift(narrowCam_, prevTruth_, truth, narrowCam_.w * 0.5, narrowCam_.h * 0.5, tx, ty);
+        st_.motionSq += (tx - dx) * (tx - dx) + (ty - dy) * (ty - dy);
+        ++st_.motionN;
+        const double pe = ang(enc.az, enc.el, truth.az, truth.el);
+        st_.poseSq += pe * pe;
+        ++st_.poseN;
+    }
+    prevTruth_ = truth;
     prevEnc_ = enc;
     havePrev_ = true;
     // окно поиска: где цель должна быть в этом кадре
@@ -1040,9 +1113,14 @@ void Emulator::stepNarrow(double t, double dt) {
             tState_ = t;
             if (tInView_ < 0) {
                 tInView_ = t;
-                st_.slewSum += t - tAssign_;
+                st_.slewSum += tNow - tAssign_;
                 ++st_.slewN;
             }
+        } else if (nOnly_ && !winOn_ && t - tLastSeen_ > c_.narrowLostHold) {
+            // цель была только у точной, та её потеряла, окно ушло из кадра, а память кончилась: искать
+            // больше негде (без этого точная навсегда оставалась в повороте к окну, которого нет)
+            event(t, "точная потеряла цель " + std::to_string(assigned_) + ", широкая её не видит");
+            assign(t, 0, "");
         }
     } else if (state_ == NState::Acquire || state_ == NState::Lost) {
         // в окне — трек, ближайший к ожидаемому месту (летящий, не помеха, держится minHold)
@@ -1100,14 +1178,14 @@ void Emulator::stepNarrow(double t, double dt) {
                     if (who != assignedBody_ || !who) ++st_.wrongLocks;
                     char b[160];
                     snprintf(b, sizeof(b), "точная %s цель %d за %.2f с%s", again ? "снова взяла" : "взяла", assigned_,
-                             t - tAssign_, who == assignedBody_ && who ? "" : " — НЕ та цель");
+                             tNow - tAssign_, who == assignedBody_ && who ? "" : " — НЕ та цель");
                     event(t, b);
                 }
             if (!gotThis_) {
                 gotThis_ = true;
                 tGot_ = t;
                 ++st_.acquired;
-                st_.acqSum += t - tAssign_;
+                st_.acqSum += tNow - tAssign_;
                 ++st_.acqN;
             }
         } else if (winOn_ && !win_.visible && t - tState_ > 0.5) {
@@ -1329,6 +1407,7 @@ void Emulator::stepNarrow(double t, double dt) {
         assign(t, 0, "");
         afterBird_ = next;
     }
+    mountFeed(t);
 ui:
     // 5. для интерфейса
     std::lock_guard<std::mutex> lk(vm_);
@@ -1365,6 +1444,14 @@ ui:
     view_.cmd = cmdPose_;
     view_.rateAz = (float)mount_.vaz;
     view_.rateEl = (float)mount_.vel;
+    view_.believed = enc;
+    if (!c_.mountIdeal) {
+        view_.rateAz = msim_.rate(0);
+        view_.rateEl = msim_.rate(1);
+        view_.accAz = msim_.accel(0);
+        view_.accEl = msim_.accel(1);
+        view_.narrowLagFrames = std::max(0, (int)nq_.size() - 1);   // кроме этого, уже дошедшего
+    }
     view_.win = win_;
     view_.winOn = winOn_;
     view_.widePose = widePose_;
@@ -1405,7 +1492,165 @@ ui:
         st_.errLock = std::move(l), st_.errAxis = std::move(a), st_.errWide = std::move(w);
         tail(st_.errLock, view_.st.errLock), tail(st_.errAxis, view_.st.errAxis), tail(st_.errWide, view_.st.errWide);
     }
-    view_.st.simT = t + dt;   // шаг [t, t+dt] уже учтён в долях времени
+    view_.st.mount = msim_.stats();
+    view_.st.biasAz = (float)wbias_.az;
+    view_.st.biasEl = (float)wbias_.el;
+    view_.st.slipAz = (float)msim_.slip(0);
+    view_.st.slipEl = (float)msim_.slip(1);
+    view_.st.simT = tNow + dt;   // шаг [t, t+dt] уже учтён в долях времени
+}
+
+// Поворотка как на железе: кадр снят сейчас (середина выдержки), до алгоритма дойдёт через camLatency;
+// алгоритм обрабатывает те кадры, что уже дошли; команда уходит контроллеру двигателя и дойдёт через
+// cmdLatency; физика поворотки — на шаг вперёд
+void Emulator::stepNarrowReal(double t, double dt) {
+    const double ex = std::max(0.f, c_.exposure);
+    NFrame f;
+    f.t = t - 0.5 * ex;
+    f.ready = t + std::max(0.f, c_.camLatency);
+    f.truth = msim_.camera(f.t);
+    f.bel = msim_.believed(f.t);
+    const Pose pa = msim_.camera(t - ex), pb = msim_.camera(t);
+    const double r0 = now_s();
+    renderNarrow(f.t, f.truth, f.px, ex > 0 ? &pa : nullptr, ex > 0 ? &pb : nullptr, ex);
+    st_.renderNarrowMs += (now_s() - r0) * 1000;
+    // смаз назначенной цели за выдержку
+    if (state_ == NState::Track && assignedBody_ && ex > 0)
+        for (const Body& b : bodies_)
+            if (b.id == assignedBody_) {
+                double ua, va, ub, vb;
+                if (project(narrowCam_, pa, b.at(t - ex), ua, va) && project(narrowCam_, pb, b.at(t), ub, vb)) {
+                    st_.blurSum += std::hypot(ub - ua, vb - va);
+                    ++st_.blurN;
+                }
+            }
+    nq_.push_back(std::move(f));
+    while (!nq_.empty() && nq_.front().ready <= t + 1e-9) {
+        NFrame& g = nq_.front();
+        nframe_.swap(g.px);
+        Pose enc = g.bel;
+        if (c_.mountCtl == 1 && c_.encoder == 0 && c_.wideBias) {   // поправка ухода нуля по широкой
+            enc.az = (float)az_norm(enc.az + wbias_.az);
+            enc.el = (float)(enc.el + wbias_.el);
+        }
+        mount_.az = g.truth.az, mount_.el = g.truth.el;   // ось на момент кадра (ошибка оси — по ней)
+        processNarrow(g.t, dt, g.truth, enc, t);
+        nq_.pop_front();
+    }
+    controlReal(t);
+    msim_.advance(t, dt, state_ == NState::Track);
+    const Pose now = msim_.camera(t + dt);   // ось сейчас: выбор ближайшей цели, поворот в событиях
+    mount_.az = now.az, mount_.el = now.el;
+    mount_.vaz = msim_.rate(0), mount_.vel = msim_.rate(1);
+}
+
+// Команда поворотке на момент t: прежний закон — куда смотреть через полтора кадра и скорость цели;
+// плавный — уставка по фильтру цели на момент, когда команда дойдёт до двигателя
+void Emulator::controlReal(double t) {
+    const WideTarget* wt = nullptr;
+    if (!nOnly_)
+        for (const auto& x : targets_)
+            if (x.id == assigned_) wt = &x;
+    const bool useN = haveNrep_ && (state_ == NState::Track || t - tLastSeen_ < (nOnly_ ? c_.narrowLostHold : 0.6));
+    const TargetReport* rep = useN ? &nrep_ : wt ? &wt->rep : nullptr;
+    Setpoint sp;
+    sp.t = t;
+    if (c_.mountCtl == 0) {
+        const double lead = 1.5 / c_.narrowFps;
+        if (rep) {
+            cmdPose_ = aim(*rep, t, c_.feedForward ? lead : 0);
+            ffAz_ = c_.feedForward ? rep->vaz : 0;
+            ffEl_ = c_.feedForward ? rep->vel : 0;
+        } else {
+            ffAz_ = ffEl_ = 0;
+        }
+        sp.az = cmdPose_.az, sp.el = cmdPose_.el, sp.vaz = ffAz_, sp.vel = ffEl_;
+        sp.hold = false;
+    } else {
+        if (!assigned_) {
+            gf_.clear();
+            gfAssignN_ = -1;
+        } else if ((st_.assignments != gfAssignN_ || !gf_.active()) && rep) {
+            // новая цель (не та же, что широкая снова увидела под другим номером): фильтр — с сообщения о ней;
+            // сколько до неё поворачиваться — прогноз
+            gf_.reset(*rep);
+            gfAssignN_ = st_.assignments;
+            gfWideT_ = rep == &nrep_ ? -1 : rep->t;
+            const double tol = 0.45 * c_.narrowFov * c_.narrowH / std::max(1, c_.narrowW);
+            etaPred_ = slew_eta(msim_.profile(0), msim_.profile(1), gf_, t, tol);
+            etaT_ = tAssign_;
+        }
+        // пока точная цель не видит — по широкой (каждое её новое сообщение)
+        if (gf_.active() && !useN && wt && wt->rep.t > gfWideT_ + 1e-9) {
+            gf_.measure(wt->rep.t, wt->rep.az, wt->rep.el, wt->rep.sigma);
+            gfWideT_ = wt->rep.t;
+        }
+        const bool bias = c_.encoder == 0 && c_.wideBias;
+        const double baz = bias ? wbias_.az : 0, bel = bias ? wbias_.el : 0;
+        if (useN && state_ != NState::Track) {
+            // точная потеряла цель и ищет по последнему своему сообщению: туда же и поворотка
+            sp = report_setpoint(nrep_, t, gcfg_.lead_cmd, baz, bel);
+        } else if (!rep) {
+            sp.hold = true;   // ни точная, ни широкая не знают, где цель: остановиться (как прежний закон)
+        } else {
+            sp = gimbal_setpoint(gf_, t, baz, bel);
+        }
+        if (!assigned_) sp.hold = true;
+        if (!sp.hold) cmdPose_ = {(float)sp.az, (float)sp.el, 0};
+    }
+    // прогноз времени поворота против того, когда цель на самом деле оказалась в кадре
+    if (etaT_ >= 0 && etaT_ == tAssign_ && tInView_ >= 0) {
+        st_.etaSum += etaPred_;
+        st_.etaErr += std::fabs((tInView_ - tAssign_) - etaPred_);
+        ++st_.etaN;
+        etaT_ = -1;
+    }
+    msim_.command(t, sp);
+}
+
+// Отметка точной — фильтру цели поворотки, невязка с широкой — в уход нуля (плавный регулятор); и как ровно
+// поворотка ведёт цель — по правде, для замеров
+void Emulator::mountFeed(double t) {
+    bool seen = false;
+    if (state_ == NState::Track && assignedBody_)
+        for (const Body& b : bodies_)
+            if (b.id == assignedBody_) {
+                double u, v;
+                if (!project(narrowCam_, prevTruth_, b.at(t), u, v)) break;
+                seen = true;
+                const double du = u - narrowCam_.w * 0.5, dv = v - narrowCam_.h * 0.5;
+                st_.centerSq += du * du + dv * dv;
+                ++st_.centerN;
+                const bool next = jitBody_ == assignedBody_ && jitK_ > 0 && std::fabs(t - jitT_ - 1.0 / c_.narrowFps) < 0.25 / c_.narrowFps;
+                if (!next) {
+                    jitBody_ = assignedBody_;
+                    jitK_ = 0;
+                } else if (jitK_ >= 2) {
+                    const double ju = u - 2 * jitU_[0] + jitU_[1], jv = v - 2 * jitV_[0] + jitV_[1];
+                    st_.jitterSq += ju * ju + jv * jv;
+                    ++st_.jitterN;
+                }
+                jitU_[1] = jitU_[0], jitV_[1] = jitV_[0];
+                jitU_[0] = u, jitV_[0] = v;
+                jitK_ = std::min(jitK_ + 1, 2);
+                jitT_ = t;
+            }
+    if (!seen) jitK_ = 0;
+    if (c_.mountIdeal || c_.mountCtl != 1) return;
+    const bool fresh = state_ == NState::Track && haveNrep_ && nrep_.t == t && tLastSeen_ == t;
+    if (!fresh) return;
+    gf_.measure(t, nrep_.az, nrep_.el, nrep_.sigma);
+    // уход нуля без датчиков: широкая видит ту же цель (точечную — у крупной широкая и точная могут
+    // указывать разные её места)
+    if (c_.encoder != 0 || !c_.wideBias || nOnly_ || t - tTrackStart_ < 0.3 || nrep_.size_deg > 0.1f) return;
+    for (const auto& w : targets_)
+        if (w.id == assigned_ && w.rep.t > biasT_ + 1e-9) {
+            double waz, wel, wsg;
+            predict(w.rep, t, waz, wel, wsg);
+            const double dtb = biasT_ < 0 ? 1.0 / c_.wideFps : std::min(0.5, w.rep.t - biasT_);
+            wbias_.update(az_diff(waz, nrep_.az), wel - nrep_.el, std::max(wsg, 0.005), dtb, gcfg_);
+            biasT_ = w.rep.t;
+        }
 }
 
 void Emulator::loop() {
@@ -1816,6 +2061,28 @@ int run_cli(int argc, char** argv) {
         else if (a == "--snow") c.sceneSnow = (float)atof(val().c_str());
         else if (a == "--scene-clouds") c.sceneClouds = (float)atof(val().c_str());
         else if (a == "--scene-visibility") c.sceneVis = (float)atof(val().c_str());
+        else if (a == "--ideal-mount") c.mountIdeal = true;   // поворотка как до 31.10 (бит в бит)
+        else if (a == "--old-ctl") c.mountCtl = 0;
+        else if (a == "--jerk") c.maxJerk = (float)atof(val().c_str());
+        else if (a == "--gains") sscanf(val().c_str(), "%f,%f", &c.mountKp, &c.mountKv);
+        else if (a == "--target-jerk") c.targetJerk = (float)atof(val().c_str());
+        else if (a == "--cam-latency") c.camLatency = (float)atof(val().c_str());
+        else if (a == "--cmd-latency") sscanf(val().c_str(), "%f,%f", &c.cmdLatency, &c.cmdJitter);
+        else if (a == "--exposure") c.exposure = (float)atof(val().c_str());
+        else if (a == "--step") c.stepDeg = (float)atof(val().c_str());
+        else if (a == "--backlash") c.backlash = (float)atof(val().c_str());
+        else if (a == "--no-backlash-comp") c.backlashComp = false;
+        else if (a == "--resonance") sscanf(val().c_str(), "%f,%f", &c.resonanceHz, &c.damping);
+        else if (a == "--slip") sscanf(val().c_str(), "%f,%d", &c.slipEvery, &c.slipSteps);
+        else if (a == "--encoder") c.encoder = 1;
+        else if (a == "--encoder-deg") c.encoderDeg = (float)atof(val().c_str());
+        else if (a == "--no-wide-bias") c.wideBias = false;
+        else if (a == "--pose-model") c.poseModel = atoi(val().c_str());
+        else if (a == "--mount-model") sscanf(val().c_str(), "%f,%f", &c.modelHz, &c.modelDamping);
+        else if (a == "--perfect-mount") {   // настоящий путь без несовершенств: только регулятор
+            c.camLatency = c.cmdLatency = c.cmdJitter = c.exposure = c.stepDeg = c.backlash = c.resonanceHz = c.slipEvery = 0;
+            c.modelHz = 0;
+        }
         else if (a == "--az") c.wideAz = (float)atof(val().c_str());
         else if (a == "--el") c.wideEl = (float)atof(val().c_str());
         else {
@@ -1830,7 +2097,11 @@ int run_cli(int argc, char** argv) {
                    "  [--godot путь] [--az 0] [--el 32]\n"
                    "  погода и время суток сцены: [--weather clear|cumulus|cloudy|overcast|haze|mist|fog|rain|storm|snow]\n"
                    "  [--time 19:30] [--time-rate 60] [--date 09-15] [--lat 55.75] [--scene-clouds 0.8] [--scene-visibility 3000]\n"
-                   "  [--rain 0.5] [--snow 0.5]\n");
+                   "  [--rain 0.5] [--snow 0.5]\n"
+                   "  поворотка (по умолчанию — как на железе, плавный регулятор): [--ideal-mount — как до 31.10] [--old-ctl — прежний закон]\n"
+                   "  [--jerk 3000] [--gains 8,32] [--target-jerk 2] [--cam-latency 0.033] [--cmd-latency 0.01,0.002] [--exposure 0.001] [--step 0.01125]\n"
+                   "  [--backlash 0.05] [--no-backlash-comp] [--resonance 12,0.15] [--slip раз_в_с,шагов] [--encoder] [--encoder-deg 0.01]\n"
+                   "  [--no-wide-bias] [--perfect-mount — без задержек, люфта, шагов, упругости]\n");
             return a == "--help" ? 0 : 2;
         }
     }
@@ -1879,6 +2150,16 @@ int run_cli(int argc, char** argv) {
            s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape, s.nextAfterBird);
     printf("ошибка: захват точной %.3f° (90%% %.3f°, %.1f пикс. точной), ось %.3f° (90%% %.3f°), широкая %.3f° (90%% %.3f°)\n",
            lm, l9, lm / nPd, am, a9, wm, w9);
+    const double jit = s.jitterN ? std::sqrt(s.jitterSq / s.jitterN) : 0, mot = s.motionN ? std::sqrt(s.motionSq / s.motionN) : 0;
+    const double poseE = s.poseN ? std::sqrt(s.poseSq / s.poseN) : 0, blur = s.blurN ? s.blurSum / s.blurN : 0;
+    const double ctr = s.centerN ? std::sqrt(s.centerSq / s.centerN) : 0;
+    const double accR = s.mount.n ? std::sqrt(s.mount.accSq / (2.0 * s.mount.n)) : 0, jrkR = s.mount.n ? std::sqrt(s.mount.profJerkSq / (2.0 * s.mount.n)) : 0;
+    printf("поворотка (%s, %s): цель от центра %.1f пикс., дрожание %.2f пикс./кадр, ошибка сдвига кадра %.2f пикс., положения %.4f°,\n"
+           "  смаз %.2f пикс.; камера при ведении — ускорение %.1f °/с² (до %.0f), рывок профиля %.0f °/с³ (до %.0f), скорость до %.1f °/с;\n"
+           "  пропусков шагов %d (%.3f°/%.3f°), поправка по широкой %.3f°/%.3f°; поворот к цели — прогноз %.2f с, ошибка %.2f с\n",
+           c.mountIdeal ? "идеальная" : "как на железе", !c.mountIdeal && c.mountCtl ? "плавный регулятор" : "прежний закон", ctr, jit, mot, poseE, blur, accR,
+           s.mount.peakAcc, jrkR, s.mount.peakProfJerk, s.mount.peakRate, s.mount.slips, s.slipAz, s.slipEl, s.biasAz, s.biasEl,
+           s.etaN ? s.etaSum / s.etaN : 0, s.etaN ? s.etaErr / s.etaN : 0);
     printf("обработка: широкая %.1f мс/кадр, точная %.2f мс/кадр; отрисовка широкой %.1f, точной %.1f мс/кадр\n",
            s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0,
            s.wideFrames ? s.renderWideMs / s.wideFrames : 0, s.narrowFrames ? s.renderNarrowMs / s.narrowFrames : 0);
@@ -1891,14 +2172,19 @@ int run_cli(int argc, char** argv) {
                     " \"unconfirmed\": %d, \"wide_swaps\": %d, \"idle_pct\": %.2f, \"false_target_pct\": %.2f, \"wide_ms\": %.2f, \"narrow_ms\": %.3f,\n"
                     " \"track_drone_pct\": %.2f, \"narrow_only_s\": %.2f, \"narrow_only_correct_s\": %.2f, \"kept\": %d, \"rebinds\": %d,\n"
                     " \"confirmed\": %d, \"veto_bird\": %d, \"veto_drone\": %d, \"veto_none\": %d, \"part_jumps\": %d,\n"
-                    " \"track_bird_s\": %.2f, \"confirmed_bird\": %d, \"veto_delay_s\": %.3f, \"veto_shape\": %d, \"next_after_bird\": %d}\n",
+                    " \"track_bird_s\": %.2f, \"confirmed_bird\": %d, \"veto_delay_s\": %.3f, \"veto_shape\": %d, \"next_after_bird\": %d,\n"
+                    " \"mount_ideal\": %d, \"mount_ctl\": %d, \"center_px\": %.3f, \"jitter_px\": %.4f, \"motion_err_px\": %.4f, \"pose_err_deg\": %.5f,\n"
+                    " \"blur_px\": %.3f, \"cam_acc_rms\": %.2f, \"cam_acc_peak\": %.1f, \"prof_jerk_rms\": %.1f, \"prof_jerk_peak\": %.0f, \"peak_rate\": %.2f,\n"
+                    " \"slips\": %d, \"slip_deg\": [%.4f, %.4f], \"bias_deg\": [%.4f, %.4f], \"eta_s\": %.3f, \"eta_err_s\": %.3f}\n",
                     s.simT, s.assignments, s.acquired, s.wrongLocks, s.losses, s.slewN ? s.slewSum / s.slewN : 0,
                     s.acqN ? s.acqSum / s.acqN : 0, 100 * s.trackTime / T,
                     s.trackTime > 0 ? 100 * s.trackCorrect / s.trackTime : 0, lm, l9, am, a9, wm, w9,
                     s.unconfirmed, s.wideSwaps, 100 * s.idleTime / T, 100 * s.falseTarget / T, s.wideFrames ? s.wideMs / s.wideFrames : 0, s.narrowFrames ? s.narrowMs / s.narrowFrames : 0,
                     100 * s.trackDrone / T, s.narrowOnly, s.narrowOnlyCorrect, s.kept, s.rebinds, s.confirmed, s.vetoBird,
                     s.vetoDrone, s.vetoNone, s.partJumps, s.trackBird, s.confirmedBird, s.vetoBird ? s.vetoDelay / s.vetoBird : 0, s.vetoShape,
-                    s.nextAfterBird);
+                    s.nextAfterBird, (int)c.mountIdeal, c.mountIdeal ? 0 : c.mountCtl, ctr, jit, mot, poseE, blur, accR, s.mount.peakAcc, jrkR,
+                    s.mount.peakProfJerk, s.mount.peakRate, s.mount.slips, s.slipAz, s.slipEl, s.biasAz, s.biasEl,
+                    s.etaN ? s.etaSum / s.etaN : 0, s.etaN ? s.etaErr / s.etaN : 0);
             fclose(f);
         }
     }
