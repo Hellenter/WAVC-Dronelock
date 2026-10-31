@@ -71,6 +71,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     c.bird_speed *= v;
     c.lock_speed_max *= v;
     c.hover_speed *= v;
+    c.still_v *= v;
     c.lock_slow *= v;
     c.drift_min *= v;
     c.size_rate_max = std::min(0.5f, c.size_rate_max * v);
@@ -93,6 +94,7 @@ TrackerConfig tracker_for_fps(const TrackerConfig& c0, float fps, float ref, flo
     c.stuck_obs = frames(c.stuck_obs, 3);
     c.stuck_base = frames(c.stuck_base, 6);
     c.stuck_hold = frames(c.stuck_hold, 10);
+    c.still_gap = frames(c.still_gap, 1);
     return c;
 }
 
@@ -106,6 +108,7 @@ Tracker::Tracker(int w, int h, const TrackerConfig& cfg) : cfg_(cfg) {
     stat_.assign(heat_.size(), 0.f);
     statT_.assign(heat_.size(), 0);
     lastDet_.assign(heat_.size(), 0);
+    still_.assign(2 * heat_.size(), StillPt());
 }
 
 void Tracker::resetTracks() {
@@ -157,6 +160,57 @@ bool Tracker::hot(float x, float y) const {
     const int cx = std::min(gw_ - 1, std::max(0, (int)x / cfg_.clutter_cell));
     const int cy = std::min(gh_ - 1, std::max(0, (int)y / cfg_.clutter_cell));
     return heat_[(size_t)cy * gw_ + cx] > cfg_.clutter_level;
+}
+
+// ---------------------------------------------------------------- стоящие отклики (still_reject)
+
+// Сколько (в номинальных кадрах) отклик в этой точке стоит на месте: на прошлых кадрах (с пропусками до
+// still_gap) был отклик той же полярности не дальше still_r от места, где он появился. 0 — не стоит
+double Tracker::stillAge(float x, float y, int pol, int level) const {
+    if (cfg_.still_reject <= 0 || still_.empty()) return 0;
+    const float r = cfg_.still_r * (float)(1 << std::min(4, std::max(0, level)));
+    const float sx = x - gx_, sy = y - gy_;
+    const int cx = std::min(gw_ - 1, std::max(0, (int)x / cfg_.clutter_cell));
+    const int cy = std::min(gh_ - 1, std::max(0, (int)y / cfg_.clutter_cell));
+    double age = 0;
+    const size_t k = pol > 0;
+    for (int yy = std::max(0, cy - 1); yy <= std::min(gh_ - 1, cy + 1); ++yy)
+        for (int xx = std::max(0, cx - 1); xx <= std::min(gw_ - 1, cx + 1); ++xx) {
+            const StillPt& p = still_[2 * ((size_t)yy * gw_ + xx) + k];
+            if (time_ - p.t > (double)cfg_.still_gap + 1e-3 || p.t >= time_ - 1e-6) continue;
+            if (std::fabs(p.x - sx) <= r && std::fabs(p.y - sy) <= r) age = std::max(age, time_ - p.t0);
+        }
+    return age;
+}
+
+// Отклики этого кадра: продолжают стоящие точки (место появления не меняется) или начинают новые
+void Tracker::stillNote(const std::vector<Candidate>& dets, int skip) {
+    if (cfg_.still_reject <= 0 || still_.empty()) return;
+    for (int di = 0; di < (int)dets.size(); ++di) {
+        if (di == skip) continue;
+        const Candidate& d = dets[di];
+        const size_t k = d.polarity > 0;
+        const float r = cfg_.still_r * (float)(1 << std::min(4, std::max(0, d.level)));
+        const float sx = d.x - gx_, sy = d.y - gy_;
+        const int cx = std::min(gw_ - 1, std::max(0, (int)d.x / cfg_.clutter_cell));
+        const int cy = std::min(gh_ - 1, std::max(0, (int)d.y / cfg_.clutter_cell));
+        bool found = false;
+        for (int yy = std::max(0, cy - 1); yy <= std::min(gh_ - 1, cy + 1) && !found; ++yy)
+            for (int xx = std::max(0, cx - 1); xx <= std::min(gw_ - 1, cx + 1) && !found; ++xx) {
+                StillPt& p = still_[2 * ((size_t)yy * gw_ + xx) + k];
+                if (time_ - p.t > (double)cfg_.still_gap + 1e-3) continue;
+                if (std::fabs(p.x - sx) <= r && std::fabs(p.y - sy) <= r) {
+                    p.t = time_;
+                    found = true;
+                }
+            }
+        if (found) continue;
+        StillPt& p = still_[2 * ((size_t)cy * gw_ + cx) + k];
+        if (time_ - p.t <= (double)cfg_.still_gap + 1e-3) continue;   // в ячейке своя стоящая точка
+        p.x = sx;
+        p.y = sy;
+        p.t0 = p.t = time_;
+    }
 }
 
 // ---------------------------------------------------------------- память статичных помех
@@ -742,6 +796,36 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // Меньший силуэт принимается — это часть цели (крыло слилось с небом)
     if (sil.valid && lockIdx >= 0 && cfg_.size_predict && tracks_[lockIdx].lsN >= 3)
         silOk = std::max(sil.w, sil.h) < cfg_.size_tol * tracks_[lockIdx].expectedSize() + 16.f;
+    // стоящие отклики (still_reject): летящий устоявшийся трек (still_lock — только захваченный) их не
+    // берёт, и силуэт захвата, севший на стоящую точку (верхушку кроны у кромки), его не ведёт
+    const bool stillOn = cfg_.still_reject > 0 && !movingCam_ && std::fabs(camDx) < 0.5f && std::fabs(camDy) < 0.5f;
+    auto stillSpeed = [&](const Track& t) {
+        if (!stillOn || !settled(t) || t.followed) return 0.f;
+        const float v = std::hypot(t.vsx, t.vsy);
+        return v >= cfg_.still_v ? v : 0.f;
+    };
+    // Стоящая точка чужая для трека: появилась (age назад), когда трек был от неё дальше still_d0
+    // (по попаданию на тот момент или по самому старому, если точка старше), и трек сейчас не на ней
+    // (прошлое попадание не рядом). Свой отклик зависшего или притормозившего дрона — точка родилась
+    // под самим треком; трек, уже севший на точку, не сдёргивается — его скорость после скачка врёт,
+    // на прогнозе он улетит. Отсекается только приход на точку, стоявшую до того, как трек подошёл
+    auto stillForeign = [&](const Track& t, float x, float y, int level, double age) {
+        if (t.obs.empty()) return true;
+        const float sx = x - gx_, sy = y - gy_;
+        const float r = 2.f * cfg_.still_r * (float)(1 << std::min(4, std::max(0, level)));
+        if (std::fabs(t.obs.back().x - sx) <= r && std::fabs(t.obs.back().y - sy) <= r) return false;
+        const double t0 = time_ - age;
+        const Track::Obs* o = &t.obs.front();
+        for (auto it = t.obs.rbegin(); it != t.obs.rend(); ++it)
+            if (it->ts <= t0 + 1e-6) { o = &*it; break; }
+        return std::hypot(o->x - sx, o->y - sy) > cfg_.still_d0 * (float)(1 << std::min(4, std::max(0, level)));
+    };
+    if (sil.valid && silOk && lockIdx >= 0) {
+        const Track& L = tracks_[lockIdx];
+        const float v = stillSpeed(L);
+        const double age = v > 0 ? stillAge(sil.x, sil.y, L.polarity, 0) : 0;
+        if (v > 0 && age * v >= cfg_.still_reject && stillForeign(L, sil.x, sil.y, 0, age)) silOk = false;
+    }
     // захваченное на мачте или столбе: большинство замеров с линией от силуэта
     if (cfg_.anchor_check && lockIdx >= 0 && (sil.valid || sil.attached)) {
         Track& L = tracks_[lockIdx];
@@ -862,8 +946,16 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     // ассоциация по прогнозу: нормированное расстояние d^2/S, жадно по возрастанию
     struct Pair { float d; int t, k; };
     std::vector<Pair> pairs;
+    std::vector<float> stillA;   // сколько стоит отклик (still_reject), считается при первой надобности
+    std::vector<char> stillHeld(tracks_.size(), 0);   // в воротах трека — стоящий отклик чужой точки
     for (int ti = 0; ti < (int)tracks_.size(); ++ti) {
         const Track& t = tracks_[ti];
+        const float sv = cfg_.still_lock && ti != lockIdx ? 0.f : stillSpeed(t);
+        if (sv > 0 && stillA.empty()) {
+            stillA.resize(dets.size());
+            for (size_t di = 0; di < dets.size(); ++di)
+                stillA[di] = (float)stillAge(dets[di].x, dets[di].y, dets[di].polarity, dets[di].level);
+        }
         for (int di = 0; di < (int)dets.size(); ++di) {
             if (shadow[di] || di == silhDet) continue;
             if (!occ_.empty() && settled(t) && occAt(dets[di].x, dets[di].y)) continue;   // отклик предмета (stuck_obs)
@@ -876,7 +968,14 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 r = std::min(r, std::max(gmin, cfg_.weak_gate * std::sqrt(std::max(t.innov, measVar(dets[di].level)) *
                                                                           (float)(t.miss + 1))));
             const float ex = dets[di].x - t.x, ey = dets[di].y - t.y, d2 = ex * ex + ey * ey;
-            if (d2 < r * r) pairs.push_back({d2 / S, ti, di});
+            if (d2 >= r * r) continue;
+            // стоящий отклик чужой точки (still_reject): трек его не берёт, но и не теряется, пока точка
+            // в его воротах, — цель за предметом или слилась с ним (как снятый с предмета, stuck_obs)
+            if (sv > 0 && stillA[di] * sv >= cfg_.still_reject && stillForeign(t, dets[di].x, dets[di].y, dets[di].level, stillA[di])) {
+                stillHeld[ti] = 1;
+                continue;
+            }
+            pairs.push_back({d2 / S, ti, di});
         }
     }
     std::stable_sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) { return a.d < b.d; });
@@ -952,7 +1051,19 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         while ((int)tr.hist.size() > cfg_.window) tr.hist.pop_front();
         ++tr.age;
         if (best < 0) {
-            ++tr.miss;
+            // в воротах стоящая чужая точка (still_reject): цель за предметом или слилась с ним — трек на
+            // прогнозе, но до stuck_obs кадров пропуск не считается (снятый с предмета так же стоял на нём
+            // stuck_obs кадров, прежде чем пойти на прогноз)
+            if (stillHeld[ti] && tr.miss > 0 && tr.stillHold < cfg_.stuck_obs) {
+                ++tr.stillHold;
+                // ...и неопределённость прогноза не растёт (обновление прогнозом же, невязка 0): иначе за
+                // время заслона ворота расползались, и захват уходил на дальний трек (ближайший к прогнозу)
+                const float S = tr.p00 + measVar(tr.level), k0 = tr.p00 / S, k1 = tr.p01 / S;
+                tr.p11 -= k1 * tr.p01;
+                tr.p00 *= 1 - k0;
+                tr.p01 *= 1 - k0;
+            } else
+                ++tr.miss;
             tr.evidence = std::max(0.f, tr.evidence - cfg_.ev_miss);
             continue;
         }
@@ -988,6 +1099,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
         tr.level = d.level;
         tr.miss = 0;
         tr.ghost = false;
+        tr.stillHold = 0;
         ++tr.hits;
         if (d.colored) {
             if (tr.colorN < 60000) ++tr.colorN;
@@ -1595,6 +1707,7 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
     noiseDets_.clear();
     for (size_t di = 0; di < dets.size(); ++di)
         if (!inTrack[di] && !clut[di] && !dets[di].weak) noiseDets_.push_back(dets[di]);
+    stillNote(dets, silhDet);
     dt_ = 1.f;   // интервал задаётся на каждый кадр (setFrameDt)
     return out_;
 }
