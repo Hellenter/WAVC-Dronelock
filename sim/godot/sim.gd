@@ -332,12 +332,14 @@ const SKY_TABLE := [
 
 const SKY_SHADER := """
 shader_type sky;
-uniform vec3 zenith : source_color = vec3(0.22, 0.42, 0.78);
-uniform vec3 horizon : source_color = vec3(0.72, 0.80, 0.90);
-uniform vec3 glow : source_color = vec3(1.0, 0.6, 0.3);
+// Цвета — sRGB; считаем в линейном свете и сами переводим обратно: в Compatibility (OpenGL) небо не
+// переводится ни на входе, ни на выходе, а дома и дымка на них — переводятся (иначе дымка ярче неба).
+uniform vec3 zenith_s = vec3(0.22, 0.42, 0.78);
+uniform vec3 horizon_s = vec3(0.72, 0.80, 0.90);
+uniform vec3 glow_s = vec3(1.0, 0.6, 0.3);
 uniform float glow_k = 0.0;
-uniform vec3 haze_col : source_color = vec3(0.75, 0.80, 0.86);
-uniform vec3 sun_col : source_color = vec3(1.0, 0.97, 0.9);
+uniform vec3 haze_s = vec3(0.75, 0.80, 0.86);
+uniform vec3 sun_s = vec3(1.0, 0.97, 0.9);
 uniform vec3 sun_dir = vec3(0.0, 0.57, 0.82);
 uniform float bright = 1.0;      // яркость неба (день = 1)
 uniform float gain = 1.0;        // экспозиция камеры
@@ -367,7 +369,13 @@ float fbm(vec2 p, int oct) {
 	return s;
 }
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+vec3 lin(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
 void sky() {
+	vec3 zenith = lin(zenith_s);
+	vec3 horizon = lin(horizon_s);
+	vec3 glow = lin(glow_s);
+	vec3 haze_col = lin(haze_s);
+	vec3 sun_col = lin(sun_s);
 	vec3 d = EYEDIR;
 	float h = max(d.y, 0.0);
 	float sd = dot(d, sun_dir);
@@ -443,7 +451,7 @@ void sky() {
 	float T = exp(-tau);
 	vec3 hz = haze_col * bright + lpc * 0.8 + sunl * bright * pow(sdp, 8.0) * 0.4 * (1.0 - T);
 	c = mix(hz, c, T);
-	COLOR = c * gain;
+	COLOR = pow(max(c * gain, vec3(0.0)), vec3(1.0 / 2.2));
 }
 """
 
@@ -652,17 +660,17 @@ func apply_env(e: Dictionary) -> void:
 		gain = float(e["exposure"])
 	else:
 		gain = clampf(0.85 / maxf(bright, 1e-6) / sqrt(maxf(dim, 0.05)), 1.0, float(e["max_gain"]))
-	var lp = float(e["light_pollution"]) * 0.008 * (1.0 - smoothstep(-10.0, -2.0, el))
+	var lp = float(e["light_pollution"]) * 0.006 * (1.0 - smoothstep(-10.0, -2.0, el))
 	var haze: Color = hor.lerp(Color(hor.get_luminance(), hor.get_luminance(), hor.get_luminance()),
 		clampf(0.35 + 0.5 * (1.0 - vis / 10000.0), 0.35, 0.85))
 	haze = haze.lerp(Color(0.62, 0.64, 0.66) * maxf(hor.get_luminance(), 0.05) / 0.64, clouds * 0.6)
 	var sm = sky_mat
-	sm.set_shader_parameter("zenith", zen)
-	sm.set_shader_parameter("horizon", hor)
-	sm.set_shader_parameter("glow", row[3])
+	sm.set_shader_parameter("zenith_s", zen)
+	sm.set_shader_parameter("horizon_s", hor)
+	sm.set_shader_parameter("glow_s", row[3])
 	sm.set_shader_parameter("glow_k", float(row[4]) * (1.0 - 0.8 * clouds))
-	sm.set_shader_parameter("haze_col", haze)
-	sm.set_shader_parameter("sun_col", scol)
+	sm.set_shader_parameter("haze_s", haze)
+	sm.set_shader_parameter("sun_s", scol)
 	sm.set_shader_parameter("sun_dir", dir_azel(az, el))
 	sm.set_shader_parameter("bright", bright * dim)
 	sm.set_shader_parameter("gain", gain)
@@ -765,7 +773,7 @@ void fragment() {
 func build_precip(wind: Vector3) -> void:
 	var r = RandomNumberGenerator.new()
 	r.seed = int(cfg.get("seed", 1)) * 7 + 3
-	var layers = [[7000, Vector3(6.0, 12.0, 6.0), -6.0], [9000, Vector3(40.0, 50.0, 40.0), -100.0]]
+	var layers = [[12000, Vector3(6.0, 12.0, 6.0), -6.0], [9000, Vector3(40.0, 50.0, 40.0), -100.0]]
 	var qm = QuadMesh.new()
 	qm.size = Vector2(1, 1)
 	for kind in ["rain", "snow"]:
