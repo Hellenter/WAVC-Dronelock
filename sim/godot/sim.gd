@@ -429,7 +429,7 @@ void sky() {
 		float k = smoothstep(th - cloud_soft, th + cloud_soft, n);
 		k *= smoothstep(0.003, 0.06, d.y);
 		if (k > 0.001) {
-			float n2 = fbm(p + sh * 0.35, 4);
+			float n2 = fbm(p + sh * 0.35, 3);   // свет: крупные формы, мелочь не нужна
 			float lit = clamp(0.6 + (n - n2) * 3.0, 0.0, 1.0);
 			float thick = smoothstep(th, th + 0.35, n);
 			float deep = cloud_cover * cloud_cover * (0.3 + 0.7 * cloud_dark);   // сплошная толща — темнее снизу
