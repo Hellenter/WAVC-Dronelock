@@ -239,9 +239,6 @@ void Fusion::choosePrimary(Tgt& g) {
         if (!(pe < c_.edgeDeg && be > pe + 0.5 * c_.edgeDeg)) pick = g.primary;
     }
     if (g.lastCam >= 0 && g.lastCam != pick) {
-        if (getenv("DL_FUSION_DEBUG"))
-            fprintf(stderr, "цель %d: камера %d -> %d (до края %.1f -> %.1f°) t=%.3f\n", g.f.id, g.lastCam, pick,
-                    listed(g, g.lastCam) ? g.obs[g.lastCam].edge : -1.0, be, now_);
         ++counters.handoffs;
         ++g.f.handoffs;
     }

@@ -604,6 +604,8 @@ void Emulator::start(const Config& cfg) {
     bodySeen_.clear();
     seamCheck_.clear();
     lastSnapT_ = -1;
+    offRefT_ = -1;
+    offN_ = 0;
     narrowCam_ = CameraModel();
     narrowCam_.w = c.narrowW;
     narrowCam_.h = c.narrowH;
@@ -898,6 +900,8 @@ void Emulator::fusedSnapshot(double t, std::vector<WideTarget>& out) {
         w.cam = f.cam;
         w.local = f.local;
         w.seenBy = f.seenBy;
+        if (!fusion_.passthrough() && fusion_.config().calib && f.cam >= 0 && f.cam < fusion_.cameras())
+            w.bias = (float)fusion_.calib(f.cam).sigmaDeg;
         if (f.cam >= 0 && f.cam < (int)wu_.size())
             for (const auto& p : wu_[f.cam]->truth)
                 if (p.first == f.local) w.truth = p.second;
@@ -1660,10 +1664,37 @@ void Emulator::stepNarrow(double t, double dt) {
             if (wt) {
                 double waz = wt->rep.az, wel = wt->rep.el, wsg = wt->rep.sigma;
                 if (c_.wideCheck) predict(wt->rep, t, waz, wel, wsg);
+                // калибровка камеры ещё не сошлась: сдвиг её направлений — общий для всех целей, а не шум
+                // сообщения; допуск на него checkBias его СКО (иначе 6 СКО калибровки 0.5° — допуск 3°, и точная
+                // сидит на помехе рядом с целью). Одна широкая — без калибровки, как было
+                double bias = 0;
+                if (wt->bias > 0) {
+                    bias = c_.checkBias * wt->bias;
+                    wsg = std::sqrt(std::max(0.0, wsg * wsg - (double)wt->bias * wt->bias));
+                }
                 // крупная цель: широкая указывает её середину, а захват точной может быть у края силуэта
-                const double tol = (c_.wideCheck ? std::max(0.5, 6.0 * wsg) : std::max(1.5, 6.0 * wsg)) +
+                const double tol = (c_.wideCheck ? std::max(0.5, 6.0 * wsg) : std::max(1.5, 6.0 * wsg)) + bias +
                                    (c_.narrowSilhouette ? 0.5 * nrep_.size_deg : 0.0);
                 off = ang(waz, wel, nrep_.az, nrep_.el) > tol && t - tTrackStart_ > (c_.wideCheck ? 0.3 : 1.0);
+                // сдвиг калибровки у всех сообщений камеры один и тот же: точная, взявшая цель, видит её на том же
+                // смещении от прогноза широкой, что и в начале. Смещение поползло (трек точной сползает с цели на
+                // помеху) — заметно с обычным допуском, без запаса на калибровку
+                if (wt->bias > 0) {
+                    const double cosE = std::cos(deg2rad(nrep_.el));
+                    const double dx = az_diff(nrep_.az, waz) * cosE, dy = nrep_.el - wel;
+                    if (offRefT_ != tTrackStart_) {
+                        offRefT_ = tTrackStart_;
+                        offN_ = 0;
+                        offX_ = offY_ = 0;
+                    }
+                    if (t - tTrackStart_ <= 0.15) {   // смещение — по первым кадрам
+                        offX_ = (offX_ * offN_ + dx) / (offN_ + 1);
+                        offY_ = (offY_ * offN_ + dy) / (offN_ + 1);
+                        ++offN_;
+                    } else if (offN_ > 0 && std::hypot(dx - offX_, dy - offY_) > tol - bias && t - tTrackStart_ > 0.3) {
+                        off = true;
+                    }
+                }
             }
             if (off && c_.narrowHold && nConf_) {
                 // широкая ушла с цели (перескок трека на соседа, помеху), а точная видит дрон: держит его
@@ -2344,6 +2375,7 @@ int run_cli(int argc, char** argv) {
         else if (a == "--no-fusion") c.fusion = false;
         else if (a == "--no-calib") c.fusionCalib = false;
         else if (a == "--calib-init") c.calibInit = (float)atof(val().c_str());
+        else if (a == "--check-bias") c.checkBias = (float)atof(val().c_str());
         else if (a == "--no-cross-cue") c.crossCue = false;
         else if (a == "--seam") c.seamShare = (float)atof(val().c_str());
         else {
@@ -2360,7 +2392,7 @@ int run_cli(int argc, char** argv) {
                    "  [--cam-err N:аз,у.м.,поворот (ошибка установки, °) | --install-err СКО°] [--seam 0.6 (доля целей у стыка)]\n"
                    "  [--deploy one|net (одно устройство | устройство на камеру)] [--net-latency 0.004] [--net-jitter 0.003]\n"
                    "  [--clock-err 0.05 (часы камер, с)] [--phase с] [--no-clock-sync] [--udp] [--no-fusion] [--no-calib]\n"
-                   "  [--calib-init 0.5] [--no-cross-cue]\n");
+                   "  [--calib-init 0.5] [--check-bias 3] [--no-cross-cue]\n");
             return a == "--help" ? 0 : 2;
         }
     }
