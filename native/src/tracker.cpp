@@ -1062,8 +1062,14 @@ const std::vector<Track>& Tracker::update(const std::vector<Candidate>& dets0, f
                 tr.p11 -= k1 * tr.p01;
                 tr.p00 *= 1 - k0;
                 tr.p01 *= 1 - k0;
-            } else
+            } else {
                 ++tr.miss;
+                // пауза вышла, а цели всё нет: как снятый с предмета, трек идёт только на прогнозе, и захват на
+                // нём уступает другому подтверждённому дрону (stuck_yield). Мозаика 4608 m1, 14 к/с: дрон ушёл
+                // за край четверти, точка соседней четверти теперь не брала трек, и не снятый с неё жёсткий
+                // захват ~5 с висел на прогнозе (на дроне 87 → 41)
+                if (stillHeld[ti] && tr.stillHold >= cfg_.stuck_obs) tr.ghost = true;
+            }
             tr.evidence = std::max(0.f, tr.evidence - cfg_.ev_miss);
             continue;
         }
