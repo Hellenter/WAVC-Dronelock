@@ -1,0 +1,10 @@
+{"sim_s": 3.00, "assignments": 2, "acquired": 0, "wrong_locks": 0, "losses": 0,
+ "slew_s": 0.000, "acquire_s": 0.000, "track_pct": 0.00, "track_correct_pct": 0.00,
+ "err_lock_deg": [0.0000, 0.0000], "err_axis_deg": [0.0000, 0.0000], "err_wide_deg": [0.0000, 0.0000],
+ "unconfirmed": 0, "wide_swaps": 0, "idle_pct": 30.00, "false_target_pct": 68.89, "wide_ms": 0.78, "narrow_ms": 0.192,
+ "track_drone_pct": 0.00, "narrow_only_s": 0.00, "narrow_only_correct_s": 0.00, "kept": 0, "rebinds": 0,
+ "confirmed": 0, "veto_bird": 0, "veto_drone": 0, "veto_none": 0, "part_jumps": 0,
+ "track_bird_s": 0.00, "confirmed_bird": 0, "veto_delay_s": 0.000, "veto_shape": 0, "next_after_bird": 0,
+ "mount_ideal": 0, "mount_ctl": 1, "center_px": 0.000, "jitter_px": 0.0000, "motion_err_px": 0.0000, "pose_err_deg": 0.00000,
+ "blur_px": 0.000, "cam_acc_rms": 0.00, "cam_acc_peak": 0.0, "prof_jerk_rms": 0.0, "prof_jerk_peak": 0, "peak_rate": 30.00,
+ "slips": 0, "slip_deg": [0.0000, 0.0000], "bias_deg": [0.0000, 0.0000], "eta_s": 0.000, "eta_err_s": 0.000}
