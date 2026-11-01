@@ -2,10 +2,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/fieldlog.hpp"
+#include "dronolok/fileutil.hpp"
 #include "dronolok/geometry.hpp"
+#include "dronolok/gimbal.hpp"
+#include "dronolok/multicam.hpp"
+#include "dronolok/netmsg.hpp"
 
 using namespace dronolok;
 
@@ -27,6 +34,17 @@ struct dl_tracker {
 
 struct dl_motion {
     GlobalMotion gm;
+};
+
+struct dl_fusion {
+    FusionConfig cfg;
+    std::vector<RigCamera> cams;
+    Fusion f;
+    bool started = false;
+    void start() {
+        if (!started) f.reset(cams, cfg);
+        started = true;
+    }
 };
 
 extern "C" {
@@ -288,4 +306,366 @@ void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose* to, f
 }
 int dl_tracker_hard(dl_tracker* t) { return (int)t->trk.lockState(); }
 
+static dl_target target(const TargetReport& r) {
+    return {r.id, r.t, r.az, r.el, r.vaz, r.vel, r.sigma, r.sigma_v, r.cls, r.confidence, r.hard, r.size_deg};
+}
+
+void dl_fusion_config_default(dl_fusion_config* c) {
+    if (!c) return;
+    const FusionConfig d;
+    *c = {d.gateDeg, d.gateSigma, d.coastS, d.dropS, d.mergeS, d.edgeDeg, d.keepS, d.rangeMin, d.rangeMax,
+          d.rangeGuess, d.calib ? 1 : 0, d.calibInitDeg, d.calibMaxDeg, d.calibHalfLife, d.calibPairMaxDt,
+          d.cue ? 1 : 0, d.independent ? 1 : 0};
+}
+dl_fusion* dl_fusion_create(const dl_fusion_config* c) {
+    dl_fusion* f = new dl_fusion;
+    if (c) {
+        FusionConfig& k = f->cfg;
+        k.gateDeg = c->gate_deg;
+        k.gateSigma = c->gate_sigma;
+        k.coastS = c->coast_s;
+        k.dropS = c->drop_s;
+        k.mergeS = c->merge_s;
+        k.edgeDeg = c->edge_deg;
+        k.keepS = c->keep_s;
+        k.rangeMin = c->range_min;
+        k.rangeMax = c->range_max;
+        k.rangeGuess = c->range_guess;
+        k.calib = c->calib != 0;
+        k.calibInitDeg = c->calib_init_deg;
+        k.calibMaxDeg = c->calib_max_deg;
+        k.calibHalfLife = c->calib_half_life;
+        k.calibPairMaxDt = c->calib_pair_max_dt;
+        k.cue = c->cue != 0;
+        k.independent = c->independent != 0;
+    }
+    return f;
+}
+void dl_fusion_destroy(dl_fusion* f) { delete f; }
+int dl_fusion_add_camera(dl_fusion* f, const dl_camera* c, const dl_pose* p, float x, float y, float z) {
+    if (!f || f->started) return -1;
+    f->cams.push_back({cam(c), pose(p), Vec3{x, y, z}});
+    return (int)f->cams.size() - 1;
+}
+void dl_fusion_set_pose(dl_fusion* f, int k, const dl_pose* p) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return;
+    f->cams[k].pose = pose(p);
+    if (f->started) f->f.setPose(k, pose(p));
+}
+void dl_fusion_update(dl_fusion* f, int k, double t, const dl_target* reps, int n) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return;
+    f->start();
+    std::vector<TargetReport> v;
+    for (int i = 0; i < n && reps; ++i) v.push_back(report(&reps[i]));
+    f->f.update(k, t, v);
+}
+int dl_fusion_targets(dl_fusion* f, dl_fused* out, int cap) {
+    if (!f) return 0;
+    f->start();
+    const std::vector<FusedTarget> v = f->f.targets();
+    for (int i = 0; i < std::min((int)v.size(), cap) && out; ++i)
+        out[i] = {target(v[i].rep), v[i].cam, v[i].local, v[i].seenBy, v[i].handoffs};
+    return (int)v.size();
+}
+void dl_fusion_observe_reference(dl_fusion* f, int id, const dl_target* r, int confident) {
+    if (!f || !r) return;
+    f->start();
+    f->f.observeReference(id, report(r), confident != 0);
+}
+int dl_fusion_resolve(dl_fusion* f, int id) { return f && f->started ? f->f.resolve(id) : 0; }
+int dl_fusion_local_of(dl_fusion* f, int id, int k) { return f && f->started ? f->f.localOf(id, k) : 0; }
+int dl_fusion_global_of(dl_fusion* f, int k, int local) { return f && f->started ? f->f.globalOf(k, local) : 0; }
+int dl_fusion_cues(dl_fusion* f, int k, double t, float* xyr, int cap) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return 0;
+    f->start();
+    const std::vector<CueArea> a = f->f.cues(k, t);
+    for (int i = 0; i < std::min((int)a.size(), cap) && xyr; ++i) {
+        xyr[3 * i] = a[i].u;
+        xyr[3 * i + 1] = a[i].v;
+        xyr[3 * i + 2] = a[i].r;
+    }
+    return (int)a.size();
+}
+int dl_fusion_project(dl_fusion* f, int k, float az, float el, float* u, float* v) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return 0;
+    f->start();
+    double uu = 0, vv = 0;
+    const bool ok = f->f.projectTo(k, az, el, uu, vv);
+    if (u) *u = (float)uu;
+    if (v) *v = (float)vv;
+    return ok && in_frame(f->cams[k].model, uu, vv) ? 1 : 0;
+}
+void dl_fusion_calib(dl_fusion* f, int k, float* sigma_deg, int* pairs) {
+    if (!f || k < 0 || k >= (int)f->cams.size()) return;
+    f->start();
+    if (sigma_deg) *sigma_deg = (float)f->f.calib(k).sigmaDeg;
+    if (pairs) *pairs = f->f.calib(k).used;
+}
+int dl_fusion_save_calib(dl_fusion* f, const char* path) {
+    if (!f || !path) return 0;
+    f->start();
+    FILE* o = open_file(path, "wb");
+    if (!o) return 0;
+    const std::string s = f->f.saveCalib();
+    const bool ok = fwrite(s.data(), 1, s.size(), o) == s.size();
+    return fclose(o) == 0 && ok ? 1 : 0;
+}
+int dl_fusion_load_calib(dl_fusion* f, const char* path) {
+    if (!f || !path) return 0;
+    f->start();
+    FILE* i = open_file(path, "rb");
+    if (!i) return 0;
+    std::string s;
+    char b[4096];
+    size_t n;
+    while ((n = fread(b, 1, sizeof(b), i)) > 0) s.append(b, n);
+    fclose(i);
+    return f->f.loadCalib(s) ? 1 : 0;
+}
+
+int dl_msg_encode_targets(int cam, unsigned seq, double t, double sent, const dl_target* reps, int n, char* out,
+                          int cap) {
+    net::WideMsg m;
+    m.cam = cam;
+    m.seq = seq;
+    m.t = t;
+    m.sent = sent;
+    for (int i = 0; i < n && reps; ++i) m.reps.push_back(report(&reps[i]));
+    const std::string s = net::encode(m);
+    if (!out || (int)s.size() + 1 > cap) return -1;
+    memcpy(out, s.c_str(), s.size() + 1);
+    return (int)s.size();
+}
+int dl_msg_decode_targets(const char* s, int* cam, unsigned* seq, double* t, double* sent, dl_target* out, int cap) {
+    net::WideMsg m;
+    if (!s || !net::decode(std::string(s), m)) return -1;
+    if (cam) *cam = m.cam;
+    if (seq) *seq = m.seq;
+    if (t) *t = m.t;
+    if (sent) *sent = m.sent;
+    for (int i = 0; i < std::min((int)m.reps.size(), cap) && out; ++i) out[i] = target(m.reps[i]);
+    return (int)m.reps.size();
+}
+
+struct dl_fieldlog {
+    FieldLog log;
+    std::vector<int> queue;
+};
+
+static thread_local std::string g_fieldlog_err;
+
+void dl_fieldlog_config_default(dl_fieldlog_config* c) {
+    if (!c) return;
+    const FieldLogConfig d;
+    c->root = nullptr;
+    c->session = nullptr;
+    c->max_mb = d.max_mb;
+    c->min_free_mb = d.min_free_mb;
+    c->pre_s = d.pre_s;
+    c->post_s = d.post_s;
+    c->max_clip_s = d.max_clip_s;
+    c->crop_px = d.crop_px;
+    c->ring_tracks = d.ring_tracks;
+    c->jpeg_q = d.jpeg_q;
+    c->snap_px = d.snap_px;
+    c->overview_every_s = d.overview_every_s;
+    c->clips_per_min = d.clips_per_min;
+    c->all_tracks = d.all_tracks ? 1 : 0;
+}
+
+dl_fieldlog* dl_fieldlog_open(const dl_fieldlog_config* c, int w, int h, double fps, const char* source,
+                              const char* settings_json) {
+    if (!c || !c->root || w <= 0 || h <= 0) {
+        g_fieldlog_err = "не задана папка журналов или размер кадра";
+        return nullptr;
+    }
+    FieldLogConfig f;
+    f.root = c->root;
+    f.session = c->session ? c->session : "";
+    f.max_mb = c->max_mb;
+    f.min_free_mb = c->min_free_mb;
+    f.pre_s = c->pre_s;
+    f.post_s = c->post_s;
+    f.max_clip_s = c->max_clip_s;
+    f.crop_px = c->crop_px;
+    f.ring_tracks = c->ring_tracks;
+    f.jpeg_q = c->jpeg_q;
+    f.snap_px = c->snap_px;
+    f.overview_every_s = c->overview_every_s;
+    f.clips_per_min = c->clips_per_min;
+    f.all_tracks = c->all_tracks != 0;
+    auto* l = new dl_fieldlog;
+    std::string err;
+    try {
+        if (!l->log.open(f, w, h, fps, source ? source : "", settings_json ? settings_json : "", err)) {
+            g_fieldlog_err = err;
+            delete l;
+            return nullptr;
+        }
+    } catch (const std::exception& e) {
+        g_fieldlog_err = e.what();
+        delete l;
+        return nullptr;
+    }
+    return l;
+}
+
+const char* dl_fieldlog_error(void) { return g_fieldlog_err.c_str(); }
+
+void dl_fieldlog_frame(dl_fieldlog* l, dl_tracker* t, int64_t index, double time_s, const uint8_t* gray, int w, int h,
+                       int stride, float cam_dx, float cam_dy) {
+    if (!l || !t) return;
+    FieldFrame f;
+    f.index = index;
+    f.t = time_s;
+    f.gray = gray && w > 0 && h > 0 ? gray : nullptr;
+    f.w = w;
+    f.h = h;
+    f.stride = stride > 0 ? stride : w;
+    f.tracks = &t->trk.confirmed();
+    t->trk.lockQueue(l->queue);
+    f.queue = &l->queue;
+    f.lockId = t->trk.lockedId();
+    f.lockState = t->trk.lockState();
+    f.verify = t->trk.verifyFrames();
+    f.manual = t->trk.manualLock();
+    f.camDx = cam_dx;
+    f.camDy = cam_dy;
+    try {
+        l->log.frame(f);
+    } catch (...) {
+    }
+}
+
+void dl_fieldlog_note(dl_fieldlog* l, const char* type, int id, const char* text, int clip) {
+    if (!l) return;
+    try {
+        l->log.note(type ? type : "note", id, text ? text : "", clip != 0);
+    } catch (...) {
+    }
+}
+
+const char* dl_fieldlog_dir(dl_fieldlog* l) { return l ? l->log.dir().c_str() : ""; }
+
+void dl_fieldlog_close(dl_fieldlog* l) {
+    if (!l) return;
+    try {
+        l->log.close();
+    } catch (...) {
+    }
+    delete l;
+}
+
 }  // extern "C"
+
+// ---- наведение поворотки
+struct dl_gimbal {
+    GimbalConfig cfg;
+    GimbalFilter f;
+    WideBias bias;
+    PoseHistory hist;
+    AxisProfile ax[2];
+    double anchor[2] = {0, 0};
+    bool anchored[2] = {false, false};
+    double spT = -1;
+};
+
+static GimbalConfig gimbal_cfg(const dl_gimbal_config* c) {
+    GimbalConfig g;
+    if (!c) return g;
+    g.max_rate = c->max_rate, g.max_accel = c->max_accel, g.max_jerk = c->max_jerk;
+    g.kp = c->kp, g.kv = c->kv, g.brake_share = c->brake_share, g.lead_cmd = c->lead_cmd;
+    g.jerk_noise = c->jerk_noise, g.acc_tau = c->acc_tau, g.sigma_pose = c->sigma_pose, g.gate = c->gate;
+    g.gate_reset = c->gate_reset, g.bias_tau = c->bias_tau, g.bias_max = c->bias_max;
+    return g;
+}
+void dl_gimbal_defaults(dl_gimbal_config* c) {
+    if (!c) return;
+    const GimbalConfig g;
+    c->max_rate = g.max_rate, c->max_accel = g.max_accel, c->max_jerk = g.max_jerk;
+    c->kp = g.kp, c->kv = g.kv, c->brake_share = g.brake_share, c->lead_cmd = g.lead_cmd;
+    c->jerk_noise = g.jerk_noise, c->acc_tau = g.acc_tau, c->sigma_pose = g.sigma_pose, c->gate = g.gate;
+    c->gate_reset = g.gate_reset, c->bias_tau = g.bias_tau, c->bias_max = g.bias_max;
+}
+dl_gimbal* dl_gimbal_create(const dl_gimbal_config* c) {
+    dl_gimbal* g = new dl_gimbal();
+    g->cfg = gimbal_cfg(c);
+    g->f.set_config(g->cfg);
+    return g;
+}
+void dl_gimbal_destroy(dl_gimbal* g) { delete g; }
+void dl_gimbal_target(dl_gimbal* g, const dl_target* tg) {
+    if (!g) return;
+    if (tg) g->f.reset(report(tg));
+    else g->f.clear();
+}
+int dl_gimbal_measure(dl_gimbal* g, double t_frame, float az, float el, float sigma) {
+    return g && g->f.measure(t_frame, az, el, sigma) ? 1 : 0;
+}
+int dl_gimbal_estimate(const dl_gimbal* g, double t, dl_target* out) {
+    if (!g || !out || !g->f.active()) return 0;
+    const TargetReport r = g->f.report(t);
+    *out = dl_target();
+    out->t = r.t, out->az = r.az, out->el = r.el, out->vaz = r.vaz, out->vel = r.vel, out->sigma = r.sigma;
+    out->sigma_v = r.sigma_v;
+    return 1;
+}
+dl_setpoint dl_gimbal_setpoint(const dl_gimbal* g, double now) {
+    dl_setpoint o{};
+    o.hold = 1;
+    if (!g) return o;
+    const Setpoint s = gimbal_setpoint(g->f, now, g->bias.az, g->bias.el);
+    o.t = s.t, o.az = (float)s.az, o.el = (float)s.el, o.vaz = (float)s.vaz, o.vel = (float)s.vel;
+    o.aaz = (float)s.aaz, o.ael = (float)s.ael, o.hold = s.hold ? 1 : 0;
+    return o;
+}
+void dl_gimbal_report_pose(dl_gimbal* g, double t, float az, float el) {
+    if (!g) return;
+    // азимут в историю — непрерывным (через 0° без скачка на 360)
+    double a = az;
+    double pa, pe;
+    if (g->hist.at(t, pa, pe)) a = pa + az_diff(az, pa);
+    g->hist.push(t, a, el);
+}
+dl_pose dl_gimbal_pose_at(const dl_gimbal* g, double t) {
+    dl_pose p{0, 0, 0};
+    if (!g) return p;
+    double az = 0, el = 0;
+    g->hist.at(t, az, el);
+    p.az = (float)az_norm(az + g->bias.az);
+    p.el = (float)(el + g->bias.el);
+    return p;
+}
+void dl_gimbal_wide_check(dl_gimbal* g, const dl_target* wide, double t_frame, float az, float el, double dt) {
+    if (!g || !wide) return;
+    double waz, wel, wsg;
+    predict(report(wide), t_frame, waz, wel, wsg);
+    g->bias.update(az_diff(waz, az), wel - el, std::max(wsg, 0.005), dt, g->cfg);
+}
+void dl_gimbal_bias(const dl_gimbal* g, float* az, float* el) {
+    if (az) *az = g ? (float)g->bias.az : 0.f;
+    if (el) *el = g ? (float)g->bias.el : 0.f;
+}
+void dl_gimbal_drive_reset(dl_gimbal* g, float az, float el) {
+    if (!g) return;
+    g->ax[0] = AxisProfile();
+    g->ax[1] = AxisProfile();
+    g->ax[0].p = az, g->ax[1].p = el;
+    g->anchored[0] = g->anchored[1] = false;
+}
+void dl_gimbal_drive(dl_gimbal* g, const dl_setpoint* sp, double t_recv, double t, double h, float* pos, float* vel) {
+    if (!g) return;
+    if (t_recv != g->spT) g->anchored[0] = g->anchored[1] = false, g->spT = t_recv;
+    for (int i = 0; i < 2; ++i) {
+        AxisProfile& a = g->ax[i];
+        if (!sp || sp->hold) {
+            a.hold(h, g->cfg, g->anchor[i], g->anchored[i], i == 0);
+        } else {
+            const double s = std::min(0.25, std::max(0.0, t - t_recv));
+            const double p0 = i ? sp->el : sp->az, v0 = i ? sp->vel : sp->vaz, a0 = i ? sp->ael : sp->aaz;
+            a.track(p0 + v0 * s + 0.5 * a0 * s * s, v0 + a0 * s, a0, h, g->cfg, i == 0);
+        }
+        if (pos) pos[i] = (float)(i ? a.p : az_norm(a.p));
+        if (vel) vel[i] = (float)a.v;
+    }
+}

@@ -3,10 +3,17 @@
 // поворота, находит цель в окне поиска и дальше ведёт её сама. Мир, камеры и поворотка —
 // синтетические, алгоритм — настоящий: Pipeline для широкой, Detector + Tracker для точной.
 //
+// Широких может быть несколько (разные сектора): у каждой свой конвейер, их цели объединяет
+// dronolok::Fusion (multicam.hpp) в цели установки с общими номерами — точная берёт цели от всех
+// и ведёт дрон через стык секторов без переназначения. Развёртывание: одно устройство на все
+// широкие (кадры в такт, объединение там же) или устройство на камеру — сообщения по сети
+// (кодек netmsg.hpp, по желанию настоящий UDP), задержки, камеры не в такт, сверка часов.
+//
 // Время модельное и общее для всех устройств. Шаг — кадр точной камеры; кадр широкой
 // обрабатывается целиком (конвейер ждём), а её сообщение о цели доходит до поворотки через
 // handoffLatency. Поэтому результат не зависит от скорости ПК и повторяется при том же seed.
 #pragma once
+#include <cmath>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -20,6 +27,10 @@
 
 #include "dronolok/detector.hpp"
 #include "dronolok/geometry.hpp"
+#include "dronolok/gimbal.hpp"
+#include "dronolok/multicam.hpp"
+#include "dronolok/netmsg.hpp"
+#include "mountsim.hpp"
 #include "pipeline.hpp"
 #include "scenelink.hpp"
 #include "silhouette.hpp"
@@ -36,11 +47,32 @@ constexpr float PANO_STEP = 0.25f, PANO_EL0 = -20.f;
 
 enum class SwitchMode : int { Manual = 0, Queue = 1, Nearest = 2 };
 
+// Широкая камера установки: где стоит и как установлена. Размер кадра, поле и частота — общие (wideW...)
+struct WideCam {
+    float az = 120, el = 32;            // куда смотрит ось, по паспорту (у первой камеры — wideAz, wideEl)
+    float x = 0, y = 0, z = 0;          // м: положение относительно поворотки точной (восток, север, верх)
+    float errAz = 0, errEl = 0, errRoll = 0;   // ошибка установки, градусы: на самом деле ось смотрит так
+    float phase = 0;                    // с: кадры позже первой камеры на столько (устройства не в такт)
+    float clock = 0;                    // с: часы её устройства спешат на столько (до сверки часов)
+};
+
+// Где работают широкие: все на одном устройстве (кадры в такт, объединение целей там же) или каждая на
+// своём — цели идут устройству поворотки по сети, объединяет оно
+enum class Deploy : int { OneDevice = 0, PerCamera = 1 };
+
 struct Config {
     // мир: пусто — синтетическое небо; иначе 3D-сцена Godot (путь к sim/scenes/*.json), см. scenelink.hpp.
     // Цели тогда летают в сцене (числа, дальность и доли типов — ниже), облака и видимость — из сцены.
     std::string scene, sector, godot, simProject;
     uint64_t renderAffinity = 0;   // ядра для отрисовки сцены, 0 — любые
+    // Погода и время суток 3D-сцены (sim.gd) поверх погоды из сцены; меняются и на ходу (setSceneEnv).
+    // Пусто или < 0 — как в сцене.
+    std::string sceneWeather;      // clear, cumulus, cloudy, overcast, haze, mist, fog, rain, storm, snow
+    float sceneTime = -1;          // ч, местное солнечное время (12 — солнце на юге)
+    float sceneTimeRate = 0;       // во сколько раз быстрее идёт время суток (0 — стоит)
+    int sceneDay = 258;            // день года: высота солнца (258 — 15 сентября)
+    float sceneLat = 55.75f;       // широта, °
+    float sceneClouds = -1, sceneVis = -1, sceneRain = -1, sceneSnow = -1;   // подстройка поверх погоды
     // Панорамная маска 360°: маска неба широкой копится по азимуту и углу места; после поворота
     // широкой маска берётся из панорамы (если она покрывает новый вид), а не учится заново
     bool panoMask = true;
@@ -62,6 +94,22 @@ struct Config {
     float wideFov = 120, wideFps = 14;
     bool wideFisheye = false;
     float wideAz = 0, wideEl = 32;   // куда смотрит ось
+    WideCam wide0;                   // первая: положение, ошибка установки, часы (az, el — выше)
+    std::vector<WideCam> moreWide;   // вторая и следующие широкие
+    int wideCount() const { return 1 + (int)moreWide.size(); }
+    // несколько широких
+    Deploy deploy = Deploy::OneDevice;
+    float netLatency = 0.004f;       // с: сеть между устройствами в одну сторону (поворотка -> камера; камера -> поворотка — в handoffLatency)
+    float netJitter = 0.003f;        // с: разброс задержки (очереди), в среднем
+    bool clockSync = true;           // устройство поворотки сверяет часы с камерами (иначе время кадров — по часам камер)
+    bool netUdp = false;             // сообщения камер — по настоящему UDP на 127.0.0.1 (проверка обмена)
+    bool fusion = true;              // объединять цели камер (выключено — у каждой камеры свои цели и номера)
+    bool fusionCalib = true;         // калибровка широких по точной
+    float calibInit = 0.5f;          // неуверенность установки широких до калибровки, СКО, градусы
+    float checkBias = 3;             // «точная ведёт не то»: неуверенность калибровки — постоянный сдвиг, не шум;
+                                     // допуск на неё — столько её СКО (а не 6, как на шум сообщения)
+    bool crossCue = true;            // камере — где ждать цель из соседнего сектора
+    float seamShare = 0;             // доля целей, которые появляются у стыка секторов и летят через него
     // точная камера на поворотке
     int narrowW = 640, narrowH = 480;
     float narrowFov = 5, narrowFps = 60;   // поле точной: 5° — зум x4 (основной у Maxim), 20° — без зума
@@ -71,6 +119,28 @@ struct Config {
     bool narrowAutoThr = true;            // порог детектора точной по шуму кадра (CFAR): при шуме 3 зум x4 ведёт 84% времени вместо 18%
     float encoderDeg = 0.01f;             // дискретность датчиков угла
     float handoffLatency = 0.06f;         // от кадра широкой до команды поворотке, с
+    // поворотка как на железе (MountSim): кадр точной доходит до алгоритма с задержкой, команда до двигателя —
+    // тоже, двигатель шаговый (микрошаг, пропуски), передача с люфтом, камера на упругом креплении.
+    // mountIdeal — как до 31.10: команда исполняется мгновенно, положение известно точно (бит в бит)
+    bool mountIdeal = false;
+    int mountCtl = 1;                     // 0 — прежний закон (ошибка + скорость цели), 1 — плавный (фильтр цели, рывок)
+    float maxJerk = 3000;                 // град/с³
+    float mountKp = 8, mountKv = 32;      // плавный: скорость к ошибке и ускорение к ошибке скорости, 1/с
+    float targetJerk = 2;                 // фильтр цели: манёвр — СКО рывка, град/с³
+    float camLatency = 0.033f;            // от середины выдержки до результата алгоритма: считывание, передача, обработка, с
+    float cmdLatency = 0.010f;            // от команды Pi до движения двигателя, с
+    float cmdJitter = 0.002f;             // разброс задержки команды, с
+    float exposure = 0.001f;              // выдержка точной, с: смаз цели, пока поворотка и цель движутся по-разному
+    float stepDeg = 0.01125f;             // микрошаг на выходе передачи: 1.8° / 16 / 10, град
+    float backlash = 0.05f;               // люфт передачи, град
+    bool backlashComp = true;             // плавный: контроллер выбирает люфт при смене направления
+    float resonanceHz = 12, damping = 0.15f;   // крепление камеры: собственная частота и затухание
+    float slipEvery = 0;                  // пропуск шагов в среднем раз в столько секунд (0 — нет)
+    int slipSteps = 8;                    // ...на столько микрошагов
+    int encoder = 0;                      // 0 — датчиков угла нет (положение по выданным шагам), 1 — на оси (encoderDeg)
+    int poseModel = 1;                    // без датчиков: 0 — по шагам, 1 — по профилю, 2 — профиль через модель крепления
+    float modelHz = 12, modelDamping = 0.15f;   // модель крепления у контроллера (по замеру на железе)
+    bool wideBias = true;                 // без датчиков: уход нуля поворотки — по широкой (обе видят цель)
     // наведение
     SwitchMode switchMode = SwitchMode::Manual;
     float dwell = 6;          // сколько вести цель, прежде чем перейти к следующей (авто), с
@@ -107,8 +177,29 @@ struct Config {
     bool nextOnBird = true;    // отсеяв птицу, точная сразу берёт следующую цель широкой (и в ручном режиме, где
                                // сама берёт только жёсткий захват широкой), а не ждёт, пока широкая подтвердит дрон
     bool vetoManual = true;    // и цель, выбранную вручную, отсеивает — но только уверенно (вдвое дольше)
+    // память о взмахах (31.10, Maxim: «очевидно птица, но хардлок не переопределяет»): птица машет пачками и
+    // между ними планирует; «подряд» сбрасывался каждой паузой, и подтверждённую (жёсткий захват) птицу точная
+    // держала до конца. Теперь взмахи копятся в секундах: кадр, на котором силуэт «машет», +1/fps, слабый (автокорр.
+    // ≥ shapeRWeak на том же периоде, что и прошлая оценка) +shapeWeakW/fps; так же копится время «птица» у
+    // классификатора трекера. Накопленное постепенно сгорает (вдвое за birdHalf с): дрон, который иногда
+    // качнётся, взмахов не набирает. Порог — сколько набрала бы непрерывная серия прежней длины (shapeHits кадров,
+    // vetoT с; подтверждённый — shapeConfK раз по столько); дроном цель подтверждается, только когда память почти сгорела
+    bool birdMemory = true;
+    float shapeRWeak = 0.6f;   // дрон по шуму — до 0.6 на случайных периодах, птица в пачке — 0.6–0.95 на своём
+    float shapeWeakW = 0.5f;
+    float birdHalf = 1.0f;     // с: накопленное сгорает вдвое
+    // подтверждённый дрон (жёсткий захват) отсеивается при вчетверо большем пороге: порыв ветра качает дрон
+    // 0.2–0.6 с — как пачка взмахов. 41 сцена (31.10): при x2 и x3 качающиеся дроны снимались, как и без памяти
+    // (16–17 раз), при x4 — 5. Первые shapeProveT с после подтверждения можно держать порог ниже (shapeConfK0):
+    // птицы снимаются чуть раньше, но и качнувшиеся дроны тоже (в очереди цель редко ведётся дольше 5 с)
+    float shapeConfK0 = 4, shapeConfK = 4;
+    float shapeProveT = 5;
+    // синтетическое небо, проверка: дрон иногда покачивается (порыв ветра) — 0.2–0.6 с из каждых 3–8 с, 3–6 Гц
+    bool droneWobble = false;
     float vetoCool = 30;       // к отсеянной цели и к целям широкой на её прогнозе не возвращаться, с
     float narrowLostHold = 2;  // цель есть только у точной: столько секунд искать её по своему прогнозу
+    // синтетическое небо: птица машет пачками (0.8–2 с из каждых 2–5 с), между ними планирует — как в 3D-сцене
+    bool birdGlide = true;
 };
 
 // Тело в мире: прямолинейное движение (у птиц — с покачиванием и взмахами)
@@ -120,6 +211,8 @@ struct Body {
     double t0 = 0;       // когда появилось
     float size = 0.5f;   // м
     float flapHz = 0, phase = 0;
+    float flapPer = 0, flapOn = 0;   // взмахи пачками: flapOn секунд из каждых flapPer (0 — машет всё время)
+    float wobPer = 0, wobOn = 0, wobHz = 0;   // дрон покачивается: wobOn секунд из каждых wobPer (droneWobble)
     bool wobble = true;    // покачивание птицы (в 3D-сцене траекторию задаёт сцена)
     bool hidden = false;   // в 3D-сцене: заслонено от установки домом или деревом
     Vec3 at(double t) const;
@@ -130,10 +223,13 @@ const char* state_name(NState s);
 
 // Цель, которую видит широкая камера (её трек), с последним сообщением о ней
 struct WideTarget {
-    int id = 0;
-    TargetReport rep;
+    int id = 0;          // номер цели установки (одна широкая — номер её трека)
+    TargetReport rep;    // в системе поворотки
     int cls = 0;
     bool hard = false;
+    int cam = 0, local = 0;   // от какой широкой сообщение и номер её трека
+    uint32_t seenBy = 1;      // какие широкие видят (бит на камеру)
+    float bias = 0;           // часть rep.sigma — неуверенность калибровки камеры (сдвиг, одинаковый у всех целей), градусы
     int truth = 0;   // ближайшее тело по правде (для оценки), 0 — ни одного рядом
     int verdict = 0; // что сказала точная: 1 — дрон (подтвердила), 2 — птица (отсеяна)
 };
@@ -169,12 +265,52 @@ struct Stats {
     int nextAfterBird = 0;                    // переходов на следующую цель сразу после отсева птицы
     int partJumps = 0;                        // захват точной перешёл на соседний трек той же цели (часть крупной)
     double wideMs = 0, narrowMs = 0;          // среднее время обработки кадра
+    // поворотка: насколько ровно и точно она ведёт цель
+    double jitterSq = 0;  int jitterN = 0;    // дрожание цели на кадре точной (вторая разность положения), пикс.
+    double motionSq = 0;  int motionN = 0;    // ошибка сдвига кадра, которым трекер вычитает поворот, пикс.
+    double poseSq = 0;    int poseN = 0;      // ошибка положения поворотки, которое знает алгоритм, град
+    double blurSum = 0;   int blurN = 0;      // смаз цели за выдержку, пикс.
+    double centerSq = 0;  int centerN = 0;    // цель от центра кадра точной при ведении, пикс.
+    MountSim::Stats mount;                    // ускорение камеры, рывок профиля, пропуски шагов
+    float biasAz = 0, biasEl = 0;             // поправка ухода нуля по широкой, град
+    float slipAz = 0, slipEl = 0;             // на самом деле пропущено, град
+    double etaSum = 0, etaErr = 0; int etaN = 0;   // прогноз времени поворота к цели и его ошибка, с
     double renderWideMs = 0, renderNarrowMs = 0;   // отрисовка кадров, сумма, мс
+    // несколько широких: цель перешла к другой камере — с тем же номером / с новым
+    int handoffOk = 0, handoffBroken = 0;
+    int renumbered = 0;                       // та же камера потеряла цель и нашла под новым номером
+    double dupTime = 0;                       // с: у одной цели больше одного номера (камеры не объединились)
+    int seamTrack = 0, seamKept = 0;          // точная вела цель, когда та перешла к другой камере; из них не потеряла за 1 с
+    int fusionCreated = 0, fusionHandoffs = 0, fusionReacquired = 0, fusionMerged = 0;
+    std::vector<float> calibDeg, calibSigma;  // по камерам: остаточная ошибка позы (правда), неуверенность калибровки
+    std::vector<int> calibPairs;
+    std::vector<int> camFrames;               // по камерам: кадров обработано
+    double clockErrMs = 0;                    // наибольшая ошибка сверки часов, мс
+    int netMsgs = 0, netBytes = 0;            // сообщений и байт по сети (устройство на камеру)
 };
 
 // Что показать в интерфейсе: копия последнего состояния
 struct View {
-    std::shared_ptr<const Result> wide;   // кадр и треки широкой
+    // по широким камерам: кадр и треки, номера целей установки у треков, проекции на её кадр
+    struct WideView {
+        std::shared_ptr<const Result> res;
+        Pose pose;                                      // по паспорту
+        std::vector<std::pair<int, int>> gid;           // трек камеры -> цель установки
+        std::vector<std::pair<float, float>> footprint; // контур кадра точной
+        std::vector<std::pair<float, float>> vetoW;     // отсеянные точной
+        struct Pt {
+            float u, v;
+            int id;
+            bool bird;
+        };
+        std::vector<Pt> truth;
+        float nWu = -1, nWv = -1;                       // где цель видит точная
+        float calibSigma = 0, calibErr = 0;             // калибровка: неуверенность и правда, градусы
+        int calibPairs = 0;
+        bool primary = false;                           // от неё сейчас сообщения о назначенной цели
+    };
+    std::vector<WideView> wides;
+    std::shared_ptr<const Result> wide;   // кадр и треки первой широкой (= wides[0].res)
     std::vector<uint8_t> narrow;          // кадр точной
     int nw = 0, nh = 0;
     std::vector<dronolok::Track> ntracks;
@@ -182,10 +318,14 @@ struct View {
     NState state = NState::Idle;
     int assigned = 0;                     // id трека широкой
     bool nConf = false, nOnly = false;    // точная подтвердила дрон; цель только у точной
+    float nBird = 0;                      // насколько точная уверена, что ведёт птицу: 1 — отсеивает
     float nWu = -1, nWv = -1;             // где точная видит цель, на кадре широкой
     std::vector<std::pair<float, float>> vetoW;   // отсеянные точной (прогноз), на кадре широкой
     std::vector<WideTarget> targets;
     Pose axis, cmd;
+    Pose believed;                        // где поворотка по своему знанию (шаги или датчик)
+    float accAz = 0, accEl = 0;           // ускорение профиля
+    int narrowLagFrames = 0;              // кадров точной в пути (задержка камеры)
     Pose widePose;                        // куда смотрит широкая
     float rateAz = 0, rateEl = 0;
     dronolok::SearchWindow win;
@@ -208,6 +348,13 @@ struct View {
     std::string status;
 };
 
+// погода 3D-сцены для sim.gd (объект "env"): только заданное, {} — как в сцене
+std::string scene_env_json(const Config& c);
+// пресет погоды sim.gd: облачность, видимость (м), дождь, снег — чтобы подстройка начиналась с него
+bool scene_weather_preset(const std::string& name, float& clouds, float& vis, float& rain, float& snow);
+// высота солнца, ° (как в sim.gd: местное солнечное время, день года, широта)
+float sun_elevation(float hours, int day, float lat);
+
 class Emulator {
 public:
     Emulator();
@@ -226,9 +373,16 @@ public:
     // обзор 360°: широкая поворачивается шагами по полкадра, на каждом шаге маска учится и
     // ложится в панораму, в конце — обратно
     void startScan() { scanReq_ = true; }
-    void setWidePose(float az, float el) {
-        wantAz_ = az;
-        wantEl_ = el;
+    // погода и время суток 3D-сцены — с ближайшего кадра (Godot не перезапускается)
+    void setSceneEnv(const Config& c) {
+        std::lock_guard<std::mutex> lk(envM_);
+        envJson_ = scene_env_json(c);
+        ++envReq_;
+    }
+    void setWidePose(float az, float el) { setWidePose(0, az, el); }
+    void setWidePose(int cam, float az, float el) {
+        std::lock_guard<std::mutex> lk(poseM_);
+        poseWant_.push_back({cam, az, el});
         ++poseReq_;
     }
     View view() const;
@@ -237,20 +391,57 @@ public:
     double dumpAt_ = 0, dumpLen_ = 0;   // отладка (--dump t,len): кадры точной в PGM
 
 private:
+    struct WideUnit;   // широкая камера: конвейер, кадры, маска (twocam.cpp)
+    struct Msg {       // сообщение в пути между устройствами
+        double at = 0;   // когда дойдёт (модельное время)
+        int kind = 0;    // 0 цели установки -> поворотке, 1 цели камеры -> поворотке (по сети), 2 подсказка камере,
+                         // 3 «птица» камере, 4 точная -> объединению (одно устройство), 5 сверка часов
+        int cam = 0;
+        std::string data;
+        std::vector<WideTarget> snap;
+        TargetReport rep;
+        int id = 0;
+        bool flag = false;
+        std::vector<std::pair<int, int>> merges;   // слияния целей (старый номер -> новый)
+    };
     void loop();
     void spawn(Body& b, double t, bool first);
-    void prepareWide();   // фон синтетического неба под текущий поворот широкой
+    void prepareWide(WideUnit& w);   // фон синтетического неба под текущий поворот широкой
     bool sceneRender(double t, int cam, const Pose& p, int W, int H, std::vector<uint8_t>& out);
-    void renderWide(double t, std::vector<uint8_t>& out);
-    void renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out);
-    void drawBodies(const CameraModel& m, const Pose& p, double t, uint8_t* px, int w, int h);
+    void renderWide(WideUnit& w, double t, std::vector<uint8_t>& out);
+    // pa, pb — положение камеры в начале и в конце выдержки ex (смаз цели); без них — без смаза
+    void renderNarrow(double t, const Pose& p, std::vector<uint8_t>& out, const Pose* pa = nullptr,
+                      const Pose* pb = nullptr, double ex = 0);
+    // pos — где стоит камера (м от поворотки): широкая не у поворотки видит цели со своего места
+    void drawBodies(const CameraModel& m, const Pose& p, const Vec3& pos, double t, uint8_t* px, int w, int h,
+                    const Pose* pa = nullptr, const Pose* pb = nullptr, double ex = 0);
     float background(double az, double el, double t, bool fine) const;
-    void onWide(double t, const Result& r);
+    void onWide(WideUnit& w, double t, const Result& r);
+    void post(Msg m);                        // в очередь сообщений по времени доставки
+    void deliver(double t);                  // дошедшие сообщения
+    void fusedSnapshot(double t, std::vector<WideTarget>& out);   // цели установки сейчас (для поворотки)
+    void setTargets(double t, std::vector<WideTarget> v);         // поворотка получила цели установки
+    void markWideBird(double t, int id);     // точная: цель id — птица; её трекам у широких сказать
+    void wideStats(double t);                // переходы целей между камерами (по правде)
+    double calibTruthDeg(const WideUnit& w) const;   // ошибка направления по камере с калибровкой (правда), градусы
+    int nearestBodyFrom(double t, const Vec3& pos, const Vec3& d, double maxDeg) const;
     void stepNarrow(double t, double dt);
+    void stepNarrowReal(double t, double dt);   // поворотка как на железе (MountSim)
+    void processNarrow(double t, double dt, const Pose& truth, const Pose& enc, double tNow);
+    void controlReal(double t);
+    void mountFeed(double t);                   // отметка точной — фильтру цели, невязка с широкой — уходу нуля
     void choose(double t);
     void assign(double t, int wideId, const char* why);
     void rebind(double t);
     bool vetoed(double t, const TargetReport& r) const;
+    // память о взмахах: сколько наберёт непрерывная серия длиной sec секунд при сгорании вдвое за birdHalf
+    double confK(double t) const {   // во сколько раз выше порог взмахов у подтверждённого дрона
+        return !nConf_ ? 1.0 : t - tConf_ < c_.shapeProveT ? c_.shapeConfK0 : c_.shapeConfK;
+    }
+    double memLevel(double sec) const {
+        const double tau = std::max(0.05f, c_.birdHalf) / 0.69314718;
+        return tau * (1 - std::exp(-sec / tau));
+    }
     void event(double t, const std::string& s);
     int nearestBody(double t, double az, double el, double maxDeg) const;
 
@@ -270,14 +461,24 @@ private:
     bool scan_ = false;
     int scanStep_ = 0;
     float scanAz0_ = 0, scanEl0_ = 0;
-    void panoLearn(const Result& r);
-    float panoMaskFor(std::vector<uint8_t>& m) const;
+    void panoLearn(const WideUnit& w, const Result& r);
+    float panoMaskFor(const WideUnit& w, std::vector<uint8_t>& m) const;
     int poseSeen_ = 0;
+    std::mutex poseM_;
+    struct PoseCmd {
+        int cam;
+        float az, el;
+    };
+    std::vector<PoseCmd> poseWant_;
     // 3D-сцена: отдельный процесс Godot
     bool sceneMode_ = false;
     std::unique_ptr<scene::Link> link_;
     scene::Options linkOpt_;
-    std::string linkHello_;
+    std::string linkHello_, linkHelloBase_;
+    std::mutex envM_;
+    std::string envJson_;
+    std::atomic<int> envReq_{0};
+    int envSeen_ = 0;
     int linkRestarts_ = 0;
     std::vector<scene::Body> sbodies_;
     mutable std::mutex vm_;
@@ -287,31 +488,33 @@ private:
     std::mt19937 rng_;
     std::vector<Body> bodies_;
     int nextBodyId_ = 1;
-    CameraModel wideCam_, narrowCam_;
-    Pose widePose_;
-    std::vector<float> wideBase_;      // небо и земля без облаков, по пикселю
-    std::vector<uint8_t> wideGround_;  // 1 — земля
-    std::vector<float> wideAz_, wideEl_;   // направления узлов сетки облаков (каждые CLOUD_STEP пикс.)
-    int cgW_ = 0, cgH_ = 0;
+    CameraModel narrowCam_;
     std::vector<int16_t> noiseTab_;    // гауссов шум, x8
-    std::vector<int16_t> wideSky_, wideNoise_;   // фон с облаками и шум кадра широкой, x8
-    double wideSkyT_ = -1;
     uint32_t noiseSeed_ = 1;
 
-    // широкая: конвейер и ожидание его результата
-    Pipeline pipe_;
-    std::mutex wm_;
-    std::condition_variable wcv_;
-    std::vector<uint8_t> wideFrame_;
-    bool wideReady_ = false;   // кадр отрисован, генератор может забрать
-    int64_t wideIdx_ = -1, wideDone_ = -1;
-    std::shared_ptr<const Result> wideRes_;
-    std::deque<std::pair<double, std::vector<WideTarget>>> inbox_;   // сообщения в пути
+    // широкие: у каждой свой конвейер; цели объединяет fusion_
+    std::vector<std::unique_ptr<WideUnit>> wu_;
+    dronolok::Fusion fusion_;
+    std::deque<Msg> net_;               // сообщения в пути (по времени доставки)
+    std::mt19937 netRng_;
+    dronolok::net::UdpSocket udpTx_, udpRx_;
     std::vector<WideTarget> targets_;   // последнее дошедшее сообщение
+    int primaryCam_ = -1;               // от какой камеры сообщения о назначенной цели
+    int uiCalibN_ = 0;
+    struct BodySeen {
+        int body, gid, cam;
+        double t;
+    };
+    std::vector<BodySeen> bodySeen_;    // оценка переходов между камерами: последний номер и камера у тела
+    std::vector<std::pair<double, int>> seamCheck_;   // точная вела тело на стыке: проверить через 1 с
+    double lastSnapT_ = -1;
+    // смещение точной от прогноза широкой в начале захвата (калибровка не сошлась): по нему — сползла ли точная
+    double offTrack_ = -1, offRefT_ = -1, offX_ = 0, offY_ = 0;
+    int offN_ = 0, offCam_ = -1;
     std::vector<int> visited_;          // уже обслуженные цели (авто: по очереди)
     std::vector<std::pair<int, double>> cool_;   // не подтверждённые точной цели широкой и до какого времени
     std::vector<std::pair<TargetReport, double>> veto_;   // отсеянные точной (где были) и до какого времени
-    std::vector<int> wideBirds_;        // треки широкой, которым точная сказала «птица»
+
 
     // точная
     struct Mount {
@@ -338,10 +541,15 @@ private:
     bool afterBird_ = false;    // точная только что отсеяла птицу: берём следующую цель и в ручном режиме
     bool nextPick_ = false;     // назначенная взята так («следующая после птицы»): пропала — ищем следующую
     bool nConf_ = false;     // точная уверена, что ведёт дрон
+    double tConf_ = 0;       // когда подтвердила
     bool nOnly_ = false;     // цель есть только у точной: трек широкой assigned_ уже не она (или пропал)
     double tBird_ = -1;      // с какого момента точная видит в цели птицу
     std::deque<float> shapeE_;   // «масса» силуэта захваченной цели по кадрам (птица по силуэту)
     int shapeId_ = 0, shapeBirdN_ = 0;
+    double shapeEv_ = 0;     // память о взмахах (birdMemory): сколько секунд силуэт «машет», со сгоранием
+    int shapeLag_ = 0;       // период прошлой оценки, кадров
+    double birdT_ = 0;       // сколько секунд (со сгоранием) классификатор трекера называет цель птицей
+    float nBird_ = 0;        // для интерфейса: доля до отсева птицы
     float shapeHz_ = 0;
     bool shapeRigid_ = false;    // окно набрано, силуэт не машет
     int detachId_ = 0;       // трек широкой, от которого точная только что отказалась (ушёл с цели)
@@ -350,6 +558,23 @@ private:
     float lastU_ = 0, lastV_ = 0, lastSz_ = 0;   // захват точной на прошлом кадре: где и какого размера, пикс.
     TargetReport nrep_;      // последнее положение по точной
     bool haveNrep_ = false;
+    // поворотка как на железе
+    MountSim msim_;
+    dronolok::GimbalConfig gcfg_;
+    dronolok::GimbalFilter gf_;   // цель для поворотки: по отметкам точной (или широкой, пока точная не видит)
+    dronolok::WideBias wbias_;
+    int gfAssignN_ = -1;           // фильтр начат на этом назначении (номер по счёту)
+    double gfWideT_ = -1, biasT_ = -1;
+    struct NFrame {
+        double t = 0, ready = 0;   // середина выдержки; когда кадр дойдёт до алгоритма
+        Pose truth, bel;           // где камера на самом деле и где по знанию поворотки
+        std::vector<uint8_t> px;
+    };
+    std::deque<NFrame> nq_;        // кадры точной в пути
+    Pose prevTruth_;
+    int jitBody_ = 0, jitK_ = 0;
+    double jitT_ = -1, jitU_[2] = {0, 0}, jitV_[2] = {0, 0};
+    double etaT_ = -1, etaPred_ = 0;   // прогноз времени поворота к назначенной цели
     dronolok::SearchWindow win_;
     bool winOn_ = false;
     Stats st_;
@@ -357,6 +582,12 @@ private:
 };
 
 // CLI: dronolok_app --twocam [параметры]
+// Широкие камеры установки: count штук, оси второй и следующих — через step° по азимуту от первой (wideAz),
+// угол места — wideEl. Ошибки установки — СКО installErr° по номеру сцены (у первой тоже); устройство на
+// камеру: кадры k-й позже первой на phase*k с (phase < 0 — вразнобой), часы спешат на ±clockErr с.
+// Положения камер (x, y, z) не трогаются.
+void layout_wides(Config& c, int count, float step, float installErr, float clockErr = 0.05f, float phase = -1);
+
 int run_cli(int argc, char** argv);
 
 }  // namespace twocam

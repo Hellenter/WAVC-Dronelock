@@ -170,6 +170,161 @@ DL_API void dl_pose_shift(const dl_camera* c, const dl_pose* from, const dl_pose
 /* Состояние захвата: 0 нет, 1 захват, 2 жёсткий (подтверждён дрон). */
 DL_API int dl_tracker_hard(dl_tracker* t);
 
+/* ---- Несколько широких камер (dronolok/multicam.hpp, netmsg.hpp) ----
+   Объединение целей: широкие камеры (каждая — свой сектор) шлют свои цели (dl_target в системе камеры,
+   id — номер её трека), объединение ведёт цели установки в системе поворотки точной: одна цель — один номер,
+   даже когда её видят две камеры или она перелетела из сектора в сектор (в щели между секторами ждёт по
+   прогнозу). Калибровка широких — по точной (dl_fusion_observe_reference). Работает там, где поворотка:
+   на устройстве с камерами (одно устройство на все) или на устройстве поворотки (камеры шлют по сети). */
+typedef struct dl_fusion dl_fusion;
+
+typedef struct {
+    float gate_deg, gate_sigma; /* допуск сопоставления: градусы + столько СКО */
+    float coast_s;              /* цель, которую не видит ни одна камера, ждёт по прогнозу, с */
+    float drop_s;               /* трек камеры не приходил столько — связь с целью снимается, с */
+    float merge_s;              /* две цели совпадают столько — это одна, с */
+    float edge_deg;             /* сообщения от соседней камеры, если цель у края кадра своей */
+    float keep_s;               /* класс и жёсткий захват держатся после перехода, с */
+    float range_min, range_max, range_guess; /* м: дальности (параллакс камер не в начале отсчёта) */
+    int calib;                  /* 1 — калибровать широкие по точной */
+    float calib_init_deg;       /* неуверенность позы до калибровки, СКО */
+    float calib_max_deg;        /* пары с невязкой больше — выбросы */
+    float calib_half_life;      /* пар: старые забываются */
+    float calib_pair_max_dt;    /* с: сообщение точной не старше этого от кадра широкой */
+    int cue;                    /* 1 — подсказки камере, где ждать цель из соседнего сектора */
+    int independent;            /* 1 — без объединения (для сравнения): id = камера * 100000 + трек */
+} dl_fusion_config;
+
+/* Цель установки. rep — в системе поворотки, rep.id = id. cam — от какой камеры сообщение (-1 — ждёт по
+   прогнозу), local — номер трека этой камеры, seen_by — биты камер, которые видят цель. */
+typedef struct {
+    dl_target rep;
+    int cam, local;
+    unsigned seen_by;
+    int handoffs;  /* переходов от камеры к камере */
+} dl_fused;
+
+DL_API void dl_fusion_config_default(dl_fusion_config* c);
+DL_API dl_fusion* dl_fusion_create(const dl_fusion_config* c);
+DL_API void dl_fusion_destroy(dl_fusion* f);
+/* Камера установки: модель, куда смотрит ось по паспорту, положение (м: восток, север, верх от поворотки).
+   Возвращает её номер k (0, 1, ...). Добавлять до первого dl_fusion_update. */
+DL_API int dl_fusion_add_camera(dl_fusion* f, const dl_camera* c, const dl_pose* p, float x, float y, float z);
+DL_API void dl_fusion_set_pose(dl_fusion* f, int k, const dl_pose* p);
+/* Цели камеры k по кадру t (время — общие часы установки), по важности (первая — захваченная камерой). */
+DL_API void dl_fusion_update(dl_fusion* f, int k, double t, const dl_target* reps, int n);
+/* Цели установки по важности; возвращает их число (может быть больше cap). */
+DL_API int dl_fusion_targets(dl_fusion* f, dl_fused* out, int cap);
+/* Точная ведёт цель id (сообщение в системе поворотки): confident — уверена, что дрон, и держит его
+   (тогда это пары для калибровки широких). */
+DL_API void dl_fusion_observe_reference(dl_fusion* f, int id, const dl_target* r, int confident);
+DL_API int dl_fusion_resolve(dl_fusion* f, int id);              /* номер после слияний, 0 — цели нет */
+DL_API int dl_fusion_local_of(dl_fusion* f, int id, int k);      /* трек камеры k у цели id, 0 — не видит */
+DL_API int dl_fusion_global_of(dl_fusion* f, int k, int local);  /* цель трека камеры k, 0 — нет */
+/* Где камере k ждать к моменту t цель из соседнего сектора: тройки u, v, r (пикс.) для dl_detector_set_focus.
+   Возвращает число областей (может быть больше cap). */
+DL_API int dl_fusion_cues(dl_fusion* f, int k, double t, float* xyr, int cap);
+/* Направление в системе поворотки -> пиксель камеры k (с калибровкой); 1 — в кадре. */
+DL_API int dl_fusion_project(dl_fusion* f, int k, float az, float el, float* u, float* v);
+/* Калибровка камеры k: неуверенность (СКО, градусы) и число учтённых пар. */
+DL_API void dl_fusion_calib(dl_fusion* f, int k, float* sigma_deg, int* pairs);
+/* Калибровка в файл и из файла (строка на камеру): при следующем запуске не учиться заново. 1 — получилось. */
+DL_API int dl_fusion_save_calib(dl_fusion* f, const char* path);
+DL_API int dl_fusion_load_calib(dl_fusion* f, const char* path);
+
+/* Сообщения по сети (UDP, одна датаграмма — одна строка, см. netmsg.hpp): цели камеры cam по кадру t
+   (часы камеры), sent — когда отправлено. Возвращает длину строки (без нуля) или -1, если не влезла в cap. */
+DL_API int dl_msg_encode_targets(int cam, unsigned seq, double t, double sent, const dl_target* reps, int n, char* out,
+                                 int cap);
+/* Разбор: число целей (может быть больше cap) или -1 — не сообщение о целях. */
+DL_API int dl_msg_decode_targets(const char* s, int* cam, unsigned* seq, double* t, double* sent, dl_target* out,
+                                 int cap);
+
+/* ---- Журнал полевых испытаний (dronolok/fieldlog.hpp): треки, захват, решения дрон/птица, вырезки вокруг
+   цели до и после срыва захвата и смены цели, снимки кадра. Пишет отдельный поток, место ограничено max_mb. ---- */
+typedef struct {
+    const char* root;      /* папка журналов (UTF-8); в ней по папке на запуск */
+    const char* session;   /* имя папки запуска, NULL или "" — дата и время */
+    double max_mb;         /* предел места на все журналы в root */
+    double min_free_mb;    /* свободно на диске меньше — вырезки и снимки не пишутся */
+    float pre_s, post_s, max_clip_s;   /* вырезка: секунд до события, после, не длиннее */
+    int crop_px;           /* сторона вырезки */
+    int ring_tracks;       /* кроме захваченной, держать вырезки стольких первых целей очереди */
+    int jpeg_q;            /* качество JPEG */
+    int snap_px;           /* снимок кадра не шире, 0 — без снимков */
+    float overview_every_s;   /* снимок кадра раз в столько секунд, 0 — только у событий */
+    int clips_per_min;     /* предел вырезок в минуту */
+    int all_tracks;        /* 1 — все подтверждённые треки каждого кадра, 0 — только захваченный */
+} dl_fieldlog_config;
+typedef struct dl_fieldlog dl_fieldlog;
+DL_API void dl_fieldlog_config_default(dl_fieldlog_config* c);
+/* w x h — кадр, fps — частота камеры, source — откуда кадры, settings_json — настройки (JSON-объект или NULL).
+   NULL — не открылся (почему — dl_fieldlog_error). */
+DL_API dl_fieldlog* dl_fieldlog_open(const dl_fieldlog_config* c, int w, int h, double fps, const char* source,
+                                     const char* settings_json);
+DL_API const char* dl_fieldlog_error(void);
+/* Кадр после dl_tracker_update: треки, захват и очередь берутся из трекера t. gray — тот же кадр (для вырезок),
+   NULL — без вырезок. time_s — время кадра от начала, с; cam_dx, cam_dy — сдвиг картинки за кадр. */
+DL_API void dl_fieldlog_frame(dl_fieldlog* l, dl_tracker* t, int64_t index, double time_s, const uint8_t* gray, int w,
+                              int h, int stride, float cam_dx, float cam_dy);
+/* Отметка извне (поворотка навелась, оператор, точная камера видит птицу...): type — короткое слово, id — трек
+   или 0, text — пояснение (UTF-8), clip = 1 — записать вырезку вокруг трека id. */
+DL_API void dl_fieldlog_note(dl_fieldlog* l, const char* type, int id, const char* text, int clip);
+DL_API const char* dl_fieldlog_dir(dl_fieldlog* l);   /* папка этого запуска */
+DL_API void dl_fieldlog_close(dl_fieldlog* l);        /* дописать и закрыть (итоги в session.json) */
+
+/* ---- Наведение поворотки точной камеры (dronolok/gimbal.hpp) ----
+   На Pi: фильтр цели (положение, скорость, ускорение по осям поворотки) по отметкам точной — со временем
+   КАДРА (середина выдержки), а не обработки: задержка камеры учитывается сама — и по сообщениям широкой,
+   пока точная цель не видит. Уставка двигателю — где будет цель, когда команда дойдёт (lead_cmd), с её
+   скоростью и ускорением. Контроллер двигателя (или поток на Pi, ~1 кГц): dl_gimbal_drive — плавный профиль
+   с пределами скорости, ускорения и рывка. Без датчиков угла: где была поворотка в момент кадра — по тому,
+   что сообщал контроллер (dl_gimbal_report_pose -> dl_gimbal_pose_at), уход нуля — по широкой. */
+typedef struct {
+    float max_rate, max_accel, max_jerk; /* град/с, град/с², град/с³ */
+    float kp, kv;                        /* 1/с: скорость к ошибке, ускорение к ошибке скорости (kv = 4 kp) */
+    float brake_share;                   /* доля ускорения на торможение к цели */
+    float lead_cmd;                      /* задержка команды до двигателя, с */
+    float jerk_noise, acc_tau;           /* манёвр цели: СКО рывка (град/с³) и сколько длится (с) */
+    float sigma_pose;                    /* ошибка положения поворотки на момент кадра, град */
+    float gate;                          /* отметка дальше стольких СКО — выброс */
+    int gate_reset;                      /* столько выбросов подряд — принять (цель сманеврировала) */
+    float bias_tau, bias_max;            /* уход нуля по широкой: за сколько секунд, не больше скольких градусов */
+} dl_gimbal_config;
+
+typedef struct {
+    double t;        /* на этот момент (now + lead_cmd) */
+    float az, el;    /* град, в координатах привода */
+    float vaz, vel;  /* град/с */
+    float aaz, ael;  /* град/с² */
+    int hold;        /* 1 — цели нет: остановиться плавно */
+} dl_setpoint;
+
+typedef struct dl_gimbal dl_gimbal;
+DL_API void dl_gimbal_defaults(dl_gimbal_config* c);
+DL_API dl_gimbal* dl_gimbal_create(const dl_gimbal_config* c); /* NULL — по умолчанию */
+DL_API void dl_gimbal_destroy(dl_gimbal* g);
+/* Цель по сообщению (обычно широкой, при назначении); NULL — цели нет. */
+DL_API void dl_gimbal_target(dl_gimbal* g, const dl_target* tg);
+/* Отметка цели точной: направление на момент кадра t_frame, СКО (град). 1 — принята, 0 — выброс. */
+DL_API int dl_gimbal_measure(dl_gimbal* g, double t_frame, float az, float el, float sigma);
+/* Оценка цели на момент t как сообщение (окно поиска, сверка с широкой). 0 — цели нет. */
+DL_API int dl_gimbal_estimate(const dl_gimbal* g, double t, dl_target* out);
+/* Уставка двигателю: цель через lead_cmd после now, минус уход нуля. */
+DL_API dl_setpoint dl_gimbal_setpoint(const dl_gimbal* g, double now);
+/* Положение поворотки со временем, как его сообщил контроллер (по профилю, шагам или датчику) — в историю;
+   dl_gimbal_pose_at — где была поворотка в момент t (с поправкой ухода нуля). */
+DL_API void dl_gimbal_report_pose(dl_gimbal* g, double t, float az, float el);
+DL_API dl_pose dl_gimbal_pose_at(const dl_gimbal* g, double t);
+/* Без датчиков угла: широкая видит ту же цель — её сообщение и направление на цель по точной (с поправкой)
+   на время кадра t_frame; dt — сколько прошло с прошлой сверки. dl_gimbal_bias — нынешняя поправка. */
+DL_API void dl_gimbal_wide_check(dl_gimbal* g, const dl_target* wide, double t_frame, float az, float el, double dt);
+DL_API void dl_gimbal_bias(const dl_gimbal* g, float* az, float* el);
+/* Профиль (контроллер двигателя): поставить в (az, el) и шаг h к уставке sp, которая дошла в момент t_recv
+   (между уставками продолжается по её скорости). pos, vel — по 2 значения: азимут, угол места. */
+DL_API void dl_gimbal_drive_reset(dl_gimbal* g, float az, float el);
+DL_API void dl_gimbal_drive(dl_gimbal* g, const dl_setpoint* sp, double t_recv, double t, double h, float* pos, float* vel);
+
 #ifdef __cplusplus
 }
 #endif

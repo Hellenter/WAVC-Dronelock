@@ -26,11 +26,15 @@ set(DL_SOURCES
   src/c_api.cpp
   src/cpu.cpp
   src/detector.cpp
+  src/fieldlog.cpp
+  src/jpeg_gray.cpp
   src/kernels_scalar.cpp
   src/kernels_sse2.cpp
   src/kernels_avx2.cpp
   src/kernels_neon.cpp
   src/motion.cpp
+  src/multicam.cpp
+  src/netmsg.cpp
   src/scene.cpp
   src/thread_pool.cpp
   src/tracker.cpp
@@ -73,6 +77,9 @@ endif()
 add_library(dronolok_static STATIC $<TARGET_OBJECTS:dronolok_obj>)
 target_include_directories(dronolok_static PUBLIC include)
 target_link_libraries(dronolok_static PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(dronolok_static PUBLIC ws2_32)   # UDP между устройствами (netmsg.cpp)
+endif()
 if(MINGW)
   target_link_options(dronolok_static INTERFACE -static)
 endif()
@@ -81,6 +88,9 @@ if(DRONOLOK_SHARED)
   add_library(dronolok SHARED $<TARGET_OBJECTS:dronolok_obj>)
   target_include_directories(dronolok PUBLIC include)
   target_link_libraries(dronolok PUBLIC Threads::Threads)
+  if(WIN32)
+    target_link_libraries(dronolok PUBLIC ws2_32)
+  endif()
   target_compile_definitions(dronolok PRIVATE DRONOLOK_SHARED)
   if(MINGW)
     target_link_options(dronolok PRIVATE -static)
@@ -106,7 +116,16 @@ if(DRONOLOK_TESTS)
   add_executable(test_geometry tests/test_geometry.cpp)
   target_link_libraries(test_geometry PRIVATE dronolok_static)
   add_test(NAME geometry COMMAND test_geometry)
+  add_executable(test_gimbal tests/test_gimbal.cpp)
+  target_link_libraries(test_gimbal PRIVATE dronolok_static)
+  add_test(NAME gimbal COMMAND test_gimbal)
   add_executable(test_occlusion tests/test_occlusion.cpp)
   target_link_libraries(test_occlusion PRIVATE dronolok_static)
   add_test(NAME occlusion COMMAND test_occlusion)
+  add_executable(test_multicam tests/test_multicam.cpp)
+  target_link_libraries(test_multicam PRIVATE dronolok_static)
+  add_test(NAME multicam COMMAND test_multicam)
+  add_executable(test_fieldlog tests/test_fieldlog.cpp)
+  target_link_libraries(test_fieldlog PRIVATE dronolok_static)
+  add_test(NAME fieldlog COMMAND test_fieldlog)
 endif()

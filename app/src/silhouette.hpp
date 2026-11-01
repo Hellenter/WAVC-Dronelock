@@ -128,9 +128,10 @@ inline BodyFrame body_frame(const dronolok::Vec3& v, double pitch_extra, double 
 
 // Нарисовать силуэт в 8-битный кадр: o += contrast * доля пикселя, размытая пятном psf (СКО, пикс.).
 // q — центр цели в мире (камера в начале координат). Возвращает размер силуэта в пикселях (большая сторона).
+// su, sv — смаз за выдержку: цель прошла по кадру столько пикселей (середина выдержки — в q)
 template <class ProjectFn>
 double draw_silhouette(const std::vector<Tri>& tris, const dronolok::Vec3& q, const BodyFrame& B, double contrast,
-                       double psf, ProjectFn&& project, uint8_t* px, int w, int h) {
+                       double psf, ProjectFn&& project, uint8_t* px, int w, int h, double su = 0, double sv = 0) {
     struct P2 { double u, v; };
     std::vector<P2> pts(tris.size() * 3);
     double umin = 1e18, umax = -1e18, vmin = 1e18, vmax = -1e18;
@@ -150,7 +151,9 @@ double draw_silhouette(const std::vector<Tri>& tris, const dronolok::Vec3& q, co
     if (ext > 2000) return ext;   // вплотную к камере — не рисуем
     // доля пикселя под силуэтом: суперсэмплинг ss x ss (мелкую цель — гуще)
     const int ss = ext < 6 ? 8 : ext < 30 ? 4 : 2;
-    const int m = (int)std::ceil(3 * psf) + 1;
+    const double smear = std::hypot(su, sv);
+    const bool smeared = smear > 0.25 && smear < 400;
+    const int m = (int)std::ceil(3 * psf) + 1 + (smeared ? (int)std::ceil(0.5 * std::max(std::fabs(su), std::fabs(sv))) + 1 : 0);
     const int bx0 = (int)std::floor(umin) - m, by0 = (int)std::floor(vmin) - m;
     const int bw = (int)std::ceil(umax) + m - bx0 + 1, bh = (int)std::ceil(vmax) + m - by0 + 1;
     std::vector<float> sub((size_t)bw * ss * bh * ss, 0.f);
@@ -199,6 +202,28 @@ double draw_silhouette(const std::vector<Tri>& tris, const dronolok::Vec3& q, co
         const double cu = 0.5 * (umin + umax), cv = 0.5 * (vmin + vmax);
         const int x = (int)std::floor(cu) - bx0, y = (int)std::floor(cv) - by0;
         if (x >= 0 && x < bw && y >= 0 && y < bh) cov[(size_t)y * bw + x] = (float)std::min(1.0, 0.5 * a);
+    }
+    // смаз: среднее силуэта по отрезку пути за выдержку (билинейно)
+    if (smeared) {
+        const int K = (int)std::ceil(2 * smear) + 1;
+        std::vector<float> acc(cov.size(), 0.f);
+        for (int k = 0; k < K; ++k) {
+            const double f = (double)k / (K - 1) - 0.5, ox = f * su, oy = f * sv;
+            const int ix = (int)std::floor(ox), iy = (int)std::floor(oy);
+            const float fx = (float)(ox - ix), fy = (float)(oy - iy);
+            for (int y = 0; y < bh; ++y)
+                for (int x = 0; x < bw; ++x) {
+                    // значение в (x, y) — силуэт, сдвинутый на (ox, oy): берём из (x - ox, y - oy)
+                    auto at = [&](int xx, int yy) {
+                        return xx >= 0 && yy >= 0 && xx < bw && yy < bh ? cov[(size_t)yy * bw + xx] : 0.f;
+                    };
+                    const int x0 = x - ix - 1, y0 = y - iy - 1;
+                    const float a = at(x0, y0), b = at(x0 + 1, y0), c = at(x0, y0 + 1), d = at(x0 + 1, y0 + 1);
+                    // x - ox = x0 + 1 - fx: между x0 и x0+1 с долей 1 - fx
+                    acc[(size_t)y * bw + x] += (a * fx + b * (1 - fx)) * fy + (c * fx + d * (1 - fx)) * (1 - fy);
+                }
+        }
+        for (size_t i = 0; i < cov.size(); ++i) cov[i] = acc[i] / K;
     }
     // пятно объектива: разделимый гаусс
     if (psf > 0.05) {

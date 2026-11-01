@@ -5,9 +5,12 @@
 // поэтому скорость отрисовки и скорость алгоритма друг на друга не влияют.
 //
 // Протокол (sim/godot/sim.gd, --live <порт>): от нас строка JSON — сначала hello с камерами и
-// целями, затем {"t", "cam", "az", "el"} на каждый кадр, {"quit": 1} в конце. От сцены — строка
+// целями (вторая и следующие широкие — "wides": [[аз, у.м., x, y, z], ...], камеры 2, 3...),
+// затем {"t", "cam", "az", "el"[, "roll"]} на каждый кадр, {"quit": 1} в конце. От сцены — строка
 // "FRAME w h n k", k строк целей "id bird shape size x y z vx vy vz hidden" (от камер: восток, север, верх; м и м/с)
 // и n байт кадра (серый, w x h).
+// Погода и время суток: "env" в hello и в запросе кадра — объект поверх погоды сцены (sim.gd: weather,
+// time, time_rate, day, lat, clouds, visibility, rain, snow); в запросе он заменяет прежний целиком.
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -38,11 +41,14 @@ public:
     ~Link() { stop(); }
     // запустить Godot, дождаться связи и передать hello (JSON без перевода строки)
     bool start(const Options& o, const std::string& hello, std::string& err);
-    // кадр камеры cam (0 широкая, 1 точная) на момент t
+    // кадр камеры cam (0 широкая, 1 точная, 2... — вторая и следующие широкие) на момент t; roll — поворот
+    // кадра вокруг оси (ошибка установки широкой)
     bool render(double t, int cam, double az, double el, std::vector<uint8_t>& px, int& w, int& h,
-                std::vector<Body>& bodies, std::string& err);
+                std::vector<Body>& bodies, std::string& err, double roll = 0);
     void stop();
     bool running() const { return proc_ != nullptr; }
+    // погода поверх сцены (JSON-объект): уйдёт со следующим запросом кадра
+    void setEnv(const std::string& envJson) { pendingEnv_ = envJson; }
     // флаг остановки эмулятора: ожидание Godot и кадра прерывается сразу, а не через 2 минуты
     void setCancel(const std::atomic<bool>* c) { cancel_ = c; }
 
@@ -57,6 +63,7 @@ private:
     void* proc_ = nullptr;
     intptr_t lsock_ = -1, sock_ = -1;
     std::string buf_;   // принятое сверх прочитанной строки
+    std::string pendingEnv_;
     int64_t frames_ = 0;
 };
 

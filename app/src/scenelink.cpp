@@ -196,17 +196,26 @@ bool Link::recvAll(uint8_t* p, size_t n) {
 }
 
 bool Link::render(double t, int cam, double az, double el, std::vector<uint8_t>& px, int& w, int& h,
-                  std::vector<Body>& bodies, std::string& err) {
+                  std::vector<Body>& bodies, std::string& err, double roll) {
     if (sock_ < 0) {
         err = "сцена не запущена";
         return false;
     }
-    char q[200];
-    snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f}\n", t, cam, az, el);
+    char q[240];
+    if (roll != 0)
+        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f, \"roll\": %.5f", t, cam, az, el, roll);
+    else
+        snprintf(q, sizeof(q), "{\"t\": %.6f, \"cam\": %d, \"az\": %.5f, \"el\": %.5f", t, cam, az, el);
+    std::string req = q;
+    if (!pendingEnv_.empty()) {
+        req += ", \"env\": " + pendingEnv_;
+        pendingEnv_.clear();
+    }
+    req += "}\n";
     std::string line;
     long long n = 0;
     int k = 0;
-    if (!sendAll(q, strlen(q)) || !recvLine(line) ||
+    if (!sendAll(req.data(), req.size()) || !recvLine(line) ||
         sscanf(line.c_str(), "FRAME %d %d %lld %d", &w, &h, &n, &k) != 4 || w <= 0 || h <= 0 || n != (long long)w * h ||
         n > MAX_FRAME || k < 0 || k > MAX_BODIES) {
         err = "сцена не ответила кадром";

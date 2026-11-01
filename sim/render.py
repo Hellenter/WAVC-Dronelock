@@ -6,6 +6,8 @@
     python sim/render.py --scene sim/scenes/city_sectors.json --sector highrise --out out/hr   # камера на сектор
     python sim/render.py --scene sim/scenes/city_sectors.json --view      # окно: крутить камеру, 1/2/3 — сектора
     python sim/render.py --scene sim/scenes/city_sectors.json --panorama --out out/pano   # полоса 360°
+    python sim/render.py --scene sim/scenes/city_sectors.json --weather rain --time 19:30 --out out/r   # погода, время
+    python sim/render.py --scene sim/scenes/city_sectors.json --gallery "clear@13;cumulus@19;fog@8" --out out/g
 
 Godot пишет кадры PNG (out/wide, out/fine), разметку <имя>_wide.mp4.gt.json и <имя>_fine.mp4.gt.json,
 meta.json (позы камер, траектории). Затем ffmpeg собирает <имя>_wide.mp4 и <имя>_fine.mp4 (H.264).
@@ -14,6 +16,7 @@ ffmpeg ищется в PATH, иначе берётся из пакета imageio
 import argparse, json, os, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+WEATHERS = ["clear", "cumulus", "cloudy", "overcast", "haze", "mist", "fog", "rain", "storm", "snow"]
 
 
 def find_ffmpeg():
@@ -62,6 +65,18 @@ def main():
     ap.add_argument("--sweep", type=float, help="качание ±° вместо обзора по кругу (вместе с --pan)")
     ap.add_argument("--view", action="store_true", help="окно просмотра вместо рендера роликов")
     ap.add_argument("--panorama", action="store_true", help="12 снимков по кругу и склейка pano.jpg")
+    ap.add_argument("--weather", help="погода поверх сцены: " + ", ".join(WEATHERS))
+    ap.add_argument("--time", help="время суток, ч (местное солнечное): 19.5 или 19:30")
+    ap.add_argument("--date", help="дата ММ-ДД (высота солнца), по умолчанию 09-15")
+    ap.add_argument("--lat", type=float, help="широта, ° (по умолчанию 55.75 — Москва)")
+    ap.add_argument("--time-rate", type=float, help="во сколько раз быстрее идёт время суток (60 — час за минуту)")
+    ap.add_argument("--clouds", type=float, help="облачность 0..1")
+    ap.add_argument("--cirrus", type=float, help="перистые облака 0..1")
+    ap.add_argument("--visibility", type=float, help="видимость, м (дымка, туман)")
+    ap.add_argument("--rain", type=float, help="дождь 0..1")
+    ap.add_argument("--snow", type=float, help="снег 0..1")
+    ap.add_argument("--exposure", help="экспозиция камеры: auto (по умолчанию) или множитель")
+    ap.add_argument("--gallery", help='кадры по погоде: "погода@часы[@азимут];..." -> gallery.jpg')
     ap.add_argument("--keep-png", action="store_true")
     ap.add_argument("--encode-only", action="store_true")
     a = ap.parse_args()
@@ -74,9 +89,16 @@ def main():
             cmd += ["--seconds", str(a.seconds)]
         if a.scale:
             cmd += ["--scale", str(a.scale)]
-        for k in ("sector", "az", "el", "pan", "sweep"):
+        for k in ("sector", "az", "el", "pan", "sweep", "weather", "time", "date", "lat", "time_rate", "clouds",
+                  "cirrus", "visibility", "rain", "snow", "exposure"):
             if getattr(a, k) is not None:
-                cmd += ["--" + k, str(getattr(a, k))]
+                cmd += ["--" + k.replace("_", "-"), str(getattr(a, k))]
+        if a.gallery:
+            cmd += ["--gallery", a.gallery]
+            print(" ".join(cmd))
+            subprocess.run(cmd, check=True)
+            subprocess.run([sys.executable, os.path.join(HERE, "gallery.py"), out], check=True)
+            return
         if a.view:
             cmd += ["--view", "1"]
             print(" ".join(cmd))

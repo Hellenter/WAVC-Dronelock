@@ -57,6 +57,37 @@ class _Window(C.Structure):
     _fields_ = [("u", C.c_float), ("v", C.c_float), ("radius", C.c_float), ("visible", C.c_int)]
 
 
+class _FusionConfig(C.Structure):
+    _fields_ = [(n, C.c_float) for n in ("gate_deg", "gate_sigma", "coast_s", "drop_s", "merge_s", "edge_deg", "keep_s",
+                                         "range_min", "range_max", "range_guess")] + \
+               [("calib", C.c_int)] + [(n, C.c_float) for n in ("calib_init_deg", "calib_max_deg", "calib_half_life",
+                                                               "calib_pair_max_dt")] + \
+               [("cue", C.c_int), ("independent", C.c_int)]
+
+
+class _Fused(C.Structure):
+    _fields_ = [("rep", _Target), ("cam", C.c_int), ("local", C.c_int), ("seen_by", C.c_uint), ("handoffs", C.c_int)]
+
+
+class _FieldLogConfig(C.Structure):
+    _fields_ = [("root", C.c_char_p), ("session", C.c_char_p), ("max_mb", C.c_double), ("min_free_mb", C.c_double),
+                ("pre_s", C.c_float), ("post_s", C.c_float), ("max_clip_s", C.c_float), ("crop_px", C.c_int),
+                ("ring_tracks", C.c_int), ("jpeg_q", C.c_int), ("snap_px", C.c_int), ("overview_every_s", C.c_float),
+                ("clips_per_min", C.c_int), ("all_tracks", C.c_int)]
+
+
+class _GimbalConfig(C.Structure):
+    _fields_ = [("max_rate", C.c_float), ("max_accel", C.c_float), ("max_jerk", C.c_float), ("kp", C.c_float),
+                ("kv", C.c_float), ("brake_share", C.c_float), ("lead_cmd", C.c_float), ("jerk_noise", C.c_float),
+                ("acc_tau", C.c_float), ("sigma_pose", C.c_float), ("gate", C.c_float), ("gate_reset", C.c_int),
+                ("bias_tau", C.c_float), ("bias_max", C.c_float)]
+
+
+class _Setpoint(C.Structure):
+    _fields_ = [("t", C.c_double), ("az", C.c_float), ("el", C.c_float), ("vaz", C.c_float), ("vel", C.c_float),
+                ("aaz", C.c_float), ("ael", C.c_float), ("hold", C.c_int)]
+
+
 class _Timing(C.Structure):
     _fields_ = [("total_ms", C.c_double), ("response_ms", C.c_double), ("select_ms", C.c_double),
                 ("jobs", C.c_int), ("jobs_skipped", C.c_int)]
@@ -126,6 +157,56 @@ def _load():
     lib.dl_target_aim.restype = _Pose
     lib.dl_target_aim.argtypes = [P(_Target), C.c_double, C.c_double]
     lib.dl_pose_shift.argtypes = [PC, PP, PP, C.c_float, C.c_float, PF, PF]
+    # несколько широких камер
+    V = C.c_void_p
+    lib.dl_fusion_config_default.argtypes = [P(_FusionConfig)]
+    lib.dl_fusion_create.restype = V
+    lib.dl_fusion_create.argtypes = [P(_FusionConfig)]
+    lib.dl_fusion_destroy.argtypes = [V]
+    lib.dl_fusion_add_camera.argtypes = [V, PC, PP, C.c_float, C.c_float, C.c_float]
+    lib.dl_fusion_set_pose.argtypes = [V, C.c_int, PP]
+    lib.dl_fusion_update.argtypes = [V, C.c_int, C.c_double, P(_Target), C.c_int]
+    lib.dl_fusion_targets.argtypes = [V, P(_Fused), C.c_int]
+    lib.dl_fusion_observe_reference.argtypes = [V, C.c_int, P(_Target), C.c_int]
+    lib.dl_fusion_resolve.argtypes = [V, C.c_int]
+    lib.dl_fusion_local_of.argtypes = [V, C.c_int, C.c_int]
+    lib.dl_fusion_global_of.argtypes = [V, C.c_int, C.c_int]
+    lib.dl_fusion_cues.argtypes = [V, C.c_int, C.c_double, PF, C.c_int]
+    lib.dl_fusion_project.argtypes = [V, C.c_int, C.c_float, C.c_float, PF, PF]
+    lib.dl_fusion_calib.argtypes = [V, C.c_int, PF, C.POINTER(C.c_int)]
+    lib.dl_fusion_save_calib.argtypes = [V, C.c_char_p]
+    lib.dl_fusion_load_calib.argtypes = [V, C.c_char_p]
+    lib.dl_msg_encode_targets.argtypes = [C.c_int, C.c_uint, C.c_double, C.c_double, P(_Target), C.c_int, C.c_char_p,
+                                          C.c_int]
+    lib.dl_msg_decode_targets.argtypes = [C.c_char_p, C.POINTER(C.c_int), C.POINTER(C.c_uint), C.POINTER(C.c_double),
+                                          C.POINTER(C.c_double), P(_Target), C.c_int]
+    lib.dl_fieldlog_config_default.argtypes = [P(_FieldLogConfig)]
+    lib.dl_fieldlog_open.restype = C.c_void_p
+    lib.dl_fieldlog_open.argtypes = [P(_FieldLogConfig), C.c_int, C.c_int, C.c_double, C.c_char_p, C.c_char_p]
+    lib.dl_fieldlog_error.restype = C.c_char_p
+    lib.dl_fieldlog_frame.argtypes = [C.c_void_p, C.c_void_p, C.c_int64, C.c_double, C.c_void_p, C.c_int, C.c_int,
+                                      C.c_int, C.c_float, C.c_float]
+    lib.dl_fieldlog_note.argtypes = [C.c_void_p, C.c_char_p, C.c_int, C.c_char_p, C.c_int]
+    lib.dl_fieldlog_dir.restype = C.c_char_p
+    lib.dl_fieldlog_dir.argtypes = [C.c_void_p]
+    lib.dl_fieldlog_close.argtypes = [C.c_void_p]
+    PG, PS, PT = C.c_void_p, P(_Setpoint), P(_Target)
+    lib.dl_gimbal_defaults.argtypes = [P(_GimbalConfig)]
+    lib.dl_gimbal_create.restype = C.c_void_p
+    lib.dl_gimbal_create.argtypes = [P(_GimbalConfig)]
+    lib.dl_gimbal_destroy.argtypes = [PG]
+    lib.dl_gimbal_target.argtypes = [PG, PT]
+    lib.dl_gimbal_measure.argtypes = [PG, C.c_double, C.c_float, C.c_float, C.c_float]
+    lib.dl_gimbal_estimate.argtypes = [PG, C.c_double, PT]
+    lib.dl_gimbal_setpoint.restype = _Setpoint
+    lib.dl_gimbal_setpoint.argtypes = [PG, C.c_double]
+    lib.dl_gimbal_report_pose.argtypes = [PG, C.c_double, C.c_float, C.c_float]
+    lib.dl_gimbal_pose_at.restype = _Pose
+    lib.dl_gimbal_pose_at.argtypes = [PG, C.c_double]
+    lib.dl_gimbal_wide_check.argtypes = [PG, PT, C.c_double, C.c_float, C.c_float, C.c_double]
+    lib.dl_gimbal_bias.argtypes = [PG, PF, PF]
+    lib.dl_gimbal_drive_reset.argtypes = [PG, C.c_float, C.c_float]
+    lib.dl_gimbal_drive.argtypes = [PG, PS, C.c_double, C.c_double, C.c_double, PF, PF]
     return lib
 
 
@@ -293,6 +374,73 @@ class NativeTracker:
         return out
 
 
+class FieldLog:
+    """Журнал полевых испытаний (native/README.md, «Журнал полевых испытаний»).
+
+    log = FieldLog("/home/pi/dronolok-logs", (h, w), fps=14, source="cam0", max_mb=4096)
+    ... каждый кадр после tracker.update(...):
+    log.frame(tracker, index, t, gray, cam=(dx, dy))
+    log.note("slew", track_id, "поворотка навелась", clip=True)
+    log.close()
+
+    Параметры как у dl_fieldlog_config: pre_s, post_s, crop_px, ring_tracks, jpeg_q, snap_px, overview_every_s,
+    clips_per_min, all_tracks, min_free_mb, session. settings — словарь настроек, попадёт в session.json.
+    """
+
+    def __init__(self, root, shape, fps, source="", settings=None, **kw):
+        import json
+        h, w = shape
+        cfg = _FieldLogConfig()
+        lib().dl_fieldlog_config_default(C.byref(cfg))
+        self._root = os.fsencode(root)
+        cfg.root = self._root
+        self._session = os.fsencode(kw.pop("session", "") or "")
+        cfg.session = self._session
+        for k, v in kw.items():
+            if not hasattr(cfg, k):
+                raise TypeError(f"неизвестный параметр журнала: {k}")
+            setattr(cfg, k, int(v) if isinstance(v, bool) else v)
+        sj = json.dumps(settings, ensure_ascii=False).encode() if settings else None
+        self._h = lib().dl_fieldlog_open(C.byref(cfg), w, h, float(fps), source.encode(), sj)
+        if not self._h:
+            raise OSError("журнал не открыт: " + lib().dl_fieldlog_error().decode(errors="replace"))
+
+    @property
+    def dir(self):
+        return lib().dl_fieldlog_dir(self._h).decode() if self._h else ""
+
+    def frame(self, tracker, index, t, gray=None, cam=(0.0, 0.0)):
+        """кадр после NativeTracker.update: треки, захват и очередь берутся из трекера"""
+        if not self._h:
+            return
+        if gray is not None:
+            import numpy as np
+            g = np.ascontiguousarray(gray, dtype=np.uint8)
+            lib().dl_fieldlog_frame(self._h, tracker._h, int(index), float(t), g.ctypes.data, g.shape[1], g.shape[0],
+                                    g.strides[0], float(cam[0]), float(cam[1]))
+        else:
+            lib().dl_fieldlog_frame(self._h, tracker._h, int(index), float(t), None, 0, 0, 0, float(cam[0]),
+                                    float(cam[1]))
+
+    def note(self, kind, track_id=0, text="", clip=False):
+        if self._h:
+            lib().dl_fieldlog_note(self._h, kind.encode(), int(track_id), text.encode(), 1 if clip else 0)
+
+    def close(self):
+        if getattr(self, "_h", None):
+            lib().dl_fieldlog_close(self._h)
+            self._h = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
 class NativeMotion:
     """Сдвиг картинки между кадрами (камера движется): estimate(gray) -> (dx, dy, quality, valid)"""
 
@@ -380,3 +528,165 @@ class Target:
     def aim(self, t, lead):
         p = lib().dl_target_aim(C.byref(self.raw), t, lead)
         return (p.az, p.el, p.roll)
+
+
+class Fusion:
+    """Цели нескольких широких камер — в одной системе (поворотки точной), одна цель — один номер,
+    в том числе при перелёте из сектора в сектор (dl_fusion_*). Камеры — до первого update:
+
+        f = Fusion()
+        k0 = f.add_camera(Camera(4608, 2592, 120), (0, 30, 0))
+        k1 = f.add_camera(Camera(4608, 2592, 120), (110, 30, 0), pos=(0.3, 0, 0))
+        f.update(k0, t, [Target.from_track(cam, pose, t, 14, tr, hard) ...])   # по кадру каждой камеры
+        for g in f.targets(): ...   # g["id"], g["target"] (в системе поворотки), g["cam"], g["seen_by"]
+        f.observe_reference(gid, narrow_target, confident=True)   # точная ведёт цель: калибровка широких
+    """
+
+    def __init__(self, **cfg):
+        c = _FusionConfig()
+        lib().dl_fusion_config_default(C.byref(c))
+        for k, v in cfg.items():
+            setattr(c, k, v)
+        self.h = lib().dl_fusion_create(C.byref(c))
+
+    def __del__(self):
+        if getattr(self, "h", None):
+            lib().dl_fusion_destroy(self.h)
+            self.h = None
+
+    def add_camera(self, cam, pose, pos=(0.0, 0.0, 0.0)):
+        """камера: модель, ось по паспорту (az, el, roll), положение (м: восток, север, верх от поворотки)"""
+        return lib().dl_fusion_add_camera(self.h, C.byref(cam.c), C.byref(_Pose(*pose)), *pos)
+
+    def set_pose(self, k, pose):
+        lib().dl_fusion_set_pose(self.h, k, C.byref(_Pose(*pose)))
+
+    def update(self, k, t, targets):
+        """цели камеры k по кадру t (Target или сырые _Target), по важности"""
+        arr = (_Target * max(1, len(targets)))(*[x.raw if isinstance(x, Target) else x for x in targets])
+        lib().dl_fusion_update(self.h, k, t, arr, len(targets))
+
+    def targets(self, cap=64):
+        buf = (_Fused * cap)()
+        n = min(cap, lib().dl_fusion_targets(self.h, buf, cap))
+        return [{"id": b.rep.id, "target": Target(b.rep), "cam": b.cam, "local": b.local, "seen_by": b.seen_by,
+                 "handoffs": b.handoffs} for b in buf[:n]]
+
+    def observe_reference(self, gid, target, confident):
+        raw = target.raw if isinstance(target, Target) else target
+        lib().dl_fusion_observe_reference(self.h, gid, C.byref(raw), 1 if confident else 0)
+
+    def resolve(self, gid):
+        return lib().dl_fusion_resolve(self.h, gid)
+
+    def local_of(self, gid, k):
+        return lib().dl_fusion_local_of(self.h, gid, k)
+
+    def global_of(self, k, local):
+        return lib().dl_fusion_global_of(self.h, k, local)
+
+    def cues(self, k, t, cap=16):
+        """где камере k ждать цель из соседнего сектора: [(u, v, r)] — для детектора (set_focus)"""
+        buf = (C.c_float * (3 * cap))()
+        n = min(cap, lib().dl_fusion_cues(self.h, k, t, buf, cap))
+        return [(buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]) for i in range(n)]
+
+    def project(self, k, az, el):
+        u, v = C.c_float(), C.c_float()
+        ok = lib().dl_fusion_project(self.h, k, az, el, C.byref(u), C.byref(v))
+        return u.value, v.value, bool(ok)
+
+    def calib(self, k):
+        s, n = C.c_float(), C.c_int()
+        lib().dl_fusion_calib(self.h, k, C.byref(s), C.byref(n))
+        return s.value, n.value
+
+    def save_calib(self, path):
+        return bool(lib().dl_fusion_save_calib(self.h, path.encode("utf-8")))
+
+    def load_calib(self, path):
+        return bool(lib().dl_fusion_load_calib(self.h, path.encode("utf-8")))
+
+
+def encode_targets(cam, seq, t, sent, targets):
+    """сообщение DLW1 (одна UDP-датаграмма): цели камеры cam по кадру t, часы камеры"""
+    arr = (_Target * max(1, len(targets)))(*[x.raw if isinstance(x, Target) else x for x in targets])
+    buf = C.create_string_buffer(65536)
+    n = lib().dl_msg_encode_targets(cam, seq, t, sent, arr, len(targets), buf, len(buf))
+    if n < 0:
+        raise ValueError("сообщение не влезло")
+    return buf.value
+
+
+def decode_targets(data, cap=64):
+    """(cam, seq, t, sent, [Target]) или None — не сообщение о целях"""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    cam, seq, t, sent = C.c_int(), C.c_uint(), C.c_double(), C.c_double()
+    buf = (_Target * cap)()
+    n = lib().dl_msg_decode_targets(data, C.byref(cam), C.byref(seq), C.byref(t), C.byref(sent), buf, cap)
+    if n < 0:
+        return None
+    return cam.value, seq.value, t.value, sent.value, [Target(buf[i]) for i in range(min(n, cap))]
+
+
+class Gimbal:
+    """Наведение поворотки точной камеры (dl_gimbal): фильтр цели с временем кадра, уставка двигателю
+    на момент, когда команда дойдёт, плавный профиль (контроллер двигателя) и положение поворотки
+    без датчиков угла.
+
+        g = Gimbal(max_rate=30, max_accel=150, max_jerk=3000, lead_cmd=0.01)
+        g.target(wide_target)                    # назначили цель (Target широкой)
+        g.measure(t_frame, az, el, sigma)        # отметка точной: направление на момент КАДРА
+        sp = g.setpoint(now)                     # -> контроллеру двигателя
+        pos, vel = g.drive(sp, t_recv, t, 0.001) # в контроллере (или в потоке на Pi), ~1 кГц
+        g.report_pose(t, az, el)                 # что сообщил контроллер -> g.pose_at(t_frame)
+    """
+
+    def __init__(self, **cfg):
+        c = _GimbalConfig()
+        lib().dl_gimbal_defaults(C.byref(c))
+        for k, v in cfg.items():
+            setattr(c, k, v)
+        self._h = lib().dl_gimbal_create(C.byref(c))
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib().dl_gimbal_destroy(self._h)
+            self._h = None
+
+    def target(self, tg):
+        lib().dl_gimbal_target(self._h, C.byref(tg.raw) if tg is not None else None)
+
+    def measure(self, t_frame, az, el, sigma):
+        return bool(lib().dl_gimbal_measure(self._h, t_frame, az, el, sigma))
+
+    def estimate(self, t):
+        out = _Target()
+        return Target(out) if lib().dl_gimbal_estimate(self._h, t, C.byref(out)) else None
+
+    def setpoint(self, now):
+        return lib().dl_gimbal_setpoint(self._h, now)
+
+    def report_pose(self, t, az, el):
+        lib().dl_gimbal_report_pose(self._h, t, az, el)
+
+    def pose_at(self, t):
+        p = lib().dl_gimbal_pose_at(self._h, t)
+        return (p.az, p.el, p.roll)
+
+    def wide_check(self, wide, t_frame, az, el, dt):
+        lib().dl_gimbal_wide_check(self._h, C.byref(wide.raw), t_frame, az, el, dt)
+
+    def bias(self):
+        a, e = C.c_float(), C.c_float()
+        lib().dl_gimbal_bias(self._h, C.byref(a), C.byref(e))
+        return a.value, e.value
+
+    def drive_reset(self, az, el):
+        lib().dl_gimbal_drive_reset(self._h, az, el)
+
+    def drive(self, sp, t_recv, t, h):
+        pos, vel = (C.c_float * 2)(), (C.c_float * 2)()
+        lib().dl_gimbal_drive(self._h, C.byref(sp) if sp is not None else None, t_recv, t, h, pos, vel)
+        return (pos[0], pos[1]), (vel[0], vel[1])

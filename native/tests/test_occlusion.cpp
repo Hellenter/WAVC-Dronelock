@@ -7,6 +7,9 @@
 //  - «зависание»: дрон плавно тормозит и висит — это не предмет, захват на нём;
 //  - «второй дрон»: дрон залетел за кромку и не вылетел, а в кадре летит другой — захват на прогнозе
 //    пропавшего уступает ему (stuck_yield), а не ждёт секунды; короткий заслон — захват остаётся на первом.
+//    То же, когда кромка стоит с начала ролика (трек на её отклик не садится, still_reject).
+//  - «вдоль кромки»: дрон летит вдоль верхушек крон, стоящих с начала ролика, и сливается с каждой —
+//    трек не пересаживается на верхушку (still_reject).
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -121,8 +124,11 @@ static int foliage(const TrackerConfig& base) {
 // Первый дрон (захвачен) на t0 залетает за кромку на hide с (0 — не вылетает), второй летит в стороне с 3-й секунды.
 // Кромка мерцает (каждый 4-й кадр) 3 с до того, как дрон к ней подлетел, и откликается вся, пока он за ней: трек
 // дрона встаёт на её отклик и снимается с предмета (stuck_obs). Возвращает, через сколько кадров после пропажи
-// захват на втором (-1 — не перешёл); back — захват в конце на первом, stuck — сколько раз трек снимался с предмета
-static int second(float fps, float hide, const TrackerConfig& base, bool* back = nullptr, int* stuck = nullptr) {
+// захват на втором (-1 — не перешёл); back — захват в конце на первом, stuck — сколько раз трек снимался с предмета.
+// standing — кромка стоит с начала ролика (видна 2 кадра из 3): трек на её отклик не садится (still_reject), и
+// захват на прогнозе пропавшего должен уступать так же (мозаика 4608 m1: дрон ушёл за край четверти)
+static int second(float fps, float hide, const TrackerConfig& base, bool* back = nullptr, int* stuck = nullptr,
+                  bool standing = false) {
     std::mt19937 rng(5);
     auto U = [&](float a, float b) { return a + (b - a) * (float)(rng() % 100000) / 100000.f; };
     Tracker t(1280, 720, tracker_for_fps(base, fps));
@@ -136,7 +142,7 @@ static int second(float fps, float hide, const TrackerConfig& base, bool* back =
         if (f >= t2) x2 -= v2;
         std::vector<Candidate> d;
         if (f < t0 || f >= t0 + occ) d.push_back(mk(x + U(-.5f, .5f), y + U(-.5f, .5f), 30));
-        if (f >= t0 || (f >= t0 - (int)(3 * fps) && f % 4 == 0)) d.push_back(mk(ox + 4, oy, 20));
+        if (f >= t0 || (standing ? f % 3 != 0 : f >= t0 - (int)(3 * fps) && f % 4 == 0)) d.push_back(mk(ox + 4, oy, 20));
         if (f >= t2) d.push_back(mk(x2 + U(-.5f, .5f), y2 + U(-.5f, .5f), 25));
         t.update(d);
         if (f == t0 - 1) CHECK(t.lockState() == LockState::Hard, "%.0f к/с: до заслона нет жёсткого захвата", fps);
@@ -151,7 +157,56 @@ static int second(float fps, float hide, const TrackerConfig& base, bool* back =
     return sw;
 }
 
+// Дрон летит вдоль кромки леса: на его пути верхушки крон — отклики, стоящие на месте с начала ролика
+// (мерцают: видны 2 кадра из 3). Проходя верхушку ближе merge пикс., дрон с ней сливается (его отклика
+// нет, есть только её). Трек дрона не должен пересаживаться на верхушку и оставаться на ней (still_reject);
+// возвращает кадров захвата на верхушке, когда дрон уже дальше 12 пикс., на дроне — onDrone (после первой)
+static int treeline(float fps, float merge, const TrackerConfig& base, int* onDrone = nullptr) {
+    std::mt19937 rng(3);
+    auto U = [&](float a, float b) { return a + (b - a) * (float)(rng() % 100000) / 100000.f; };
+    Tracker t(1280, 720, tracker_for_fps(base, fps));
+    const float v = 50.f / fps;
+    std::vector<float> tops;
+    for (float x = 420; x < 1100; x += 90) tops.push_back(x);
+    float x = 100;
+    const float y = 300, ty = 305;
+    int onTop = 0, on = 0;
+    for (int f = 0; x < 1150; ++f) {
+        x += v;
+        std::vector<Candidate> d;
+        bool merged = false;
+        for (float tx : tops) {
+            const bool m = std::fabs(tx - x) < merge;
+            merged |= m;
+            if (f % 3 != 0 || m) d.push_back(mk(tx + U(-.3f, .3f), ty + U(-.3f, .3f), 18));
+        }
+        if (!merged) d.push_back(mk(x + U(-.5f, .5f), y + U(-.5f, .5f), 30));
+        t.update(d);
+        if (x < tops[0] - merge) continue;
+        for (const Track& tr : t.confirmed())
+            if (tr.id == t.lockedId()) {
+                bool top = false;
+                for (float tx : tops) top |= std::hypot(tr.x - tx, tr.y - ty) < 4 && std::hypot(x - tx, y - ty) > 12;
+                onTop += top;
+                on += std::hypot(tr.x - x, tr.y - y) < 12;
+            }
+    }
+    if (onDrone) *onDrone = on;
+    return onTop;
+}
+
 int main() {
+    for (float fps : {10.f, 14.f, 25.f, 60.f})
+        for (float merge : {8.f, 10.f}) {
+            TrackerConfig off;
+            off.still_reject = 0;
+            int onA = 0, onB = 0;
+            const int a = treeline(fps, merge, TrackerConfig(), &onA), b = treeline(fps, merge, off, &onB);
+            std::printf("%2.0f к/с, вдоль кромки (сливается за %.0f пикс.): захват на верхушке %d кадров, на дроне %d (без правила %d и %d)\n",
+                        fps, merge, a, onA, b, onB);
+            CHECK(a <= (int)std::lround(0.1f * fps), "%.0f к/с, вдоль кромки %.0f: захват на верхушке %d кадров", fps, merge, a);
+            CHECK(onA >= onB, "%.0f к/с, вдоль кромки %.0f: на дроне %d кадров, без правила %d", fps, merge, onA, onB);
+        }
     for (float fps : {14.f, 25.f, 60.f})
         for (float brake : {0.5f, 1.f}) hover(fps, brake, 3.f);
     const TrackerConfig on;
@@ -189,6 +244,14 @@ int main() {
         CHECK(stuck > 0, "%.0f к/с: трек первого дрона не снялся с кромки", fps);
         CHECK(a >= 0 && a <= (int)std::lround(1.5f * fps), "%.0f к/с: захват на прогнозе пропавшего не уступил второму (%d)", fps, a);
         CHECK(back, "%.0f к/с: после короткого заслона захват не на первом дроне", fps);
+        const int s = second(fps, 0, TrackerConfig(), nullptr, nullptr, true);
+        bool sback = false;
+        second(fps, 0.4f, TrackerConfig(), &sback, nullptr, true);
+        std::printf("%2.0f к/с, второй дрон, кромка стоит с начала: захват на нём через %.1f с; заслон 0.4 с — %s\n", fps,
+                    (float)s / fps, sback ? "на первом" : "не на первом");
+        CHECK(s >= 0 && s <= (int)std::lround(1.5f * fps),
+              "%.0f к/с, кромка стоит с начала: захват на прогнозе пропавшего не уступил второму (%d)", fps, s);
+        CHECK(sback, "%.0f к/с, кромка стоит с начала: после короткого заслона захват не на первом дроне", fps);
     }
     if (failures) std::printf("%d ошибок\n", failures);
     else std::printf("заслон: всё в порядке\n");

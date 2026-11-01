@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "dronolok/detector.hpp"
+#include "dronolok/fieldlog.hpp"
 #include "dronolok/scene.hpp"
 #include "gt_eval.hpp"
 #include "video_source.hpp"
@@ -134,6 +135,11 @@ struct Settings {
     bool adapt = true;
     // журнал треков (замеры): по строке на подтверждённый трек каждого кадра, CSV
     std::string trackLog;
+    // Журнал полевых испытаний (dronolok/fieldlog.hpp): папка журналов, "" — не писать. Как на устройстве:
+    // треки, захват, решения дрон/птица, вырезки вокруг цели у срывов и смен цели. Пишется первый проход
+    // видео (повтор ролика — нет); перемотка начинает треки заново (событие reset). root в fieldCfg не нужен
+    std::string fieldLog;
+    dronolok::FieldLogConfig fieldCfg;
 };
 
 // Что реально включено для кадра w x h. Авто: кадр до ~2 Мп (Full HD и меньше) —
@@ -217,6 +223,13 @@ enum Mark : uint8_t {
     MARK_MISS = 64,     // ...и он не найден
 };
 
+// Где был захват на кадре — в пикселях видео; по нему приложение ищет места, где разметка
+// и трекер расходятся. state: 0 — захвата нет, 1 — проверка, 2 — жёсткий
+struct LockMark {
+    float x = 0, y = 0;
+    uint8_t state = 0;
+};
+
 struct Stat {
     double mean = 0, p50 = 0, p95 = 0, max = 0;
 };
@@ -267,6 +280,7 @@ public:
     void seek(int64_t frame);
     int64_t length() const;              // кадров на шкале (0 — неизвестно)
     void marks(std::vector<uint8_t>& out) const;
+    void lockMarks(std::vector<LockMark>& out) const;   // по номеру кадра, как marks
     int findInHistory(int64_t frame) const;   // seq последнего обработанного кадра frame или -1
     void relearnMask();
     // Маска неба снаружи (панорамная маска 360° эмулятора при известном повороте камеры): ставится
@@ -326,6 +340,14 @@ public:
     };
     Progress progress() const;
 
+    // Журнал полевых испытаний, который пишется сейчас (Settings::fieldLog)
+    struct FieldStatus {
+        bool on = false;
+        std::string dir, err;     // папка запуска; почему не пишется
+        dronolok::FieldLogStats st;
+    };
+    FieldStatus fieldStatus() const;
+
     std::shared_ptr<const Result> latest() const;
     // Последние обработанные кадры для просмотра назад на паузе (номера seq подряд).
     // Держим не больше HIST_MAX кадров и HIST_BYTES памяти.
@@ -349,6 +371,7 @@ private:
     VideoInfo info_;
     VideoInfo fileInfo_;   // как в файле; info_ — с частотой, заданной вручную (Settings::videoFps)
     void applyVideoFps(const Settings& s);
+    std::string settingsJson(const Settings& s, int w, int h) const;
     std::shared_ptr<const dronolok::GroundTruth> gt_;   // под rm_: разметку можно заменить на ходу
     bool haveGt_ = false;
 
@@ -374,6 +397,9 @@ private:
     std::atomic<int64_t> seekReq_{-1};
     std::atomic<int64_t> preN_{0};       // кадров в предзагрузке (0 — читаем файл)
     std::string staticMsg_;
+    // журнал полевых испытаний (пишет поток обработки; статус — под rm_)
+    dronolok::FieldLog* flog_ = nullptr;
+    std::string flogDir_, flogErr_;
 
     // очередь кадров
     mutable std::mutex qm_;
@@ -390,6 +416,7 @@ private:
     size_t histBytes_ = 0;
     std::vector<FrameRec> log_;
     std::vector<uint8_t> marks_;
+    std::vector<LockMark> lockMarks_;
     long dropped_ = 0, decoded_ = 0;
     std::deque<double> decodeTimes_;   // моменты выдачи кадров декодером
     std::string backend_, status_;
